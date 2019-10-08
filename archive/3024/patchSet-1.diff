@@ -1,0 +1,383 @@
+commit 3b38c621a309adb2b8a913b365a58ed0a3aec9cb
+Author: Jason King <jason.king@joyent.com>
+Date:   2017-12-01T11:20:45-06:00 (1 year, 10 months ago)
+    
+    Hackathon - VNC
+
+diff --git a/lib/cloudapi2.js b/lib/cloudapi2.js
+index a409e18..62e70cd 100644
+--- a/lib/cloudapi2.js
++++ b/lib/cloudapi2.js
+@@ -42,13 +42,15 @@ var querystring = require('querystring');
+ var vasync = require('vasync');
+ var auth = require('smartdc-auth');
+ var EventEmitter = require('events').EventEmitter;
++var mod_watershed = require('watershed');
++var mod_restify = require('restify-clients');
+ 
+ var bunyannoop = require('./bunyannoop');
+ var common = require('./common');
+ var errors = require('./errors');
+ var SaferJsonClient = require('./SaferJsonClient');
+ 
+-
++var shed = new mod_watershed.Watershed();
+ 
+ // ---- globals
+ 
+@@ -152,6 +154,9 @@ function CloudApi(options) {
+     //this.token = options.token;
+ 
+     this.client = new SaferJsonClient(options);
++
++    // Websockets cannot use the JSON client
++    this.webSocketClient = new mod_restify.HttpClient(options);
+ }
+ 
+ 
+@@ -302,6 +307,91 @@ CloudApi.prototype._request = function _request(opts, cb) {
+     });
+ };
+ 
++/**
++ * Cloud API websocket request wrapper
++ *
++ * @param {Object|String} opts - object or string for endpoint
++ *      - {String} path - URL endpoint to hit
++ *      - {String} method - HTTP(s) request method
++ *      - {Object} data - data to be passed
++ *      - {Object} headers - optional additional request headers
++ * @param {Function} cb passed via the restify client
++ */
++CloudApi.prototype._createWebSocket = function _createWebSocket(opts, cb) {
++    var self = this;
++    if (typeof (opts) === 'string')
++        opts = {path: opts};
++    assert.object(opts, 'opts');
++    assert.optionalObject(opts.data, 'opts.data');
++    assert.optionalString(opts.method, 'opts.method');
++    assert.optionalObject(opts.headers, 'opts.headers');
++    assert.func(cb, 'cb');
++
++    var method = (opts.method || 'GET').toLowerCase();
++
++    // GET and POST are the only two methods that seem to make sense for
++    // creating a websocket
++    assert.ok(['get', 'post'].indexOf(method) >= 0,
++        'invalid HTTP method given');
++
++    if (self.roles && self.roles.length > 0) {
++        if (opts.path.indexOf('?') !== -1) {
++            opts.path += '&as-role=' + self.roles.join(',');
++        } else {
++            opts.path += '?as-role=' + self.roles.join(',');
++        }
++    }
++
++    self._getAuthHeaders(method, opts.path, function (err, headers) {
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        var wskey = shed.generateKey();
++
++        if (opts.headers) {
++            common.objMerge(headers, opts.headers);
++        }
++        common.objMerge(headers, {
++            'connection': 'upgrade',
++            'upgrade': 'websocket',
++            'sec-websocket-key': wskey,
++            'sec-websocket-version': 13
++        });
++
++        var reqOpts = {
++            path: opts.path,
++            headers: headers
++        };
++
++        var upgradeCb = function (upgradeErr, req, res, body) {
++            if (upgradeErr) {
++                cb(upgradeErr);
++                return;
++            }
++
++            req.once('upgradeResult', function (uErr, uRes, socket, head) {
++                if (uErr) {
++                    cb(uErr);
++                    return;
++                }
++
++                // Everything currently using websockets are latency
++                // sensitive, so send data as soon as it's given to us
++                socket.setNoDelay(true);
++                var client = shed.connect(uRes, socket, head, wskey);
++                cb(null, client, uRes);
++            });
++        };
++
++        if (opts.data)
++            self.webSocketClient[method](reqOpts, opts.data, upgradeCb);
++        else
++            self.webSocketClient[method](reqOpts, upgradeCb);
++    });
++};
++
+ /**
+  * A simple wrapper around making a GET request to an endpoint and
+  * passing back the body returned
+@@ -831,6 +921,17 @@ CloudApi.prototype.getMachine = function getMachine(opts, cb) {
+     });
+ };
+ 
++/**
++ * Create a VNC connection to a HVM's console
++ *
++ * @param {String} uuid (required) The machine id.
++ * @param {Function} callback of the form `function (err, shed, res)`
++ */
++CloudApi.prototype.getMachineVnc = function getMachineVnc(uuid, cb) {
++    var endpoint = format('/%s/machines/%s/vnc', this.account, uuid);
++    this._createWebSocket({path: endpoint}, cb);
++};
++
+ /**
+  * resize a machine by id.
+  *
+diff --git a/lib/do_instance/do_vnc.js b/lib/do_instance/do_vnc.js
+new file mode 100644
+index 0000000..4fdf313
+--- /dev/null
++++ b/lib/do_instance/do_vnc.js
+@@ -0,0 +1,154 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017 Joyent, Inc.
++ *
++ * `triton instance vnc ...`
++ */
++
++var net = require('net');
++var vasync = require('vasync');
++var common = require('../common');
++var errors = require('../errors');
++var format = require('util').format;
++
++function getInstance(ctx, next) {
++    ctx.cli.tritonapi.getInstance(ctx.id, function onInstance(err, inst) {
++        if (err) {
++            next(err);
++            return;
++        }
++
++        ctx.inst = inst;
++        next();
++    });
++}
++
++function createServer(port, cb) {
++    var server = net.createServer(function (conn) {
++        cb(null, conn);
++    });
++
++    server.listen(port);
++
++    server.on('listening', function serverListen() {
++        var actualPort = server.address().port;
++        var connstr = format('vnc://127.0.0.1:%d', actualPort);
++        console.log('Listening on ' + connstr);
++    });
++
++    server.on('error', function serverError(err) {
++        cb(err);
++    });
++}
++
++function startProxy(ctx, next) {
++    createServer(ctx.port, function onConnect(cErr, conn) {
++        if (cErr) {
++            next(cErr);
++            return;
++        }
++
++        // VNC is latency sensitive, so send data as soon as it's available
++        conn.setNoDelay(true);
++
++        // The VNC protocol starts with the _server_ sending a handshake
++        // to the client, so we explicitly want to defer creation of the
++        // websocket until we have a connection on the proxy
++        ctx.cli.tritonapi.getInstanceVnc(ctx.inst.id, function vnc(vErr, shed) {
++            conn.on('data', function serverData(data) {
++                shed.send(data);
++            });
++
++            shed.on('binary', function shedData(data) {
++                conn.write(data);
++            });
++
++            conn.on('end', function serverEnd(data) {
++                console.log('# Connection closed');
++                shed.end('Connection closed');
++                process.exit(0);
++            });
++
++            shed.on('end', function shedEnd(code, reason) {
++                conn.end();
++                var msg = format('# Websocket closed: %d - %s', code, reason);
++                console.log(msg);
++                process.exit(0);
++            });
++
++            shed.on('error', function shedError(shedErr) {
++                conn.end();
++                if (shedErr) {
++                    console.log('# Websocket error: ', shedErr);
++                }
++                // A shed 'end' event will follow this
++            });
++
++            shed.on('connectionReset', function shedReset() {
++                console.log('# Connection reset by peer');
++                conn.end();
++                // A shed 'end' event will follow this
++            });
++        });
++    });
++}
++
++function do_vnc(subcmd, opts, args, callback) {
++    if (opts.help) {
++        this.do_help('help', {}, [subcmd], callback);
++        return;
++    } else if (args.length === 0) {
++        callback(new errors.UsageError('missing INST arg'));
++        return;
++    }
++
++    var id = args.shift();
++    var port = opts.port || 0;
++
++    vasync.pipeline({arg: {cli: this.top, id: id, port: port}, funcs: [
++        common.cliSetupTritonApi,
++
++        // We could skip the instance lookup here and directly call
++        // tritonapi.getInstanceVnc with 'id', however, the instance id given
++        // would not be validated until a connection is made to the server
++        // proxy we create with start_server.  Instead the id is validated
++        // before we start the proxy so that we can immediately exit if
++        // there is an error.
++        getInstance,
++        startProxy
++    ]}, callback);
++}
++
++do_vnc.options = [
++    {
++        names: ['help', 'h'],
++        type: 'bool',
++        help: 'Show this help.'
++    },
++    {
++        names: ['port', 'p'],
++        helpArg: 'PORT',
++        type: 'positiveInteger',
++        help: 'The port number the server listens on.  If not specified, '
++            + 'a random port number is used.'
++    }
++];
++
++do_vnc.synopses = ['{{name}} vnc [OPTIONS] INST'];
++do_vnc.help = [
++    'Start VNC server for instance.',
++    '',
++    '{{usage}}',
++    '',
++    '{{options}}',
++    'Where INST is an instance name, id, or short id.'
++].join('\n');
++
++do_vnc.completionArgtypes = ['tritoninstance', 'none'];
++
++module.exports = do_vnc;
+diff --git a/lib/do_instance/index.js b/lib/do_instance/index.js
+index d8f1513..0519114 100644
+--- a/lib/do_instance/index.js
++++ b/lib/do_instance/index.js
+@@ -45,6 +45,7 @@ function InstanceCLI(top) {
+             'enable-firewall',
+             'disable-firewall',
+             { group: '' },
++            'vnc',
+             'ssh',
+             'ip',
+             'wait',
+@@ -77,6 +78,7 @@ InstanceCLI.prototype.do_fwrules = require('./do_fwrules');
+ InstanceCLI.prototype.do_enable_firewall = require('./do_enable_firewall');
+ InstanceCLI.prototype.do_disable_firewall = require('./do_disable_firewall');
+ 
++InstanceCLI.prototype.do_vnc = require('./do_vnc');
+ InstanceCLI.prototype.do_ssh = require('./do_ssh');
+ InstanceCLI.prototype.do_ip = require('./do_ip');
+ InstanceCLI.prototype.do_wait = require('./do_wait');
+diff --git a/lib/tritonapi.js b/lib/tritonapi.js
+index a0e8ea7..d830c5d 100644
+--- a/lib/tritonapi.js
++++ b/lib/tritonapi.js
+@@ -1139,6 +1139,39 @@ TritonApi.prototype.getInstance = function getInstance(opts, cb) {
+     });
+ };
+ 
++// ---- instance console vnc
++
++/**
++ * Get VNC connection to the console of an HVM instance.
++ * @param {String} id: Required.  The instance UUID, name, or short ID.
++ * @param {Function} callback of the form `function (err, shed)`
++ */
++TritonApi.prototype.getInstanceVnc = function getInstanceVnc(id, cb) {
++    assert.string(id, 'id');
++
++    var self = this;
++    var shed = null;
++
++    vasync.pipeline({arg: {client: self, id: id}, funcs: [
++        _stepInstId,
++        function getVncConnection(arg, next) {
++            self.cloudapi.getMachineVnc(arg.instId, function (err, shed_, _) {
++                if (err) {
++                    next(err);
++                    return;
++                }
++                shed = shed_;
++                next();
++            });
++        }
++    ]}, function (err) {
++        if (err) {
++            cb(err, null);
++        } else {
++            cb(null, shed);
++        }
++    });
++};
+ 
+ // ---- instance enable/disable firewall
+ 
+diff --git a/package.json b/package.json
+index 4a681c0..56ea03e 100644
+--- a/package.json
++++ b/package.json
+@@ -28,6 +28,7 @@
+     "tabula": "1.9.0",
+     "vasync": "1.6.3",
+     "verror": "1.10.0",
++    "watershed": "0.4.0",
+     "which": "1.2.4",
+     "wordwrap": "1.0.0"
+   },

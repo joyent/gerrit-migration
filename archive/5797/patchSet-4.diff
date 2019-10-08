@@ -1,0 +1,648 @@
+commit 30e02afb5903bc34a476be892924e5c1515c63b6
+Author: Isaac Davis <isaac.davis@joyent.com>
+Date:   2019-03-15T21:28:47+00:00 (7 months ago)
+    
+    MANTA-4122 Muskie could have a cheaper directory listing API
+    MANTA-4067 muskie ensureDirectoryEmpty should be cheaper
+
+diff --git a/lib/common.js b/lib/common.js
+index b65e6f6..44e4c70 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -630,33 +630,111 @@ function addCustomHeaders(req, res) {
+     });
+ }
+ 
++/*
++ * The "opts" argument can contain the following fields:
++ *   - checkParams: a boolean indicating whether to restrict the use of
++ *     sensitive query parameters to operators. These sensitive parameters are:
++ *     - sort === 'none'
++ *     - skip_owner_check === 'true'
++ */
++function readdir(dir, req, opts) {
++    if (opts === undefined) {
++        opts = { checkParams: true };
++    } else {
++        assert.object(opts, 'opts');
++        assert.bool(opts.checkParams, 'opts.checkParams');
++    }
++
++    /*
++     * We check for the sensitive query parameters mentioned above, and, if
++     * checkParams is specified, verify that the request came from an operator.
++     *
++     * The caller should pass checkParams as `true` anywhere readdir is being
++     * called where the query parameters have been sent directly by the
++     * client -- for example, when servicing a GET request on a directory.
++     * The intent is to restrict the use of sensitive parameters to operators,
++     * for reasons explained below.
++     *
++     * The caller can pass checkParams as `false` anywhere muskie has set these
++     * parameters itself and knows it is safe to do so regardless of the
++     * client's operator status -- for example, when checking if a directory is
++     * empty, as explained below.
++     *
++     * "sort === 'none'" is sensitive because it removes the guarantee of any
++     * consistent total order of the results returned, or even that two
++     * identical requests return the same results. This lack of ordering also
++     * makes pagination unsafe, as there's no guarantee that each child will get
++     * returned exactly once in a sequence of paginated requests. This behavior
++     * is likely not what the client expects or wants, so we limit its use to
++     * operators.
++     *
++     * "skip_owner_check === 'true'" is sensitive because it theoretically
++     * allows users to see objects owned by other users that reside in the
++     * directory being listed. We thus limit its use to operators as well.
++     *
++     * These two parameters constitute a short-term approach to a faster
++     * directory listing, to be used in the garbage collection process that runs
++     * in mako zones. In this use case, the client does not care about the order
++     * of results returned (because it deletes all results it gets back before
++     * asking for more) nor who owns the objects (because  it knows that only
++     * poseidon has written to the directory in question).
++     *
++     * "sort === 'none'" is also used internally when checking if a directory
++     * is empty, because we only care whether results exist, not what order they
++     * are in.
++     */
++    var nosort = req.params.sort === 'none';
++    var ownerCheck = !(req.params.skip_owner_check === 'true');
++    if (opts.checkParams) {
++        var isOperator = req.caller.account.isOperator;
++
++        var ee;
++        if (!isOperator) {
++            var badParams = [];
++            if (nosort) {
++                badParams.push('sort=none');
++            }
++            if (!ownerCheck) {
++                badParams.push('skip_owner_check=true');
++            }
++            if (badParams.length != 0) {
++                ee = new EventEmitter();
++                setImmediate(function () {
++                    ee.emit('error',
++                        new QueryParameterForbiddenError(badParams));
++                });
++                return (ee);
++            }
++        }
++    }
+ 
+-function readdir(dir, req) {
+     var l = parseInt(req.params.limit || 256, 10);
+     if (l <= 0 || l > 1024) {
+-        var ee = new EventEmitter();
+-        process.nextTick(function () {
++        ee = new EventEmitter();
++        setImmediate(function () {
+             ee.emit('error', new InvalidLimitError(l));
+         });
+         return (ee);
+     }
+ 
+-    var account = req.owner.account.uuid;
+     // We want the really low-level API here, as we want to go hit the place
+     // where all the keys are, not where the dirent itself is.
+     var client = req.moray;
+     var filter = new morayFilter.AndFilter();
+ 
+-    filter.addFilter(new morayFilter.EqualityFilter({
+-        attribute: 'owner',
+-        value: account
+-    }));
++    if (ownerCheck) {
++        var account = req.owner.account.uuid;
++        filter.addFilter(new morayFilter.EqualityFilter({
++            attribute: 'owner',
++            value: account
++        }));
++    }
+     filter.addFilter(new morayFilter.EqualityFilter({
+         attribute: 'dirname',
+         value: dir
+     }));
+ 
+-    //The 'dir' above comes in as the path of the request.  The 'dir'
++    // The 'dir' above comes in as the path of the request.  The 'dir'
+     // and 'obj' parameters are filters.
+     var hasDir = (req.params.dir !== undefined ||
+                   req.params.directory !== undefined);
+@@ -675,7 +753,7 @@ function readdir(dir, req) {
+     var tsort = req.params.sort === 'mtime';
+ 
+     var log = req.log;
+-    var opts = {
++    var morayOpts = {
+         limit: l,
+         requestId: req.getId(),
+         sort: {},
+@@ -684,22 +762,32 @@ function readdir(dir, req) {
+     };
+ 
+     if (tsort) {
+-        opts.sort.attribute = '_mtime';
++        morayOpts.sort.attribute = '_mtime';
+         if (reverse) {
+-            opts.sort.order = 'ASC';
++            morayOpts.sort.order = 'ASC';
+         } else {
+-            opts.sort.order = 'DESC';
++            morayOpts.sort.order = 'DESC';
+         }
++    } else if (nosort) {
++        delete morayOpts.sort;
+     } else {
+-        opts.sort.attribute = 'name';
++        // If we do not specify tsort or nosort, we sort by name.
++        morayOpts.sort.attribute = 'name';
+         if (reverse) {
+-            opts.sort.order = 'DESC';
++            morayOpts.sort.order = 'DESC';
+         } else {
+-            opts.sort.order = 'ASC';
++            morayOpts.sort.order = 'ASC';
+         }
+     }
+ 
+-    if (marker) {
++    /*
++     * If a marker was provided with the request, add an appropriate filter so
++     * that this page of results begins at the appropriate position in the full
++     * result set.  If this is a request for unsorted results, it doesn't make
++     * sense to use a marker as there is no consistent total order of the result
++     * set.
++     */
++    if (marker && !nosort) {
+         if (tsort) {
+             var mtime = Date.parse(marker);
+             if (Number.isFinite(mtime)) {
+@@ -716,23 +804,24 @@ function readdir(dir, req) {
+         }
+ 
+         var sortArgs = {
+-            attribute: opts.sort.attribute,
++            attribute: morayOpts.sort.attribute,
+             value: marker
+         };
+-        if (opts.sort.order === 'ASC') {
++        if (morayOpts.sort.order === 'ASC') {
+             filter.addFilter(new morayFilter.GreaterThanEqualsFilter(sortArgs));
+         } else {
+             filter.addFilter(new morayFilter.LessThanEqualsFilter(sortArgs));
+         }
+     }
+ 
+-    opts.filter = filter.toString();
++    morayOpts.filter = filter.toString();
+ 
+     log.debug({
+         dir: dir,
+-        filter: opts.filter
++        opts: opts,
++        morayOpts: morayOpts
+     }, 'readdir: entered');
+-    var mreq = client.search(opts);
++    var mreq = client.search(morayOpts);
+ 
+     mreq.on('record', function (r) {
+         if (r.key !== req.key) {
+diff --git a/lib/dir.js b/lib/dir.js
+index 01f2fd0..70c4cbc 100644
+--- a/lib/dir.js
++++ b/lib/dir.js
+@@ -145,7 +145,7 @@ function getDirectory(req, res, next) {
+     }
+ 
+     if (req.method !== 'HEAD') {
+-        var mreq = common.readdir(req.key, req);
++        var mreq = common.readdir(req.key, req, { checkParams: true });
+ 
+         mreq.once('error', function (err) {
+             mreq.removeAllListeners('end');
+@@ -210,10 +210,17 @@ function ensureDirectoryEmpty(req, res, next) {
+     var children = false;
+     var mreq;
+ 
+-    // Just override the limit, so we don't ask moray to
+-    // do too much work
++    /*
++     * A regular readdir() operation is expensive: it sorts and formats a page
++     * of results from the directory in a form appropriate for clients.  As we
++     * only need to know if the directory has any entries, we'll just ask for
++     * one entry and disable any sorting of the result set. We also override
++     * skip_owner_check to ensure that it is false.
++     */
+     req.params.limit = 1;
+-    mreq = common.readdir(req.key, req);
++    req.params.sort = 'none';
++    req.params.skip_owner_check = 'false';
++    mreq = common.readdir(req.key, req, { checkParams: false });
+ 
+     mreq.once('error', next);
+ 
+diff --git a/lib/errors.js b/lib/errors.js
+index f963f60..ac42afb 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -541,6 +541,19 @@ function PreSignedRequestError(msg) {
+ util.inherits(PreSignedRequestError, MuskieError);
+ 
+ 
++// We expect an array of the offending parameters.
++function QueryParameterForbiddenError(params) {
++    MuskieError.call(this, {
++        restCode: 'QueryParameterForbidden',
++        statusCode: 403,
++        message: sprintf(
++            'Use of these query parameters is restricted to operators: %s',
++            params.join(', '))
++    });
++}
++util.inherits(QueryParameterForbiddenError, MuskieError);
++
++
+ function RequestedRangeNotSatisfiableError(req, err) {
+     if (err && err._result && err._result.headers) {
+         this.headers = {
+diff --git a/package.json b/package.json
+index a1189c7..3e07661 100644
+--- a/package.json
++++ b/package.json
+@@ -51,7 +51,8 @@
+         "manta": "5.1.0",
+         "nodeunit": "0.9.1",
+         "node-uuid": "1.4.1",
+-        "forkexec": "^1.0.0"
++        "forkexec": "^1.0.0",
++        "smartdc-auth": "^2.5.7"
+     },
+     "scripts": {
+         "start": "./build/node/bin/node ./main.js",
+diff --git a/test/dir.test.js b/test/dir.test.js
+index 1545716..4e98a4b 100644
+--- a/test/dir.test.js
++++ b/test/dir.test.js
+@@ -53,10 +53,177 @@ function writeStreamingObject(client, key, cb) {
+     });
+ }
+ 
++/*
++ * Tests whether (or not) we are allowed to list the contents of a dir, given
++ * these input arguments:
++ *   - t: the test object - to be passed in from a wrapper function
++ *   - isOperator: whether we want to perform the request as an operator or not
++ *   - expectOk: whether we want the request to succeed or fail
++ *   - path: the directory to list
++ *   - params: an object containing the desired query parameters, of the form:
++ *     {
++ *        key1: "value1"
++ *        key2: "value2"
++ *        ...
++ *     }
++ *
++ * This function does not verify that the request returns well-formed results.
++ * See testListWithParams for that.
++ *
++ * Because some query parameters are not exposed through the node-manta client,
++ * we use a lower-level JSON client to perform the request.
++ */
++function testParamsAllowed(t, isOperator, expectOk, path, params) {
++    var queryParams = params || {};
++    var client = helper.createJsonClient();
++
++    var key;
++    var user;
++    if (isOperator) {
++        key = helper.getOperatorPrivkey();
++        user = helper.TEST_OPERATOR;
++    } else {
++        key = helper.getRegularPrivkey();
++        user = process.env.MANTA_USER;
++    }
++    var keyId = helper.getKeyFingerprint(key);
++    var signOpts = {
++        key: key,
++        keyId: keyId,
++        user: user
++    };
++
++    // Perform the ls request, and check the response according to expectOk
++    helper.signRequest(signOpts, function gotSignature(err, authz, date) {
++        var opts = {
++            headers: {
++                authorization: authz,
++                date: date
++            },
++            path: path,
++            query: queryParams
++        };
++        client.get(opts, function (get_err, get_req, get_res) {
++            if (expectOk) {
++                t.ifError(get_err);
++            } else {
++                t.ok(get_err);
++                t.equal(get_err.statusCode, 403);
++                t.equal(get_err.restCode, 'QueryParameterForbidden');
++            }
++            t.end();
++        });
++    });
++}
++
++/*
++ * Verifies that we get well-formed results back when listing the contents of a
++ * dir with the given query parameters. Arguments:
++ *   - t: the test object - to be passed in from a wrapper function
++ *   - params: an object containing the desired query parameters, of the form:
++ *     {
++ *        key1: "value1"
++ *        key2: "value2"
++ *        ...
++ *     }
++ *
++ * This function ensures that the request will be permitted by always performing
++ * the request as an operator, and thus does not test access control. See
++ * testParamsAllowed for that.
++ *
++ * Because some query parameters are not exposed through the node-manta client,
++ * we use a lower-level JSON client to perform the request.
++ */
++function testListWithParams(t, params) {
++    var self = this;
++    var queryParams = params || {};
++    var client = helper.createJsonClient();
++
++    var key = helper.getOperatorPrivkey();
++    var keyId = helper.getKeyFingerprint(key);
++    var user = helper.TEST_OPERATOR;
++    var signOpts = {
++        key: key,
++        keyId: keyId,
++        user: user
++    };
++
++    // Generate some subdirectory names we can read back
++    var subdirs = [];
++    var count = 5;
++    var i;
++    for (i = 0; i < count; i++) {
++        subdirs.push(self.dir + '/' + uuid.v4());
++    }
++    subdirs = subdirs.sort();
++
++
++    // Make the subdirectories
++    vasync.forEachParallel({
++        func: mkdir,
++        inputs: subdirs
++    }, function subdirsCreated(mkdir_err, results) {
++        t.ifError(mkdir_err);
++
++        // Read the subdirectories back with the specified query params
++        helper.signRequest(signOpts, function gotSig(sig_err, authz, date) {
++            t.ifError(sig_err);
++            var opts = {
++                headers: {
++                    authorization: authz,
++                    date: date
++                },
++                path: self.dir,
++                query: queryParams
++            };
++            client.get(opts, function (get_err, get_req, get_res) {
++                t.ifError(get_err);
++
++                // Parse the response body into a list of directory names
++                var jsonStrings = get_res.body.split('\n').filter(isNotEmpty);
++                var names = [];
++                jsonStrings.forEach(function appendName(s) {
++                    t.doesNotThrow(parseAndAppend.bind(null, s, names));
++                });
++                names = names.sort();
++
++                // Verify that we got back all of the directories we created
++                t.deepEqual(subdirs, names.map(prependDir));
++                t.end();
++            });
++        });
++    });
++
++    // helper functions
++
++    function mkdir(path, cb) {
++        self.operatorClient.mkdir(path, function madeDir(err, res) {
++            t.ifError(err);
++            t.ok(res);
++            t.checkResponse(res, 204);
++            cb(err);
++        });
++    }
++
++    function isNotEmpty(str) {
++        return (str !== '');
++    }
++
++    function parseAndAppend(str, list) {
++        list.push(JSON.parse(str).name);
++    }
++
++    function prependDir(name) {
++        return (self.dir + '/' + name);
++    }
++}
++
++
+ ///--- Tests
+ 
+ before(function (cb) {
+     this.client = helper.createClient();
++    this.operatorClient = helper.createOperatorClient();
+     this.top = '/' + this.client.user;
+     this.root = this.top + '/stor';
+     this.mpuRoot = this.top + '/uploads';
+@@ -610,6 +777,69 @@ test('ls 404', function (t) {
+ });
+ 
+ 
++test('operator can ls with no sort', function (t) {
++    testParamsAllowed(t, true, true, this.root, {
++        sort: 'none'
++    });
++});
++
++
++test('operator can ls with no owner check', function (t) {
++    testParamsAllowed(t, true, true, this.root, {
++        skip_owner_check: 'true'
++    });
++});
++
++
++test('operator can ls with sort and no owner check', function (t) {
++    testParamsAllowed(t, true, true, this.root, {
++        sort: 'none',
++        skip_owner_check: 'true'
++    });
++});
++
++
++test('regular user cannot ls with no sort', function (t) {
++    testParamsAllowed(t, false, false, this.root, {
++        sort: 'none'
++    });
++});
++
++
++test('regular user cannot ls with no owner check', function (t) {
++    testParamsAllowed(t, false, false, this.root, {
++        skip_owner_check: 'true'
++    });
++});
++
++
++test('regular user cannot ls with no sort and no owner check', function (t) {
++    testParamsAllowed(t, false, false, this.root, {
++        sort: 'none',
++        skip_owner_check: 'true'
++    });
++});
++
++test('ls with no sort returns accurate list of results', function (t) {
++    testListWithParams.bind(this)(t, {
++        sort: 'none'
++    });
++});
++
++test('ls with no owner check returns accurate list of results', function (t) {
++    testListWithParams.bind(this)(t, {
++        skip_owner_check: 'true'
++    });
++});
++
++test('ls with no sort and no owner check returns accurate list of results',
++    function (t) {
++    testListWithParams.bind(this)(t, {
++        sort: 'none',
++        skip_owner_check: 'true'
++    });
++});
++
+ test('rmdir', function (t) {
+     this.client.unlink(this.dir, function (err, res) {
+         t.ifError(err);
+diff --git a/test/helper.js b/test/helper.js
+index 6d2416d..1f183ee 100644
+--- a/test/helper.js
++++ b/test/helper.js
+@@ -20,6 +20,7 @@ var manta = require('manta');
+ var once = require('once');
+ var restify = require('restify');
+ var smartdc = require('smartdc');
++var smartdc_auth = require('smartdc-auth');
+ var sshpk = require('sshpk');
+ var VError = require('verror').VError;
+ 
+@@ -83,6 +84,10 @@ function getOperatorPrivkey() {
+     return (fs.readFileSync(TEST_OPERATOR_KEY, 'utf8'));
+ }
+ 
++function getKeyFingerprint(key) {
++    return (sshpk.parseKey(key, 'auto').fingerprint('md5').toString());
++}
++
+ function createLogger(name, stream) {
+     var log = bunyan.createLogger({
+         level: (process.env.LOG_LEVEL || 'warn'),
+@@ -195,7 +200,7 @@ function createSDCClient() {
+ 
+ function createOperatorSDCClient() {
+     var key = getOperatorPrivkey();
+-    var keyId = sshpk.parseKey(key, 'auto').fingerprint('md5').toString();
++    var keyId = getKeyFingerprint(key);
+ 
+     var log = createLogger();
+     var client = smartdc.createClient({
+@@ -217,7 +222,7 @@ function createOperatorSDCClient() {
+ 
+ function createOperatorClient() {
+     var key = getOperatorPrivkey();
+-    var keyId = sshpk.parseKey(key, 'auto').fingerprint('md5').toString();
++    var keyId = getKeyFingerprint(key);
+ 
+     var log = createLogger();
+     var client = manta.createClient({
+@@ -290,6 +295,30 @@ function createAuthToken(opts, cb) {
+ }
+ 
+ 
++function signRequest(opts, cb) {
++    var key = opts.key || getRegularPrivkey();
++
++    var sign = manta.privateKeySigner({
++        key: key,
++        keyId: opts.keyId || process.env.MANTA_KEY_ID,
++        user: opts.user || process.env.MANTA_USER
++    });
++
++    var rs = smartdc_auth.requestSigner({
++        sign: sign,
++        mantaSubUser: true
++    });
++
++    var date = rs.writeDateHeader();
++
++    rs.sign(function gotSignature(err, authz) {
++        if (err) {
++            cb(err);
++            return;
++        }
++        cb(null, authz, date);
++    });
++}
+ 
+ function signUrl(opts, expires, cb) {
+     if (typeof (opts) === 'string') {
+@@ -318,6 +347,7 @@ function signUrl(opts, expires, cb) {
+         method: opts.method || 'GET',
+         path: opts.path,
+         role: opts.role,
++        query: opts.query,
+         'role-tag': opts['role-tag'],
+         sign: manta.privateKeySigner({
+             algorithm: 'rsa-sha256',
+@@ -444,6 +474,7 @@ module.exports = {
+     },
+ 
+     POSEIDON_ID: POSEIDON_ID,
++    TEST_OPERATOR: TEST_OPERATOR,
+     createClient: createClient,
+     createJsonClient: createJsonClient,
+     createRawClient: createRawClient,
+@@ -453,7 +484,11 @@ module.exports = {
+     createAuthToken: createAuthToken,
+     createOperatorSDCClient: createOperatorSDCClient,
+     createOperatorClient: createOperatorClient,
++    signRequest: signRequest,
+     signUrl: signUrl,
+     getRegularPubkey: getRegularPubkey,
+-    getRegularPrivkey: getRegularPrivkey
++    getRegularPrivkey: getRegularPrivkey,
++    getOperatorPubkey: getOperatorPubkey,
++    getOperatorPrivkey: getOperatorPrivkey,
++    getKeyFingerprint: getKeyFingerprint
+ };
+diff --git a/tools/jsl.node.conf b/tools/jsl.node.conf
+index eac7168..6b349fa 100644
+--- a/tools/jsl.node.conf
++++ b/tools/jsl.node.conf
+@@ -179,6 +179,7 @@
+ +define NotImplementedError
+ +define ParentNotDirectoryError
+ +define PreSignedRequestError
+++define QueryParameterForbiddenError
+ +define RequestEntityTooLargeError
+ +define ResourceNotFoundError
+ +define RootDirectoryError

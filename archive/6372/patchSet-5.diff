@@ -1,0 +1,433 @@
+commit 60f11b60c4b48e6d93c298e91798c1d3e2e52494
+Author: Pedro Palazon Candel <pedro@joyent.com>
+Date:   2019-06-03T12:33:07+02:00 (4 months ago)
+    
+    TRITON-1320 firewaller-agent needs to rewrite ipf rules on boot
+
+diff --git a/config-migration.js b/config-migration.js
+new file mode 100644
+index 0000000..3c6ee11
+--- /dev/null
++++ b/config-migration.js
+@@ -0,0 +1,192 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++/*
++ * Firewaller agent config migration from/to pre/post cfwlogging
++ * See https://github.com/joyent/rfd/blob/master/rfd/0163/README.md
++ */
++
++'use strict';
++
++var bunyan = require('bunyan');
++var vasync = require('vasync');
++
++var mod_vm = require('./lib/vm');
++var fw = require('./lib/fw');
++
++var fs = require('fs');
++var util = require('util');
++
++var LOG = bunyan.createLogger({
++    name: 'firewaller-config-migration',
++    level: 'debug'
++});
++
++var DEV_IPFEV = '/dev/ipfev';
++var IPF_CONF = '%s/config/ipf.conf';
++
++vasync.pipeline({
++    funcs: [
++        // Get all the local VMs with firewall_enabled=true
++        function loadFwEnabledVms(ctx, next) {
++            mod_vm.list(LOG, {
++                firewall_enabled: true
++            }, function listVmsCb(err, vms) {
++                if (err) {
++                    next(err);
++                    return;
++                }
++                ctx.vms = vms;
++                ctx.vmsByVmUUID = {};
++                ctx.vms.forEach(function (vm) {
++                    ctx.vmsByVmUUID[vm.uuid] = vm;
++                });
++                next();
++            });
++        },
++        // Load all the firewall rules for those vms
++        function loadFwEnabledRules(ctx, next) {
++            if (!ctx.vms.length) {
++                next();
++                return;
++            }
++            fw.list({
++                log: LOG,
++                payload: {
++                    localVMs: ctx.vms,
++                    vms: ctx.vms
++                }
++            }, function listRulesCb(err, rules) {
++                if (err) {
++                    next(err);
++                    return;
++                }
++                ctx.rules = rules;
++                next();
++            });
++        },
++        // We're interested only in firewall rules which have `rule.log` set
++        function filterRulesWithSetTags(ctx, next) {
++            if (!ctx.rules.length) {
++                next();
++                return;
++            }
++            ctx.rules = ctx.rules.filter(function ruleHasTags(rule) {
++                return rule.log;
++            });
++            next();
++        },
++        // Since firewall rules don't keep a reference to the VM they belong
++        // to, we need to figure out which VM UUIDs we're gonna need to check
++        // based into the firewall rules
++        function getVmsForRulesWithSetTags(ctx, next) {
++            if (ctx.rules.length === 0) {
++                next();
++                return;
++            }
++            ctx.rulesByVmUUID = {};
++            vasync.forEachParallel({
++                inputs: ctx.rules,
++                func: function getRuleVm(rule, nextRule) {
++                    fw.vms({
++                        log: LOG,
++                        payload: {
++                            rule: rule,
++                            vms: ctx.vms
++                        }
++                    }, function getRuleVmCb(getErr, vmUuids) {
++                        if (getErr) {
++                            nextRule(getErr);
++                            return;
++                        }
++                        vmUuids.forEach(function addToCtx(vmUuid) {
++                            if (!ctx.rulesByVmUUID[vmUuid]) {
++                                ctx.rulesByVmUUID[vmUuid] = [];
++                            }
++                            ctx.rulesByVmUUID[vmUuid].push(rule);
++                        });
++                        nextRule();
++                    });
++                }
++            }, next);
++        },
++        function getPlatformIPFVersion(ctx, next) {
++            var vFile = '/etc/ipf/smartos_version';
++            if (fs.existsSync(vFile)) {
++                ctx.ipfSmartosVersion = Number(fs.readFileSync(vFile, 'utf8'));
++            } else {
++                ctx.ipfSmartosVersion = (ctx.haveDevIpfEv) ? 2 : 1;
++            }
++            next();
++        },
++        // Once we know which vms to check, we need to review the contents of
++        // the IPF files
++        function checkIPFVersions(ctx, next) {
++            if (!ctx.rulesByVmUUID) {
++                next();
++                return;
++            }
++            ctx.vmsToRewriteIPF = [];
++            var vmsToCheck = Object.keys(ctx.rulesByVmUUID);
++            LOG.debug({vmsToCheck: vmsToCheck}, 'VMs to check');
++            if (!vmsToCheck.length) {
++                next();
++                return;
++            }
++            vasync.forEachParallel({
++                inputs: vmsToCheck,
++                func: function testIPFFiles(aVm, nextVm) {
++                    var ipfv4 = util.format(IPF_CONF,
++                        ctx.vmsByVmUUID[aVm].zonepath);
++                    var ipfv4Data = fs.readFileSync(ipfv4, 'utf8');
++                    var re = /^# smartos_ipf_version (\d+)$/m;
++                    var ipfv4Res = re.exec(ipfv4Data);
++                    // If we cannot find a version written on the rules file,
++                    // let's assume it's version 1 (pre RFD 163):
++                    var rulesVersion = (ipfv4Res !== null) ?
++                            Number(ipfv4Res[1]) : 1;
++                    if (rulesVersion !== ctx.ipfSmartosVersion) {
++                        ctx.vmsToRewriteIPF.push(ctx.vmsByVmUUID[aVm]);
++                    }
++
++                    LOG.debug({
++                        smartos_ipf_version: ctx.ipfSmartosVersion,
++                        rules_ipf_version: rulesVersion,
++                        vm_uuid: aVm
++                    }, 'SmartOS IPF version check');
++                    nextVm();
++                }
++            }, next);
++        },
++        function updateIpfFiles(ctx, next) {
++            if (!Array.isArray(ctx.vmsToRewriteIPF) ||
++                ctx.vmsToRewriteIPF.length === 0) {
++                next();
++                return;
++            }
++            fw.update({
++                log: LOG,
++                payload: {
++                    localVms: ctx.vmsToRewriteIPF
++                }
++            }, next);
++        }
++    ],
++    arg: {
++        haveDevIpfEv: fs.existsSync(DEV_IPFEV)
++    }
++}, function pipeCb(pipeErr) {
++    if (pipeErr) {
++        console.error(pipeErr);
++    }
++});
++
++
++// vim: set softtabstop=4 shiftwidth=4:
+diff --git a/deps/fw/lib/fw.js b/deps/fw/lib/fw.js
+index 1ee415f..10463b5 100644
+--- a/deps/fw/lib/fw.js
++++ b/deps/fw/lib/fw.js
+@@ -21,7 +21,7 @@
+  * CDDL HEADER END
+  *
+  *
+- * Copyright (c) 2018, Joyent, Inc. All rights reserved.
++ * Copyright 2019 Joyent, Inc.
+  *
+  *
+  * fwadm: Main entry points
+@@ -105,6 +105,9 @@ var v6fallbacks = fallbacks.concat([
+     'pass out quick proto ipv6-icmp from any to any keep state',
+     'pass out proto ipv6-icmp from any to any']);
+ 
++// Do not use directly - use haveIpfEventLogger() instead.
++var haveDevIpfEv = undefined;
++var DEV_IPFEV = '/dev/ipfev';
+ 
+ // --- Internal helper functions
+ 
+@@ -120,6 +123,17 @@ function assertStringOrObject(obj, name) {
+ }
+ 
+ 
++/**
++ * Determine if /dev/ipfev exists, caching the result for future calls in the
++ * global variable haveDevIpfEv.
++ */
++function haveIpfEventLogger() {
++    if (haveDevIpfEv === undefined) {
++        haveDevIpfEv = fs.existsSync(DEV_IPFEV);
++    }
++    return haveDevIpfEv;
++}
++
+ /**
+  * For a rule and a direction, return whether or not we actually need to
+  * write ipf rules. FROM+ALLOW and TO+BLOCK are essentially no-ops, as
+@@ -1083,6 +1097,16 @@ function ipfRuleObj(opts) {
+     // ipfilter uses /etc/protocols which calls ICMPv6 'ipv6-icmp'
+     var ipfProto = (rule.protocol === 'icmp6') ? 'ipv6-icmp' : rule.protocol;
+ 
++    var readtags = [];
++    if (haveIpfEventLogger()) {
++        if (rule.uuid) {
++            readtags.push(util.format('uuid=%s', rule.uuid));
++        }
++        if (rule.log) {
++            readtags.push('cfwlog');
++        }
++    }
++
+     var sortObj = {
+         action: rule.action,
+         direction: dir,
+@@ -1097,7 +1121,9 @@ function ipfRuleObj(opts) {
+         type: opts.type,
+         uuid: rule.uuid,
+         value: opts.value,
+-        version: rule.version
++        version: rule.version,
++        allTags: readtags.length !== 0 ?
++            util.format(' set-tag(%s)', readtags.join(', ')) : ''
+     };
+ 
+     if (opts.type === 'wildcard' && opts.value === 'any') {
+@@ -1252,16 +1278,21 @@ function prepareIPFdata(opts, log, callback) {
+             '# AND MAY BE OVERWRITTEN AT ANY TIME.',
+             '#',
+             '# File generated at ' + date.toString(),
+-            '#',
+-            ''];
++            '#'
++        ];
++        if (haveIpfEventLogger()) {
++            ipf4Conf.push('# smartos_ipf_version 2');
++        }
++        ipf4Conf.push('#', '');
+         var ipf6Conf = ipf4Conf.slice();
+         var iks = hasKey(keepInboundState, vm) ? keepInboundState[vm] : {};
+ 
+         conf[vm].sort(compareRules).forEach(function (sortObj) {
+             var ktxt = KEEP_FRAGS;
+-            if ((sortObj.direction === 'from' && sortObj.action === 'allow')
+-                || (sortObj.direction === 'to' && iks[sortObj.protocol])) {
+-                ktxt += KEEP_STATE;
++            if (sortObj.allTags !== '' ||
++                (sortObj.direction === 'from' && sortObj.action === 'allow') ||
++                (sortObj.direction === 'to' && iks[sortObj.protocol])) {
++                ktxt += KEEP_STATE + sortObj.allTags;
+             }
+ 
+             if (!hasKey(rulesIncluded, sortObj.uuid)) {
+@@ -2183,7 +2214,7 @@ function listRemoteVMs(opts, callback) {
+ 
+             // XXX: support sorting by other fields, filtering
+             var sortFn = function _sort(a, b) {
+-                return (a.uuid > b.uuid) ? 1: -1;
++                return (a.uuid > b.uuid) ? 1 : -1;
+             };
+ 
+             log.debug('listRemoteVMs: finish');
+@@ -2238,7 +2269,7 @@ function listRules(opts, callback) {
+             // XXX: support sorting by other fields, filtering
+             // (eg: enabled=true vm=<uuid>)
+             var sortFn = function _defaultSort(a, b) {
+-                return (a.uuid > b.uuid) ? 1: -1;
++                return (a.uuid > b.uuid) ? 1 : -1;
+             };
+             var mapFn = function _defaultMap(r) {
+                 return r.serialize();
+diff --git a/npm/postinstall.sh b/npm/postinstall.sh
+index 645f079..7cd0010 100755
+--- a/npm/postinstall.sh
++++ b/npm/postinstall.sh
+@@ -6,7 +6,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2019, Joyent, Inc.
++# Copyright 2019 Joyent, Inc.
+ #
+ 
+ if [[ "${SDC_AGENT_SKIP_LIFECYCLE:-no}" = "yes" ]]; then
+@@ -65,6 +65,12 @@ function import_smf_manifest()
+     if [[ $(uname -s) == "SunOS" ]]; then
+         svccfg import $SMF_DIR/${AGENT}-setup.xml
+     fi
++
++    subfile "$ROOT/smf/manifests/${AGENT}-config-migration.xml.in" \
++        "$SMF_DIR/${AGENT}-config-migration.xml"
++    if [[ $(uname -s) == "SunOS" ]]; then
++        svccfg import $SMF_DIR/${AGENT}-config-migration.xml
++    fi
+ }
+ 
+ function instance_exists()
+diff --git a/npm/postuninstall.sh b/npm/postuninstall.sh
+index e3ea84c..31ed946 100755
+--- a/npm/postuninstall.sh
++++ b/npm/postuninstall.sh
+@@ -6,7 +6,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2019, Joyent, Inc.
++# Copyright 2019 Joyent, Inc.
+ #
+ 
+ if [[ "${SDC_AGENT_SKIP_LIFECYCLE:-no}" = "yes" ]]; then
+@@ -20,6 +20,12 @@ NAME=firewaller
+ if [[ $(uname -s) == "SunOS" ]]; then
+     svcadm disable -s $NAME
+     svccfg delete $NAME
++    svcadm disable -s $NAME-agent-setup
++    svccfg delete $NAME-agent-setup
++    svcadm disable -s $NAME-config-migration
++    svccfg delete $NAME-config-migration
+ fi
+ 
+ rm -f "$SMFDIR/$NAME.xml"
++rm -f "$SMFDIR/$NAME-agent-setup.xml"
++rm -f "$SMFDIR/$NAME-config-migration.xml"
+diff --git a/smf/manifests/firewaller-config-migration.xml.in b/smf/manifests/firewaller-config-migration.xml.in
+new file mode 100644
+index 0000000..a7f5982
+--- /dev/null
++++ b/smf/manifests/firewaller-config-migration.xml.in
+@@ -0,0 +1,57 @@
++<?xml version="1.0"?>
++<!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
++<!--
++    This Source Code Form is subject to the terms of the Mozilla Public
++    License, v. 2.0. If a copy of the MPL was not distributed with this
++    file, You can obtain one at http://mozilla.org/MPL/2.0/.
++-->
++<!--
++    Copyright 2019 Joyent, Inc.
++-->
++<!--
++  Firewaller agent config migration SMF manifest.
++  When per-zone ipf.conf and ipf6.conf files change in a way that it's not backward compatible,
++  we need a service which will ensure that each zone's ipf configuration files are a version that
++  is compatible with the running system.
++ -->
++<service_bundle type="manifest" name="firewaller">
++  <service name="smartdc/agent/firewaller-config-migration" type="service" version="@@VERSION@@">
++    <dependency name="network_and_local_filesystem" grouping="require_all" restart_on="error" type="service">
++      <service_fmri value="svc:/network/physical"/>
++      <service_fmri value="svc:/system/filesystem/local"/>
++    </dependency>
++    <!--
++        Make vmadmd and zones services depend on this service so that firewall
++        rules are correct before those services cause them to be read.
++    -->
++    <dependent name="smartdc_vmadmd_and_system_zones" grouping="optional_all" restart_on="none">
++      <service_fmri value="svc:/system/smartdc/vmadmd:default"/>
++      <service_fmri value="svc:/system/zones:default"/>
++    </dependent>
++    <exec_method type="method" name="start" exec="/usr/bin/ctrun -l child -o noorphan @@ROOT@@/node/bin/node --abort_on_uncaught_exception @@ROOT@@/config-migration.js &amp;" timeout_seconds="60">
++      <method_context>
++        <method_credential user="root" group="staff"/>
++        <method_environment>
++          <envvar name="PATH" value="@@PREFIX@@/bin:/usr/bin:/usr/sbin"/>
++        </method_environment>
++      </method_context>
++    </exec_method>
++    <exec_method type="method" name="restart" exec=":kill" timeout_seconds="60">
++      <method_context>
++        <method_credential user="root" group="staff"/>
++      </method_context>
++    </exec_method>
++    <exec_method type="method" name="stop" exec=":kill" timeout_seconds="60">
++      <method_context>
++        <method_credential user="root" group="staff"/>
++      </method_context>
++    </exec_method>
++    <instance name="default" enabled="true"/>
++    <stability value="Unstable"/>
++    <template>
++      <common_name>
++        <loctext xml:lang="C">Firewaller Agent Config Migration</loctext>
++      </common_name>
++    </template>
++  </service>
++</service_bundle>

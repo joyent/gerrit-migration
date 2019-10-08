@@ -1,0 +1,382 @@
+commit 272503fac2578e6f595be3912edf4d788da25035
+Author: John Levon <john.levon@joyent.com>
+Date:   2019-09-19T17:17:56+00:00 (3 weeks ago)
+    
+    OS-7988 need swapgs mitigation
+
+diff --git a/usr/src/uts/i86pc/ml/kpti_trampolines.s b/usr/src/uts/i86pc/ml/kpti_trampolines.s
+index 6ab3edc3d4..117d540eee 100644
+--- a/usr/src/uts/i86pc/ml/kpti_trampolines.s
++++ b/usr/src/uts/i86pc/ml/kpti_trampolines.s
+@@ -9,7 +9,7 @@
+  * http://www.illumos.org/license/CDDL.
+  */
+ /*
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -88,7 +88,7 @@
+  * Syscalls are different to interrupts (at least in the SYSENTER/SYSCALL64
+  * cases) in that they do not push an interrupt frame (and also have some other
+  * effects). In the syscall trampolines, we assume that we can only be taking
+- * the call from userland and use SWAPGS and an unconditional overwrite of %cr3.
++ * the call from userland and use swapgs and an unconditional overwrite of %cr3.
+  * We do not do any stack pivoting for syscalls (and we leave SYSENTER's
+  * existing %rsp pivot untouched) -- instead we spill registers into
+  * %gs:CPU_KPTI_* as we need to.
+@@ -503,7 +503,7 @@ tr_sysc_ret_end:
+ 	pushq	%gs:CPU_KPTI_CS;		\
+ 	pushq	%gs:CPU_KPTI_RIP;		\
+ 	mov	%gs:CPU_KPTI_R13, %r13;		\
+-	SWAPGS;					\
++	swapgs;					\
+ 	jmp	isr;				\
+ 	SET_SIZE(tr_/**/isr)
+ 
+@@ -536,10 +536,9 @@ tr_intr_ret_start:
+ 	ENTRY_NP(tr_iret_user)
+ #if DEBUG
+ 	/*
+-	 * Ensure that we return to user land with CR0.TS clear. We do this
+-	 * before we trampoline back and pivot the stack and %cr3. This way
+-	 * we're still on the kernel stack and kernel %cr3, though we are on the
+-	 * user GSBASE.
++	 * Panic if we find CR0.TS set. We're still on the kernel stack and
++	 * %cr3, but we do need to swap back to the kernel gs. (We don't worry
++	 * about swapgs speculation here.)
+ 	 */
+ 	pushq	%rax
+ 	mov	%cr0, %rax
+@@ -559,7 +558,10 @@ tr_intr_ret_start:
+ 	cmpq	$1, kpti_enable
+ 	jne	1f
+ 
++	/* we're on user gsbase: swap back so we can pivot */
+ 	swapgs
++	/* swapgs mitigation (probably silly in this case) */
++	lfence
+ 	mov	%r13, %gs:CPU_KPTI_R13
+ 	PIVOT_KPTI_STK(%r13)
+ 	SET_USER_CR3(%r13)
+@@ -567,6 +569,7 @@ tr_intr_ret_start:
+ 	/* Zero these to make sure they didn't leak from a kernel trap */
+ 	movq	$0, %gs:CPU_KPTI_R13
+ 	movq	$0, %gs:CPU_KPTI_R14
++	/* and back to user gsbase again */
+ 	swapgs
+ 1:
+ 	iretq
+diff --git a/usr/src/uts/i86pc/os/cpuid.c b/usr/src/uts/i86pc/os/cpuid.c
+index c02e2e0469..6c317392b3 100644
+--- a/usr/src/uts/i86pc/os/cpuid.c
++++ b/usr/src/uts/i86pc/os/cpuid.c
+@@ -910,6 +910,7 @@
+  * more work in the system to mitigate against:
+  *
+  *   - Spectre v1
++ *   - swapgs (Spectre v1 variant)
+  *   - Spectre v2
+  *   - Meltdown (Spectre v3)
+  *   - Rogue Register Read (Spectre v3a)
+@@ -926,7 +927,7 @@
+  * overall approach that the system has taken to address these as well as their
+  * shortcomings. Unfortunately, not all of the above have been handled today.
+  *
+- * SPECTRE FAMILY (Spectre v2, ret2spec, SpectreRSB)
++ * SPECTRE v2, ret2spec, SpectreRSB
+  *
+  * The second variant of the spectre attack focuses on performing branch target
+  * injection. This generally impacts indirect call instructions in the system.
+@@ -1035,11 +1036,43 @@
+  * it may make more sense to investigate using prediction barriers as the whole
+  * system is only executing a single instruction at a time while in kmdb.
+  *
+- * SPECTRE FAMILY (v1, v4)
++ * SPECTRE v1, v4
+  *
+  * The v1 and v4 variants of spectre are not currently mitigated in the
+  * system and require other classes of changes to occur in the code.
+  *
++ * SPECTRE v1 (SWAPGS VARIANT)
++ *
++ * The class of Spectre v1 vulnerabilities aren't all about bounds checks, but
++ * can generally affect any branch-dependent code. The swapgs issue is one
++ * variant of this. If we are coming in from userspace, we can have code like
++ * this:
++ *
++ *	cmpw	$KCS_SEL, REGOFF_CS(%rsp)
++ *	je	1f
++ *	movq	$0, REGOFF_SAVFP(%rsp)
++ *	swapgs
++ *	1:
++ *	movq	%gs:CPU_THREAD, %rax
++ *
++ * If an attacker can cause a mis-speculation of the branch here, we could skip
++ * the needed swapgs, and use the /user/ %gsbase as the base of the %gs-based
++ * load. If subsequent code can act as the usual Spectre cache gadget, this
++ * would potentially allow KPTI bypass. To fix this, we need an lfence prior to
++ * any use of the %gs override.
++ *
++ * The other case is also an issue: if we're coming into a trap from kernel
++ * space, we could mis-speculate and swapgs the user %gsbase back in prior to
++ * using it. AMD systems are not vulnerable to this version, as a swapgs is
++ * serializing with respect to subsequent uses. But as AMD /does/ need the other
++ * case, and the fix is the same in both cases (an lfence at the branch target
++ * 1: in this example), we'll just do it unconditionally.
++ *
++ * Note that we don't enable user-space "wrgsbase" via CR4_FSGSBASE, making it
++ * harder for user-space to actually set a useful %gsbase value: although it's
++ * not clear, it might still be feasible via lwp_setprivate(), though, so we
++ * mitigate anyway.
++ *
+  * MELTDOWN
+  *
+  * Meltdown, or spectre v3, allowed a user process to read any data in their
+@@ -1159,12 +1192,13 @@
+  * and what's done in various places:
+  *
+  *  - Spectre v1: Not currently mitigated
++ *  - swapgs: lfences after swapgs paths
+  *  - Spectre v2: Retpolines/RSB Stuffing or EIBRS if HW support
+  *  - Meltdown: Kernel Page Table Isolation
+  *  - Spectre v3a: Updated CPU microcode
+  *  - Spectre v4: Not currently mitigated
+  *  - SpectreRSB: SMEP and RSB Stuffing
+- *  - L1TF: spec_uarch_flush, smt exclusion, requires microcode
++ *  - L1TF: spec_uarch_flush, SMT exclusion, requires microcode
+  *  - MDS: x86_md_clear, requires microcode, disabling hyper threading
+  *
+  * The following table indicates the x86 feature set bits that indicate that a
+diff --git a/usr/src/uts/intel/amd64/ml/amd64.il b/usr/src/uts/intel/amd64/ml/amd64.il
+index fc78c95a95..3e2a790729 100644
+--- a/usr/src/uts/intel/amd64/ml/amd64.il
++++ b/usr/src/uts/intel/amd64/ml/amd64.il
+@@ -23,6 +23,10 @@
+  * Use is subject to license terms.
+  */
+ 
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
+ /
+ / In-line functions for amd64 kernels.
+ /
+@@ -189,34 +193,26 @@
+         movw    %di, %gs
+         .end
+ 
+-	/*
+-	 * OPTERON_ERRATUM_88 requires mfence
+-	 */
+-        .inline __swapgs, 0
+-        mfence
+-        swapgs
+-	.end
+-
+ /*
+  * prefetch 64 bytes
+  */
+ 
+- 	.inline	prefetch_read_many,8
++	.inline	prefetch_read_many,8
+ 	prefetcht0	(%rdi)
+ 	prefetcht0	32(%rdi)
+ 	.end
+ 
+- 	.inline	prefetch_read_once,8
++	.inline	prefetch_read_once,8
+ 	prefetchnta	(%rdi)
+ 	prefetchnta	32(%rdi)
+ 	.end
+ 
+- 	.inline	prefetch_write_many,8
++	.inline	prefetch_write_many,8
+ 	prefetcht0	(%rdi)
+ 	prefetcht0	32(%rdi)
+ 	.end
+ 
+- 	.inline	prefetch_write_once,8
++	.inline	prefetch_write_once,8
+ 	prefetcht0	(%rdi)
+ 	prefetcht0	32(%rdi)
+ 	.end
+diff --git a/usr/src/uts/intel/amd64/sys/privregs.h b/usr/src/uts/intel/amd64/sys/privregs.h
+index 83782c4b37..ff0d53cae6 100644
+--- a/usr/src/uts/intel/amd64/sys/privregs.h
++++ b/usr/src/uts/intel/amd64/sys/privregs.h
+@@ -24,6 +24,10 @@
+  * Use is subject to license terms.
+  */
+ 
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
+ #ifndef	_AMD64_SYS_PRIVREGS_H
+ #define	_AMD64_SYS_PRIVREGS_H
+ 
+@@ -206,7 +210,8 @@ struct regs {
+ 	je	6f;				\
+ 	movq	$0, REGOFF_SAVFP(%rsp);		\
+ 	SWAPGS;					\
+-6:	CLEAN_CS
++6:	lfence; /* swapgs mitigation */		\
++	CLEAN_CS
+ 
+ #define	INTR_POP			\
+ 	leaq	sys_lcall32(%rip), %r11;\
+@@ -216,7 +221,8 @@ struct regs {
+ 	cmpw	$KCS_SEL, REGOFF_CS(%rsp);\
+ 	je	8f;			\
+ 5:	SWAPGS;				\
+-8:	addq	$REGOFF_RIP, %rsp
++8:	lfence; /* swapgs mitigation */	\
++	addq	$REGOFF_RIP, %rsp
+ 
+ #define	USER_POP			\
+ 	__RESTORE_REGS;			\
+diff --git a/usr/src/uts/intel/asm/cpu.h b/usr/src/uts/intel/asm/cpu.h
+index faaaea7c8e..95e882601a 100644
+--- a/usr/src/uts/intel/asm/cpu.h
++++ b/usr/src/uts/intel/asm/cpu.h
+@@ -172,17 +172,6 @@ __set_gs(selector_t value)
+ 	    : "r" (value));
+ }
+ 
+-#if !defined(__xpv)
+-
+-extern __GNU_INLINE void
+-__swapgs(void)
+-{
+-	__asm__ __volatile__(
+-	    "mfence; swapgs");
+-}
+-
+-#endif /* !__xpv */
+-
+ #endif	/* __amd64 */
+ 
+ #endif	/* !__lint && __GNUC__ */
+diff --git a/usr/src/uts/intel/ia32/ml/exception.s b/usr/src/uts/intel/ia32/ml/exception.s
+index 5806087ca1..b35eab3220 100644
+--- a/usr/src/uts/intel/ia32/ml/exception.s
++++ b/usr/src/uts/intel/ia32/ml/exception.s
+@@ -174,8 +174,9 @@
+ 	leaq	tr_brand_sys_sysenter(%rip), %r11
+ 	cmpq	%r11, 24(%rsp)
+ 	jne	2f
+-1:	SWAPGS
+-2:	popq	%r11
++1:	swapgs
++2:	lfence /* swapgs mitigation */
++	popq	%r11
+ #endif	/* !__xpv */
+ 
+ 	INTR_PUSH
+diff --git a/usr/src/uts/intel/ia32/os/sundep.c b/usr/src/uts/intel/ia32/os/sundep.c
+index cfb4552287..34e0a03d68 100644
+--- a/usr/src/uts/intel/ia32/os/sundep.c
++++ b/usr/src/uts/intel/ia32/os/sundep.c
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1992, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1990, 1991 UNIX System Laboratories, Inc. */
+@@ -551,16 +551,19 @@ update_sregs(struct regs *rp,  klwp_t *lwp)
+ 		 *
+ 		 * We've just mucked up the kernel's gsbase.  Oops.  In
+ 		 * particular we can't take any traps at all.  Make the newly
+-		 * computed gsbase be the hidden gs via __swapgs, and fix
++		 * computed gsbase be the hidden gs via swapgs, and fix
+ 		 * the kernel's gsbase back again. Later, when we return to
+ 		 * userland we'll swapgs again restoring gsbase just loaded
+ 		 * above.
+ 		 */
+-		__swapgs();
++		__asm__ __volatile__("mfence; swapgs");
++
+ 		rp->r_gs = pcb->pcb_gs;
+ 
+ 		/*
+-		 * restore kernel's gsbase
++		 * Restore kernel's gsbase. Note that this also serializes any
++		 * attempted speculation from loading the user-controlled
++		 * %gsbase.
+ 		 */
+ 		wrmsr(MSR_AMD_GSBASE, kgsbase);
+ 
+diff --git a/usr/src/uts/intel/kdi/kdi_asm.s b/usr/src/uts/intel/kdi/kdi_asm.s
+index f106d643f7..3dd6db5952 100644
+--- a/usr/src/uts/intel/kdi/kdi_asm.s
++++ b/usr/src/uts/intel/kdi/kdi_asm.s
+@@ -23,7 +23,7 @@
+  * Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+  *
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -271,6 +271,9 @@
+ 	 * KDI_SAVE_REGS macro to prevent a usermode process's GSBASE from being
+ 	 * blown away.  On the hypervisor, we don't need to do this, since it's
+ 	 * ensured we're on our requested kernel GSBASE already.
++	 *
++	 * No need to worry about swapgs speculation here as it's unconditional
++	 * and via wrmsr anyway.
+ 	 */
+ 	subq	$10, %rsp
+ 	sgdt	(%rsp)
+diff --git a/usr/src/uts/intel/sys/archsystm.h b/usr/src/uts/intel/sys/archsystm.h
+index 0c9ceac7be..55c387f9b1 100644
+--- a/usr/src/uts/intel/sys/archsystm.h
++++ b/usr/src/uts/intel/sys/archsystm.h
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1993, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_ARCHSYSTM_H
+@@ -94,10 +94,8 @@ extern void brand_sys_call();
+ #endif
+ extern void sys_sysenter();
+ extern void tr_sys_sysenter();
+-extern void _sys_sysenter_post_swapgs();
+ extern void brand_sys_sysenter();
+ extern void tr_brand_sys_sysenter();
+-extern void _brand_sys_sysenter_post_swapgs();
+ 
+ extern void dosyscall(void);
+ 
+diff --git a/usr/src/uts/intel/sys/segments.h b/usr/src/uts/intel/sys/segments.h
+index 6bf18b3082..52831c9d87 100644
+--- a/usr/src/uts/intel/sys/segments.h
++++ b/usr/src/uts/intel/sys/segments.h
+@@ -2,7 +2,7 @@
+  * Copyright (c) 2004, 2010, Oracle and/or its affiliates. All rights reserved.
+  */
+ /*
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #ifndef	_SYS_SEGMENTS_H
+@@ -179,7 +179,6 @@ extern void __set_ds(selector_t);
+ extern void __set_es(selector_t);
+ extern void __set_fs(selector_t);
+ extern void __set_gs(selector_t);
+-extern void __swapgs(void);
+ #endif	/* __amd64 */
+ 
+ #if defined(__amd64)

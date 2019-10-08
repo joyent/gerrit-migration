@@ -1,0 +1,384 @@
+commit b24aee75ca2f29f266c500cc41fa36dd5fb548fb
+Author: dyep <dyep49@gmail.com>
+Date:   2019-03-28T06:18:51-07:00 (6 months ago)
+    
+    TRITON-1291 hermes translation of customer_uuid to manta user
+    Reviewed by: Pedro Palazón Candel <pedro@joyent.com>
+
+diff --git a/.gitmodules b/.gitmodules
+new file mode 100644
+index 0000000..0242ce6
+--- /dev/null
++++ b/.gitmodules
+@@ -0,0 +1,4 @@
++[submodule "sdc-hermes"]
++	path = sdc-hermes
++	url = git@github.com:joyent/sdc-hermes.git
++	branch = TRITON-1291
+diff --git a/actor/actor.js b/actor/actor.js
+index 4fb8471..6e36b9b 100644
+--- a/actor/actor.js
++++ b/actor/actor.js
+@@ -16,6 +16,7 @@ var mod_path = require('path');
+ var mod_assert = require('assert-plus');
+ var mod_backoff = require('backoff');
+ var mod_jsprim = require('jsprim');
++var mod_mahi = require('mahi');
+ var mod_manta = require('manta');
+ var mod_vasync = require('vasync');
+ var mod_yakaa = require('yakaa');
+@@ -67,6 +68,10 @@ var GS = {
+ 	gs_backoff: null,
+ 	gs_heartbeat_timeout: null,
+ 
++	gs_mahi: {
++		client: null
++	},
++
+ 	gs_manta: {
+ 		agent: null,
+ 		client: null,
+@@ -321,16 +326,24 @@ handle_message(msg)
+ 		log.info({
+ 			config: msg.config,
+ 			http_proxy: msg.http_proxy,
+-			https_proxy: msg.https_proxy
++			https_proxy: msg.https_proxy,
++			mahi: msg.mahi
+ 		}, 'received manta configuration from server');
+ 
+ 		if (GS.gs_manta.client) {
+ 			GS.gs_manta.client.close();
+ 		}
++		if (GS.gs_mahi.client) {
++			GS.gs_mahi.client.close();
++		}
+ 		if (GS.gs_manta.agent) {
+ 			GS.gs_manta.agent.destroy();
+ 		}
+ 
++		GS.gs_mahi.client = mod_mahi.createClient({
++			url: msg.mahi.url
++		});
++
+ 		GS.gs_manta.user = msg.config.user;
+ 
+ 		/*
+@@ -491,7 +504,8 @@ start_worker(logset_name)
+ 			logset_name: logset_name
+ 		}),
+ 		datacenter: GS.gs_dcname,
+-		nodename: GS.gs_sysinfo['UUID']
++		nodename: GS.gs_sysinfo['UUID'],
++		mahi: GS.gs_mahi.client
+ 	});
+ 
+ 	/*
+diff --git a/actor/lib/logsets.js b/actor/lib/logsets.js
+index 1838815..6c41de1 100644
+--- a/actor/lib/logsets.js
++++ b/actor/lib/logsets.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ 
+@@ -112,9 +112,33 @@ parse_date(logset, logpath)
+ 	return (null);
+ }
+ 
++function
++uuid_to_account(logset, logpath, mahi, callback)
++{
++	var m = logset.regex.exec(logpath);
++
++	if (!logset.customer_uuid) {
++		callback();
++		return;
++	}
++
++	var position = logset.customer_uuid.slice(1);
++	var customer_uuid = m[position];
++
++	mahi.getAccountById(customer_uuid, function onAccount(err, response) {
++		if (err) {
++		    callback(err);
++		    return;
++		}
++
++		callback(null, response.account.login);
++	});
++}
++
+ /*
+  * Substitute:
+  *   %u --> Manta User
++ *   %U --> Manta Customer Username
+  *   %d --> Datacentre Name
+  *   %z --> Zone Name
+  *   %n --> Node Name (or Zone Name for a Zone)
+@@ -125,7 +149,7 @@ parse_date(logset, logpath)
+  *      --> UTC Date/Time from (possibly adjusted) date_string matches
+  */
+ function
+-local_to_manta_path(manta_user, logset, logpath, datacenter, nodename)
++local_to_manta_path(manta_user, logset, logpath, datacenter, nodename, customer)
+ {
+ 	var m = logset.regex.exec(logpath);
+ 	var indate = parse_date(logset, logpath);
+@@ -188,6 +212,10 @@ local_to_manta_path(manta_user, logset, logpath, datacenter, nodename)
+ 				out += manta_user;
+ 				state = null;
+ 				break;
++			case 'U':
++				out += customer;
++				state = null;
++				break;
+ 			case 'r':
+ 				out += logset.zonerole;
+ 				state = null;
+@@ -280,7 +308,8 @@ module.exports = {
+ 	list_logsets: list_logsets,
+ 	local_to_manta_path: local_to_manta_path,
+ 	parse_date: parse_date,
+-	ready: ready
++	ready: ready,
++	uuid_to_account: uuid_to_account
+ };
+ 
+ /* vim: set syntax=javascript ts=8 sts=8 sw=8 noet: */
+diff --git a/actor/lib/worker.js b/actor/lib/worker.js
+index ac3cf82..43b1b95 100644
+--- a/actor/lib/worker.js
++++ b/actor/lib/worker.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ var mod_fs = require('fs');
+@@ -42,6 +42,7 @@ LogsetWorker(options)
+ 
+ 	self.lsw_log = options.log;
+ 	self.lsw_manta = options.manta;
++	self.lsw_mahi = options.mahi;
+ 
+ 	self.lsw_logset = options.logset;
+ 
+@@ -253,52 +254,64 @@ _disp()
+ 	/*
+ 	 * Derive the path that we would upload this file to, in Manta:
+ 	 */
+-	var manta_path = lib_logsets.local_to_manta_path(self.lsw_manta_user,
+-	    self.lsw_logset, inf.path, self.lsw_datacenter, self.lsw_nodename);
+-
+-	/*
+-	 * If we are not attempting to delete the file, an act that may cause
+-	 * permanent data loss if mishandled, we can trust our memory of a
+-	 * recent verification.
+-	 */
+-	if (!_delete && REMEMBER.uploaded_already(inf.real_path, manta_path,
+-	    inf.mtime.valueOf())) {
+-		self.lsw_log.trace({
+-			file: inf
+-		}, 'upload remembered; skipping until deletion required');
+-		_swtch();
+-		return;
+-	}
+-
+-	self.lsw_log.debug({
+-		file: inf,
+-		manta_path: manta_path,
+-		do_delete: _delete
+-	}, 'archiving log file');
+-
+-	self._manta_upload(inf, manta_path, _delete, function (err) {
++	lib_logsets.uuid_to_account(self.lsw_logset, inf.path, self.lsw_mahi,
++	function getAccount(err, customer) {
+ 		if (err) {
+-			self.lsw_log.error({
+-				err: err
+-			}, 'failed to upload file to Manta');
+-			setTimeout(function () {
+-				/*
+-				 * Inject a pause, and then continue...
+-				 */
+-				_swtch();
+-			}, 1000);
+-			return;
++		    self.lsw_log.error({
++			err: err
++		    }, 'failed to translate customer UUID to Manta account');
++		    _swtch();
++		    return;
+ 		}
+ 
++		var manta_path = lib_logsets.local_to_manta_path(self.lsw_manta_user,
++		    self.lsw_logset, inf.path, self.lsw_datacenter, self.lsw_nodename,
++		    customer);
++
+ 		/*
+-		 * We have either uploaded this file, or verified that it has
+-		 * previously been uploaded with identical contents.  Cache
+-		 * this to avoid needing to re-verify in the next enumeration:
++		 * If we are not attempting to delete the file, an act that may cause
++		 * permanent data loss if mishandled, we can trust our memory of a
++		 * recent verification.
+ 		 */
+-		REMEMBER.mark_uploaded(inf.real_path, manta_path,
+-		    inf.mtime.valueOf());
+-		_swtch();
+-		return;
++		if (!_delete && REMEMBER.uploaded_already(inf.real_path, manta_path,
++		    inf.mtime.valueOf())) {
++			self.lsw_log.trace({
++				file: inf
++			}, 'upload remembered; skipping until deletion required');
++			_swtch();
++			return;
++		}
++
++		self.lsw_log.debug({
++			file: inf,
++			manta_path: manta_path,
++			do_delete: _delete
++		}, 'archiving log file');
++
++		self._manta_upload(inf, manta_path, _delete, function (err) {
++			if (err) {
++				self.lsw_log.error({
++					err: err
++				}, 'failed to upload file to Manta');
++				setTimeout(function () {
++					/*
++					 * Inject a pause, and then continue...
++					 */
++					_swtch();
++				}, 1000);
++				return;
++			}
++
++			/*
++			 * We have either uploaded this file, or verified that it has
++			 * previously been uploaded with identical contents.  Cache
++			 * this to avoid needing to re-verify in the next enumeration:
++			 */
++			REMEMBER.mark_uploaded(inf.real_path, manta_path,
++			    inf.mtime.valueOf());
++			_swtch();
++			return;
++		});
+ 	});
+ };
+ 
+diff --git a/etc/config.json.sample b/etc/config.json.sample
+index afa4585..1230f09 100644
+--- a/etc/config.json.sample
++++ b/etc/config.json.sample
+@@ -10,6 +10,9 @@
+   "cnapi": {
+     "url": "http://cnapi.sf1.sf1.joyent.com"
+   },
++  "mahi": {
++    "url": "http://mahi.sf1.sf1.joyent.com"
++  },
+   "manta": {
+     "url": "https://us-east.manta.joyent.com",
+     "user": "manta_username",
+diff --git a/hermes.js b/hermes.js
+index ef75401..9e67b00 100644
+--- a/hermes.js
++++ b/hermes.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ var mod_fs = require('fs');
+@@ -137,6 +137,11 @@ validate_config(cfg)
+ 	if (!cfg)
+ 		return (false);
+ 
++	if (!cfg.mahi) {
++		GS.gs_log.info('configuration missing "mahi"');
++		return (false);
++	}
++
+ 	if (!cfg.manta) {
+ 		GS.gs_log.info('configuration missing "manta"');
+ 		return (false);
+@@ -252,7 +257,8 @@ configure_server(server)
+ 		https_proxy: 'http://' + GS.gs_config.admin_ip +
+ 		    ':3128',
+ 		http_proxy: 'http://' + GS.gs_config.admin_ip +
+-		    ':3128'
++		    ':3128',
++		mahi: GS.gs_config.mahi
+ 	});
+ 
+ 	server.configured(true);
+diff --git a/lib/logsets.js b/lib/logsets.js
+index adf20ad..9da1413 100644
+--- a/lib/logsets.js
++++ b/lib/logsets.js
+@@ -51,7 +51,8 @@ var COPY_FIELDS = [
+ 	'date_string',
+ 	'date_adjustment',
+ 	'debounce_time',
+-	'retain_time'
++	'retain_time',
++	'customer_uuid'
+ ];
+ 
+ /*
+diff --git a/package.json b/package.json
+index c058c03..f0b0356 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "hermes",
+-  "version": "0.3.1",
++  "version": "0.4.1",
+   "description": "Centralised tool to upload SDC logs to Manta",
+   "main": "hermes.js",
+   "author": "Joshua M. Clulow <jmc@joyent.com>",
+@@ -12,6 +12,7 @@
+     "cueball": "^2.0.1",
+     "jsprim": "^1.4.0",
+     "lstream": "^0.0.4",
++    "mahi": "^2.2.4",
+     "manta": "^4.3.0",
+     "once": "~1.2.0",
+     "restify": "^4.3.0",
+diff --git a/sapi_manifests/hermes/template b/sapi_manifests/hermes/template
+index 2616519..1142cee 100644
+--- a/sapi_manifests/hermes/template
++++ b/sapi_manifests/hermes/template
+@@ -11,6 +11,9 @@
+   "cnapi": {
+     "url": "http://{{{cnapi_domain}}}"
+   },
++  "mahi": {
++    "url": "http://{{{mahi_domain}}}"
++  },
+   "manta": {
+     "user": "{{{SDC_MANTA_USER}}}",
+     "url": "{{{SDC_MANTA_URL}}}",
+diff --git a/sdc-hermes b/sdc-hermes
+new file mode 160000
+index 0000000..4fcf66d
+--- /dev/null
++++ b/sdc-hermes
+@@ -0,0 +1 @@
++Subproject commit 4fcf66d182e174d586f95e71671432df7acf0b9a

@@ -1,0 +1,1087 @@
+commit d26711cd21beca2712d3f616568b65bb3260590d
+Author: Trent Mick <trentm@gmail.com>
+Date:   2018-10-30T14:25:44-07:00 (11 months ago)
+    
+    MANTA-3552 create Manta Prometheus image
+
+diff --git a/.gitignore b/.gitignore
+index a812e15..81ab896 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,4 +7,5 @@
+ /npm-debug.log
+ /sdcadm-*.sh
+ /tmp
++/etc/sdcadm.completion
+ man/man1/sdcadm.1
+diff --git a/CHANGES.md b/CHANGES.md
+index 258ff14..b2eac15 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -10,6 +10,11 @@
+ 
+ # sdcadm Changelog
+ 
++## 1.22.0
++
++- MANTA-3552 Add `sdcadm post-setup prometheus` to setup a core Triton
++  Prometheus service.
++
+ ## 1.21.4
+ 
+ - TRITON-722 "sdcadm health" still assumes each CN will have an "admin" nictag
+diff --git a/etc/defaults.json b/etc/defaults.json
+index ae969c2..8d5a31f 100644
+--- a/etc/defaults.json
++++ b/etc/defaults.json
+@@ -45,7 +45,8 @@
+         "net-agent": "net-agent",
+         "config-agent": "config-agent",
+         "dockerlogger": "dockerlogger",
+-        "volapi": "volapi"
++        "volapi": "volapi",
++        "prometheus": "prometheus"
+     },
+     "svcMinImages": {
+         "binder": "20140731T211135Z",
+diff --git a/lib/common.js b/lib/common.js
+index cb2d66c..d902b24 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -19,6 +19,7 @@ var path = require('path');
+ var tty = require('tty');
+ var util = require('util');
+ var vasync = require('vasync');
++var VError = require('verror');
+ var backoff = require('backoff');
+ var once = require('once');
+ var sprintf = require('extsprintf').sprintf;
+@@ -87,6 +88,32 @@ function objCopy(obj, target) {
+ }
+ 
+ 
++/**
++ * Convert a boolean or string representation into a boolean, or error out.
++ *
++ * @param value {Boolean|String} The input value to convert.
++ * @param default_ {Boolean} The default value if `value` is undefined.
++ * @param field {String} The field name to quote in the possibly
++ *      thrown error.
++ */
++function boolFromString(value, default_, field) {
++    assert.bool(default_, 'default_');
++    assert.string(field, 'field');
++
++    if (value === undefined) {
++        return default_;
++    } else if (value === 'false') {
++        return false;
++    } else if (value === 'true') {
++        return true;
++    } else if (typeof (value) === 'boolean') {
++        return value;
++    } else {
++        throw new VError('invalid value for "%s": %j is not a boolean',
++            field, value);
++    }
++}
++
+ /**
+  * Load sdcadm config.
+  *
+@@ -170,6 +197,13 @@ function loadConfig(options, cb) {
+                 config.dns_domain = sdcConfig.dns_domain;
+                 config.datacenter_name = sdcConfig.datacenter_name;
+                 config.ufds_admin_uuid = sdcConfig.ufds_admin_uuid;
++                config.ufds_is_master = boolFromString(
++                    sdcConfig.ufds_is_master, false, 'ufds_is_master');
++                config.ufds_ldap_root_dn = sdcConfig.ufds_ldap_root_dn;
++                config.ufds_ldap_root_pw = sdcConfig.ufds_ldap_root_pw;
++                config.ufds_remote_ip = sdcConfig.ufds_remote_ip;
++                config.ufds_remote_ldap_root_pw =
++                    sdcConfig.ufds_remote_ldap_root_pw;
+                 config.coal = sdcConfig.coal;
+                 config.assets_admin_ip = sdcConfig.assets_admin_ip;
+                 config.datacenter_location = sdcConfig.datacenter_location;
+diff --git a/lib/post-setup/index.js b/lib/post-setup/index.js
+index 3f6cd2e..cef3c2d 100644
+--- a/lib/post-setup/index.js
++++ b/lib/post-setup/index.js
+@@ -27,7 +27,7 @@ function PostSetupCLI(top) {
+         name: 'sdcadm post-setup',
+         desc: 'Common post-setup procedures.\n' +
+             '\n' +
+-            'The default setup of a SmartDataCenter headnode is somewhat\n' +
++            'The default setup of a Triton Data Center headnode is somewhat\n' +
+             'minimal. "Everything up to adminui." Practical usage of\n' +
+             'SDC -- whether for production, development or testing --\n' +
+             'involves a number of common post-setup steps. This command\n' +
+@@ -75,6 +75,7 @@ PostSetupCLI.prototype.do_docker = require('./docker').do_docker;
+ PostSetupCLI.prototype.do_cmon = require('./cmon').do_cmon;
+ PostSetupCLI.prototype.do_cns = require('./cns').do_cns;
+ PostSetupCLI.prototype.do_volapi = require('./volapi').do_volapi;
++PostSetupCLI.prototype.do_prometheus = require('./prometheus').do_prometheus;
+ 
+ // --- exports
+ 
+diff --git a/lib/post-setup/prometheus.js b/lib/post-setup/prometheus.js
+new file mode 100644
+index 0000000..3ef8435
+--- /dev/null
++++ b/lib/post-setup/prometheus.js
+@@ -0,0 +1,547 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * The 'sdcadm post-setup prometheus' CLI subcommand.
++ */
++
++var assert = require('assert-plus');
++var util = require('util'),
++    format = util.format;
++var vasync = require('vasync');
++
++var common = require('../common');
++var errors = require('../errors');
++var DownloadImages = require('../procedures/download-images').DownloadImages;
++var shared = require('../procedures/shared');
++var steps = require('../steps');
++
++
++function do_prometheus(subcmd, opts, args, cb) {
++    var self = this;
++    if (opts.help) {
++        this.do_help('help', {}, [subcmd], cb);
++        return;
++    } else if (args.length > 0) {
++        cb(new errors.UsageError('too many args: ' + args));
++        return;
++    }
++
++    var start = Date.now();
++    var svcName = 'prometheus';
++    var svcData = {
++        name: svcName,
++        params: {
++            package_name: 'sdc_1024',
++            billing_id: 'TO_FILL_IN', // filled in from 'package_name'
++            image_uuid: 'TO_FILL_IN',
++            archive_on_delete: true,
++            delegate_dataset: true,
++            maintain_resolvers: true,
++            networks: [
++                {name: 'admin'},
++                // Prometheus needs to be on the external to properly work with
++                // CMON's Triton service discovery and CNS -- at least until CNS
++                // support split horizon DNS to provide separate records on the
++                // admin network.
++                //
++                // Triton's Prometheus instances will therefore have a NIC on
++                // CMON's non-admin network. Currently by default that is the
++                // "external" network.
++                //
++                // A firewall will be setup on prometheus0 so that by default no
++                // inbound requests are allowed on that interface.
++                {name: 'external', primary: true}
++            ],
++            // Required to block inbound requests, because Prometheus instances
++            // are on the external. See comment above.
++            firewall_enabled: true,
++            tags: {
++                smartdc_role: 'prometheus',
++                smartdc_type: 'core'
++            }
++        },
++        metadata: {
++            SERVICE_NAME: svcName,
++            SERVICE_DOMAIN: 'TO_FILL_IN',
++            'user-script': 'TO_FILL_IN'
++        }
++    };
++
++    var context = {
++        sdcadm: self.sdcadm,
++        didSomething: false,
++        imageArg: opts.image || 'latest',
++        channelRef: opts.channel || 'default'
++    };
++
++    vasync.pipeline({arg: context, funcs: [
++        steps.sapi.assertFullMode,
++
++        function ensureSdcApp(_, next) {
++            self.sdcadm.ensureSdcApp({}, next);
++        },
++
++        function ctxSvcDomain(ctx, next) {
++            assert.string(self.sdcadm.sdcApp.metadata.datacenter_name,
++                '"sdc" application\'s metadata must' +
++                'have a "datacenter_name" property');
++            assert.string(self.sdcadm.sdcApp.metadata.dns_domain,
++                '"sdc" application\'s metadata must' +
++                'have a "dns_domain" property');
++            ctx.svcDomain = svcName + '.' +
++                self.sdcadm.sdcApp.metadata.datacenter_name + '.' +
++                self.sdcadm.sdcApp.metadata.dns_domain;
++            next();
++        },
++
++        function ctxSvcPkg(ctx, next) {
++            var filter = {name: svcData.params.package_name, active: true};
++            self.sdcadm.papi.list(filter, {}, function (err, pkgs) {
++                if (err) {
++                    next(err);
++                    return;
++                } else if (pkgs.length !== 1) {
++                    next(new errors.InternalError({
++                        message: format('%d "%s" active package found',
++                            pkgs.length, svcData.params.package_name)
++                    }));
++                    return;
++                }
++                ctx.svcPkg = pkgs[0];
++                next();
++            });
++        },
++
++        // Find the appropriate image to use. We use the `--image` option arg
++        // to choose the appropriate image (limiting to the image name
++        // for this service).
++        //
++        // This either errors out or sets `ctx.svcImg` to the image manifest
++        // and `ctx.needToDownloadImg = true` if the image needs to be
++        // downloaded from the image server.
++        //
++        // Dev Note: This should be a shared thing, perhaps as a step.
++        function ctxSvcImg(ctx, next) {
++            var imgName = self.sdcadm.config.imgNameFromSvcName[svcName];
++
++            if (ctx.imageArg === 'latest') {
++                self.sdcadm.updates.listImages({
++                    name: imgName,
++                    channel: opts.channel
++                }, function (listErr, imgs) {
++                    if (listErr) {
++                        next(listErr);
++                    } else if (imgs && imgs.length) {
++                        // TODO presuming sorted by published_at
++                        ctx.svcImg = imgs[imgs.length - 1];
++
++                        self.sdcadm.imgapi.getImage(
++                            ctx.svcImg.uuid,
++                            function (getErr, img) {
++                                if (getErr && getErr.body &&
++                                    getErr.body.code === 'ResourceNotFound') {
++                                    ctx.needToDownloadImg = true;
++                                    next();
++                                } else if (getErr) {
++                                    next(getErr);
++                                } else {
++                                    assert.object(img, 'img');
++                                    ctx.needToDownloadImg = false;
++                                    next();
++                                }
++                            }
++                        );
++                    } else {
++                        next(new errors.UpdateError(
++                            format('no "%s" image found in %s channel of ' +
++                                'updates server', imgName, ctx.channelRef)));
++                    }
++                });
++
++            } else if (ctx.imageArg === 'current') {
++                self.sdcadm.imgapi.listImages({
++                    name: imgName
++                }, function (err, imgs) {
++                    if (err) {
++                        next(err);
++                    } else if (imgs && imgs.length) {
++                        // TODO presuming sorted by published_at
++                        ctx.svcImg = imgs[imgs.length - 1];
++                        ctx.needToDownloadImg = false;
++                        next();
++                    } else {
++                        next(new errors.UpdateError(format(
++                            'no "%s" image found in this DC\'s IMGAPI',
++                            imgName)));
++                    }
++                });
++
++            } else if (common.UUID_RE.test(ctx.imageArg)) {
++                // imageArg is the UUID of an image in the local IMGAPI or
++                // in updates.joyent.com.
++                self.sdcadm.getImage({
++                    uuid: ctx.imageArg,
++                    channel: opts.channel
++                }, function (err, img) {
++                    if (err && err.body &&
++                        err.body.code === 'ResourceNotFound') {
++                        next(new errors.UpdateError(format(
++                            'no image "%s" was found in the %s channel of ' +
++                            'the updates server',
++                            ctx.imageArg, ctx.channelRef)));
++                    } else if (err) {
++                        next(err);
++                    } else {
++                        assert.object(img, 'img');
++                        if (img.name !== imgName) {
++                            next(new errors.UpdateError(format(
++                                'image "%s" (%s) is not a "%s" image',
++                                ctx.imageArg, img.name, imgName)));
++                        } else {
++                            ctx.svcImg = img;
++                            // `SdcAdm.getImage` doesn't explicitly tell us if
++                            // the image is already in the DC, but we can
++                            // infer that from `img.channels`. If it has that
++                            // field, then it was a response from querying
++                            // updates.joyent.com.
++                            ctx.needToDownloadImg =
++                                img.hasOwnProperty('channels');
++                            next();
++                        }
++                    }
++                });
++
++            } else {
++                // imageArg must be an image `version`.
++                self.sdcadm.imgapi.listImages({
++                    name: imgName,
++                    version: ctx.imageArg
++                }, function (localErr, localImgs) {
++                    if (localErr && !(localErr.body &&
++                        localErr.body.code === 'ResourceNotFound')) {
++                        next(localErr);
++                    } else if (!localErr && localImgs && localImgs.length > 0) {
++                        // TODO presuming sorted by published_at
++                        ctx.svcImg = localImgs[localImgs.length - 1];
++                        ctx.needToDownloadImg = false;
++                        next();
++                    } else {
++                        // Look in updates.joyent.com.
++                        self.sdcadm.updates.listImages({
++                            name: imgName,
++                            version: ctx.imageArg,
++                            channel: opts.channel
++                        }, function (updatesErr, updatesImgs) {
++                            if (updatesErr) {
++                                next(updatesErr);
++                            } else if (updatesImgs && updatesImgs.length > 0) {
++                                // TODO presuming sorted by published_at
++                                ctx.svcImg = updatesImgs[
++                                    updatesImgs.length - 1];
++                                ctx.needToDownloadImg = true;
++                                next();
++                            } else {
++                                next(new errors.UpdateError(format(
++                                    'no "%s" image with version "%s" found ' +
++                                    'in the %s channel of the updates server',
++                                    imgName, ctx.imageArg, ctx.channelRef)));
++                            }
++                        });
++                    }
++                });
++            }
++        },
++
++        function importSvcImageIfNecessary(ctx, next) {
++            self.progress('Using image %s (%s@%s)', ctx.svcImg.uuid,
++                ctx.svcImg.name, ctx.svcImg.version);
++            if (!ctx.needToDownloadImg) {
++                next();
++                return;
++            }
++
++            self.progress('Need to import image %s from updates server',
++                ctx.svcImg.uuid);
++            var proc = new DownloadImages({
++                images: [ctx.svcImg],
++                channel: opts.channel
++            });
++            proc.execute({
++                sdcadm: self.sdcadm,
++                log: self.log,
++                progress: self.progress
++            }, next);
++        },
++
++        function getSvc(ctx, next) {
++            self.sdcadm.sapi.listServices({
++                name: svcName,
++                application_uuid: self.sdcadm.sdcApp.uuid
++            }, function (svcErr, svcs) {
++                if (svcErr) {
++                    next(svcErr);
++                    return;
++                } else if (svcs && svcs.length > 0) {
++                    ctx.svc = svcs[0];
++                }
++                next();
++            });
++        },
++
++        function updateExistingSvc(ctx, next) {
++            if (ctx.svc && ctx.svc.params.image_uuid !== ctx.svcImg.uuid) {
++                ctx.svc.params.image_uuid = ctx.svcImg.uuid;
++                self.progress('Updating "%s" SAPI service image_uuid',
++                    svcName);
++                ctx.didSomething = true;
++                self.sdcadm.sapi.updateService(ctx.svc.uuid, ctx.svc, next);
++            } else {
++                next();
++            }
++        },
++
++        shared.getUserScript,
++
++        function createSvcIfNecessary(ctx, next) {
++            if (ctx.svc) {
++                next();
++                return;
++            }
++
++            self.progress('Creating "%s" SAPI service', svcName);
++            ctx.didSomething = true;
++
++            svcData.params.image_uuid = ctx.svcImg.uuid;
++            svcData.metadata['user-script'] = ctx.userScript;
++            svcData.metadata['SERVICE_DOMAIN'] = ctx.svcDomain;
++            svcData.params.billing_id = ctx.svcPkg.uuid;
++            delete svcData.params.package_name;
++
++            self.sdcadm.sapi.createService(
++                svcName,
++                self.sdcadm.sdcApp.uuid,
++                svcData,
++                function (err, svc) {
++                    if (err) {
++                        next(new errors.SDCClientError(err, 'sapi'));
++                        return;
++                    }
++                    ctx.svc = svc;
++                    self.log.info({svc: svc}, 'created svc');
++                    next();
++                }
++            );
++        },
++
++        function ctxHeadnodeUuid(ctx, next) {
++            self.sdcadm.getCurrServerUuid(function (err, hnUuid) {
++                if (err) {
++                    next(err);
++                    return;
++                }
++                ctx.headnodeUuid = hnUuid;
++                next();
++            });
++        },
++
++        function ctxSvcSapiInsts(ctx, next) {
++            assert.object(ctx.svc, 'ctx.svc');
++
++            var filter = {
++                service_uuid: ctx.svc.uuid
++            };
++            self.sdcadm.sapi.listInstances(filter, function (err, insts) {
++                if (err) {
++                    next(new errors.SDCClientError(err, 'sapi'));
++                } else {
++                    ctx.svcSapiInsts = insts;
++                    next();
++                }
++            });
++        },
++
++        function createFirstInstIfNecessary(ctx, next) {
++            if (ctx.svcSapiInsts && ctx.svcSapiInsts.length > 0) {
++                if (ctx.svcSapiInsts.length === 1) {
++                    self.progress('Not creating an instance: there is ' +
++                        'already one %s instance (VM %s)',
++                        svcName, ctx.svcSapiInsts[0].params.alias);
++                } else {
++                    self.progress('Not creating an instance: there are ' +
++                        'already %d %s instances',
++                        ctx.svcSapiInsts.length, svcName);
++                }
++                next();
++                return;
++            }
++
++            self.progress('Creating first "%s" instance on this server',
++                svcName);
++            ctx.didSomething = true;
++
++            self.sdcadm.sapi.createInstance(
++                ctx.svc.uuid,
++                {
++                    params: {
++                        alias: svcName + '0',
++                        server_uuid: ctx.headnodeUuid
++                    }
++                },
++                function (err, inst) {
++
++                if (err) {
++                    next(new errors.SDCClientError(err, 'sapi'));
++                    return;
++                }
++                self.progress('Created VM %s (%s)', inst.uuid,
++                    inst.params.alias);
++                ctx.firstInst = inst;
++                next();
++            });
++        },
++
++        // A prometheus instance needs to auth with CMON. To do so it creates
++        // a key and client cert. The public key is advertised as the
++        // 'instPubKey' metadata key. That public key needs to be added to the
++        // 'admin' account.
++        function addFirstInstPubKeyToAdminIfNecessary(ctx, next) {
++            if (!ctx.firstInst) {
++                next();
++                return;
++            }
++
++            var context2 = {
++                sdcadm: ctx.sdcadm,
++                log: self.log
++            };
++            vasync.pipeline({arg: context2, funcs: [
++                // A provisioned prometheus instance will create its key
++                // pair and publish its pubkey as the 'instPubKey' metadatum.
++                // This is done during "boot/setup.sh".
++                function getInstPubKey(ctx2, next2) {
++                    steps.instance.waitForVmInstanceMetadatum({
++                        sdcadm: ctx2.sdcadm,
++                        instanceUuid: ctx.firstInst.uuid,
++                        metadataKey: 'instPubKey',
++                        // Something is really up if it takes >30s after the
++                        // zone is running for the pub key to have been posted.
++                        timeoutMs: 30 * 1000
++                    }, function onInstPubKey(err, instPubKey) {
++                        ctx2.instPubKey = instPubKey;
++                        next2(err);
++                    });
++                },
++
++                steps.ufds.createMasterUfdsClient,
++
++                function addKey(ctx2, next2) {
++                    var keyData = {
++                        openssh: ctx2.instPubKey
++                    };
++                    var parts = ctx2.instPubKey.split(/\s+/g);
++                    if (parts.length >= 3) {
++                        keyData.name = parts[2];
++                    }
++                    ctx2.masterUfdsClient.addKey(
++                            'admin',
++                            keyData,
++                            function (err, key) {
++                        if (err) {
++                            next2(err);
++                        } else {
++                            self.progress('Added prometheus instance '
++                                + 'key (%s) to admin account', key.name);
++                            next2();
++                        }
++                    });
++                }
++            ]}, function finishedAddKey(err) {
++                if (context2.masterUfdsClient) {
++                    context2.masterUfdsClient.close();
++                }
++                ctx.didSomething = true;
++                next(err);
++            });
++        },
++
++        function echoPromUrl(ctx, next) {
++            var instUuid = ctx.firstInst
++                ? ctx.firstInst.uuid : ctx.svcSapiInsts[0].uuid;
++            ctx.sdcadm.vmapi.getVm({uuid: instUuid}, function (err, vm) {
++                if (err) {
++                    next(new errors.SDCClientError(err, 'vmapi'));
++                } else if (vm.nics && vm.nics.length > 0) {
++                    // Assuming the first NIC is the admin one.
++                    var instAdminIp = vm.nics[0].ip;
++                    self.progress(
++                        '%s (admin network) url: http://%s:9090',
++                        vm.alias, instAdminIp);
++                    next();
++                } else {
++                    next();
++                }
++            });
++        },
++
++        function done(ctx, next) {
++            if (ctx.didSomething) {
++                self.progress('Setup "%s" service (%ds)',
++                    svcName,
++                    Math.floor((Date.now() - start) / 1000));
++            } else {
++                self.progress('"%s" service is already set up', svcName);
++            }
++
++            next();
++        }
++    ]}, cb);
++}
++
++do_prometheus.options = [
++    {
++        names: ['help', 'h'],
++        type: 'bool',
++        help: 'Show this help.'
++    },
++    {
++        names: ['image', 'i'],
++        type: 'string',
++        help: 'Specifies which image to use for the first instance. ' +
++            'Use "latest" (the default) for the latest available on ' +
++            'updates.joyent.com, "current" for the latest image already ' +
++            'in the datacenter (if any), or an image UUID or version.'
++    },
++    {
++        names: ['channel', 'C'],
++        type: 'string',
++        help: 'The updates.joyent.com channel from which to fetch the ' +
++            'image. See `sdcadm channel get` for the default channel.'
++    }
++];
++
++do_prometheus.help = [
++    'Create the "prometheus" service and a first instance.',
++    '',
++    'Usage:',
++    '     {{name}} prometheus [OPTIONS]',
++    '',
++    '{{options}}',
++    'This will setup the Triton prometheus service, which is used by Triton',
++    'to gather metrics on its own operation. It depends on CMON -- setup via',
++    '`sdcadm post-setup cmon`. Commonly the grafana service is setup after',
++    'this with `sdcadm post-setup grafana`.'
++].join('\n');
++
++// --- exports
++
++module.exports = {
++    do_prometheus: do_prometheus
++};
+diff --git a/lib/procedures/download-images.js b/lib/procedures/download-images.js
+index 913b984..1ece8c4 100644
+--- a/lib/procedures/download-images.js
++++ b/lib/procedures/download-images.js
+@@ -28,7 +28,9 @@ var Procedure = require('./procedure').Procedure;
+ 
+ function DownloadImages(options) {
+     assert.arrayOfObject(options.images, 'options.images');
++    assert.optionalString(options.channel, 'options.channel');
+     this.images = options.images;
++    this.channel = options.channel;
+ }
+ util.inherits(DownloadImages, Procedure);
+ 
+@@ -54,7 +56,7 @@ DownloadImages.prototype.summarize = function diSummarize() {
+ 
+ /**
+  * The 'source' URL (IMGAPI endpoint) can optionally be passed in. It defaults
+- * to 'updates.joyent.com?channel=<current-channel>'.
++ * to 'https://updates.joyent.com?channel=<current-channel>'.
+  */
+ DownloadImages.prototype.execute = function diExecute(options, cb) {
+     assert.object(options, 'options');
+@@ -72,7 +74,9 @@ DownloadImages.prototype.execute = function diExecute(options, cb) {
+     var source = options.source;
+     if (!source) {
+         source = sdcadm.config.updatesServerUrl;
+-        if (sdcadm.updates.channel) {
++        if (self.channel) {
++            source += '?channel=' + self.channel;
++        } else if (sdcadm.updates.channel) {
+             source += '?channel=' + sdcadm.updates.channel;
+         }
+     }
+diff --git a/lib/procedures/index.js b/lib/procedures/index.js
+index 2298c0b..913b6b5 100644
+--- a/lib/procedures/index.js
++++ b/lib/procedures/index.js
+@@ -203,7 +203,8 @@ function coordinatePlan(opts, cb) {
+             var simpleServices = [
+                 'amon', 'amonredis', 'assets', 'ca',
+                 'cnapi', 'cns', 'dhcpd', 'docker', 'fwapi', 'manta',
+-                'napi', 'rabbitmq', 'redis', 'sdc', 'ufds', 'vmapi', 'volapi'
++                'napi', 'rabbitmq', 'redis', 'sdc', 'ufds', 'vmapi', 'volapi',
++                'prometheus'
+             ].concat(HA_READY_SIMPLE_SVCS);
+             var handle = [];
+             var remaining = [];
+diff --git a/lib/sdcadm.js b/lib/sdcadm.js
+index a466f20..c67e7e2 100644
+--- a/lib/sdcadm.js
++++ b/lib/sdcadm.js
+@@ -154,6 +154,7 @@ function SdcAdm(options) {
+             if (self._sapi === undefined) {
+                 self._sapi = new sdcClients.SAPI({
+                     url: self.config.sapi.url,
++                    version: '~2',
+                     agent: self.cueballAgent,
+                     userAgent: self.userAgent,
+                     log: self.log,
+@@ -315,8 +316,9 @@ function SdcAdm(options) {
+             return self._wfapi;
+         }
+     });
+-    // NOTE: A method using self.ufds should take care of
+-    // calling self._ufds.close(function (err) {}); Yuck.
++    // NOTE: A method using self.ufds should take care of calling
++    // self._ufds.close(function (err) {}); Yuck. A better alternative is to
++    // switch calling code to using `steps.ufds.createLocalUfdsClient`.
+     Object.defineProperty(this, 'ufds', {
+         get: function () {
+             if (self._ufds === undefined) {
+@@ -1056,11 +1058,14 @@ SdcAdm.prototype.getServices = function getServices(opts, cb) {
+  *
+  * @param opts {Object} Required.
+  *      - uuid {UUID} Required. The image uuid.
++ *      - channel {String} Optional. A channel other than the default channel
++ *        to use when querying the updates server.
+  * @param cb {Function} `function (err, img)`
+  */
+ SdcAdm.prototype.getImage = function getImage(opts, cb) {
+     assert.object(opts, 'opts');
+     assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalString(opts.channel, 'opts.channel');
+     assert.func(cb, 'cb');
+     var self = this;
+ 
+@@ -1074,7 +1079,11 @@ SdcAdm.prototype.getImage = function getImage(opts, cb) {
+             self.imgapi.getImage(opts.uuid, function (iErr, iImg) {
+                 if (iErr && iErr.body &&
+                     iErr.body.code === 'ResourceNotFound') {
+-                    self.updates.getImage(opts.uuid, function (err, image) {
++                    self.updates.getImage(
++                        opts.uuid,
++                        {channel: opts.channel},
++                        function (err, image) {
++
+                         if (err) {
+                             next(err);
+                             return;
+@@ -3715,6 +3724,7 @@ SdcAdm.prototype.checkHealth = function checkHealth(opts, cb) {
+         vmapi: '/ping',
+         volapi: '/ping',
+         workflow: '/ping',
++        // XXX prometheus
+         // agents
+         firewaller: '/status'
+     };
+diff --git a/lib/steps/index.js b/lib/steps/index.js
+index 1d8832f..a843cc5 100644
+--- a/lib/steps/index.js
++++ b/lib/steps/index.js
+@@ -19,9 +19,15 @@
+ module.exports = {
+     binder: require('./binder'),
+     dnsdomain: require('./dnsdomain'),
++    get instance() {
++        return require('./instance');
++    },
+     noRabbit: require('./noRabbit'),
+     sapi: require('./sapi'),
+     servers: require('./servers'),
++    get ufds() {
++        return require('./ufds');
++    },
+     updateVmSize: require('./updateVmSize'),
+     usbkey: require('./usbkey'),
+     zookeeper: require('./zookeeper')
+diff --git a/lib/steps/instance.js b/lib/steps/instance.js
+new file mode 100644
+index 0000000..e116e1c
+--- /dev/null
++++ b/lib/steps/instance.js
+@@ -0,0 +1,80 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018 Joyent, Inc.
++ *
++ * Steps for doing some things with Triton core instances.
++ */
++
++var assert = require('assert-plus');
++var vasync = require('vasync');
++var VError = require('verror');
++
++var errors = require('../errors');
++
++
++/*
++ * Wait for the given instance metadatum value to be set, then return it.
++ *
++ * Dev Note: This doesn't fit the current "step" mold in that it calls back
++ * with a value rather than setting results on the context `arg` like other
++ * steps. See "lib/steps/README.md". This better fits one of the TODOs there
++ * for having curried steps.
++ */
++function waitForVmInstanceMetadatum(args, cb) {
++    assert.object(args, 'args');
++    assert.object(args.sdcadm, 'args.sdcadm');
++    assert.uuid(args.instanceUuid, 'args.instanceUuid');
++    assert.string(args.metadataKey, 'args.metadataKey');
++    assert.optionalFinite(args.timeoutMs, 'args.timeoutMs');
++    assert.optionalFinite(args.intervalMs, 'args.intervalMs');
++    assert.func(cb, 'cb');
++
++    var intervalMs = args.intervalMs || 1000;
++    var metadataValue;
++    var start = Date.now();
++
++    vasync.whilst(
++        function shouldWeKeepGoing() {
++            return (metadataValue === undefined);
++        },
++        function checkOnce(next) {
++            if (args.timeoutMs && Date.now() - start > args.timeoutMs) {
++                next(new VError(
++                    'timeout (%dms) waiting for VM instance %s metadatum "%s"',
++                    args.timeoutMs, args.instanceUuid, args.metadataKey));
++                return;
++            }
++
++            args.sdcadm.vmapi.getVm({
++                uuid: args.instanceUuid
++            }, function (err, vm) {
++                if (err) {
++                    next(new errors.SDCClientError(err, 'vmapi'));
++                } else if (vm.customer_metadata
++                            .hasOwnProperty(args.metadataKey)) {
++                    metadataValue = vm.customer_metadata[args.metadataKey];
++                    next();
++                } else {
++                    setTimeout(next, intervalMs);
++                }
++            });
++        },
++        function whilstDone(err) {
++            cb(err, metadataValue);
++        }
++    );
++}
++
++
++// --- exports
++
++module.exports = {
++    waitForVmInstanceMetadatum: waitForVmInstanceMetadatum
++};
++
++// vim: set softtabstop=4 shiftwidth=4:
+diff --git a/lib/steps/ufds.js b/lib/steps/ufds.js
+new file mode 100644
+index 0000000..3ee1b03
+--- /dev/null
++++ b/lib/steps/ufds.js
+@@ -0,0 +1,146 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018 Joyent, Inc.
++ *
++ * Steps for doing some things with UFDS.
++ */
++
++var assert = require('assert-plus');
++var UFDS = require('ufds');
++var VError = require('verror');
++
++
++function _createUfdsClient(clientOpts, cb) {
++    var client = new UFDS(clientOpts);
++
++    client.once('error', cb);
++    client.once('connect', function () {
++        client.removeAllListeners('error');
++        client.on('error', function (err) {
++            clientOpts.log.error(err, 'UFDS disconnected');
++        });
++        client.on('connect', function () {
++            clientOpts.log.info('UFDS reconnected');
++        });
++        cb(null, client);
++    });
++}
++
++function _getUfdsClientOpts(ufdsHost, bindDN, bindPassword, log) {
++    assert.string(ufdsHost, 'ufdsHost');
++    assert.string(bindDN, 'bindDN');
++    assert.string(bindPassword, 'bindPassword');
++    assert.object(log, 'log');
++
++    return {
++        bindDN: bindDN,
++        bindPassword: bindPassword,
++        log: log,
++        url: 'ldaps://' + ufdsHost,
++        connectTimeout: 10000,
++        retry: {
++            maxDelay: 10000,
++            retries: 2
++        }
++    };
++}
++
++
++/*
++ * Get a connected client to the local UFDS and set `arg.masterUfdsClient`.
++ *
++ * The "master" UFDS is determine by the "ufds_*" config vars in the Triton
++ * config (i.e. the metadata on the 'sdc' SAPI application). If
++ *
++ * Callers must clean up by calling `arg.masterUfdsClient.close()` when
++ * finished.
++ */
++function createLocalUfdsClient(arg, cb) {
++    assert.object(arg, 'arg');
++    assert.object(arg.log, 'arg.log');
++    assert.object(arg.sdcadm, 'arg.sdcadm');
++    assert.object(arg.sdcadm.config, 'arg.sdcadm.config');
++    assert.func(cb, 'cb');
++
++    var clientOpts;
++    var config = arg.sdcadm.config;
++    var log = arg.log.child({ufds: 'local'}, true);
++
++    if (!config.ufds_ldap_root_pw) {
++        cb(new VError('"ufds_ldap_root_pw" config is not set'));
++        return;
++    }
++    clientOpts = _getUfdsClientOpts(
++        'ufds.' + config.datacenter_name + '.' + config.dns_domain,
++        config.ufds_ldap_root_dn, config.ufds_ldap_root_pw, log);
++
++    _createUfdsClient(clientOpts, function (err, client) {
++        arg.localUfdsClient = client;
++        cb(err);
++    });
++}
++
++
++/*
++ * Get a connected client to the "master" UFDS and set `arg.masterUfdsClient`.
++ *
++ * The "master" UFDS is determine by the "ufds_*" config vars in the Triton
++ * config (i.e. the metadata on the 'sdc' SAPI application).
++ *
++ * Callers must clean up by calling `arg.masterUfdsClient.close()` when
++ * finished.
++ */
++function createMasterUfdsClient(arg, cb) {
++    assert.object(arg, 'arg');
++    assert.object(arg.log, 'arg.log');
++    assert.object(arg.sdcadm, 'arg.sdcadm');
++    assert.object(arg.sdcadm.config, 'arg.sdcadm.config');
++    assert.func(cb, 'cb');
++
++    var clientOpts;
++    var config = arg.sdcadm.config;
++    var log = arg.log.child({ufds: 'master'}, true);
++
++    if (config.ufds_is_master) {
++        if (!config.ufds_ldap_root_pw) {
++            cb(new VError('"ufds_ldap_root_pw" config is not set'));
++            return;
++        }
++        clientOpts = _getUfdsClientOpts(
++            'ufds.' + config.datacenter_name + '.' + config.dns_domain,
++            config.ufds_ldap_root_dn, config.ufds_ldap_root_pw, log);
++    } else {
++        if (!config.ufds_remote_ip) {
++            cb(new VError(
++                '"ufds_remote_ip" config is not set (ufds_is_master=false)'));
++            return;
++        }
++        if (!config.ufds_remote_ldap_root_pw) {
++            cb(new VError('"ufds_remote_ldap_root_pw" config is not set '
++                + '(ufds_is_master=false)'));
++            return;
++        }
++        clientOpts = _getUfdsClientOpts(config.ufds_remote_ip,
++            config.ufds_ldap_root_dn, config.ufds_remote_ldap_root_pw, log);
++    }
++
++    _createUfdsClient(clientOpts, function (err, client) {
++        arg.masterUfdsClient = client;
++        cb(err);
++    });
++}
++
++
++// --- exports
++
++module.exports = {
++    createLocalUfdsClient: createLocalUfdsClient,
++    createMasterUfdsClient: createMasterUfdsClient
++};
++
++// vim: set softtabstop=4 shiftwidth=4:
+diff --git a/package.json b/package.json
+index ea136e2..2be7bab 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "sdcadm",
+-  "description": "Administer a SmartDataCenter (SDC) standup",
+-  "version": "1.21.4",
++  "description": "Administer a Triton Data Center",
++  "version": "1.22.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+@@ -22,14 +22,14 @@
+     "progbar": "1.2.0",
+     "read": "1.0.5",
+     "restify-clients": "1.4.0",
+-    "sdc-clients": "10.3.0",
++    "sdc-clients": "12.0.0",
+     "semver": "5.4.1",
+     "strsplit": "1.0.0",
+     "tabula": "1.9.0",
+     "tape": "3.5.0",
+     "ufds": "1.3.0",
+     "urclient": "1.2.0",
+-    "vasync": "^1.6.4",
++    "vasync": "2.2.0",
+     "verror": "^1.10.0",
+     "wf-client": "0.3.0"
+   },
+diff --git a/tools/rsync-to b/tools/rsync-to
+index f89fb59..e80efe5 100755
+--- a/tools/rsync-to
++++ b/tools/rsync-to
+@@ -41,3 +41,5 @@ for name in $toSync; do
+     fi
+ done
+ rsync -av ${TOP}/tools/rotate-logs.sh $NODE:$BASEDIR/tools/ $extraOpts
++
++ssh $NODE "$BASEDIR/bin/sdcadm completion > $BASEDIR/etc/sdcadm.completion"
+\ No newline at end of file

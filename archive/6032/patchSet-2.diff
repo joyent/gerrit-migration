@@ -1,0 +1,317 @@
+commit f2732443f77133468066f3c0d0f068c587180325
+Author: Josh Wilsdon <jwilsdon@joyent.com>
+Date:   2019-03-29T14:35:20-07:00 (6 months ago)
+    
+    TRITON-1297 CNAPI ServerReboot endpoint relies on "exit 113" and executing arbitrary shell scripts
+
+diff --git a/docs/index.md b/docs/index.md
+index dae8eda..74ce6bc 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -1193,13 +1193,14 @@ Set the value of a Server's attribute.
+ | agents               | Array   | Array of agents present on this server                                                                                                                                                                         |
+ | boot_platform        | String  | The platform image to be used on next boot                                                                                                                                                                     |
+ | default_console      | String  | Console type                                                                                                                                                                                                   |
++| etagRetries          | Number  | number of times to retry update in case of ETag conflict                                                                                                                                                       |
+ | rack_identifier      | String  | The id of the server's rack                                                                                                                                                                                    |
+ | comments             | String  | Any comments about the server                                                                                                                                                                                  |
+ | next_reboot          | String  | ISO timestamp when next reboot is scheduled for                                                                                                                                                                |
+ | nics                 | Array   | List of NICs to update (see `Updating NICs` section)                                                                                                                                                           |
+ | reserved             | Boolean | Server is available for provisioning                                                                                                                                                                           |
+ | reservoir            | Boolean | Server should be considered last for provisioning                                                                                                                                                              |
+-| reservation_ratio    | Nmber   | The reservation ratio                                                                                                                                                                                          |
++| reservation_ratio    | Number  | The reservation ratio                                                                                                                                                                                          |
+ | overprovision_ratios | Object  | The overprovisioning ratios. Must be an object with Number value keys and keys must be one of 'cpu', 'ram', 'disk', 'io', 'net'.                                                                               |
+ | serial               | String  | Serial device                                                                                                                                                                                                  |
+ | setup                | Boolean | True if server has been set up                                                                                                                                                                                 |
+@@ -1221,18 +1222,22 @@ Reboot the server.
+ 
+ ### Inputs
+ 
+-| Param        | Type   | Description |
+-| ------------ | ------ | ----------- |
+-| origin       | String |             |
+-| creator_uuid | String |             |
++| Param        | Type    | Description                                                                                                   |
++| ------------ | ------- | ------------------------------------------------------------------------------------------------------------- |
++| origin       | String  |                                                                                                               |
++| creator_uuid | String  |                                                                                                               |
++| drain        | Boolean | Wait for server's cn-agent to be drained before sending the reboot command                                    |
++| nojob        | Boolean | If true, don't create a workflow job, but instead talk to the server_reboot task in cn-agent (default: false) |
+ 
+ 
+ ### Responses
+ 
+-| Code | Type   | Description                       |
+-| ---- | ------ | --------------------------------- |
+-| 204  | Object | Server reboot initiated           |
+-| 500  | None   | Error attempting to set up server |
++| Code | Type   | Description                                                                             |
++| ---- | ------ | --------------------------------------------------------------------------------------- |
++| 202  | Object | Server reboot initiated (object with job_uuid is returned)                              |
++| 204  | None   | Server reboot initiated                                                                 |
++| 500  | None   | Error attempting to set up server                                                       |
++| 503  | None   | When nojob=true, this means the server does not support the server_reboot cn-agent task |
+ 
+ 
+ ## ServerFactoryReset (PUT /servers/:server\_uuid/factory-reset)
+diff --git a/lib/endpoints/servers.js b/lib/endpoints/servers.js
+index 9e00afb..96a78d9 100644
+--- a/lib/endpoints/servers.js
++++ b/lib/endpoints/servers.js
+@@ -36,6 +36,9 @@ var validation = require('../validation/endpoints');
+ var SERVER_LIST_MIN_LIMIT = 1;
+ var SERVER_LIST_MAX_LIMIT = 1000;
+ 
++var TASK_COMMAND_EXECUTE_MIN_VERSON = '2.6.0';
++var TASK_SERVER_REBOOT_MIN_VERSION = '2.11.0';
++var TASK_SERVER_SYSINFO_MIN_VERSION = '2.10.0';
+ 
+ // --- helpers
+ 
+@@ -338,13 +341,14 @@ Server.get = function handlerServerGet(req, res, next) {
+  * @param {Array} agents Array of agents present on this server
+  * @param {String} boot_platform The platform image to be used on next boot
+  * @param {String} default_console Console type
++ * @param {Number} etagRetries number of times to retry update in case of ETag conflict
+  * @param {String} rack_identifier The id of the server's rack
+  * @param {String} comments Any comments about the server
+  * @param {String} next_reboot ISO timestamp when next reboot is scheduled for
+  * @param {Array} nics List of NICs to update (see `Updating NICs` section)
+  * @param {Boolean} reserved Server is available for provisioning
+  * @param {Boolean} reservoir Server should be considered last for provisioning
+- * @param {Nmber} reservation_ratio The reservation ratio
++ * @param {Number} reservation_ratio The reservation ratio
+  * @param {Object} overprovision_ratios The overprovisioning ratios. Must be an object with Number value keys and keys must be one of 'cpu', 'ram', 'disk', 'io', 'net'.
+  * @param {String} serial Serial device
+  * @param {Boolean} setup True if server has been set up
+@@ -371,6 +375,7 @@ Server.update = function handlerServerUpdate(req, res, next) {
+         'comments': ['optional', 'isStringType', 'isTrim'],
+         'datacenter': ['optional', 'isStringType', 'isTrim'],
+         'default_console': ['optional', 'isStringType', 'isTrim'],
++        'etagRetries': ['optional', 'isNumberType'],
+         'next_reboot': ['optional', 'isStringType', 'isTrim'],
+         'nics': ['optional', 'isArrayType'],
+         'overprovision_ratios': ['optional', 'isObjectType'],
+@@ -537,7 +542,7 @@ Server.update = function handlerServerUpdate(req, res, next) {
+             // didn't either. This means as a client you'll get an ETag error if
+             // something changes between the getObject and putObject in the
+             // upsert.
+-            etagRetries: 0
++            etagRetries: req.params.etagRetries || 0
+         }, function (modifyError) {
+             if (modifyError) {
+                 next(new restify.InternalError(modifyError.message));
+@@ -559,27 +564,37 @@ Server.update = function handlerServerUpdate(req, res, next) {
+  * @endpoint POST /servers/:server\_uuid/reboot
+  * @param {String} origin
+  * @param {String} creator_uuid
++ * @param {Boolean} drain Wait for server's cn-agent to be drained before sending the reboot command
++ * @param {Boolean} nojob If true, don't create a workflow job, but instead talk to the server_reboot task in cn-agent (default: false)
+  * @section Server API
+  *
+- * @response 204 Object Server reboot initiated
++ * @response 202 Object Server reboot initiated (object with job_uuid is returned)
++ * @response 204 None Server reboot initiated
+  * @response 500 None Error attempting to set up server
++ * @response 503 None When nojob=true, this means the server does not support the server_reboot cn-agent task
+  */
+ /* END JSSTYLED */
+ 
+ Server.reboot = function handlerServerReboot(req, res, next) {
++    var self = this;
++
+     assert.object(req, 'req');
+     assert.object(req.params, 'req.params');
+     assert.object(req.stash, 'req.stash');
+     assert.object(req.stash.server, 'req.stash.server');
+ 
++    var cnAgent = getCnAgentFromStashedServer(req.stash.server);
+     var params = {
+         origin: req.params.origin,
+         creator_uuid: req.params.creator_uuid,
+-        drain: req.params.drain
++        drain: req.params.drain,
++        supportsServerRebootTask: false
+     };
+     var rules = {
+         'server_uuid': ['isStringType'],
+         'creator_uuid': ['optional', 'isStringType'],
++        'drain': ['optional', 'isBooleanType'],
++        'nojob': ['optional', 'isBooleanType'],
+         'origin': ['optional', 'isStringType']
+     };
+ 
+@@ -588,6 +603,60 @@ Server.reboot = function handlerServerReboot(req, res, next) {
+         return;
+     }
+ 
++    if (cnAgent.version && semver.gte(cnAgent.version,
++        TASK_SERVER_REBOOT_MIN_VERSION)) {
++
++        params.supportsServerRebootTask = true;
++    }
++
++    // In nojob=true mode, we'll just call the server_reboot task on the CN.
++    // Unless it's unsupported in which case we'll return a ServiceUnavailable
++    // since the CN cannot serve this request.
++    if (req.params.nojob) {
++        vasync.pipeline({arg: {}, funcs: [
++            function ensureSupported(ctx, cb) {
++                self.log.debug({
++                    cnAgent: cnAgent,
++                    supported: params.supportsServerRebootTask,
++                    serverUuid: req.params.server_uuid,
++                    task: 'server_reboot',
++                    taskMinVersion: TASK_SERVER_REBOOT_MIN_VERSION
++                }, 'cn-agent task detection');
++
++                if (!params.supportsServerRebootTask) {
++                    cb (new restify.ServiceUnavailableError('cn-agent version' +
++                        ' on server does not support server_reboot: ' +
++                        (cnAgent.version ? cnAgent.version : 'unknown') +
++                        ' < ' + TASK_SERVER_REBOOT_MIN_VERSION));
++                    return;
++                }
++
++                cb();
++            }, function callServerRebootTask(ctx, cb) {
++                req.stash.server.sendTaskRequest({
++                    cb: function () {},
++                    log: self.log,
++                    params: req.params,
++                    req_id: req.getId(),
++                    synccb: function (err, results) {
++                        if (err) {
++                            self.log.error({
++                                err: err
++                            }, 'error returned from server_reboot');
++                        }
++
++                        cb(err);
++                    },
++                    task: 'server_reboot'
++                });
++           }
++        ]}, function _doneReboot(err) {
++            res.send(204);
++            next(err);
++        });
++        return;
++    }
++
+     req.stash.server.reboot(params, function (rebootError, jobUuid) {
+         if (rebootError) {
+             next(new restify.InternalError(rebootError.message));
+@@ -847,7 +916,9 @@ Server.sysinfoRefresh = function handlerServerSysinfoRefresh(req, res, next) {
+         function detectSysinfoTask(ctx, cb) {
+             var cnAgent = getCnAgentFromStashedServer(req.stash.server);
+ 
+-            if (cnAgent.version && semver.gte(cnAgent.version, '2.10.0')) {
++            if (cnAgent.version && semver.gte(cnAgent.version,
++                TASK_SERVER_SYSINFO_MIN_VERSION)) {
++
+                 ctx.haveSysinfoTask = true;
+             } else {
+                 ctx.haveSysinfoTask = false;
+@@ -1221,7 +1292,8 @@ Server.executeCommand = function executeCommand(opts, callback) {
+         }, function callUrIfAncient(ctx, cb) {
+             if (useCnAgentCommandExecute &&
+                 ctx.cnAgent.version &&
+-                semver.gte(ctx.cnAgent.version, '2.6.0')) {
++                semver.gte(ctx.cnAgent.version,
++                    TASK_COMMAND_EXECUTE_MIN_VERSON)) {
+ 
+                 handleWithUr = false;
+             }
+diff --git a/lib/models/server.js b/lib/models/server.js
+index e49f6da..20d23c7 100644
+--- a/lib/models/server.js
++++ b/lib/models/server.js
+@@ -493,7 +493,8 @@ ModelServer.prototype.reboot = function (params, callback) {
+         target: uuid,
+         origin: params.origin,
+         creator_uuid: params.creator_uuid,
+-        drain: params.drain || false
++        drain: params.drain || false,
++        supportsServerRebootTask: params.supportsServerRebootTask || false
+     };
+ 
+     self.log.info('Instantiating server-reboot workflow');
+diff --git a/lib/workflows/server-reboot.js b/lib/workflows/server-reboot.js
+index 6b66c66..2ad5959 100644
+--- a/lib/workflows/server-reboot.js
++++ b/lib/workflows/server-reboot.js
+@@ -37,7 +37,7 @@ function validateParams(job, callback) {
+ function pauseCnTaskHandler(job, callback) {
+     // Only with "job.params.drain"
+     if (!job.params.drain) {
+-        callback(null, job);
++        callback(null, 'No need to pause cn-agent');
+         return;
+     }
+     var pause = '/servers/' + job.params.server_uuid + '/cn-agent/pause';
+@@ -116,16 +116,40 @@ function waitForCnAgentDrained(job, callback) {
+ }
+ 
+ 
++//
++// This function has 2 modes depending on whether the supportsServerRebootTask
++// parameter is true or not. If true, this will call ServerReboot with the
++// nojob=true parameter which will result in a server_reboot task being run on
++// the CN via cn-agent. Otherwise, this will send a script to CommandExecute
++// which will 'exit 113' and reboot the server. Ideally this second mode will
++// eventually go away, since we'd like to do away with Ur (HEAD-1946) and this
++// special exit code (AGENT-733).
++//
+ function sendRebootMessage(job, callback) {
+-    var urUrl = '/servers/' + job.params.server_uuid + '/execute';
+     var cnapiUrl = job.params.cnapi_url;
+-    var cnapi = restify.createJsonClient({ url: cnapiUrl});
++    var rebootUrl = '/servers/' + job.params.server_uuid + '/reboot';
++    var urUrl = '/servers/' + job.params.server_uuid + '/execute';
+ 
++    var cnapi = restify.createJsonClient({ url: cnapiUrl});
+ 
+     var payload = {
+         script: '#!/bin/bash\nexit 113'
+     };
+ 
++    job.log.debug({params: job.params}, 'sendRebootMessage job params');
++
++    if (job.params.supportsServerRebootTask) {
++        cnapi.post(rebootUrl, {nojob: true}, function (err, req, res) {
++            job.log.info({
++                err: err,
++                req: req,
++                res: res
++            }, 'POSTed reboot with nojob=true');
++            callback(err);
++        });
++        return;
++    }
++
+     cnapi.post(urUrl, payload, function (error, req, res) {
+         if (error) {
+             job.log.info('Error posting to Ur via CNAPI:' + error.message);
+@@ -143,6 +167,7 @@ function markServerAsRebooting(job, callback) {
+     var serverUrl = '/servers/' + job.params.server_uuid;
+ 
+     var payload = {
++        etagRetries: 3,
+         transitional_status: 'rebooting'
+     };
+ 
+diff --git a/package.json b/package.json
+index 6a1430c..b7030e9 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "cnapi",
+   "description": "SmartDataCenter Compute Node API",
+-  "version": "1.21.10",
++  "version": "1.22.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {

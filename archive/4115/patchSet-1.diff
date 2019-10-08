@@ -1,0 +1,418 @@
+commit 44aa96f3966d2ff3c3aec075f7fa95385110709c
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2018-06-01T21:47:55+00:00 (1 year, 4 months ago)
+    
+    OS-6949 bhyve should expose clock params like KVM
+
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm.c b/usr/src/uts/i86pc/io/vmm/vmm.c
+index 84080d487e..51a1bbe6a3 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm.c
+@@ -135,6 +135,9 @@ struct vcpu {
+ 	uint64_t	nextrip;	/* (x) next instruction to execute */
+ #ifndef __FreeBSD__
+ 	uint64_t	tsc_offset;	/* (x) offset from host TSC */
++	uint64_t	pvc_wall_gpa;	/* (x) GPA of PV wall clock struct */
++	uint64_t	pvc_sys_gpa;	/* (x) GPA of PV system time struct */
++	hrtime_t	pvc_sys_upt;	/* (x) hrtime of last systime update */
+ #endif
+ };
+ 
+@@ -200,6 +203,9 @@ struct vm {
+ 	uint16_t	threads;		/* (o) num of threads/core */
+ 	uint16_t	maxcpus;		/* (o) max pluggable cpus */
+ #ifndef __FreeBSD__
++	hrtime_t	systime_offset;		/* (i) systime offset */
++	timespec_t	wallclock;		/* (i) wall clock at "boot" */
++
+ 	krwlock_t	ioport_rwlock;
+ 	list_t		ioport_hooks;
+ #endif /* __FreeBSD__ */
+@@ -547,6 +553,10 @@ vm_init(struct vm *vm, bool create)
+ 	for (i = 0; i < VM_MAXCPU; i++) {
+ 		vm->vcpu[i].tsc_offset = tsc_off;
+ 	}
++
++	/* Record system-wide pvclock offsets at "boot" time */
++	vm->systime_offset = gethrtime();
++	gethrestime(&vm->wallclock);
+ #endif /* __FreeBSD__ */
+ }
+ 
+@@ -1738,6 +1748,134 @@ vm_handle_reqidle(struct vm *vm, int vcpuid, bool *retu)
+ }
+ 
+ #ifndef __FreeBSD__
++
++#define	MSR_KVM_WALL_CLOCK_NEW	0x4b564d00
++#define	MSR_KVM_SYSTEM_TIME_NEW	0x4b564d01
++#define	PVCLOCK_TSC_STABLE_BIT	(1 << 0)
++#define	PVCLOCK_GUEST_STOPPED	(1 << 1)
++
++#define	PVCLOCK_UPDATE_MIN_INTVL	MSEC2NSEC(500)
++
++struct pvclock_wall_clock {
++	uint32_t	version;
++	uint32_t	sec;
++	uint32_t	nsec;
++	uint32_t	_pad;
++};
++
++struct pvclock_vcpu_time_info {
++	uint32_t	version;
++	uint32_t	_pad0;
++	uint64_t	tsc_timestamp;
++	uint64_t	system_time;
++	uint32_t	tsc_to_system_mul;
++	int8_t		tsc_shift;
++	uint8_t		flags;
++	uint8_t		_pad[2];
++};
++
++static void
++vm_populate_pvclock_wall(struct vm *vm, struct pvclock_wall_clock *wall)
++{
++	uint32_t ver;
++
++	ver = wall->version;
++	ver += ((ver & 0x1) != 0) ? 2 : 1;
++	wall->version = ver;
++	membar_producer();
++
++	wall->sec = vm->wallclock.tv_sec;
++	wall->nsec = vm->wallclock.tv_nsec;
++
++	membar_producer();
++	wall->version = ver + 1;
++}
++
++static void
++vm_populate_pvclock_systime(struct vm *vm, int vcpuid, void *held_addr)
++{
++	struct vcpu *cpu = &vm->vcpu[vcpuid];
++	struct pvclock_vcpu_time_info *tinfo;
++	void *cookie;
++	uint64_t tsc, hrtime;
++	uint32_t scale, ver;
++	uint8_t shift;
++	/* locally defined to avoid include conflicts from machsystm */
++	extern hrtime_t tsc_gethrtime_params(uint64_t *, uint32_t *, uint8_t *);
++
++	if ((cpu->pvc_sys_gpa & 0x1) == 0) {
++		return;
++	}
++	if (gethrtime() <= cpu->pvc_sys_upt + PVCLOCK_UPDATE_MIN_INTVL) {
++		return;
++	}
++	if (held_addr == NULL) {
++		const uint64_t addr = cpu->pvc_sys_gpa & ~0x1UL;
++
++		tinfo = vm_gpa_hold(vm, vcpuid, addr, sizeof (*tinfo),
++		    VM_PROT_RW, &cookie);
++		/* The mapping _should_ have been verified already */
++		if (tinfo == NULL) {
++			/* XXX: panic? */
++			return;
++		}
++	} else {
++		tinfo = held_addr;
++	}
++
++	hrtime = tsc_gethrtime_params(&tsc, &scale, &shift);
++	VERIFY(shift <= INT8_MAX);
++
++	ver = tinfo->version;
++	ver += ((ver & 0x1) != 0) ? 2 : 1;
++	tinfo->version = ver;
++	membar_producer();
++
++	tinfo->tsc_timestamp = tsc + cpu->tsc_offset;
++	tinfo->system_time = hrtime - vm->systime_offset;
++	tinfo->tsc_to_system_mul = scale;
++	tinfo->tsc_shift = (int8_t)shift;
++	tinfo->flags = PVCLOCK_TSC_STABLE_BIT;
++
++	membar_producer();
++	tinfo->version = ver + 1;
++	cpu->pvc_sys_upt = hrtime;
++
++	if (held_addr == NULL) {
++		vm_gpa_release(cookie);
++	}
++}
++
++
++static int
++vm_handle_rdmsr(struct vm *vm, int vcpuid, struct vm_exit *vme)
++{
++	struct vcpu *cpu = &vm->vcpu[vcpuid];
++	const uint32_t code = vme->u.msr.code;
++	uint64_t val = 0;
++	int res = 0;
++
++	switch (code) {
++	case MSR_KVM_WALL_CLOCK_NEW:
++		val = cpu->pvc_wall_gpa;
++		break;
++	case MSR_KVM_SYSTEM_TIME_NEW:
++		val = cpu->pvc_sys_gpa;
++		break;
++	default:
++		res = -1;
++		break;
++	}
++
++	if (res == 0) {
++		const uint32_t high = val >> 32;
++		const uint32_t low = val;
++
++		VERIFY0(vm_set_register(vm, vcpuid, VM_REG_GUEST_RDX, high));
++		VERIFY0(vm_set_register(vm, vcpuid, VM_REG_GUEST_RAX, low));
++	}
++	return (res);
++}
+ static int
+ vm_handle_wrmsr(struct vm *vm, int vcpuid, struct vm_exit *vme)
+ {
+@@ -1746,6 +1884,67 @@ vm_handle_wrmsr(struct vm *vm, int vcpuid, struct vm_exit *vme)
+ 	const uint64_t val = vme->u.msr.wval;
+ 
+ 	switch (code) {
++	case MSR_KVM_WALL_CLOCK_NEW: {
++		void *cookie;
++		struct pvclock_wall_clock *wall;
++
++		if (val == 0) {
++			cpu->pvc_wall_gpa = 0;
++			return (0);
++		}
++
++		/*
++		 * Make sure the offset is not so deep that the structure will
++		 * spill into another page (and upset vm_gpa_hold).
++		 */
++		if (PAGE_SIZE - (val & PAGE_MASK) < sizeof (*wall)) {
++			return (-1);
++		}
++
++		wall = vm_gpa_hold(vm, vcpuid, val, sizeof (*wall), VM_PROT_RW,
++		    &cookie);
++		if (wall == NULL) {
++			return (-1);
++		}
++
++		cpu->pvc_wall_gpa = val;
++		vm_populate_pvclock_wall(vm, wall);
++		vm_gpa_release(cookie);
++
++		return (0);
++	}
++	case MSR_KVM_SYSTEM_TIME_NEW: {
++		const uint64_t addr = val & ~0x1UL;
++		struct pvclock_vcpu_time_info *tinfo;
++		void *cookie;
++
++		/* The low bit is used to enable the functionality */
++		if ((val & 0x1) == 0) {
++			cpu->pvc_sys_gpa = val;
++			return (0);
++		}
++
++		/*
++		 * Make sure the offset is not so deep that the structure will
++		 * spill into another page (and upset vm_gpa_hold).
++		 */
++		if (PAGE_SIZE - (addr & PAGE_MASK) < sizeof (*tinfo)) {
++			return (-1);
++		}
++
++		tinfo = vm_gpa_hold(vm, vcpuid, addr, sizeof (*tinfo),
++		    VM_PROT_RW, &cookie);
++		if (tinfo == NULL) {
++			return (-1);
++		}
++
++		cpu->pvc_sys_gpa = val;
++		cpu->pvc_sys_upt = 0;
++		vm_populate_pvclock_systime(vm, vcpuid, tinfo);
++		vm_gpa_release(cookie);
++
++		return (0);
++	}
+ 	case MSR_TSC:
+ 		cpu->tsc_offset = val - rdtsc();
+ 		return (0);
+@@ -2021,6 +2220,9 @@ restart:
+ 		vtc.vtc_status |= VTCS_FPU_RESTORED;
+ 	}
+ 	vtc.vtc_status |= VTCS_FPU_CTX_CRITICAL;
++
++	/* If a pvclock entry is associated with the vCPU, update it. */
++	vm_populate_pvclock_systime(vm, vcpuid, NULL);
+ #endif
+ 
+ 	vcpu_require_state(vm, vcpuid, VCPU_RUNNING);
+@@ -2082,6 +2284,11 @@ restart:
+ 			vm_inject_ud(vm, vcpuid);
+ 			break;
+ #ifndef __FreeBSD__
++		case VM_EXITCODE_RDMSR:
++			if (vm_handle_rdmsr(vm, vcpuid, vme) != 0) {
++				retu = true;
++			}
++			break;
+ 		case VM_EXITCODE_WRMSR:
+ 			if (vm_handle_wrmsr(vm, vcpuid, vme) != 0) {
+ 				retu = true;
+diff --git a/usr/src/uts/i86pc/io/vmm/x86.c b/usr/src/uts/i86pc/io/vmm/x86.c
+index d6426bde44..9601d615ee 100644
+--- a/usr/src/uts/i86pc/io/vmm/x86.c
++++ b/usr/src/uts/i86pc/io/vmm/x86.c
+@@ -88,6 +88,13 @@ log2(u_int x)
+ 	return (fls(x << (1 - powerof2(x))) - 1);
+ }
+ 
++#ifndef __FreeBSD__
++static volatile boolean_t vmm_kvm_cpuid = B_TRUE;
++
++#define	KVM_FEATURE_CLOCKSOURCE2	(1 << 3)
++#define	KVM_FEATURE_CLOCKSOURCE_STABLE	(1 << 24)
++#endif
++
+ int
+ x86_emulate_cpuid(struct vm *vm, int vcpu_id,
+ 		  uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+@@ -109,8 +116,18 @@ x86_emulate_cpuid(struct vm *vm, int vcpu_id,
+ 		if (*eax > cpu_exthigh)
+ 			*eax = cpu_exthigh;
+ 	} else if (*eax >= 0x40000000) {
++#ifdef __FreeBSD__
+ 		if (*eax > CPUID_VM_HIGH)
+ 			*eax = CPUID_VM_HIGH;
++#else /* __FreeBSD__ */
++		if (vmm_kvm_cpuid) {
++			if (*eax > 0x40000001)
++				*eax = 0x40000001;
++		} else {
++			if (*eax > CPUID_VM_HIGH)
++				*eax = CPUID_VM_HIGH;
++		}
++#endif /* __FreeBSD__ */
+ 	} else if (*eax > cpu_high) {
+ 		*eax = cpu_high;
+ 	}
+@@ -479,12 +496,38 @@ x86_emulate_cpuid(struct vm *vm, int vcpu_id,
+ 			}
+ 			break;
+ 
++#ifdef __FreeBSD__
+ 		case 0x40000000:
+ 			regs[0] = CPUID_VM_HIGH;
+ 			bcopy(bhyve_id, &regs[1], 4);
+ 			bcopy(bhyve_id + 4, &regs[2], 4);
+ 			bcopy(bhyve_id + 8, &regs[3], 4);
+ 			break;
++#else
++		case 0x40000000:
++			if (!vmm_kvm_cpuid) {
++				regs[0] = CPUID_VM_HIGH;
++				bcopy(bhyve_id, &regs[1], 4);
++				bcopy(bhyve_id + 4, &regs[2], 4);
++				bcopy(bhyve_id + 8, &regs[3], 4);
++			} else {
++				const char kvm_id[12] = "KVMKVMKVM\0\0";
++
++				regs[0] = 0x40000001;
++				bcopy(kvm_id, &regs[1], 4);
++				bcopy(kvm_id + 4, &regs[2], 4);
++				bcopy(kvm_id + 8, &regs[3], 4);
++			}
++			break;
++		case 0x40000001:
++			if (vmm_kvm_cpuid) {
++				regs[0] = KVM_FEATURE_CLOCKSOURCE2 |
++				    KVM_FEATURE_CLOCKSOURCE_STABLE;
++				regs[1] = regs[2] = regs[3] = 0;
++			}
++			break;
++
++#endif /* __FreeBSD__ */
+ 
+ 		default:
+ 			/*
+diff --git a/usr/src/uts/i86pc/os/timestamp.c b/usr/src/uts/i86pc/os/timestamp.c
+index 7344e1a492..e280e6dc4f 100644
+--- a/usr/src/uts/i86pc/os/timestamp.c
++++ b/usr/src/uts/i86pc/os/timestamp.c
+@@ -280,6 +280,59 @@ tsc_gethrtime_tick_delta(void)
+ 	return (hrt);
+ }
+ 
++/* Calculate the hrtime while exposing the parameters of that calculation. */
++hrtime_t
++tsc_gethrtime_params(uint64_t *tscp, uint32_t *scalep, uint8_t *shiftp)
++{
++	uint32_t old_hres_lock, scale;
++	hrtime_t tsc, last, base;
++
++	do {
++		old_hres_lock = hres_lock;
++
++		if (gethrtimef == tsc_gethrtime_delta) {
++			ulong_t flags;
++
++			flags = clear_int_flag();
++			tsc = tsc_read() + tsc_sync_tick_delta[CPU->cpu_id];
++			restore_int_flag(flags);
++		} else {
++			tsc = tsc_read();
++		}
++
++		last = tsc_last;
++		base = tsc_hrtime_base;
++		scale = nsec_scale;
++
++	} while ((old_hres_lock & ~1) != hres_lock);
++
++	if (tsc >= last) {
++		tsc -= last;
++	} else if (tsc >= last - 2 * tsc_max_delta) {
++		tsc = 0;
++	} else {
++		tsc = tsc_protect(tsc);
++	}
++
++	TSC_CONVERT_AND_ADD(tsc, base, nsec_scale);
++
++	if (tscp != NULL) {
++		/*
++		 * Do not simply communicate the delta applied to the hrtime
++		 * base, but rather the effective TSC measurement.
++		 */
++		*tscp = tsc + last;
++	}
++	if (scalep != NULL) {
++		*scalep = scale;
++	}
++	if (shiftp != NULL) {
++		*shiftp = NSEC_SHIFT;
++	}
++
++	return (base);
++}
++
+ /*
+  * This is similar to the above, but it cannot actually spin on hres_lock.
+  * As a result, it caches all of the variables it needs; if the variables
+diff --git a/usr/src/uts/i86pc/sys/machsystm.h b/usr/src/uts/i86pc/sys/machsystm.h
+index 10553f9eda..56d43feaea 100644
+--- a/usr/src/uts/i86pc/sys/machsystm.h
++++ b/usr/src/uts/i86pc/sys/machsystm.h
+@@ -231,6 +231,7 @@ extern page_t *page_get_high_mfn(mfn_t);
+ #endif
+ 
+ extern hrtime_t tsc_gethrtime_tick_delta(void);
++extern hrtime_t tsc_gethrtime_params(uint64_t *, uint32_t *, uint8_t *);
+ 
+ #endif /* _KERNEL */
+ 

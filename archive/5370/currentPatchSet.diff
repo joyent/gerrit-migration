@@ -1,0 +1,212 @@
+commit 7ec9f8048c1c85d92f7109eb9ee9b88eb0b9cce6
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2019-05-28T18:20:32+00:00 (4 months ago)
+    
+    TRITON-629 NAPI gets stuck in nightly-1 with a "Server is still initializing" error
+    Reviewed by: Rui Loura <rui@joyent.com>
+    Reviewed by: Trent Mick <trentm@gmail.com>
+    Approved by: Trent Mick <trentm@gmail.com>
+
+diff --git a/lib/migrate.js b/lib/migrate.js
+index b5f529b..6320050 100644
+--- a/lib/migrate.js
++++ b/lib/migrate.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -149,13 +149,17 @@ function migrate(opts, callback) {
+             model: model,
+             moray: moray
+         }
+-    }, function (err, res) {
++    }, function postMigrate(err, res) {
+         if (err) {
+-            return callback(err);
++            callback(new VError(err,
++                'failed to migrate bucket %s', bucket.name));
++            return;
+         }
++
+         log.trace({ bucket: bucket.name, res: res }, 'migration complete');
+         log.info('end migration for bucket %s', bucket.name);
+-        return callback();
++
++        callback();
+     });
+ }
+ 
+diff --git a/lib/napi.js b/lib/napi.js
+index 97fbdce..86d9378 100644
+--- a/lib/napi.js
++++ b/lib/napi.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -39,6 +39,7 @@ var VError = require('verror');
+ // --- Globals
+ 
+ 
++var INIT_RETRY_DELAY = 10000;
+ var METRICS_SERVER_PORT = 8881;
+ var USAGE_PERIOD = 8 * 60 * 60 * 1000; // 8 hours
+ var PKG = require('../package.json');
+@@ -63,8 +64,12 @@ function periodicUsageLog(log) {
+  */
+ function NAPI(opts) {
+     var self = this;
++
+     this.log = opts.log;
+     this.config = opts.config;
++
++    this.lastErr = null;
++
+     constants.UFDS_ADMIN_UUID = opts.config.ufdsAdminUuid;
+ 
+     if (opts.config.overlay.enabled) {
+@@ -118,13 +123,23 @@ function NAPI(opts) {
+     }
+ 
+     function checkServices(req, res, next) {
+-        if (!req.app.isInState('running')) {
+-            next(new restify.ServiceUnavailableError(
+-                'Server is still initializing'));
++        if (req.app.isInState('running')) {
++            next();
+             return;
+         }
+ 
+-        next();
++        /*
++         * In case NAPI's been stuck in a state for a while, log the current
++         * state and any saved Error to help point administrators in the right
++         * direction when debugging.
++         */
++        req.log.warn({
++            state: req.app.getState(),
++            lastErr: req.app.lastErr
++        }, 'NAPI cannot currently service requests');
++
++        next(new restify.ServiceUnavailableError(
++            'Server is still initializing'));
+     }
+ 
+     var before = [ populateReq, checkServices ];
+@@ -299,7 +314,7 @@ NAPI.prototype.state_init.moray = function (S) {
+     });
+ 
+     S.on(self.moray, 'error', function onMorayError(err) {
+-        self.initErr = new VError(err, 'moray: connection failed');
++        self.lastErr = new VError(err, 'moray: connection failed');
+         S.gotoState('failed');
+     });
+ };
+@@ -319,9 +334,7 @@ NAPI.prototype.state_init.buckets = function (S) {
+     models.init(self, function (err) {
+         if (err) {
+             self.log.error(err, 'Error initializing models; retrying in 10s');
+-            S.timeout(10000, function () {
+-                S.gotoState('init.buckets');
+-            });
++            S.gotoStateTimeout(INIT_RETRY_DELAY, 'init.buckets');
+             return;
+         }
+ 
+@@ -332,7 +345,7 @@ NAPI.prototype.state_init.buckets = function (S) {
+ NAPI.prototype.state_init.migrations = function (S) {
+     var self = this;
+ 
+-    S.validTransitions([ 'init.loadInitialData', 'failed' ]);
++    S.validTransitions([ 'init.migrations', 'init.loadInitialData' ]);
+ 
+     mod_migrate.migrateAll({
+         app: self,
+@@ -340,8 +353,8 @@ NAPI.prototype.state_init.migrations = function (S) {
+         models: models.models
+     }, function afterMigrate(err) {
+         if (err) {
+-            self.initErr = new VError(err, 'failed to migrate data');
+-            S.gotoState('failed');
++            self.log.error(err, 'Error migrating data; retrying in 10s');
++            S.gotoStateTimeout(INIT_RETRY_DELAY, 'init.migration');
+             return;
+         }
+ 
+@@ -383,10 +396,14 @@ NAPI.prototype.state_running = function (S) {
+ NAPI.prototype.state_failed = function (S) {
+     var self = this;
+ 
++    assert.ok(self.lastErr instanceof Error, 'lastErr is set');
++
+     S.validTransitions([]);
+ 
++    self.log.error(self.lastErr, 'NAPI failed to initialize');
++
+     self._cleanup(function () {
+-        self.emit('error', self.initErr);
++        self.emit('error', self.lastErr);
+     });
+ };
+ 
+@@ -396,14 +413,14 @@ NAPI.prototype.state_stopping = function (S) {
+     S.validTransitions([ 'stopped' ]);
+ 
+     self._cleanup(function (err) {
+-        self.stoperr = err;
++        self.lastErr = err;
+         S.gotoState('stopped');
+     });
+ };
+ 
+ NAPI.prototype.state_stopped = function (S) {
+     S.validTransitions([]);
+-    setImmediate(this.stopcb, this.stoperr);
++    setImmediate(this.stopcb, this.lastErr);
+ };
+ 
+ NAPI.prototype._cleanup = function (callback) {
+diff --git a/package.json b/package.json
+index 3acf8c6..c888df8 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "napi",
+   "description": "SmartDataCenter Networking API",
+-  "version": "1.4.0",
++  "version": "1.4.1",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+@@ -15,16 +15,16 @@
+     "jsprim": "1.4.0",
+     "lomstream": "1.1.0",
+     "macaddr": "0.0.1",
+-    "mooremachine": "2.2.0",
++    "mooremachine": "2.3.0",
+     "moray": "3.5.0",
+     "node-uuid": "1.4.8",
+     "portolan-moray": "git+https://github.com/joyent/sdc-portolan-moray.git#7e2c4ca",
+-    "restify": "4.3.0",
++    "restify": "4.3.4",
+     "restify-warden": "1.1.0",
+-    "sdc-clients": "11.1.0",
++    "sdc-clients": "13.0.1",
+     "tape": "4.5.1",
+     "trace-event": "1.3.0",
+-    "triton-metrics": "0.4.0",
++    "triton-metrics": "1.0.2",
+     "vasync": "1.6.4",
+     "verror": "1.9.0"
+   },

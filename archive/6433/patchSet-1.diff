@@ -1,0 +1,1201 @@
+commit 5c970c67aa9f922fd619b30e63c667d1916304e9
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2019-06-12T19:59:14-07:00 (4 months ago)
+    
+    MANTA-4337 muppet needs debouncing and protection against lost backends
+
+diff --git a/lib/app.js b/lib/app.js
+new file mode 100644
+index 0000000..8cc959a
+--- /dev/null
++++ b/lib/app.js
+@@ -0,0 +1,201 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++/*jsl:ignore*/
++'use strict';
++/*jsl:end*/
++
++const mod_fs = require('fs');
++const mod_assert = require('assert-plus');
++const mod_forkexec = require('forkexec');
++const mod_net = require('net');
++const mod_util = require('util');
++const mod_zkstream = require('zkstream');
++const mod_vasync = require('vasync');
++const VError = require('verror');
++const FSM = require('mooremachine').FSM;
++
++const lib_lbman = require('./lb_manager');
++const lib_watch = require('./watch');
++
++function domainToPath(domain) {
++    return ('/' + domain.split('.').reverse().join('/'));
++}
++
++const MDATA_TIMEOUT = 30000;
++const SETUP_RETRY_TIMEOUT = 30000;
++
++function AppFSM(cfg) {
++    this.a_log = cfg.log;
++
++    this.a_adminIPs = cfg.adminIPS;
++    this.a_mantaIPs = cfg.mantaIPS;
++    this.a_trustedIP = cfg.trustedIP;
++    this.a_untrustedIPs = [];
++    if (cfg.hasOwnProperty('untrustedIPs'))
++        this.a_untrustedIPs = cfg.untrustedIPs;
++    this.a_zkCfg = cfg.zookeeper;
++    this.a_name = cfg.name;
++    this.a_path = domainToPath(cfg.name);
++    this.a_lastError = null;
++
++    this.a_restartCmd = cfg.restart;
++
++    FSM.call(this, 'getips');
++}
++mod_util.inherits(AppFSM, FSM);
++
++/*
++ * Uses mdata-get or our configuration JSON to figure out which of our NIC IP
++ * addresses are "untrusted" or "public" -- where we should be listening for
++ * connections.
++ */
++AppFSM.prototype.state_getips = function (S) {
++    var self = this;
++    var log = this.a_log;
++    // Allow hardcoding addresses in the configuration.
++    if (this.a_untrustedIPs.length > 0) {
++        S.gotoState('zksetup');
++        return;
++    }
++
++    const args = [ '/usr/sbin/mdata-get', 'sdc:nics' ];
++    log.info({ cmd: args }, 'Loading NIC information');
++    mod_forkexec.forkExecWait({
++        argv: args
++    }, S.callback(function (err, info) {
++        if (err) {
++            self.a_lastError = new VError(err,
++                'failed to load NIC information');
++            S.gotoState('setuperr');
++            return;
++        }
++
++        const nics = JSON.parse(info.stdout);
++        mod_assert.array(nics, 'nics');
++
++        function _pushIP(ip) {
++            /* If this is an admin, manta, or other trusted IP, skip it. */
++            if ((self.a_adminIPs && self.a_adminIPs.indexOf(ip) !== -1) ||
++                (self.a_mantaIPs && self.a_mantaIPs.indexOf(ip) !== -1) ||
++                ip === self.a_trustedIP)  {
++
++                return;
++            }
++
++            if (!mod_net.isIPv4(ip) && !mod_net.isIPv6(ip)) {
++                log.warn('invalid IP found in NIC information: "%s"', ip);
++                return;
++            }
++
++            self.a_untrustedIPs.push(ip);
++        }
++
++        function _addIPsFromNics(nic) {
++            if (nic.hasOwnProperty('ips')) {
++                nic.ips.forEach(function parseIP(addr) {
++                    _pushIP(addr.split('/')[0]);
++                });
++            } else if (nic.hasOwnProperty('ip')) {
++                _pushIP(nic.ip);
++            } else {
++                log.warn({ nic: nic }, 'NIC has no IP addresses');
++            }
++        }
++
++        nics.forEach(_addIPsFromNics);
++
++        log.info({ ips: self.a_untrustedIPs },
++            'selected IPs for untrusted networks');
++
++        S.gotoState('zksetup');
++    }));
++    S.timeout(MDATA_TIMEOUT, function () {
++        this.a_lastError = new Error('Timeout waiting for mdata-get exec');
++        S.gotoState('setuperror');
++    });
++};
++
++/* Sleeps and restarts the entire setup process. */
++AppFSM.prototype.state_setuperror = function (S) {
++    this.a_log.error(this.a_lastError, 'muppet startup failed: retry in 30sec');
++    S.gotoStateTimeout(SETUP_RETRY_TIMEOUT, 'getips');
++};
++
++AppFSM.prototype.state_zksetup = function (S) {
++    var opts = {
++        servers: [],
++        log: this.a_log,
++        sessionTimeout: this.a_zkCfg.timeout
++    };
++
++    this.a_zkCfg.servers.forEach(function (s) {
++        // Support old zk-plus (host) or new zkstream (address) configs
++        var _host = s.address || s.host;
++        opts.servers.push({ address: _host, port: s.port });
++    });
++
++    this.a_log.debug({
++        servers: opts.servers,
++        timeout: opts.sessionTimeout
++    }, 'Creating ZooKeeper client');
++
++    this.a_zk = new mod_zkstream.Client(opts);
++    this.a_nsf = new lib_watch.HostWatcherFSM({
++        zk: this.a_zk,
++        path: this.a_path,
++        log: this.a_log
++    });
++
++    S.on(this.a_zk, 'session', function () {
++        S.gotoState('watch');
++    });
++};
++
++AppFSM.prototype.state_watch = function (S) {
++    this.a_watcher = this.a_zk.watcher(this.a_path);
++    S.gotoState('running');
++};
++
++AppFSM.prototype.state_running = function (S) {
++    var self = this;
++    var log = this.a_log;
++
++    S.on(this.a_watcher, 'childrenChanged', function (kids) {
++        log.debug({ kids: kids }, 'childrenChanged fired');
++        self.a_nsf.childrenChanged(kids);
++    });
++
++    S.on(this.a_nsf, 'hostsChanged', function (hosts) {
++        const opts = {
++            trustedIP: self.a_trustedIP,
++            untrustedIPs: self.a_untrustedIPs,
++            hosts: hosts,
++            log: self.a_log.child({component: 'lb_manager'}),
++            restart: self.a_restartCmd
++        };
++        log.trace({ hosts: hosts }, 'going to restart lb');
++        lib_lbman.restart(opts, function (err) {
++            if (err) {
++                log.error(err, 'lb restart failed');
++                return;
++            }
++            log.info({ hosts: hosts }, 'lb restarted');
++        });
++    });
++
++    S.on(this.a_zk, 'session', function () {
++        S.gotoState('watch');
++    });
++};
++
++module.exports = {
++    AppFSM: AppFSM
++};
+diff --git a/lib/index.js b/lib/index.js
+deleted file mode 100644
+index 16dcc09..0000000
+--- a/lib/index.js
++++ /dev/null
+@@ -1,23 +0,0 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- */
+-
+-/*
+- * Copyright (c) 2017, Joyent, Inc.
+- */
+-
+-const lbm = require('./lb_manager');
+-const zkm = require('./zk.js');
+-const Watch = require('./watch').Watch;
+-
+-
+-///--- Exports
+-module.exports = {
+-    createWatch: function createWatch(options) {
+-        return (new Watch(options));
+-    },
+-    createZKClient: zkm.createZKClient,
+-    restartLB: lbm.restart
+-};
+diff --git a/lib/watch.js b/lib/watch.js
+index 0085aaf..5461296 100644
+--- a/lib/watch.js
++++ b/lib/watch.js
+@@ -5,298 +5,276 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*jsl:ignore*/
+ 'use strict';
+ /*jsl:end*/
+ 
+-const EventEmitter = require('events').EventEmitter;
+-const util = require('util');
+-const assert = require('assert-plus');
+-const once = require('once');
+-const vasync = require('vasync');
+-const verror = require('verror');
+-const jsprim = require('jsprim');
++const mod_fs = require('fs');
++const mod_assert = require('assert-plus');
++const mod_forkexec = require('forkexec');
++const mod_net = require('net');
++const mod_util = require('util');
++const mod_zkstream = require('zkstream');
++const mod_vasync = require('vasync');
++const VError = require('verror');
++const FSM = require('mooremachine').FSM;
++
++const HOLD_TIME = 30000;
++const REMOVAL_THROTTLE = 0.2;
++
++const HISTORY_LENGTH = 32;
++const COLLECTION_TIMEOUT = 15000;
++const RETRY_TIMEOUT = 15000;
++const FETCH_CONCURRENCY = 8;
++
++
++function diffSets(list1, list2) {
++    var idx1 = {};
++    var idx2 = {};
++    var out = { added: [], removed: [] };
++    list1.forEach(function (val) {
++        idx1[val] = true;
++    });
++    list2.forEach(function (val) {
++        if (idx1[val] !== true)
++            out.added.push(val);
++        idx2[val] = true;
++    });
++    list1.forEach(function (val) {
++        if (idx2[val] !== true)
++            out.removed.push(val);
++    });
++    return (out);
++}
+ 
+ 
+-///--- Globals
++function HostWatcherFSM(opts) {
++    this.hw_zk = opts.zk;
++    this.hw_path = opts.path;
++    this.hw_log = opts.log;
+ 
+-const sprintf = util.format;
++    this.hw_lastSeen = {};
++    this.hw_lastHosts = [];
++    this.hw_lastKids = [];
++    this.hw_kids = [];
++    this.hw_history = [];
++    this.hw_hostHistory = [];
++    this.hw_nextExpiry = 0;
+ 
+-///--- Private Functions
++    this.hw_lastError = null;
+ 
+-// Turns something like manta.machine.joyent.com into com/joyent/machine/manta
+-function domainToPath(domain) {
+-    return ('/' + domain.split('.').reverse().join('/'));
++    FSM.call(this, 'idle');
+ }
++mod_util.inherits(HostWatcherFSM, FSM);
+ 
++HostWatcherFSM.prototype.childrenChanged = function (kids) {
++    this.emit('childrenChangedAsserted', kids);
++};
+ 
+-///--- API
+-function Watch(options) {
+-    assert.object(options);
+-    assert.string(options.domain);
+-    assert.object(options.log);
+-    assert.object(options.zk);
++HostWatcherFSM.prototype._newDiff = function (diff) {
++    this.hw_history.push({ time: new Date(), diff: diff });
++    while (this.hw_history.length > HISTORY_LENGTH)
++        this.hw_history.shift();
++};
+ 
+-    EventEmitter.call(this);
++HostWatcherFSM.prototype._newHostDiff = function (diff) {
++    this.hw_hostHistory.push({ time: new Date(), diff: diff });
++    while (this.hw_hostHistory.length > HISTORY_LENGTH)
++        this.hw_hostHistory.shift();
++};
+ 
+-    this.hosts = [];
+-    this.log = options.log.child({clazz: 'Watch'}, true);
+-    this.path = domainToPath(options.domain);
+-    this.zk = options.zk;
+-}
+-util.inherits(Watch, EventEmitter);
++HostWatcherFSM.prototype.state_idle = function (S) {
++    var self = this;
++    var now = Date.now();
++    var delta = (this.hw_nextExpiry - now);
++    if (delta > 0) {
++       S.gotoStateTimeout(delta, 'collecting');
++    }
++    S.on(this, 'childrenChangedAsserted', function (kids) {
++        var diff = diffSets(self.hw_lastKids, kids);
++        if (diff.added.length > 0 || diff.removed.length > 0) {
++            self._newDiff(diff);
++            self.hw_kids = kids;
++            S.gotoState('collecting');
++        }
++    });
++};
+ 
+-Watch.prototype.start = function start(callback) {
+-    callback = once(callback);
++HostWatcherFSM.prototype.state_collecting = function (S) {
++    var self = this;
++    this.hw_log.trace('got a change, collecting diff for %d ms...',
++        COLLECTION_TIMEOUT);
++    S.on(this, 'childrenChangedAsserted', function (kids) {
++        var diff = diffSets(self.hw_kids, kids);
++        if (diff.added.length > 0 || diff.removed.length > 0) {
++            self._newDiff(diff);
++            self.hw_kids = kids;
++        }
++    });
++    S.timeout(COLLECTION_TIMEOUT, function () {
++        S.gotoState('fetch');
++    });
++};
+ 
+-    const log = this.log;
+-    const zk = this.zk;
++HostWatcherFSM.prototype.state_fetch = function (S) {
+     var self = this;
+-    var tasks = [];
+-
+-    log.debug({
+-        path: self.path
+-    }, 'start: entered');
+-
+-    /*
+-     * Setup tasks we need to accomplish on start
+-     *  mkdirp - for ensuring the path in ZK exists
+-     *  watch - for creating the ZK watcher on the above path
+-     *  setup - for setting up watchers for hosts being added/removed/changed
+-     *          in the above ZK path
+-     */
+-    tasks.push(function mkdirp(_, cb) {
+-        cb = once(cb);
+-
+-        log.debug({
+-            path: self.path
+-        }, 'mkdirp: ensuring directory exists');
+-        const nullBuffer = new Buffer('null', 'ascii');
+-        zk.createWithEmptyParents(self.path, nullBuffer, {}, function (err) {
+-            if (err && err.code === 'NODE_EXISTS') {
+-                log.debug({
+-                    path: self.path
+-                }, 'mkdirp: directory already exists');
+-                cb(null);
+-            } else if (err) {
+-                cb(err);
+-            } else {
+-                log.debug({
+-                    path: self.path
+-                }, 'mkdirp: directory created');
+-                cb(null);
+-            }
+-        });
++    var zk = this.hw_zk;
++    var log = this.hw_log;
++
++    var kids = this.hw_kids;
++    var repeat = false;
++    S.on(this, 'childrenChangedAsserted', function (nkids) {
++        var diff = diffSets(self.hw_lastKids, nkids);
++        if (diff.added.length > 0 || diff.removed.length > 0) {
++            self._newDiff(diff);
++            self.hw_kids = nkids;
++            repeat = true;
++        }
+     });
+ 
+-    tasks.push(function watch(_, cb) {
+-        cb = once(cb);
++    log.trace('fetching info about hosts...');
+ 
+-        log.debug({
+-            path: self.path
+-        }, 'watch: creating watcher');
++    var hosts = [];
+ 
+-        self.watcher = zk.watcher(self.path);
+-        cb(null);
+-    });
++    var opts = {
++        worker: doKid,
++        concurrency: FETCH_CONCURRENCY
++    };
++    this.hw_kidq = mod_vasync.queuev(opts);
++    S.on(this.hw_kidq, 'end', S.callback(function () {
++        if (hosts.length === 0) {
++            log.warn('tried to generate empty backends list, ignoring');
++            S.gotoState('collecting');
++            return;
++        }
+ 
+-    tasks.push(function setup(_, cb) {
+-        assert.object(self.watcher);
+-        cb = once(cb);
++        var hostDiff = diffSets(self.hw_lastHosts, hosts);
+ 
+-        log.debug({
+-            path: self.path
+-        }, 'setup: registering hooks');
++        var removed = hostDiff.removed;
+ 
+-        self.watcher.on('error', function onWatchError(watchErr) {
+-            log.error({
+-                err: watchErr,
+-                path: self.path
+-            }, 'onWatchError: error from ZooKeeper');
+-            self.emit('error', watchErr);
++        var now = Date.now();
++        hosts.forEach(function (h) {
++            self.hw_lastSeen[h] = now;
+         });
+ 
+-        self.watcher.on('childrenChanged', function onChildren(children) {
+-            log.debug({
+-                path: self.path,
+-                children: children
+-            }, 'onChildrenChanged: watch fired');
+-
+-            /*
+-             * Children are returned as a list of UUID's like:
+-             *  children: [
+-             *    "26ec0faf-740e-4b55-be1a-XXXX",
+-             *    "a6a58d04-0099-4319-83dc-XXXX"
+-             *  ]
+-             *
+-             * This function then fetches the object at the path
+-             * corresponding to this entry, determining if it is a
+-             * host we care about.
+-             */
+-            function getChild(child, _cb) {
+-                const p = self.path + '/' + child;
+-                // Get info about host out of ZK
+-                zk.get(p, function (err, _obj) {
+-                    if (err) {
+-                        err.path = p;
+-                        _cb(err);
+-                        return;
+-                    }
+-
+-                    // Object returned as binary data from get()
+-                    var obj = JSON.parse(_obj.toString());
+-
+-                    if (obj && obj.type === 'host') {
+-                        log.debug({
+-                            path: self.path,
+-                            host: obj
+-                        }, 'onChildrenChanged::getChild: host fetched');
+-                        _cb(null, obj.host.address);
+-                    } else {
+-                        /*
+-                         * webapi and loadbalancer instances both register
+-                         * themselves into the same domain, but as different
+-                         * types ("host" and "load_balancer", respectively).
+-                         * Here we effectively filter out anything but
+-                         * webapi instances.
+-                         */
+-                        _cb(null);
+-                    }
+-                });
+-            }
++        removed = removed.sort(function (a, b) {
++            if (self.hw_lastSeen[a] < self.hw_lastSeen[b])
++                return (-1);
++            if (self.hw_lastSeen[a] > self.hw_lastSeen[b])
++                return (1);
++            if (a < b)
++                return (-1);
++            if (a > b)
++                return (1);
++            return (0);
++        });
+ 
+-            /*
+-             * Process children array in parallel, calling getChild() on each
+-             * entry
+-             */
+-            const opts = {
+-                func: getChild,
+-                inputs: children
+-            };
+-            vasync.forEachParallel(opts, function (err, res) {
+-                if (err) {
+-                    var emitError = false;
+-                    verror.errorForEach(err, function (getChildErr) {
+-                        if (getChildErr.name === 'ZKPingTimeoutError' &&
+-                            getChildErr.code === 'PING_TIMEOUT') {
+-                            /*
+-                             * There is no meaningful action to be taken for a
+-                             * zookeeper ping timeout. Muppet will be notified
+-                             * if the zookeeper session becomes invalid and can
+-                             * take action at that point. Log a debug message
+-                             * and otherwise ignore it.
+-                             */
+-                            log.debug({
+-                                path: getChildErr.path
+-                            }, 'onChildrenChanged: zookeeper ping timeout');
+-                        } else if (getChildErr.name === 'ZKError' &&
+-                            getChildErr.code === 'NO_NODE') {
+-                            /*
+-                             * Failed to fetch the information about a host from
+-                             * zookeeper. This need not be a fatal error. Log a
+-                             * warning and carry on with the set of hosts that
+-                             * we have info about.
+-                             */
+-                            log.warn({
+-                                path: getChildErr.path
+-                            }, 'onChildrenChanged: get host information ' +
+-                                'failed');
+-                        } else {
+-                            log.error({
+-                                path: getChildErr.path,
+-                                err: err
+-                            }, 'onChildrenChanged: get host information ' +
+-                                'failed');
+-                            emitError = true;
+-                        }
+-                    });
+-
+-                    if (emitError) {
+-                        self.emit('error', err);
+-                        return;
+-                    }
+-
+-                }
+-
+-                var hosts = [];
+-                /*
+-                 * This little snippet just drops
+-                 * nulls and duplicates
+-                 */
+-                res.successes.forEach(function uniqHost(h) {
+-                    if (h && (hosts.indexOf(h) < 0)) {
+-                        hosts.push(h);
+-                    }
+-                });
+-                hosts.sort();
+-
+-                /*
+-                 * Only emit if the set of webapi instances has
+-                 * changed.
+-                 */
+-                if (!jsprim.deepEqual(hosts, self.hosts)) {
+-                    // Log the changes first
+-                    log.info({
+-                        path: self.path,
+-                        current: self.hosts,
+-                        new: hosts
+-                    }, 'onChildrenChanged: hosts differ, changing');
+-                    self.hosts = hosts;
+-
+-                    // Emit updated hosts list
+-                    self.emit('hosts', self.hosts);
+-                } else {
+-                    log.info({
+-                        path: self.path,
+-                        current: self.hosts
+-                    }, 'onChildrenChanged: got hosts, but no changes');
+-                }
++        var rmThresh = Math.ceil(REMOVAL_THROTTLE * self.hw_lastHosts.length);
++        log.trace('checking removal throttle (removing %d, threshold %d)',
++            removed.length, rmThresh);
++        if (removed.length > rmThresh) {
++            log.warn('throttling backend removal to %d backends (tried to ' +
++                'remove %d)', rmThresh, removed.length);
++            self.hw_nextExpiry = now + HOLD_TIME;
++            var toRestore = removed.slice(rmThresh);
++            toRestore.forEach(function (h) {
++                hosts.push(h);
+             });
+-        });
+-        cb(null);
+-    });
++            removed = removed.slice(0, rmThresh);
++        }
+ 
+-    // Kick off the mkdirp -> watch -> register pipeline
+-    vasync.pipeline({ funcs: tasks }, function (err) {
+-        if (err) {
+-            log.error({
+-                path: self.path,
+-                err: err
+-            }, 'Watch start: ZK error');
+-            if (typeof (callback) === 'function') {
+-                callback(err);
++        while (removed.length > 0) {
++            var host = removed.pop();
++            var lastSeen = self.hw_lastSeen[host];
++            var delta = now - lastSeen;
++            if (delta < HOLD_TIME) {
++                hosts.push(host);
++                var exp = lastSeen + HOLD_TIME;
++                if (self.hw_nextExpiry < now || exp < self.hw_nextExpiry)
++                    self.hw_nextExpiry = exp;
+             } else {
+-                self.emit('error', err);
++                removed.push(host);
++                break;
+             }
+-        } else {
+-            log.debug({
+-                path: self.path
+-            }, 'start: watching successful');
++        }
+ 
+-            if (typeof (callback) === 'function')
+-                callback(null);
++        hostDiff = diffSets(self.hw_lastHosts, hosts);
++        self._newHostDiff(hostDiff);
+ 
+-            process.nextTick(function () {
+-                self.emit('start');
++        if (hostDiff.added.length !== 0 || hostDiff.removed.length !== 0) {
++            self.hw_lastHosts = hosts;
++            setImmediate(function () {
++                self.emit('hostsChanged', hosts);
+             });
+         }
++
++        if (repeat) {
++            S.gotoState('collecting');
++        } else {
++            S.gotoState('idle');
++        }
++    }));
++    kids.forEach(function (kid) {
++        self.hw_kidq.push(kid);
+     });
+-};
++    self.hw_kidq.close();
++
++    function doKid(name, cb) {
++        const path = self.hw_path + '/' + name;
++        zk.get(path, S.callback(function (err, json) {
++            if (err && err.name === 'ZKError' && err.code === 'NO_NODE') {
++                log.debug({ path: path }, 'saw node in childrenChanged but ' +
++                    'was missing at get()');
++                cb();
++                return;
++            } else if (err) {
++                self.hw_lastError = err;
++                self.hw_kidq.kill();
++                S.gotoState('retry');
++                return;
++            }
+ 
+-Watch.prototype.toString = function toString() {
+-    var str = '[object Watch <';
+-    str += sprintf('path=%s,', (this.path || 'null'));
+-    str += sprintf('hosts=%j', (this.hosts || []));
+-    str += '>]';
+-    return (str);
++            try {
++                var obj = JSON.parse(json.toString('utf-8'));
++            } catch (e) {
++                log.debug({ err: e, path: path }, 'failed parsing JSON in ' +
++                    'ZK node, ignoring');
++                cb();
++                return;
++            }
++            if (typeof (obj) !== 'object' || obj.type !== 'host') {
++                log.trace({ path: path }, 'not a host node');
++                cb();
++                return;
++            }
++            hosts.push(obj.host.address);
++            cb();
++        }));
++    }
+ };
+ 
+-
+-///--- Exports
++HostWatcherFSM.prototype.state_retry = function (S) {
++    var self = this;
++    this.hw_log.warn(this.hw_lastError, 'error while updating backend list');
++    S.on(this, 'childrenChangedAsserted', function (kids) {
++        var diff = diffSets(self.hw_kids, kids);
++        if (diff.added.length > 0 || diff.removed.length > 0) {
++            self._newDiff(diff);
++            self.hw_kids = kids;
++        }
++    });
++    if (!this.hw_zk.isConnected()) {
++        S.on(this.hw_zk, 'connect', function () {
++            S.gotoState('fetch');
++        });
++        return;
++    }
++    S.gotoStateTimeout(RETRY_TIMEOUT, 'fetch');
++};
+ 
+ module.exports = {
+-    Watch: Watch
++	HostWatcherFSM: HostWatcherFSM
+ };
+diff --git a/lib/zk.js b/lib/zk.js
+deleted file mode 100644
+index e64bf4c..0000000
+--- a/lib/zk.js
++++ /dev/null
+@@ -1,44 +0,0 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- */
+-
+-/*
+- * Copyright (c) 2017, Joyent, Inc.
+- */
+-const assert = require('assert-plus');
+-const zkstream = require('zkstream');
+-
+-function createZKClient(cfg) {
+-    assert.object(cfg, 'cfg');
+-    assert.object(cfg.log, 'cfg.log');
+-    assert.arrayOfObject(cfg.zookeeper.servers, 'cfg.zookeeper.servers');
+-    assert.number(cfg.zookeeper.timeout, 'cfg.zookeeper.timeout');
+-
+-    var opts = {
+-        servers: [],
+-        log: cfg.log,
+-        sessionTimeout: cfg.zookeeper.timeout
+-    };
+-
+-    cfg.zookeeper.servers.forEach(function (s) {
+-        // Support old zk-plus (host) or new zkstream (address) configs
+-        var _host = s.address || s.host;
+-        opts.servers.push({ address: _host, port: s.port });
+-    });
+-
+-    cfg.log.debug({
+-        servers: opts.servers,
+-        timeout: opts.sessionTimeout
+-    }, 'Creating ZooKeeper client');
+-
+-    return (new zkstream.Client(opts));
+-}
+-
+-
+-///--- API
+-
+-module.exports = {
+-    createZKClient: createZKClient
+-};
+diff --git a/muppet.js b/muppet.js
+index 63ac128..7fa53d0 100644
+--- a/muppet.js
++++ b/muppet.js
+@@ -17,80 +17,16 @@
+ 'use strict';
+ /*jsl:end*/
+ 
+-const fs = require('fs');
+-const assert = require('assert-plus');
+-const backoff = require('backoff');
+-const bunyan = require('bunyan');
+-const dashdash = require('dashdash');
+-const forkexec = require('forkexec');
+-const net = require('net');
+-const once = require('once');
++const mod_fs = require('fs');
++const mod_assert = require('assert-plus');
++const mod_bunyan = require('bunyan');
++const mod_dashdash = require('dashdash');
++const mod_forkexec = require('forkexec');
++const mod_net = require('net');
+ const VError = require('verror');
+-const zkstream = require('zkstream');
+-const core = require('./lib');
+-
+-
+-///--- Helper functions
+-
+-function getUntrustedIPs(cfg, callback) {
+-    // Allow hardcoding addresses in the configuration.
+-    if (cfg.hasOwnProperty('untrustedIPs')) {
+-        callback();
+-        return;
+-    }
+-
+-    cfg.untrustedIPs = [];
+-
+-    const args = [ '/usr/sbin/mdata-get', 'sdc:nics' ];
+-    cfg.log.info({ cmd: args }, 'Loading NIC information');
+-    forkexec.forkExecWait({
+-        argv: args
+-    }, function (err, info) {
+-        if (err) {
+-            cfg.log.error(info, 'Failed to load NIC information');
+-            setImmediate(callback,
+-                new VError(err, 'Fetching untrusted IPs failed'));
+-            return;
+-        }
+-
+-        const nics = JSON.parse(info.stdout);
+-        assert.array(nics, 'nics');
+-
+-        cfg.log.info({ nics: nics }, 'Looked up NICs');
+-
+-        function _pushIP(ip) {
+-            /* If this is an admin, manta, or other trusted IP, skip it. */
+-            if ((cfg.adminIPS && cfg.adminIPS.indexOf(ip) !== -1) ||
+-                (cfg.mantaIPS && cfg.mantaIPS.indexOf(ip) !== -1) ||
+-                ip === cfg.trustedIP)  {
+-
+-                return;
+-            }
+-
+-            if (!net.isIPv4(ip) && !net.isIPv6(ip)) {
+-                return;
+-            }
+-
+-            cfg.untrustedIPs.push(ip);
+-        }
+-
+-        function _addIPsFromNics(nic) {
+-            if (nic.hasOwnProperty('ips')) {
+-                nic.ips.forEach(function parseIP(addr) {
+-                    _pushIP(addr.split('/')[0]);
+-                });
+-            } else if (nic.hasOwnProperty('ip')) {
+-                _pushIP(nic.ip);
+-            } else {
+-                cfg.log.warn({ nic: nic }, 'NIC has no IP addresses');
+-            }
+-        }
+-
+-        nics.forEach(_addIPsFromNics);
+-        callback();
+-    });
+-}
+ 
++const lib_app = require('./lib/app');
++const lib_lbman = require('./lib/lb_manager');
+ 
+ ///--- CLI Functions
+ 
+@@ -114,20 +50,20 @@ function configure() {
+         }
+     ];
+ 
+-    const parser = new dashdash.Parser({options: cli_options});
+-    var log = bunyan.createLogger({
++    const parser = new mod_dashdash.Parser({options: cli_options});
++    var log = mod_bunyan.createLogger({
+         level: (process.env.LOG_LEVEL || 'info'),
+         name: 'muppet',
+         stream: process.stdout,
+         serializers: {
+-            err: bunyan.stdSerializers.err
++            err: mod_bunyan.stdSerializers.err
+         }
+     });
+ 
+     var opts;
+     try {
+         opts = parser.parse(process.argv);
+-        assert.object(opts, 'options');
++        mod_assert.object(opts, 'options');
+     } catch (e) {
+         log.fatal(e, 'invalid options');
+         process.exit(1);
+@@ -140,7 +76,7 @@ function configure() {
+     var cfg;
+     try {
+         const _f = opts.file || __dirname + '/etc/config.json';
+-        cfg = JSON.parse(fs.readFileSync(_f, 'utf8'));
++        cfg = JSON.parse(mod_fs.readFileSync(_f, 'utf8'));
+         if (cfg.adminIPS && typeof (cfg.adminIPS) === 'string') {
+             cfg.adminIPS = cfg.adminIPS.split(',');
+         }
+@@ -152,10 +88,10 @@ function configure() {
+         process.exit(1);
+     }
+ 
+-    assert.string(cfg.name, 'config.name');
+-    assert.string(cfg.trustedIP, 'config.trustedIP');
+-    assert.object(cfg.zookeeper, 'config.zookeeper');
+-    assert.optionalArrayOfString(cfg.untrustedIPs,
++    mod_assert.string(cfg.name, 'config.name');
++    mod_assert.string(cfg.trustedIP, 'config.trustedIP');
++    mod_assert.object(cfg.zookeeper, 'config.zookeeper');
++    mod_assert.optionalArrayOfString(cfg.untrustedIPs,
+         'config.untrustedIPs');
+ 
+     if (cfg.logLevel)
+@@ -163,11 +99,11 @@ function configure() {
+ 
+     if (opts.verbose) {
+         opts.verbose.forEach(function () {
+-            log.level(Math.max(bunyan.TRACE, (log.level() - 10)));
++            log.level(Math.max(mod_bunyan.TRACE, (log.level() - 10)));
+         });
+     }
+ 
+-    if (log.level() <= bunyan.DEBUG)
++    if (log.level() <= mod_bunyan.DEBUG)
+         log = log.child({src: true});
+ 
+     cfg.log = log;
+@@ -188,150 +124,7 @@ function usage(msg) {
+ }
+ 
+ 
+-
+-///--- Internal Functions
+-
+-function startWatch(opts, cb) {
+-    assert.object(opts, 'options');
+-    assert.object(opts.config, 'options.config');
+-    assert.object(opts.config.log, 'options.config.log');
+-    assert.object(opts.zk, 'options.zk');
+-    assert.func(cb, 'callback');
+-
+-    cb = once(cb);
+-
+-    function _start(_, _cb) {
+-        _cb = once(_cb);
+-
+-        const cfg = opts.config;
+-        const watch = new core.createWatch({
+-            domain: cfg.name,
+-            log: cfg.log,
+-            zk: opts.zk
+-        });
+-        watch.start(function onStart(startErr) {
+-            if (startErr) {
+-                _cb(startErr);
+-                return;
+-            }
+-
+-            // Watcher emits `hosts` on a change to hosts in ZK
+-            watch.on('hosts', function onHosts(hosts) {
+-                const _opts = {
+-                    trustedIP: cfg.trustedIP,
+-                    untrustedIPs: cfg.untrustedIPs,
+-                    hosts: hosts || [],
+-                    log: cfg.log.child({component: 'lb_manager'}),
+-                    restart: cfg.restart
+-                };
+-                core.restartLB(_opts, function (err) {
+-                    if (err) {
+-                        cfg.log.error({
+-                            hosts: hosts,
+-                            err: err
+-                        }, 'lb restart failed');
+-                        return;
+-                    }
+-
+-                    cfg.log.info({
+-                        hosts: hosts
+-                    }, 'lb restarted');
+-                });
+-            });
+-
+-            /*
+-             * Watcher directly handles certain classes of zookeeper errors, but
+-             * emits an error event for those not directly handled.
+-             */
+-            watch.on('error', function onError(err) {
+-                cfg.log.error({
+-                    err: err
+-                }, 'zookeeper error');
+-            });
+-
+-            _cb(null, watch);
+-        });
+-    }
+-
+-    const retry = backoff.call(_start, {}, cb);
+-    retry.failAfter(Infinity);
+-    retry.setStrategy(new backoff.ExponentialStrategy());
+-
+-    retry.on('backoff', function (num, delay, err) {
+-        opts.config.log.warn({
+-            err: err,
+-            num_attempts: num,
+-            delay: delay
+-        }, 'failed to start ZooKeeper watch');
+-    });
+-    retry.start();
+-}
+-
+-function watcher(cfg, zk_client) {
+-    startWatch({
+-        config: cfg,
+-        zk: zk_client
+-    }, function onStartWatch(err, watch) {
+-        if (err) {
+-            cfg.log.fatal(err, 'Failed to start watch');
+-            process.exit(1);
+-        }
+-        cfg.log.info('ZooKeeper watch created');
+-    });
+-}
+-
+-function zookeeper(cfg) {
+-    assert.object(cfg, 'cfg');
+-    assert.object(cfg.log, 'cfg.log');
+-
+-    const zk_client = core.createZKClient(cfg);
+-
+-    zk_client.on('session', function onSession() {
+-        cfg.log.info('ZooKeeper session started');
+-        watcher(cfg, zk_client);
+-    });
+-
+-    zk_client.on('connect', function onConnect() {
+-        cfg.log.info('ZooKeeper successfully connected');
+-    });
+-
+-    zk_client.on('close', function onClose() {
+-        cfg.log.warn('ZooKeeper connection closed');
+-    });
+-
+-    zk_client.on('expire', function onExpire() {
+-        cfg.log.warn('ZooKeeper connection expired');
+-    });
+-
+-    /*
+-     * zkstream attempts to retry the connection to zookeeper. On retry
+-     * exhaustion it will emit a `failed` event.
+-     * For this we only log an error, because when ZK comes back up, zkstream
+-     * will automatically reconnect and re-arm the watchers (if they existed)
+-     */
+-    zk_client.on('failed', function onFailed(err) {
+-        cfg.log.error(err, 'ZooKeeper: received failed event');
+-    });
+-}
+-
+-
+ ///--- Mainline
+ 
+-(function main() {
+-    var cfg = configure();
+-
+-    getUntrustedIPs(cfg, function (err) {
+-        if (err) {
+-            // We failed to load our IPs: abort.
+-            cfg.log.fatal(err, 'Failed to look up any IPs');
+-            process.exit(1);
+-        }
+-
+-        cfg.log.info({
+-            trustedIP: cfg.trustedIP,
+-            untrustedIPs: cfg.untrustedIPs
+-        }, 'Selected IPs for untrusted networks');
+-
+-        zookeeper(cfg);
+-    });
+-})();
++var config = configure();
++var app = new lib_app.AppFSM(config);
+diff --git a/package.json b/package.json
+index 7980839..f9522a5 100644
+--- a/package.json
++++ b/package.json
+@@ -1,32 +1,33 @@
+ {
+-    "name": "muppet",
+-    "description": "Joyent's Load Balancer",
+-    "version": "1.1.0",
+-    "author": "Joyent (joyent.com)",
+-    "private": true,
+-    "dependencies": {
+-        "assert-plus": "1.0.0",
+-        "backoff": "2.3.0",
+-        "bunyan": "2.0.2",
+-        "dashdash": "1.14.1",
+-        "forkexec": "1.1.0",
+-        "haproxy-stat": "0.1.0",
+-        "jsprim": "1.4.0",
+-        "node-uuid": "1.4.1",
+-        "once": "1.4.0",
+-        "vasync": "2.2.0",
+-        "verror": "1.10.0",
+-        "zkstream": "0.11.6"
+-    },
+-    "devDependencies": {
+-        "nodeunit": "0.11.2",
+-        "diff": "4.0.1"
+-    },
+-    "scripts": {
+-        "start": "node ./muppet.js"
+-    },
+-    "sdcDependencies": {
+-        "config-agent": ">=1.2.0"
+-    },
+-    "license": "MPL-2.0"
++  "name": "muppet",
++  "description": "Joyent's Load Balancer",
++  "version": "1.1.0",
++  "author": "Joyent (joyent.com)",
++  "private": true,
++  "dependencies": {
++    "assert-plus": "1.0.0",
++    "backoff": "2.3.0",
++    "bunyan": "2.0.2",
++    "dashdash": "1.14.1",
++    "forkexec": "1.1.0",
++    "haproxy-stat": "0.1.0",
++    "jsprim": "1.4.0",
++    "mooremachine": "2.3.0",
++    "node-uuid": "1.4.1",
++    "once": "1.4.0",
++    "vasync": "2.2.0",
++    "verror": "1.10.0",
++    "zkstream": "0.11.8"
++  },
++  "devDependencies": {
++    "nodeunit": "0.11.2",
++    "diff": "4.0.1"
++  },
++  "scripts": {
++    "start": "node ./muppet.js"
++  },
++  "sdcDependencies": {
++    "config-agent": ">=1.2.0"
++  },
++  "license": "MPL-2.0"
+ }

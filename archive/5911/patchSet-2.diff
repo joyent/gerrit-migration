@@ -1,0 +1,1919 @@
+commit 7bcd187cabd7a04d46b5a644b0aee062f5110920
+Author: Marsell Kukuljevic <marsell@joyent.com>
+Date:   2019-03-18T23:27:11+01:00 (7 months ago)
+    
+    TRITON-9 affinity is racy
+
+diff --git a/docs/index.md b/docs/index.md
+index 0a1a908..d0bab61 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -54,6 +54,7 @@ VM, but the current version only considers the following characteristics:
+ | nic_tags      | array    | If VLAN filtering is enabled, nic_tags needed for VM |
+ | owner_uuid    | string   | UUID of the new zone's owner                         |
+ | locality      | hash     | Hints for VM placement                               |
++| affinity      | array    | Requirements for VM placement                        |
+ 
+ The following are a couple of valid VM payload examples. The object must contain
+ at least ***ram*** and ***owner_uuid***.
+@@ -423,8 +424,9 @@ aware that you'll need to add the custom file back after any DAPI zone upgrade.
+ *Note: This list may be a little out of date. See
+ [lib/algorithms](../lib/alogrithms/) for the authoritative list.*
+ 
+-| **Name**                        | **Action**                                                  |
+-| ------------------------------- | ----------------------------------------------------------- |
++| **Name**                        | **Action**                                                   |
++| ------------------------------- | ------------------------------------------------------------ |
++| calculate-locality-hints        | Transforms affinities into locality hints.                   |
+ | calculate-recent-vms            | Adds recent VMs to pipeline if they haven't appeared yet in CNAPI.   |
+ | calculate-server-unreserved     | Does some free-resource calculations that are used by other plugins. |
+ | hard-filter-feature-min-platform| Removes servers that don't pass platform requirements for specific optional features used by the VM being allocated. |
+@@ -647,3 +649,61 @@ When `strict` is true, either a server will be found that fulfills all
+ requirements, or the allocation will fail. An example is a request that wants to
+ guarantee a new database VM does not end up on the same server as a different
+ database VM, for HA purposes.
++
++
++
++## Affinities
++
++Affinities are similar to locality hints -- and are transformed into locality
++hints for later filtering -- but provide far broader control over where a new
++VM will be allocated. Please see [Locality Hints](#locality-hints) for more
++details.
++
++Affinities are an array of affinity objects with the following format:
++
++    {
++        "key": "instance" | "container" | <tag string>,
++        "operator": "!=" | "==",
++        "value": <see below>,
++        "valueType": "exact" | "glob" | "re",
++        "isSoft": true | false
++    }
++
++When the `key` is "instance" or "container" (they the same thing), the affinity
++is matching on a VM alias. Otherwise the match is performed on VM tags.
++
++`operator` determines whether a new VM should be allocated on the same servers
++as matching VMs ("=="), or *not* be allocated on those same servers ("!=").
++
++`valueType` specifies whether `value` is an exact string ("exact") to match on
++the target set by `key`, a glob to match against the same ("glob"), or a regular
++expression applied to the same ("re").
++
++`value` contains the value used for filtering. Based on the `valueType`:
++
++* "exact": a VM UUID, a partial or full prefix Docker ID, or a full alias
++   (e.g. "webhead")
++* "re": a regular expression to apply to an alias or tag (e.g. "/web/")
++* "glob": a glob to apply to an alias or tag (e.g. "web\*")
++
++An example:
++
++    "affinity: [
++        {
++            "key": "container",
++            "operator": "==",
++            "value": "database-*",
++            "valueType": "glob",
++            "isSoft": false
++        }, {
++            "key": "disabled",
++            "operator": "!=",
++            "value": "yes",
++            "valueType": "exact",
++            "isSoft": false
++        }
++    ]
++
++This will attempt to place the new VM on a CN which contains at least one VM
++with an alias starting with "database-", which also does not have the tag
++"disabled" set to "yes".
+diff --git a/lib/algorithms/calculate-affinity.js b/lib/algorithms/calculate-affinity.js
+new file mode 100644
+index 0000000..003d0c9
+--- /dev/null
++++ b/lib/algorithms/calculate-affinity.js
+@@ -0,0 +1,114 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++/*
++ * Transforms affinities into locality hints, and sometimes filters servers as
++ * well. Note that this plugin must be followed by hard-filter-locality-hints.js
++ * in order for affinities to work.
++ *
++ * Affinities, like locality hints, are used to control which CN a new VM will
++ * be allocated to. Sometimes users want to ensure that a new VM is colocated
++ * with an existing VM on a CN, and sometimes users want to guarantee that a VM
++ * won't be on the same CN as a set of other CNs.
++ *
++ * Affinities come as an array with objects in the following format:
++ *
++ * {
++ *     key: KEY,
++ *     operator: OPERATOR,
++ *     value: VALUE,
++ *     valueType: TYPE,
++ *     isSoft: BOOLEAN
++ * }
++ *
++ * KEY: "instance", "container", or a VM tag string
++ * OPERATOR: "!=" or "=="
++ * VALUE: an exact string, a regex string, or glob string
++ * TYPE: whether the VALUE is an exact string ("exact"), a glob ("glob") or a
++ *       regular expression ("re").
++ * BOOLEAN: whether this affinity is mandatory, or can be ignored if it cannot
++ *         be fulfilled
++ *
++ * An example of an affinity that requires the new VM colocatio with any VM that
++ * has the tag "purpose": "webserver":
++ *
++ * {
++ *     key: 'purpose',
++ *     operator: '==',
++ *     value: 'webserver',
++ *     valueType: 'exact',
++ *     isSoft: false
++ * }
++ *
++ * This plugin converts affinity contraints (e.g. instance alias starts with
++ * "foo") to locality hints using VM UUIDs since locality hints only operate
++ * with VM UUIDs.
++ */
++
++var assert = require('assert-plus');
++var converter = require('./shared/affinity');
++
++
++/**
++ * Convert affinities to locality hints (`opts.vm.locality`).
++ */
++function
++convertAffinityToLocality(servers, opts, cb)
++{
++	assert.arrayOfObject(servers, 'servers');
++	assert.object(opts, 'opts');
++	assert.func(cb, 'cb');
++
++	var reasons = {};
++	var affinity = opts.vm.affinity;
++
++	if (servers.length === 0) {
++		cb(null, servers, reasons);
++		return;
++	}
++
++	if (affinity === undefined) {
++		reasons.skip = 'No affinity found';
++		cb(null, servers, reasons);
++		return;
++	}
++
++	var ownerUuid = opts.vm.owner_uuid;
++	assert.uuid(ownerUuid, 'opts.vm.owner_uuid');
++
++	var args = {
++		log: opts.log,
++		affinity: affinity,
++		ownerUuid: ownerUuid,
++		vmapi: {
++			getVm: opts.getVm,
++			listVms: opts.listVms
++		}
++	};
++
++	converter.localityFromAffinity(args, function affCb(err, locality) {
++		if (err) {
++			reasons['*'] = err;
++			cb(null, [], reasons);
++			return;
++		}
++
++		if (locality)
++			opts.vm.locality = locality;
++
++		cb(null, servers, reasons);
++		return;
++	});
++}
++
++module.exports = {
++	name: 'Convert affinity to locality hints',
++	run: convertAffinityToLocality
++};
+diff --git a/lib/algorithms/hard-filter-volumes-from.js b/lib/algorithms/hard-filter-volumes-from.js
+index 42d5362..f8fd646 100644
+--- a/lib/algorithms/hard-filter-volumes-from.js
++++ b/lib/algorithms/hard-filter-volumes-from.js
+@@ -121,7 +121,7 @@ loadVmAndFilter(log, servers, requiredVms, getVm, cb)
+ 
+ 		var vmUuid = remainingVms.shift();
+ 
+-		return getVm(vmUuid, function (err, vm) {
++		return getVm({ uuid: vmUuid }, function (err, vm) {
+ 			if (err) {
+ 				log.error('Error loading VM', err);
+ 
+diff --git a/lib/algorithms/shared/affinity.js b/lib/algorithms/shared/affinity.js
+new file mode 100644
+index 0000000..474c041
+--- /dev/null
++++ b/lib/algorithms/shared/affinity.js
+@@ -0,0 +1,575 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/* BEGIN JSSTYLED */
++/*
++ * Copyright 2019 Joyent, Inc.
++ *
++ * VM affinity support -- rules/hints for deciding to what server a new VM is
++ * provisioned. We convert affinities to locality hints -- which is used further
++ * down the dapi chain -- and under some circumstances filter servers too.
++ *
++ * The goal is to provide the affinity features that Docker Swarm provides with
++ * its "affinity" container filters, described here:
++ *      https://docs.docker.com/swarm/scheduler/filter/#how-to-write-filter-expressions
++ * The other Swarm filters are ignored. See DOCKER-630 for discussion.
++ *
++ * # Affinity types
++ *
++ * There are three affinity axes in the Swarm docs:
++ *
++ * - *container affinity*: Specify to land on the same or different server
++ *   as an existing VM(s):
++ *      container==db0
++ *
++ * - *label affinity*: Specify to land on the same or different server as
++ *   existing VMs with a given tag:
++ *      role=webhead
++ *
++ * - *image affinity*: Specify to land on a node with the given image.
++ *   Note: We skip this one. For Triton an image is present on all nodes in the
++ *   DC.
++ *
++ * # Limitations
++ *
++ * - dapi's locality hints cannot handle mixed strict and non-strict rules.
++ *   E.g.: container==db0 & container!=~db1
++ *   To support that we'd need to extend the "locality" data structure format.
++ *   Currently we just drop the non-strict rules when hitting this.
++ */
++
++var assert = require('assert-plus');
++var format = require('util').format;
++var vasync = require('vasync');
++var XRegExp = require('xregexp');
++
++var UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
++
++
++// ---- internal support stuff
++
++
++/*
++ * Convert a filter expression into a string.
++ */
++function strFromFilterExpr(expr) {
++    return format('%s%s%s%s', expr.key, expr.operator, expr.isSoft ? '~' : '',
++        expr.value);
++}
++
++
++function isUUID(str) {
++    return str && str.length === 36 && str.match(UUID_RE);
++}
++
++
++function isInst(aff) {
++    return aff.key === 'container' || aff.key === 'instance';
++}
++
++
++/*
++ * Takes a Docker ID and returns the associated VM UUID
++ */
++function dockerIdToUuid(dockerId) {
++    var out = dockerId.substr(0, 8) + '-'
++        + dockerId.substr(8, 4) + '-'
++        + dockerId.substr(12, 4) + '-'
++        + dockerId.substr(16, 4) + '-'
++        + dockerId.substr(20, 12);
++
++    return out;
++}
++
++
++/*
++ * Looks up all active VMs that have matching tag values or globs
++ */
++function getVmUuidsFromTagValGlob(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.affinity, 'opts.affinity');
++    assert.uuid(opts.ownerUuid, 'opts.ownerUuid');
++    assert.func(cb, 'cb');
++
++    var aff = opts.affinity;
++    var query = {
++        fields: 'uuid,alias,tags',
++        owner_uuid: opts.ownerUuid,
++        state: 'active',
++        predicate: {
++            or: [
++                { eq: [ 'tag.' + aff.key,              aff.value ] },
++                { eq: [ 'tag.docker:label:' + aff.key, aff.value ] }
++            ]
++        }
++    };
++
++    opts.vmapi.listVms(query, {
++        headers: { 'x-request-id': opts.log.fields.req_id }
++    }, function listVmsCb(err, vms) {
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        var vmUuids = vms.map(function (vm) { return vm.uuid; });
++
++        opts.log.debug({
++            affinity: strFromFilterExpr(aff),
++            vms: vmUuids
++        }, 'getVmUuidsFromTagValGlob');
++
++        cb(null, vmUuids);
++    });
++}
++
++
++/*
++ * Looks up all active VMs that have tag values which match the regex
++ */
++function getVmUuidsFromTagRe(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.affinity, 'opts.affinity');
++    assert.uuid(opts.ownerUuid, 'opts.ownerUuid');
++    assert.func(cb, 'cb');
++
++    var aff = opts.affinity;
++    var query = {
++        fields: 'uuid,alias,tags',
++        owner_uuid: opts.ownerUuid,
++        state: 'active',
++        predicate: {
++            or: [
++                { eq: [ 'tag.' + aff.key,              '*' ] },
++                { eq: [ 'tag.docker:label:' + aff.key, '*' ] }
++            ]
++        }
++    };
++
++    opts.vmapi.listVms(query, {
++        headers: {'x-request-id': opts.log.fields.req_id}
++    }, function listVmsCb(err, vms) {
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        var valueRe = XRegExp(aff.value.slice(1, -1));
++
++        var taggedVms = vms.filter(function filterOnTags(vm) {
++            var tag   = vm.tags[aff.key];
++            var label = vm.tags['docker:label:' + aff.key];
++
++            return ((tag !== undefined && valueRe.test(tag.toString())) ||
++                   (label !== undefined && valueRe.test(label)));
++        });
++
++        var vmUuids = taggedVms.map(function (vm) { return vm.uuid; });
++
++        opts.log.debug({
++            affinity: strFromFilterExpr(aff),
++            vms: vmUuids
++        }, 'getVmUuidsFromTagRe');
++
++        cb(null, vmUuids);
++    });
++}
++
++
++/*
++ * Looks up the active VM which has a docker ID
++ */
++function getVmUuidFromDockerId(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.affinity, 'opts.affinity');
++    assert.uuid(opts.ownerUuid, 'opts.ownerUuid');
++    assert.func(cb, 'cb');
++
++    var aff = opts.affinity;
++    assert.ok(isInst(aff));
++
++    var vmUuid = dockerIdToUuid(aff.value);
++
++    opts.vmapi.getVm({
++        uuid: vmUuid,
++        owner_uuid: opts.ownerUuid,
++        fields: 'uuid,alias,state,internal_metadata,docker'
++    }, {
++        headers: { 'x-request-id': opts.log.fields.req_id }
++    }, function getVmCb(err, vm) {
++        if (err && err.statusCode !== 404) {
++            cb(err);
++        } else if (!err && vm && vm.docker
++            && ['destroyed', 'failed'].indexOf(vm.state) === -1
++            && vm.internal_metadata['docker:id'] === aff.value)
++        {
++            cb(null, [vmUuid]);
++        } else {
++            cb(null, []);
++        }
++    });
++}
++
++
++/*
++ * See getVmUuidFromName() comment
++ */
++function fullVmListSearch(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.affinity, 'opts.affinity');
++    assert.uuid(opts.ownerUuid, 'opts.ownerUuid');
++    assert.func(cb, 'cb');
++
++    var cache = opts.cache;
++    var aff = opts.affinity;
++
++    // memoized call to listVms() for this owner
++    function getAllActiveVms(next) {
++        if (cache.allActiveVms) {
++            next(null, cache.allActiveVms);
++            return;
++        }
++
++        opts.vmapi.listVms({
++            fields: 'uuid,alias,internal_metadata,docker',
++            owner_uuid: opts.ownerUuid,
++            state: 'active'
++        }, {
++            headers: { 'x-request-id': opts.log.fields.req_id }
++        }, function (err, allActiveVms) {
++            if (err) {
++                next(err);
++                return;
++            }
++
++            cache.allActiveVms = allActiveVms;
++            next(null, allActiveVms);
++        });
++    }
++
++    getAllActiveVms(function getAllCb(err, allVms) {
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        var type = aff.valueType;
++
++        if (type === 're') {
++            // Regex is only on container alias, not id
++            var reRe = XRegExp(aff.value.slice(1, -1));
++
++            var reVms = allVms.filter(function checkAlias1(_vm) {
++                return _vm.alias && reRe.test(_vm.alias);
++            });
++
++            cb(null, reVms);
++        } else if (type === 'glob') {
++            // Glob is only on container alias, not id.
++            var globRe = new RegExp('^' + aff.value.replace(/\*/g, '.*') + '$');
++
++            var globVms = allVms.filter(function checkAlias2(_vm) {
++                return _vm.alias && globRe.test(_vm.alias);
++            });
++
++            cb(null, globVms);
++        } else if (type === 'exact') {
++            /*
++             * This is a exact name match (preferred) or id prefix. If there are
++             * multiple id-prefix matches, we'll raise an ambiguity error.
++             */
++            var exactErr;
++            var nameMatch;
++            var idPrefixMatches = [];
++
++            for (var i = 0; i < allVms.length; i++) {
++                var vm = allVms[i];
++
++                if (vm.alias && vm.alias === aff.value) {
++                    nameMatch = vm;
++                    break;
++                }
++
++                if (vm.docker && vm.internal_metadata['docker:id'] &&
++                    vm.internal_metadata['docker:id'].indexOf(aff.value) === 0)
++                {
++                    idPrefixMatches.push(vm);
++                }
++            }
++
++            var vms = [];
++
++            if (nameMatch) {
++                vms = [nameMatch];
++            } else if (idPrefixMatches.length > 1) {
++                exactErr = format('Multiple matches: %s=%j', aff.value,
++                    idPrefixMatches);
++            } else if (idPrefixMatches.length === 1) {
++                vms = [idPrefixMatches[0]];
++            }
++
++            cb(exactErr, vms);
++        } else {
++            cb('Unknown affinity valueType: ' + aff.valueType);
++        }
++    });
++}
++
++
++/*
++ * Looks up active VMs which have an alias matching the given regex, glob,
++ * or exact match. Also performs prefix searches on docker IDs.
++ */
++function getVmUuidFromName(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.affinity, 'opts.affinity');
++    assert.uuid(opts.ownerUuid, 'opts.ownerUuid');
++    assert.func(cb, 'cb');
++
++    var log = opts.log;
++    var ownerUuid = opts.ownerUuid;
++    var aff = opts.affinity;
++    assert.ok(isInst(aff));
++
++    /*
++     * First attempt an exact name (aka alias) match as a quick out,
++     * if possible.
++     */
++    if (aff.valueType === 'exact' || aff.valueType === 'glob') {
++        opts.vmapi.listVms({
++            fields: 'uuid,alias',
++            owner_uuid: ownerUuid,
++            state: 'active',
++            // this supports simple glob
++            predicate: { eq: [ 'alias', aff.value ] }
++        }, {
++            headers: { 'x-request-id': log.fields.req_id }
++        }, function listVmsCb(err, vms_) {
++            if (err) {
++                done(err);
++            } else if (vms_.length){
++                done(null, vms_);
++            } else {
++                fullVmListSearch(opts, done);
++            }
++        });
++    } else {
++        fullVmListSearch(opts, done);
++    }
++
++    function done(err, vms) {
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        var vmUuids = vms.map(function (vm) { return vm.uuid; });
++
++        log.debug({
++            affinity: strFromFilterExpr(aff),
++            vms: vmUuids
++        }, 'getVmUuidFromName');
++
++        cb(null, vmUuids);
++    }
++}
++
++
++/*
++ * Find the VM(s) matching the given 'affinity'.
++ *
++ * If `affinity.key === "container" or "instance"`, the affinity value can be
++ * any of:
++ *
++ * - instance uuid: use that directly
++ * - docker id: if at least a 32-char prefix of a docker_id, then can construct
++ *   instance UUID from that and use that directly
++ * - short docker id: look up all docker containers by uuid
++ * - name: lookup all (not just docker) containers by alias
++ * - name glob: lookup all (not just docker) containers by alias. IIUC, Swarm's
++ *   implementation is just simple globbing: '*'-only
++ * - name regex: lookup all (not just docker) containers by alias
++ *
++ * Else `affinity.key` is a tag key:
++ *
++ * Find any VMs matching that key/value. As above, the value can be an exact
++ * value (stringified comparison), glob (simple '*'-only glob) or regex.
++ *
++ * Dev Note: Annoyingly we prefix docker labels with "docker:label:" on VM.tags.
++ * So we search both. Note that this can look obtuse or ambiguious to the docker
++ * user if a container has both 'foo' and 'docker:label:foo' VM tags.
++ */
++function vmUuidsFromAffinity(opts, cb) {
++    assert.object(opts.affinity, 'opts.affinity');
++    assert.object(opts.log, 'opts.log');
++    assert.uuid(opts.ownerUuid, 'opts.ownerUuid');
++    assert.object(opts.vmapi, 'opts.vmapi');
++    assert.object(opts.cache, 'opts.cache');
++    assert.func(cb, 'cb');
++
++    var aff = opts.affinity;
++
++    // $tag=$value
++    // $tag=$glob
++    if (!isInst(aff) && aff.valueType !== 're') {
++        getVmUuidsFromTagValGlob(opts, cb);
++
++    // $tag==/regex/
++    // Get a all '$key=*'-tagged VMs and post-filter with `value` regex.
++    } else if (!isInst(aff) && aff.valueType === 're') {
++        getVmUuidsFromTagRe(opts, cb);
++
++    // container==UUID
++    } else if (isUUID(aff.value)) {
++        assert.ok(isInst(aff));
++        cb(null, [aff.value]);
++
++    // container==<full 64-char docker id>
++    //
++    // Given a full 64-char docker id, Docker-docker will skip container
++    // *name* matching (at least that's what containers.js#findContainerIdMatch
++    // implies). We'll do the same here. Any other length means we need to
++    // consider name matching.
++    } else if (/^[a-f0-9]{64}$/.test(aff.value)) {
++        getVmUuidFromDockerId(opts, cb);
++
++    // container=<name>
++    // container=<short docker id>
++    // container=<name glob> (simple '*'-globbing only)
++    // container=<name regex>
++    } else {
++        getVmUuidFromName(opts, cb);
++    }
++}
++
++
++/*
++ * Calculate locality hints from affinities. Potentially filter servers as well.
++ */
++function localityFromAffinity(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.object(opts.vmapi, 'opts.vmapi');
++    assert.array(opts.affinity, 'opts.affinity');
++    assert.uuid(opts.ownerUuid, 'opts.ownerUuid');
++    assert.func(cb, 'cb');
++
++    var log = opts.log;
++
++    var affinities = opts.affinity;
++    if (affinities.length === 0) {
++        cb();
++        return;
++    }
++
++    /*
++     * Limitation: sdc-designation's soft-filter-locality-hints.js can't
++     * handle mixed hard (strict) and soft (non-strict) affinities. However,
++     * while affinities just mean a specific server or not, we can effectively
++     * handle this by just dropping soft affinities if there are hard ones.
++     */
++    var haveHard = false;
++    var haveSoft = false;
++    var softAffinities = [];
++    var hardAffinities = [];
++    for (var i = 0; i < affinities.length; i++) {
++        var isSoft = affinities[i].isSoft;
++        if (isSoft) {
++            haveSoft = true;
++            softAffinities.push(affinities[i]);
++        } else {
++            haveHard = true;
++            hardAffinities.push(affinities[i]);
++        }
++    }
++    if (haveHard && haveSoft) {
++        log.debug({ softAffinities: softAffinities },
++            'localityFromAffinity: mixed hard and soft affinities: '
++            + 'drop soft affinities');
++        affinities = hardAffinities;
++    }
++
++    var strict = haveHard;
++    var near = [];
++    var far = [];
++
++    var cache = {};
++    function setLocalityFromAff(aff, next) {
++        if (aff.key === 'image') {
++            log.debug({affinity: aff}, 'ignore "image" affinity');
++            next();
++            return;
++        }
++
++        vmUuidsFromAffinity({
++            affinity: aff,
++            log: log,
++            ownerUuid: opts.ownerUuid,
++            vmapi: opts.vmapi,
++            cache: cache
++        }, function uuidsCb(err, vmUuids) {
++            if (err) {
++                next(err);
++                return;
++            }
++
++            if (vmUuids.length !== 0) {
++                if (aff.operator === '==') {
++                    near = near.concat(vmUuids);
++                } else {
++                    far = far.concat(vmUuids);
++                }
++                next();
++                return;
++            }
++
++            /*
++             * Either we drop the affinity or error out. If it is a strict '==',
++             * then we need to error out (no server will match). If it is
++             * non-strict, or '!=', then we are fine dropping the affinity. See
++             * some discussion in DAPI-306.
++             */
++            if (!strict || aff.operator === '!=') {
++                log.debug({ affinity: aff }, 'drop affinity, no matching vms');
++                next();
++            } else if (!isInst(aff)) {
++                next(format('no active containers found matching tag "%s=%s" ' +
++                   'for affinity "%s"', aff.key, aff.value,
++                   strFromFilterExpr(aff)));
++            } else {
++                next(format('no active containers found matching "%s" for ' +
++                    'affinity "%s"', aff.value, strFromFilterExpr(aff)));
++            }
++        });
++    }
++
++    vasync.forEachPipeline({
++        inputs: affinities,
++        func: setLocalityFromAff
++    }, function forEachCb(err) {
++        if (err) {
++            cb(err);
++        } else if (!near.length && !far.length) {
++            cb();
++        } else {
++            var locality = {
++                strict: strict
++            };
++
++            if (near.length > 0) locality.near = near;
++            if (far.length > 0) locality.far = far;
++
++            cb(null, locality);
++        }
++    });
++}
++
++
++module.exports = {
++    localityFromAffinity: localityFromAffinity
++};
++
++/* END JSSTYLED */
+diff --git a/lib/validations.js b/lib/validations.js
+index 4a82d82..32cf91d 100644
+--- a/lib/validations.js
++++ b/lib/validations.js
+@@ -25,6 +25,8 @@ var SAFETY_DELTA = 0.01;  // just some margin when treating floats as integers
+ var SDC_VERSION_RE = /^\d\.\d$/;
+ var UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+ var VALID_SPREADS = ['min-ram', 'max-ram', 'random', 'min-owner'];
++var AFFINITY_STR_ATTR = ['key', 'operator', 'value', 'valueType'];
++var AFFINITY_VALUE_TYPES = ['exact', 'glob', 're'];
+ 
+ var DEFAULTS_BOOLEAN_ATTR = [
+ 	'filter_headnode',
+@@ -71,7 +73,12 @@ validateVm(vm)
+ 
+ 	if (vm.traits) {
+ 		var msg = validateTraits(vm.traits);
++		if (msg)
++			return ('VM ' + msg);
++	}
+ 
++	if (vm.affinity) {
++		msg = validateAffinity(vm.affinity);
+ 		if (msg)
+ 			return ('VM ' + msg);
+ 	}
+@@ -209,6 +216,43 @@ validatePlatformLimits(requirements, requirementName, prefix)
+ 	return (null);
+ }
+ 
++/*
++ * Checks that if an affinity exists, it has the expected format. Affinity
++ * consists of an array of objects, each object having 'key', 'value,'
++ * 'valueType', 'operator', 'isSoft' attributes.
++ */
++function validateAffinity(affinities)
++{
++	if (!affinities)
++		return (null);
++
++	if (!Array.isArray(affinities))
++		return ('"affinity" is not an array');
++
++	for (var i = 0; i < affinities.length; i++) {
++		var affinity = affinities[i];
++
++		for (var j = 0; j < AFFINITY_STR_ATTR.length; j++) {
++			var attr = AFFINITY_STR_ATTR[j];
++
++			if (typeof (affinity[attr]) !== 'string')
++				return ('"affinity.' + attr +
++					'" is not a string');
++		}
++
++		if (typeof (affinity.isSoft) !== 'boolean')
++			return ('"affinity.isSoft" is not a boolean');
++
++		if (affinity.operator !== '==' && affinity.operator !== '!=')
++			return ('"affinity.operator" has invalid operator');
++
++		if (AFFINITY_VALUE_TYPES.indexOf(affinity.valueType) === -1)
++			return ('"affinity.valueType" has invalid value');
++	}
++
++	return (null);
++}
++
+ /*
+  * Checks that if a locality hint exists, it has the expected format -- it is
+  * a hash, 'near' and 'far' are valid keys, and values must be either UUIDs or
+@@ -595,6 +639,7 @@ module.exports = {
+ 	validateVmPayload: validateVmPayload,
+ 	validateDefaults: validateDefaults,
+ 	validateTraits: validateTraits,
++	validateAffinity: validateAffinity,
+ 	validateLocality: validateLocality,
+ 	validateServer: validateServer,
+ 	validateServers: validateServers,
+diff --git a/package.json b/package.json
+index 55beddb..db70e0e 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "dapi",
+   "description": "SmartDataCenter Designation API",
+-  "version": "8.6.0",
++  "version": "8.7.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+@@ -10,7 +10,8 @@
+     "libuuid": "0.2.1",
+     "joyent-schemas": "git+https://github.com/joyent/schemas.git#09cebfca94169601568fec60f7a6144130f7fd31",
+     "jsprim": "1.3.1",
+-    "vasync": "~1.6.4"
++    "vasync": "~1.6.4",
++    "xregexp": "3.1.0"
+   },
+   "devDependencies": {
+     "tape": "4.0.0"
+diff --git a/test/algorithms/calculate-affinity.test.js b/test/algorithms/calculate-affinity.test.js
+new file mode 100644
+index 0000000..69d9f96
+--- /dev/null
++++ b/test/algorithms/calculate-affinity.test.js
+@@ -0,0 +1,822 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var test = require('tape');
++var filter = require('../../lib/algorithms/calculate-affinity.js');
++var common = require('./common.js');
++
++
++var OWNER_UUID = 'b20ae67c-48d9-11e9-bef6-17de1751b73a';
++var SERVERS = [ {
++	uuid: '81d14dce-497a-11e9-97e5-d72e945337f6'
++}, {
++	uuid: '883e90f4-497a-11e9-bef3-2f3dd387291d'
++} ];
++var LOG = {
++	info: function () {},
++	debug: function () {},
++	fields: { req_id: 'foo' }
++};
++
++
++function getDefaultOpts(t) {
++	return {
++		log: LOG,
++		getVm: function getVm() {
++			t.fail('should not call getVm()');
++		},
++		listVms: function listVms() {
++			t.fail('should not call listVms()');
++		},
++		vm: {
++			owner_uuid: OWNER_UUID
++		}
++	};
++}
++
++
++test('calculateLocalityHints() with no affinity', function test1(t) {
++	var opts = getDefaultOpts(t);
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, { skip: 'No affinity found' }, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with empty affinity', function test2(t) {
++	var opts = getDefaultOpts(t);
++	opts.vm.affinity = [];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() does not override locality when no affinity',
++function test3(t) {
++	var opts = getDefaultOpts(t);
++	opts.vm.locality = { foo: 'bar' };
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, { skip: 'No affinity found' }, 'reasons');
++		t.deepEqual(opts.vm.locality, { foo: 'bar' }, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with affinity, getVm() success',
++function test4(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			predicate: { eq: [ 'alias', 'webhead3' ] },
++			state: 'active',
++			fields: 'uuid,alias'
++		}, 'args');
++		cb(null, [ { uuid: 'fb02171e-4970-11e9-b315-7f49301411e7' } ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '!=',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			strict: true,
++			far: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ]
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints(), container behaves same as instance',
++function test5(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			predicate: { eq: [ 'alias', 'webhead3' ] },
++			state: 'active',
++			fields: 'uuid,alias'
++		}, 'args');
++		cb(null, [ { uuid: 'fb02171e-4970-11e9-b315-7f49301411e7' } ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'container',
++		operator: '!=',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			strict: true,
++			far: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ]
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with affinity, getVM() fail, prefix found',
++function test6(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		if (args.fields === 'uuid,alias') {
++			t.deepEqual(args, {
++				owner_uuid: OWNER_UUID,
++				predicate: { eq: [ 'alias', 'webhead3' ] },
++				state: 'active',
++				fields: 'uuid,alias'
++			}, 'args');
++			cb(null, []);
++			return;
++		}
++
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			state: 'active',
++			fields: 'uuid,alias,internal_metadata,docker'
++		}, 'args');
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			docker: true,
++			internal_metadata: { 'docker:id': 'webhead3' }
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '!=',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			strict: true,
++			far: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ]
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with affinity, getVM() fail, prefix not found',
++function test7(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		if (args.fields === 'uuid,alias') {
++			t.deepEqual(args, {
++				owner_uuid: OWNER_UUID,
++				predicate: { eq: [ 'alias', 'webhead3' ] },
++				state: 'active',
++				fields: 'uuid,alias'
++			}, 'args');
++			cb(null, []);
++			return;
++		}
++
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			state: 'active',
++			fields: 'uuid,alias,internal_metadata,docker'
++		}, 'args');
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			docker: true,
++			internal_metadata: { 'docker:id': 'webhead2' }
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '!=',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with affinity, getVM() fail, not docker',
++function test8(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		if (args.fields === 'uuid,alias') {
++			t.deepEqual(args, {
++				owner_uuid: OWNER_UUID,
++				predicate: { eq: [ 'alias', 'webhead3' ] },
++				state: 'active',
++				fields: 'uuid,alias'
++			}, 'args');
++			cb(null, []);
++			return;
++		}
++
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			state: 'active',
++			fields: 'uuid,alias,internal_metadata,docker'
++		}, 'args');
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			docker: false,
++			internal_metadata: { 'docker:id': 'webhead3' }
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '!=',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with == instance, VM found',
++function test9(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			predicate: { eq: [ 'alias', 'webhead3' ] },
++			state: 'active',
++			fields: 'uuid,alias'
++		}, 'args');
++		cb(null, [ { uuid: 'fb02171e-4970-11e9-b315-7f49301411e7' } ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ],
++			strict: true
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with ==~ instance, VM found',
++function test10(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			predicate: { eq: [ 'alias', 'webhead3' ] },
++			state: 'active',
++			fields: 'uuid,alias'
++		}, 'args');
++		cb(null, [ { uuid: 'fb02171e-4970-11e9-b315-7f49301411e7' } ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: 'webhead3',
++		isSoft: true,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ],
++			strict: false
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with == instance, VM not found, docker:id found',
++function test11(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		if (args.fields === 'uuid,alias') {
++			t.deepEqual(args, {
++				owner_uuid: OWNER_UUID,
++				predicate: { eq: [ 'alias', 'webhead3' ] },
++				state: 'active',
++				fields: 'uuid,alias'
++			}, 'args');
++			cb(null, []);
++			return;
++		}
++
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			state: 'active',
++			fields: 'uuid,alias,internal_metadata,docker'
++		}, 'args');
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			docker: true,
++			internal_metadata: { 'docker:id': 'webhead3' }
++		} ]);
++		return;
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ],
++			strict: true
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with ==, VM not found, docker:id not found',
++function test12(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		if (args.fields === 'uuid,alias') {
++			t.deepEqual(args, {
++				owner_uuid: OWNER_UUID,
++				predicate: { eq: [ 'alias', 'webhead3' ] },
++				state: 'active',
++				fields: 'uuid,alias'
++			}, 'args');
++		} else {
++			t.deepEqual(args, {
++				owner_uuid: OWNER_UUID,
++				state: 'active',
++				fields: 'uuid,alias,internal_metadata,docker'
++			}, 'args');
++		}
++
++		cb(null, []);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: 'webhead3',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(filtServers, [], 'servers');
++		t.deepEqual(reasons, {
++			'*': 'no active containers found matching "webhead3" ' +
++				'for affinity "instance==webhead3"'
++		}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with reg, VM found',
++function test13(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			state: 'active',
++			fields: 'uuid,alias,internal_metadata,docker'
++		}, 'args');
++
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			alias: 'webhead3'
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: '/web/',
++		isSoft: false,
++		valueType: 're'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ],
++			strict: true },
++		'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with reg, VM not matched',
++function test14(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			state: 'active',
++			fields: 'uuid,alias,internal_metadata,docker'
++		}, 'args');
++
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			alias: 'ebhead3'
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: '/web/',
++		isSoft: false,
++		valueType: 're'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(filtServers, [], 'servers');
++		t.deepEqual(reasons, {
++			'*': 'no active containers found matching "/web/" for' +
++				' affinity "instance==/web/"'
++		}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with glob, VM found',
++function test15(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			predicate: { eq: [ 'alias', 'web*' ] },
++			state: 'active',
++			fields: 'uuid,alias'
++		}, 'args');
++
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			alias: 'webhead3'
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: 'web*',
++		isSoft: false,
++		valueType: 'glob'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ],
++			strict: true },
++		'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with glob, VM not directly matched',
++function test16(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		if (args.fields === 'uuid,alias') {
++			cb(null, []);
++			return;
++		}
++
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			alias: 'webhead3'
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: '*eb*',
++		isSoft: false,
++		valueType: 'glob'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ],
++			strict: true
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() with glob, VM not matched in/directly',
++function test17(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		if (args.fields === 'uuid,alias') {
++			cb(null, []);
++			return;
++		}
++
++		cb(null, [ {
++			uuid: 'fb02171e-4970-11e9-b315-7f49301411e7',
++			alias: 'wbhead3'
++		} ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: '*eb*',
++		isSoft: false,
++		valueType: 'glob'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(filtServers, [], 'servers');
++		t.deepEqual(reasons, {
++			'*': 'no active containers found matching "*eb*" for' +
++				' affinity "instance==*eb*"'
++		}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() searching with tag, VM found',
++function test18(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			predicate: {
++				or: [ {
++					eq: [ 'tag.foo', 'bar' ]
++				}, {
++					eq: [ 'tag.docker:label:foo', 'bar' ]
++				} ]
++			},
++			state: 'active',
++			fields: 'uuid,alias,tags'
++		}, 'args');
++
++		cb(null, [ { uuid: 'fb02171e-4970-11e9-b315-7f49301411e7' } ]);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'foo',
++		operator: '==',
++		value: 'bar',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ 'fb02171e-4970-11e9-b315-7f49301411e7' ],
++			strict: true },
++		'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() searching with tag, VM not found',
++function test19(t) {
++	var opts = getDefaultOpts(t);
++
++	opts.listVms = function listVms(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			predicate: {
++				or: [ {
++					eq: [ 'tag.foo', 'bar' ]
++				}, {
++					eq: [ 'tag.docker:label:foo', 'bar' ]
++				} ]
++			},
++			state: 'active',
++			fields: 'uuid,alias,tags'
++		}, 'args');
++
++		cb(null, []);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'foo',
++		operator: '==',
++		value: 'bar',
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(filtServers, [], 'servers');
++		t.deepEqual(reasons, {
++			'*': 'no active containers found matching tag ' +
++				'"foo=bar" for affinity "foo==bar"'
++		}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() searching full Docker id, VM found',
++function test20(t) {
++	var dockerId = '97ed62d4dc30d1f53b903dac1e90c8fee4a77a30f0099b42f34f6' +
++		'7cb5b17019c';
++
++	var opts = getDefaultOpts(t);
++
++	opts.getVm = function getVm(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			uuid: '97ed62d4-dc30-d1f5-3b90-3dac1e90c8fe',
++			fields: 'uuid,alias,state,internal_metadata,docker'
++		}, 'args');
++
++		cb(null, {
++			uuid: '97ed62d4-dc30-d1f5-3b90-3dac1e90c8fe',
++			state: 'running',
++			docker: true,
++			internal_metadata: { 'docker:id': dockerId }
++		});
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: dockerId,
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(SERVERS, filtServers, 'servers');
++		t.deepEqual(reasons, {}, 'reasons');
++		t.deepEqual(opts.vm.locality, {
++			near: [ '97ed62d4-dc30-d1f5-3b90-3dac1e90c8fe' ],
++			strict: true
++		}, 'locality');
++		t.end();
++	});
++});
++
++
++test('calculateLocalityHints() searching full Docker id, VM not found',
++function test21(t) {
++	var dockerId = '97ed62d4dc30d1f53b903dac1e90c8fee4a77a30f0099b42f34f6' +
++		'7cb5b17019c';
++
++	var opts = getDefaultOpts(t);
++
++	opts.getVm = function getVm(args, extras, cb) {
++		t.deepEqual(args, {
++			owner_uuid: OWNER_UUID,
++			uuid: '97ed62d4-dc30-d1f5-3b90-3dac1e90c8fe',
++			fields: 'uuid,alias,state,internal_metadata,docker'
++		}, 'args');
++
++		cb(null, null);
++	};
++
++	opts.vm.affinity = [ {
++		key: 'instance',
++		operator: '==',
++		value: dockerId,
++		isSoft: false,
++		valueType: 'exact'
++	} ];
++
++	filter.run(SERVERS, opts, function runCb(err, filtServers, reasons) {
++		t.ifError(err);
++		t.deepEqual(filtServers, [], 'servers');
++		t.deepEqual(reasons, {
++			'*': 'no active containers found matching "97ed62d4dc' +
++				'30d1f53b903dac1e90c8fee4a77a30f0099b42f34f67' +
++				'cb5b17019c" for affinity "instance==97ed62d4' +
++				'dc30d1f53b903dac1e90c8fee4a77a30f0099b42f34f' +
++				'67cb5b17019c"'
++		}, 'reasons');
++		t.deepEqual(opts.vm.locality, undefined, 'locality');
++		t.end();
++	});
++});
++
++
++test('name', function (t) {
++	t.equal(typeof (filter.name), 'string');
++	t.end();
++});
+diff --git a/test/algorithms/common.js b/test/algorithms/common.js
+index c640fb0..8b40de9 100644
+--- a/test/algorithms/common.js
++++ b/test/algorithms/common.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/test/algorithms/hard-filter-volumes-from.test.js b/test/algorithms/hard-filter-volumes-from.test.js
+index d47792c..21e655c 100644
+--- a/test/algorithms/hard-filter-volumes-from.test.js
++++ b/test/algorithms/hard-filter-volumes-from.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ var test = require('tape');
+@@ -96,8 +96,8 @@ test('filterVolumesFrom() with no getVm set', function (t) {
+ 
+ 
+ test('filterVolumesFrom() with getVm set', function (t) {
+-	common.OPTS.getVm = function (vmUuid, cb) {
+-		return (cb(null, VM_LOOKUP[vmUuid]));
++	common.OPTS.getVm = function (opts, cb) {
++		return (cb(null, VM_LOOKUP[opts.uuid]));
+ 	};
+ 
+ 	var vm = {
+diff --git a/test/allocator.test.js b/test/allocator.test.js
+index 36ef630..2a459c1 100644
+--- a/test/allocator.test.js
++++ b/test/allocator.test.js
+@@ -790,6 +790,7 @@ test('load available algorithms', function (t) {
+ 	var names = Object.keys(algorithms).sort();
+ 
+ 	var expectedNames = [
++		'calculate-affinity',
+ 		'calculate-server-unreserved',
+ 		'calculate-ticketed-vms',
+ 		'hard-filter-capness',
+diff --git a/test/common.js b/test/common.js
+index f942073..57b6858 100644
+--- a/test/common.js
++++ b/test/common.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ var fs = require('fs');
+@@ -35,6 +35,7 @@ var ALGO_DESC = [
+ 		'hard-filter-min-ram',
+ 		'hard-filter-min-cpu',
+ 		'hard-filter-min-disk',
++		'calculate-affinity',
+ 		'hard-filter-locality-hints',
+ 		'hard-filter-owners-servers',
+ 		['or', 'hard-filter-reservoir',
+diff --git a/test/integration.test.js b/test/integration.test.js
+index edb597f..c6ec070 100644
+--- a/test/integration.test.js
++++ b/test/integration.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ var test = require('tape');
+@@ -238,6 +238,10 @@ test('allocate 1', function (t) {
+ 		}, {
+ 			step: 'Servers with enough unreserved disk',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
++		}, {
++			step: 'Convert affinity to locality hints',
++			remaining: [ '00000000-0000-0000-0000-00259094373c' ],
++			reasons: { skip: 'No affinity found' }
+ 		}, {
+ 			step: 'Servers with requested hard locality considered',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ],
+@@ -428,6 +432,10 @@ test('allocate 2', function (t) {
+ 		}, {
+ 			step: 'Servers with enough unreserved disk',
+ 			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
++		}, {
++			step: 'Convert affinity to locality hints',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ],
++			reasons: { skip: 'No affinity found' }
+ 		}, {
+ 			step: 'Servers with requested hard locality considered',
+ 			remaining: [ '00000000-0000-0000-0000-0025909437d4' ],
+diff --git a/test/validations.test.js b/test/validations.test.js
+index dcba842..6a8a835 100644
+--- a/test/validations.test.js
++++ b/test/validations.test.js
+@@ -271,6 +271,74 @@ test('validate platform limits', function (t) {
+ });
+ 
+ 
++test('validate affinity', function testAffinity(t) {
++	var validAffinities = [
++		null,
++		[],
++		[ {
++			key: 'instance',
++			operator: '!=',
++			value: 'webhead3',
++			isSoft: false,
++			valueType: 'exact'
++		} ],
++		[ {
++			key: 'container',
++			operator: '==',
++			value: 'webhead*',
++			isSoft: true,
++			valueType: 'glob'
++		}, {
++			key: 'role',
++			operator: '==',
++			value: '/web/',
++			isSoft: false,
++			valueType: 're'
++		} ]
++	];
++
++	validAffinities.forEach(function validateAffinity(affinity) {
++		var res = validations.validateAffinity(affinity);
++		t.ifError(res);
++	});
++
++	var badAffinityChecks = [ [
++		function (a) { a.operator = '=~'; },
++		'"affinity.operator" has invalid operator'
++	], [
++		function (a) { a.valueType = 'foo'; },
++		'"affinity.valueType" has invalid value'
++	], [
++		function (a) { a.isSoft = 1; },
++		'"affinity.isSoft" is not a boolean'
++	], [
++		function (a) { a.key = 1; },
++		'"affinity.key" is not a string'
++	], [
++		function (a) { a.operator = 1; },
++		'"affinity.operator" is not a string'
++	], [
++		function (a) { a.value = 1; },
++		'"affinity.value" is not a string'
++	], [
++		function (a) { a.valueType = 1; },
++		'"affinity.valueType" is not a string'
++	] ];
++
++	badAffinityChecks.forEach(function testBadAffinity(check) {
++		var mutator = check[0];
++		var errMsg = check[1];
++
++		var badAffinity = deepCopy(validAffinities[2]);
++		mutator(badAffinity[0]);
++		var res = validations.validateAffinity(badAffinity);
++		t.equal(res, errMsg);
++	});
++
++	t.end();
++});
++
++
+ test('validate locality', function (t) {
+ 	var validLocalities = [
+ 		{},

@@ -1,0 +1,906 @@
+commit 8ca46690cfa358703e0be4dde4b1c227f731151b
+Author: David Pacheco <dap@joyent.com>
+Date:   2019-05-22T15:25:28-07:00 (5 months ago)
+    
+    MANTA-4234 document how to construct a request timeline for debugging
+    Reviewed by: Alex Wilson <alex.wilson@joyent.com>
+    Approved by: Alex Wilson <alex.wilson@joyent.com>
+
+diff --git a/0002-investigation-tasks.adoc b/0002-investigation-tasks.adoc
+index 0b2380e..a88a9cb 100644
+--- a/0002-investigation-tasks.adoc
++++ b/0002-investigation-tasks.adoc
+@@ -795,16 +795,372 @@ client, and we also know which Muskie zone it was.
+ 
+ === Build a request timeline
+ 
+-// XXX
+-// loadbalancer log: accept time, completion time
+-// muskie log:
+-// - completion time
+-// - client "Date" header (note: different clock)
+-// - latency (only for time-to-first-byte)
+-// - request timers
+-// - shark information
+-// object metadata (e.g., mtime on record)
+-// mako access log entries
++Building a request timeline can be incredibly valuable for understanding why a
++particular request failed or why a request took as long as it did.  Timelines
++are especially useful for understanding apparently mysterious failure modes
++like request timeouts, "socket hang-up" errors, "connection reset" errors, and
++the like.
++
++A request timeline is simply a list of events related to a request and the
++precise timestamps when they were reported.  You can include as much or as
++little detail as is relevant to your problem.  It's common to focus on the
++phases that happen inside Muskie.  These are the simplest to collect and they're
++often sufficient when failure modes are explicit (e.g., an authentication
++failure or a 404 response).  A pretty complete request timeline could include a
++lot more than that about what happens at the load balancer and storage nodes.
++
++NOTE: Keep in mind that wall clocks vary across physical machines.  When
++comparing timestamps recorded from different systems, beware that differences
++may simply be a result of differences in the wall clock time on those systems.
++Within Manta, clocks are usually synchronized to within a few hundred
++milliseconds.  (You can check this for the servers you're looking at using NTP
++tools.)  Timestamps reported by clients can be much further off, but if they're
++also using NTP to synchronize their clocks, they may well be pretty close.
++
++==== A brief review of request handling
++
++A typical GET request for an object stored in Manta runs as follows:
++
++* The client establishes a TCP connection to the Manta load balancer.  As part
++  of this process, the load balancer establishes a TCP connection to a Muskie
++  instance to handle any requests that arrive over this connection.
++* The client constructs an HTTP request and sends it over the TCP connection.
++* The load balancer forwards the request to Muskie.
++* Muskie begins processing the request.
++** There are a number of (usually very fast) setup phases within Muskie.
++** Muskie authenticates the request.  This may involve fetching authentication
++   and authorization information from Mahi, in which case an HTTP request will
++   be sent over the network to Mahi to fetch basic information about the
++   account.
++** Muskie fetches metadata associated with the object.  This step involves a few
++   network RPC calls to the metadata tier: first to an Electric-Moray instance,
++   which forwards the request to a Moray instance, which executes a SQL query
++   against a PostgreSQL primary.
++** Muskie authorizes the request.  This involves comparing the authenticated
++   user's credentials to the credentials required to access the object
++   (specified in its metadata).
++** Muskie makes an HTTP request to a storage node hosting a copy of the object.
++** Assuming this request succeeds, Muskie reports a successful response header
++   to the client.  Then data is sent from the storage node, through Muskie,
++   through the load balancer, and to the client.
++** The request concludes when the last data is sent to the client.
++
++// XXX make a visual of the above steps?
++
++PUT requests to upload objects are similar except that there's an additional
++metadata RPC after all the data has streamed to the storage nodes.  Other types
++of requests (e.g., creation and deletion of directories) are largely similar,
++but generally don't involve storage nodes.
++
++This is a simplification.  For details, see the Muskie source code.  (Don't be
++afraid to crack it open!)
++
++There are 1-2 dozen phases of request handling within Muskie, but most of the
++elapsed time of a request happens in only a handful of phases that relate to
++making requests to external services.  These are described below.
++
++==== Key events during a request lifetime
++
++The table below explains a number of events that happen while processing a
++request and where you can find more information about it.  Many of these entries
++refer to entries in logs that are documented elsewhere in this guide.  See
++<<_understanding_a_muskie_log_entry>> and
++<<_understanding_a_load_balancer_log_entry>>.
++
++Remember, it's not necessary to collect all of these to start!  Start with the
++basics and flesh out what looks relevant.  Some of what's below won't apply to
++every request.  However, if you're stumped about a strange failure mode, it's
++often helpful to construct a pretty complete timeline, as you'll often find
++surprising gaps or unusual intervals (e.g., exactly 60 seconds from when
++something started until when some obscure error message was reported, which
++might suggest a timeout).
++
++If you don't know where to start, consider a timeline that just includes:
++
++- when the request was constructed on the client
++- when the request was received by the load balancer (if possible)
++- when the request was received by Muskie
++- when the metadata phases of request handling were completed in Muskie
++- when the request was completed by Muskie
++
++It's common to start there, skim the `req.timers` field (mentioned below) to
++look for unusually long phases (e.g., those taking upwards of 1 second), and
++add those to the timeline as needed.
++
++[cols="4*",options="header"]
++|===
++|Event
++|Component where it happens
++|Where to find the timestamp
++|Notes
++
++|Client establishes a TCP connection to the load balancer.
++|Load balancer
++|<<_understanding_a_load_balancer_log_entry,Load balancer log entry>>, `accept_date` field.  Note that this is not the date at the very start of the load balancer log entry.
++|Both the client and server may use timeouts that measure from this timestamp.  It can be helpful to check for intervals of round numbers (e.g., exactly 1 or 2 minutes).
++
++|Client constructs the HTTP request.
++|Client (outside Manta)
++|<<_understanding_a_muskie_log_entry,Muskie log entry>>, `req.headers.date` (the `Date` header supplied by the client with the HTTP request)
++|Large gaps between when the client constructed the request and when Muskie began processing it could indicate queueing in Muskie or somewhere in the network before reaching Muskie.
++
++|Muskie begins processing the request.
++|Muskie
++|<<_understanding_a_muskie_log_entry,Muskie log entry>>.  There's no discrete field for this, but you can compute this by taking the timestamp when Muskie completed the request (see below) and subtracting the total latency of the request (including time to transfer data).  To calculate the total latency, sum all the timers in `req.phases`.
++|This is a very useful point at which to divide an investigation, since large gaps in time _before_ this point indicate queueing prior to the request reaching Muskie, which generally involve different tools and data sources than latency after this point.
++
++|Muskie makes HTTP request to Mahi (authcache) to load information needed to authenticate and authorize this request.
++|Muskie
++|<<_understanding_a_muskie_log_entry,Muskie log entry>>, `req.timers`.  These requests generally occur during the `loadCaller` and `loadOwner` phases, though they can also happen during `parseHttpAuthToken` (if the `x-auth-token` header is provided by the client), or `getActiveRoles`.  You can generally infer that if these HTTP requests were made, they started after one of these phases began and completed before the same phase ended.  To determine the actual start and end timestamps, you have compute them based on the latency of the previous phases and the time when Muskie began processing the request (or the latency of the subsequent phases and the time when Muskie finished processing the request).
++|Most requests do not actually involve any of these HTTP requests because the information is usually cached in Muskie.  However, latency here may indicate a problem with Mahi or the network.
++
++|Muskie makes RPCs to load metadata.
++|Muskie
++|<<_understanding_a_muskie_log_entry,Muskie log entry>>, `req.timers`.  These requests most commonly occur during the `getMetadata` phase.  For the actual start and end timestamps, you must compute them based on the latency of the other phases and the time the request completed (or finished).
++|High latency here indicates a slow read RPC to the metadata tier.
++
++|Muskie issues HTTP requests to storage nodes.
++|Muskie
++|<<_understanding_a_muskie_log_entry,Muskie log entry>>, `req.timers` and `req.sharksContacted`.  For GET requests, this happens during the `streamFromSharks` phase.  For PUT requests, this happens during the `startSharkStreams` phase.  Since multiple storage nodes may be contacted, sometimes in parallel and sometimes sequentially, the `sharksContacted` field has more fine-grained information about the time for each particular storage node.
++|This step is often forgotten, but it's important to complete before Muskie sends successful response headers to the client.  High latency between when these requests are issued and when storage nodes send headers back may indicate a DNS problem, a network problem, or a storage node that's offline or overloaded.
++
++|Muskie sends response headers.
++|Muskie
++|<<_understanding_a_muskie_log_entry,Muskie log entry>>, `latency` field (elapsed time in milliseconds, which must be added to the initial timestamp)
++a|Sometimes called latency-to-first-byte, this is a significant point in the request because until this point, the client has heard nothing from the server while the server authenticates the client, loads metadata, and authorizes the request.  Many clients have timeouts (sometimes as short as a few seconds) from when they send the request until they see response headers.  If there's a long gap in this range and then Muskie subsequently reports a client error (e.g., timed out waiting for the client or a closed connection from the client), the client may have given up.
++
++Also, the work associated with the rest of this request depends on how large the end user's object is and how much network bandwidth they have available to Manta.  As a result, it's common to summarize this latency-to-first-byte rather than the whole latency of the request, as this number is more comparable across different types of requests.
++
++|Muskie begins streaming data between storage nodes and the client.
++|Muskie
++|<<_understanding_a_muskie_log_entry,Muskie log entry>>, `req.timers` field.  For GET operations, the phase where data is transferred is called `streamFromSharks`.  For PUT operations, the phase is called `sharkStreams`.
++|This should be about the same time as the response headers are sent.
++
++|Storage nodes process HTTP requests
++|Mako
++|`mako-access` log.  Entries in the mako-access log include both a timestamp when they completed and a latency, which allows you to compute the end timestamp.
++|High latency between when Muskie began transferring data to or from storage nodes and when storage nodes report having started may indicate overload on the storage node or a network problem.
++
++|Muskie finishes streaming data between storage nodes and the client.
++|Muskie
++|See the row above where Muskie begins streaming data.  The end of the corresponding phase indicates when this finished.
++|The time for this phase is highly variable depending on how much data is requested and the bandwidth available to the client.  It's more useful to compute throughput (as the total bytes sent divided by the latency of this phase) than look at the latency directly.  Low throughput here can be indicative of almost anything: a slow client, a slow network, overloaded Muskie, or an overloaded storage node.
++
++|Muskie makes RPCs to save metadata.
++|Muskie
++a|<<_understanding_a_muskie_log_entry,Muskie log entry>>, `req.timers`.  These requests most commonly occur during the `saveMetadata` phase.  For the actual start and end timestamps, you must compute them based on the latency of the other phases and the time the request completed (or finished).
++
++Another possible indicator of this timestamp may be given by the `mtime` stored in the object metadata, assuming it hasn't been changed since the request you're investigating completed.
++
++
++|High latency here indicates a slow write RPC to the metadata tier.
++
++|Load balancer indicates the TCP session ended.
++|Load balancer
++|Load balancer log, `syslog_date` field.
++|This is generally the last time the client heard anything from the server associated with this request.  Normally, this indicates the end of the request.  In pathological cases where metadata operation takes several minutes, the load balancer may terminate the request, logging this entry and sending a failure response to the client, even though Muskie is still processing the request.  This is typically followed by a Muskie log entry with a timestamp _after_ this point.  The latency of the various phases in the Muskie request point to what took so long.
++|===
++
++There's loads more information available in the system.  Depending on your
++problem, you may need to get more creative.  Examples:
++
++- The approximate time when any system (or zone) halted or booted can be
++  determined from the output of `last reboot`, `uptime`, SMF service times, or
++  process start times.
++- The precise time when a process started can be extracted from `ps(1)`.
++- The precise time when a system panicked can be extracted from a crash dump
++  from the `panic_hrestime` and `panic_hrtime` variables.
++- The time that a process crashed (dumped core) can be inferred from the mtime
++  of the core file or entries in the SMF log file.
++
++// XXX Add an example, ideally that includes load balancer, muskie, and mako.
++
++==== Example request timeline
++
++Let's <<_finding_or_generating_a_failed_request,make our own test request>> and
++make a timeline for it:
++
++[source,text]
++----
++$ mget -v /dap/stor/cmd.tgz 2> >(bunyan) > /dev/null
++...
++[2019-05-22T18:22:55.329Z] TRACE: mget/MantaClient/12438 on blinky.local (/Users/dap/install/lib/node_modules/manta/node_modules/restify-clients/lib/HttpClient.js:210 in onResponse): Response received (client_res={})
++    HTTP/1.1 200 OK
++    etag: cb1036e4-3b57-c118-cd46-961f6ebe12d0
++    last-modified: Tue, 08 Apr 2014 21:56:13 GMT
++    accept-ranges: bytes
++    content-type: application/octet-stream
++    content-md5: vVRjo74mJquDRsoW2HJM/g==
++    content-length: 17062152
++    durability-level: 2
++    date: Wed, 22 May 2019 18:22:55 GMT
++    server: Manta
++    x-request-id: 0b241d9c-d076-4c9b-b954-3b65adb73c73
++    x-response-time: 187
++    x-server-name: 204ac483-7e7e-4083-9ea2-c9ea22f459fd
++    connection: keep-alive
++    x-request-received: 1558549375054
++    x-request-processing-time: 275
++----
++
++With the debug output from the client command, we can easily find the Muskie
++instance (`204ac483-7e7e-4083-9ea2-c9ea22f459fd`) that handled this request and
++request-id (`0b241d9c-d076-4c9b-b954-3b65adb73c73`).  (This is just an example.
++If you don't have these in your case, see
++<<_finding_or_generating_a_failed_request>>.)
++
++To find the Muskie log entry, we must first find Muskie zone
++`204ac483-7e7e-4083-9ea2-c9ea22f459fd`.  We can see which datacenter it's in
++using `manta-adm show`:
++
++[source,text]
++----
++[root@headnode (staging-1) ~]# manta-adm show -a webapi
++SERVICE          SH DATACENTER ZONENAME
++webapi            1 staging-1  380920d9-ed44-4bcd-b61c-4b99f49c1329
++webapi            1 staging-2  204ac483-7e7e-4083-9ea2-c9ea22f459fd
++webapi            1 staging-3  6e59a763-6f6a-46a1-926e-90c1b7fc370b
++----
++
++It's in staging-2.  Following the
++<<_if_you_have_the_x_request_id_and_x_server_name_headers,instructions above>>,
++we can search for the log entry for this request:
++
++[source,text]
++----
++[root@headnode (staging-2) ~]# manta-oneach -z 204ac483-7e7e-4083-9ea2-c9ea22f459fd 'grep 0b241d9c-d076-4c9b-b954-3b65adb73c73 /var/log/muskie.log'
++SERVICE          ZONE     OUTPUT
++webapi           204ac483 {"name":"muskie","hostname":"204ac483-7e7e-4083-9ea2-c9ea22f459fd","pid":969231,"component":"HttpServer","audit":true,"level":30,"_audit":true,"operation":"getstorage","billable_operation":"GET","bytesTransferred":"17062152","logicalRemoteAddress":"172.20.5.18","remoteAddress":"127.0.0.1","remotePort":53399,"reqHeaderLength":503,"req":{"method":"GET","url":"/dap/stor/cmd.tgz","headers":{"accept":"*/*","x-request-id":"0b241d9c-d076-4c9b-b954-3b65adb73c73","date":"Wed, 22 May 2019 18:22:55 GMT","authorization":"Signature keyId=\"/dap/keys/c0:24:6d:54:c4:5e:72:15:b5:65:21:80:69:81:cb:14\",algorithm=\"ecdsa-sha256\",headers=\"date\",signature=\"MEUCIBaFtaKwO2XwOfJGXPw2ITfr1C2v7fHi0lMcsCa4049FAiEAkaZ/oPTYNbYdVvAXJM9pFq3rJgZB2F7gUQjKu2UG1m4=\"","user-agent":"restify/1.4.1 (x64-darwin; v8/3.14.5.9; OpenSSL/1.0.1t) node/0.10.45","accept-version":"~1.0","host":"manta.staging.joyent.us","connection":"keep-alive","x-forwarded-for":"::ffff:172.20.5.18"},"httpVersion":"1.1","owner":"bc8cd146-fecb-11e1-bd8a-bb6f54b49808","caller":{"login":"dap","uuid":"bc8cd146-fecb-11e1-bd8a-bb6f54b49808","groups":[],"user":null},"timers":{"earlySetup":99,"parseDate":30,"parseQueryString":35,"handler-3":202,"checkIfPresigned":10,"enforceSSL":8,"ensureDependencies":10,"_authSetup":9,"preSignedUrl":7,"checkAuthzScheme":14,"parseAuthTokenHandler":300,"signatureHandler":152,"parseKeyId":149,"loadCaller":3396,"verifySignature":4258,"parseHttpAuthToken":15,"loadOwner":4353,"getActiveRoles":192,"gatherContext":34,"setup":303,"getMetadata":169779,"storageContext":17,"authorize":201,"ensureEntryExists":5,"assertMetadata":3,"getDirectoryCount":3,"getDirectory":3,"negotiateContent":65,"checkIfMatch":10,"checkIfNoneMatch":5,"checkIfModified":10,"checkIfUnmodified":5,"verifyRange":4,"streamFromSharks":576907}},"resHeaderLength":369,"res":{"statusCode":200,"headers":{"etag":"cb1036e4-3b57-c118-cd46-961f6ebe12d0","last-modified":"Tue, 08 Apr 2014 21:56:13 GMT","accept-ranges":"bytes","content-type":"application/octet-stream","content-md5":"vVRjo74mJquDRsoW2HJM/g==","content-length":"17062152","durability-level":2,"date":"Wed, 22 May 2019 18:22:55 GMT","server":"Manta","x-request-id":"0b241d9c-d076-4c9b-b954-3b65adb73c73","x-response-time":187,"x-server-name":"204ac483-7e7e-4083-9ea2-c9ea22f459fd"}},"latency":187,"objectId":"cb1036e4-3b57-c118-cd46-961f6ebe12d0","sharksContacted":[{"shark":"1.stor.staging.joyent.us","result":"ok","timeToFirstByte":2,"timeTotal":577,"_startTime":1558549375336}],"entryShard":"tcp://3.moray.staging.joyent.us:2020","route":"getstorage","_auditData":true,"dataLatency":762,"dataSize":17062152,"latencyToFirstByte":187,"msg":"handled: 200","time":"2019-05-22T18:22:55.914Z","v":0}
++----
++
++or, formatted with bunyan:
++
++[source,text]
++----
++[2019-05-22T18:22:55.914Z]  INFO: muskie/HttpServer/969231 on 204ac483-7e7e-4083-9ea2-c9ea22f459fd: handled: 200 (audit=true, _audit=true, operation=getstorage, billable_operation=GET, bytesTransferred=17062152, logicalRemoteAddress=172.20.5.18, remoteAddress=127.0.0.1, remotePort=53399, reqHeaderLength=503, resHeaderLength=369, latency=187, objectId=cb1036e4-3b57-c118-cd46-961f6ebe12d0, entryShard=tcp://3.moray.staging.joyent.us:2020, route=getstorage, _auditData=true, dataLatency=762, dataSize=17062152, latencyToFirstByte=187, req.owner=bc8cd146-fecb-11e1-bd8a-bb6f54b49808)
++    GET /dap/stor/cmd.tgz HTTP/1.1
++    accept: */*
++    x-request-id: 0b241d9c-d076-4c9b-b954-3b65adb73c73
++    date: Wed, 22 May 2019 18:22:55 GMT
++    authorization: Signature keyId="/dap/keys/c0:24:6d:54:c4:5e:72:15:b5:65:21:80:69:81:cb:14",algorithm="ecdsa-sha256",headers="date",signature="MEUCIBaFtaKwO2XwOfJGXPw2ITfr1C2v7fHi0lMcsCa4049FAiEAkaZ/oPTYNbYdVvAXJM9pFq3rJgZB2F7gUQjKu2UG1m4="
++    user-agent: restify/1.4.1 (x64-darwin; v8/3.14.5.9; OpenSSL/1.0.1t) node/0.10.45
++    accept-version: ~1.0
++    host: manta.staging.joyent.us
++    connection: keep-alive
++    x-forwarded-for: ::ffff:172.20.5.18
++    --
++    HTTP/1.1 200 OK
++    etag: cb1036e4-3b57-c118-cd46-961f6ebe12d0
++    last-modified: Tue, 08 Apr 2014 21:56:13 GMT
++    accept-ranges: bytes
++    content-type: application/octet-stream
++    content-md5: vVRjo74mJquDRsoW2HJM/g==
++    content-length: 17062152
++    durability-level: 2
++    date: Wed, 22 May 2019 18:22:55 GMT
++    server: Manta
++    x-request-id: 0b241d9c-d076-4c9b-b954-3b65adb73c73
++    x-response-time: 187
++    x-server-name: 204ac483-7e7e-4083-9ea2-c9ea22f459fd
++    --
++    sharksContacted: [
++      {
++        "shark": "1.stor.staging.joyent.us",
++        "result": "ok",
++        "timeToFirstByte": 2,
++        "timeTotal": 577,
++        "_startTime": 1558549375336
++      }
++    ]
++    --
++    req.caller: {
++      "login": "dap",
++      "uuid": "bc8cd146-fecb-11e1-bd8a-bb6f54b49808",
++      "groups": [],
++      "user": null
++    }
++    --
++    req.timers: {
++      "earlySetup": 99,
++      "parseDate": 30,
++      "parseQueryString": 35,
++      "handler-3": 202,
++      "checkIfPresigned": 10,
++      "enforceSSL": 8,
++      "ensureDependencies": 10,
++      "_authSetup": 9,
++      "preSignedUrl": 7,
++      "checkAuthzScheme": 14,
++      "parseAuthTokenHandler": 300,
++      "signatureHandler": 152,
++      "parseKeyId": 149,
++      "loadCaller": 3396,
++      "verifySignature": 4258,
++      "parseHttpAuthToken": 15,
++      "loadOwner": 4353,
++      "getActiveRoles": 192,
++      "gatherContext": 34,
++      "setup": 303,
++      "getMetadata": 169779,
++      "storageContext": 17,
++      "authorize": 201,
++      "ensureEntryExists": 5,
++      "assertMetadata": 3,
++      "getDirectoryCount": 3,
++      "getDirectory": 3,
++      "negotiateContent": 65,
++      "checkIfMatch": 10,
++      "checkIfNoneMatch": 5,
++      "checkIfModified": 10,
++      "checkIfUnmodified": 5,
++      "verifyRange": 4,
++      "streamFromSharks": 576907
++    }
++----
++
++Similarly, we can <<_finding_a_load_balancer_log_entry,look for a load balancer
++log entry>>, which gets us this:
++
++[source,text]
++----
++2019-05-22T18:22:56+00:00 710f85a9-6f13-4fcf-8f3f-a03c4a508714 haproxy[550758]: ::ffff:172.20.5.18:56707 [22/May/2019:18:22:55.125] https secure_api/be1 6/0/0/188/934 200 17062612 - - ---- 25/8/24/8/0 0/0 "GET /dap/stor/cmd.tgz HTTP/1.1"
++----
++
++From these log entries, we can put together this timeline:
++
++[source,text]
++----
++18:22:55    Z  Client generates "Date" header for request
++               (source: Muskie log entry, request headers)
++
++18:22:55.125Z  Load balancer haproxy accepts TCP request from client (172.20.5.18)
++               (source: Load balancer log entry, accept timestamp)
++
++18:22:55.153Z  Muskie begins processing request
++               (source: Muskie log entry timestamp minus the sum of all handler times)
++
++18:22:55.166Z  Muskie begins loading metadata for request
++               (source: Muskie log entry, inferred wall time for "getMetadata" handler start)
++
++18:22:55.336Z  Muskie begins HTTP request to storage node "1.stor.staging.joyent.us"
++               (source: Muskie log entry, "sharksContacted" object)
++
++18:22:55.337Z  Muskie begins streaming data from storage node
++               (source: Muskie log entry, inferred wall time for "streamFromSharks" handler start)
++
++18:22:55.913Z  Muskie finishes streaming data from storage node
++               (source: Muskie log entry, "sharksContacted" object)
++
++18:22:55.914Z  Muskie records the request completed
++               (source: Muskie log entry timestamp)
++
++18:22:56    Z  Load balancer haproxy terminates session
++               (source: haproxy log message timestamp)
++
++18:22:56.059Z  Load balancer haproxy terminates session
++               (source: accept time (see above) plus 934ms total latency reported by haproxy)
++----
++
+ 
+ === Details about specific error messages
+ 
+diff --git a/TODO.md b/TODO.md
+index b745c3d..6e8a435 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -15,6 +15,8 @@ path through the decision tree goes where it should.
+ - load balancer problems
+ - muskie slowness
+ 
++- overview of object metadata, using mlocate
++
+ - message:
+ {"phase":"0","what":"phase 0: input \"/khangngu/stor/books/treasure_island.txt\"","code":"InvalidArgumentError","message":"failed to dispatch task: requested image is not available","input":"/khangngu/stor/books/treasure_island.txt","p0input":"/khangngu/stor/books/treasure_island.txt"}
+ from: https://chatlogs.joyent.us/logs/manta/2018/07/26#00:11:10.748Z
+diff --git a/docs/index.html b/docs/index.html
+index e7e70e6..4e3d74a 100644
+--- a/docs/index.html
++++ b/docs/index.html
+@@ -485,7 +485,13 @@ body.book #toc,body.book #preamble,body.book h1.sect0,body.book .sect1>h2{page-b
+ </ul>
+ </li>
+ <li><a href="#_understanding_a_load_balancer_log_entry">Understanding a load balancer log entry</a></li>
+-<li><a href="#_build_a_request_timeline">Build a request timeline</a></li>
++<li><a href="#_build_a_request_timeline">Build a request timeline</a>
++<ul class="sectlevel3">
++<li><a href="#_a_brief_review_of_request_handling">A brief review of request handling</a></li>
++<li><a href="#_key_events_during_a_request_lifetime">Key events during a request lifetime</a></li>
++<li><a href="#_example_request_timeline">Example request timeline</a></li>
++</ul>
++</li>
+ <li><a href="#_details_about_specific_error_messages">Details about specific error messages</a>
+ <ul class="sectlevel3">
+ <li><a href="#_request_has_exceeded_bytes">"Request has exceeded &#8230;&#8203; bytes"</a></li>
+@@ -2491,7 +2497,478 @@ client, and we also know which Muskie zone it was.</p>
+ </div>
+ <div class="sect2">
+ <h3 id="_build_a_request_timeline">Build a request timeline</h3>
++<div class="paragraph">
++<p>Building a request timeline can be incredibly valuable for understanding why a
++particular request failed or why a request took as long as it did.  Timelines
++are especially useful for understanding apparently mysterious failure modes
++like request timeouts, "socket hang-up" errors, "connection reset" errors, and
++the like.</p>
++</div>
++<div class="paragraph">
++<p>A request timeline is simply a list of events related to a request and the
++precise timestamps when they were reported.  You can include as much or as
++little detail as is relevant to your problem.  It&#8217;s common to focus on the
++phases that happen inside Muskie.  These are the simplest to collect and they&#8217;re
++often sufficient when failure modes are explicit (e.g., an authentication
++failure or a 404 response).  A pretty complete request timeline could include a
++lot more than that about what happens at the load balancer and storage nodes.</p>
++</div>
++<div class="admonitionblock note">
++<table>
++<tr>
++<td class="icon">
++<div class="title">Note</div>
++</td>
++<td class="content">
++Keep in mind that wall clocks vary across physical machines.  When
++comparing timestamps recorded from different systems, beware that differences
++may simply be a result of differences in the wall clock time on those systems.
++Within Manta, clocks are usually synchronized to within a few hundred
++milliseconds.  (You can check this for the servers you&#8217;re looking at using NTP
++tools.)  Timestamps reported by clients can be much further off, but if they&#8217;re
++also using NTP to synchronize their clocks, they may well be pretty close.
++</td>
++</tr>
++</table>
++</div>
++<div class="sect3">
++<h4 id="_a_brief_review_of_request_handling">A brief review of request handling</h4>
++<div class="paragraph">
++<p>A typical GET request for an object stored in Manta runs as follows:</p>
++</div>
++<div class="ulist">
++<ul>
++<li>
++<p>The client establishes a TCP connection to the Manta load balancer.  As part
++of this process, the load balancer establishes a TCP connection to a Muskie
++instance to handle any requests that arrive over this connection.</p>
++</li>
++<li>
++<p>The client constructs an HTTP request and sends it over the TCP connection.</p>
++</li>
++<li>
++<p>The load balancer forwards the request to Muskie.</p>
++</li>
++<li>
++<p>Muskie begins processing the request.</p>
++<div class="ulist">
++<ul>
++<li>
++<p>There are a number of (usually very fast) setup phases within Muskie.</p>
++</li>
++<li>
++<p>Muskie authenticates the request.  This may involve fetching authentication
++and authorization information from Mahi, in which case an HTTP request will
++be sent over the network to Mahi to fetch basic information about the
++account.</p>
++</li>
++<li>
++<p>Muskie fetches metadata associated with the object.  This step involves a few
++network RPC calls to the metadata tier: first to an Electric-Moray instance,
++which forwards the request to a Moray instance, which executes a SQL query
++against a PostgreSQL primary.</p>
++</li>
++<li>
++<p>Muskie authorizes the request.  This involves comparing the authenticated
++user&#8217;s credentials to the credentials required to access the object
++(specified in its metadata).</p>
++</li>
++<li>
++<p>Muskie makes an HTTP request to a storage node hosting a copy of the object.</p>
++</li>
++<li>
++<p>Assuming this request succeeds, Muskie reports a successful response header
++to the client.  Then data is sent from the storage node, through Muskie,
++through the load balancer, and to the client.</p>
++</li>
++<li>
++<p>The request concludes when the last data is sent to the client.</p>
++</li>
++</ul>
++</div>
++</li>
++</ul>
++</div>
++<div class="paragraph">
++<p>PUT requests to upload objects are similar except that there&#8217;s an additional
++metadata RPC after all the data has streamed to the storage nodes.  Other types
++of requests (e.g., creation and deletion of directories) are largely similar,
++but generally don&#8217;t involve storage nodes.</p>
++</div>
++<div class="paragraph">
++<p>This is a simplification.  For details, see the Muskie source code.  (Don&#8217;t be
++afraid to crack it open!)</p>
++</div>
++<div class="paragraph">
++<p>There are 1-2 dozen phases of request handling within Muskie, but most of the
++elapsed time of a request happens in only a handful of phases that relate to
++making requests to external services.  These are described below.</p>
++</div>
++</div>
++<div class="sect3">
++<h4 id="_key_events_during_a_request_lifetime">Key events during a request lifetime</h4>
++<div class="paragraph">
++<p>The table below explains a number of events that happen while processing a
++request and where you can find more information about it.  Many of these entries
++refer to entries in logs that are documented elsewhere in this guide.  See
++<a href="#_understanding_a_muskie_log_entry">Understanding a Muskie log entry</a> and
++<a href="#_understanding_a_load_balancer_log_entry">Understanding a load balancer log entry</a>.</p>
++</div>
++<div class="paragraph">
++<p>Remember, it&#8217;s not necessary to collect all of these to start!  Start with the
++basics and flesh out what looks relevant.  Some of what&#8217;s below won&#8217;t apply to
++every request.  However, if you&#8217;re stumped about a strange failure mode, it&#8217;s
++often helpful to construct a pretty complete timeline, as you&#8217;ll often find
++surprising gaps or unusual intervals (e.g., exactly 60 seconds from when
++something started until when some obscure error message was reported, which
++might suggest a timeout).</p>
++</div>
++<div class="paragraph">
++<p>If you don&#8217;t know where to start, consider a timeline that just includes:</p>
++</div>
++<div class="ulist">
++<ul>
++<li>
++<p>when the request was constructed on the client</p>
++</li>
++<li>
++<p>when the request was received by the load balancer (if possible)</p>
++</li>
++<li>
++<p>when the request was received by Muskie</p>
++</li>
++<li>
++<p>when the metadata phases of request handling were completed in Muskie</p>
++</li>
++<li>
++<p>when the request was completed by Muskie</p>
++</li>
++</ul>
++</div>
++<div class="paragraph">
++<p>It&#8217;s common to start there, skim the <code>req.timers</code> field (mentioned below) to
++look for unusually long phases (e.g., those taking upwards of 1 second), and
++add those to the timeline as needed.</p>
++</div>
++<table class="tableblock frame-all grid-all stretch">
++<colgroup>
++<col style="width: 25%;">
++<col style="width: 25%;">
++<col style="width: 25%;">
++<col style="width: 25%;">
++</colgroup>
++<thead>
++<tr>
++<th class="tableblock halign-left valign-top">Event</th>
++<th class="tableblock halign-left valign-top">Component where it happens</th>
++<th class="tableblock halign-left valign-top">Where to find the timestamp</th>
++<th class="tableblock halign-left valign-top">Notes</th>
++</tr>
++</thead>
++<tbody>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Client establishes a TCP connection to the load balancer.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Load balancer</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_load_balancer_log_entry">Load balancer log entry</a>, <code>accept_date</code> field.  Note that this is not the date at the very start of the load balancer log entry.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Both the client and server may use timeouts that measure from this timestamp.  It can be helpful to check for intervals of round numbers (e.g., exactly 1 or 2 minutes).</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Client constructs the HTTP request.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Client (outside Manta)</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>, <code>req.headers.date</code> (the <code>Date</code> header supplied by the client with the HTTP request)</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Large gaps between when the client constructed the request and when Muskie began processing it could indicate queueing in Muskie or somewhere in the network before reaching Muskie.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie begins processing the request.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>.  There&#8217;s no discrete field for this, but you can compute this by taking the timestamp when Muskie completed the request (see below) and subtracting the total latency of the request (including time to transfer data).  To calculate the total latency, sum all the timers in <code>req.phases</code>.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">This is a very useful point at which to divide an investigation, since large gaps in time <em>before</em> this point indicate queueing prior to the request reaching Muskie, which generally involve different tools and data sources than latency after this point.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie makes HTTP request to Mahi (authcache) to load information needed to authenticate and authorize this request.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>, <code>req.timers</code>.  These requests generally occur during the <code>loadCaller</code> and <code>loadOwner</code> phases, though they can also happen during <code>parseHttpAuthToken</code> (if the <code>x-auth-token</code> header is provided by the client), or <code>getActiveRoles</code>.  You can generally infer that if these HTTP requests were made, they started after one of these phases began and completed before the same phase ended.  To determine the actual start and end timestamps, you have compute them based on the latency of the previous phases and the time when Muskie began processing the request (or the latency of the subsequent phases and the time when Muskie finished processing the request).</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Most requests do not actually involve any of these HTTP requests because the information is usually cached in Muskie.  However, latency here may indicate a problem with Mahi or the network.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie makes RPCs to load metadata.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>, <code>req.timers</code>.  These requests most commonly occur during the <code>getMetadata</code> phase.  For the actual start and end timestamps, you must compute them based on the latency of the other phases and the time the request completed (or finished).</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">High latency here indicates a slow read RPC to the metadata tier.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie issues HTTP requests to storage nodes.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>, <code>req.timers</code> and <code>req.sharksContacted</code>.  For GET requests, this happens during the <code>streamFromSharks</code> phase.  For PUT requests, this happens during the <code>startSharkStreams</code> phase.  Since multiple storage nodes may be contacted, sometimes in parallel and sometimes sequentially, the <code>sharksContacted</code> field has more fine-grained information about the time for each particular storage node.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">This step is often forgotten, but it&#8217;s important to complete before Muskie sends successful response headers to the client.  High latency between when these requests are issued and when storage nodes send headers back may indicate a DNS problem, a network problem, or a storage node that&#8217;s offline or overloaded.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie sends response headers.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>, <code>latency</code> field (elapsed time in milliseconds, which must be added to the initial timestamp)</p></td>
++<td class="tableblock halign-left valign-top"><div class="content"><div class="paragraph">
++<p>Sometimes called latency-to-first-byte, this is a significant point in the request because until this point, the client has heard nothing from the server while the server authenticates the client, loads metadata, and authorizes the request.  Many clients have timeouts (sometimes as short as a few seconds) from when they send the request until they see response headers.  If there&#8217;s a long gap in this range and then Muskie subsequently reports a client error (e.g., timed out waiting for the client or a closed connection from the client), the client may have given up.</p>
++</div>
++<div class="paragraph">
++<p>Also, the work associated with the rest of this request depends on how large the end user&#8217;s object is and how much network bandwidth they have available to Manta.  As a result, it&#8217;s common to summarize this latency-to-first-byte rather than the whole latency of the request, as this number is more comparable across different types of requests.</p>
++</div></div></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie begins streaming data between storage nodes and the client.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>, <code>req.timers</code> field.  For GET operations, the phase where data is transferred is called <code>streamFromSharks</code>.  For PUT operations, the phase is called <code>sharkStreams</code>.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">This should be about the same time as the response headers are sent.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Storage nodes process HTTP requests</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Mako</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock"><code>mako-access</code> log.  Entries in the mako-access log include both a timestamp when they completed and a latency, which allows you to compute the end timestamp.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">High latency between when Muskie began transferring data to or from storage nodes and when storage nodes report having started may indicate overload on the storage node or a network problem.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie finishes streaming data between storage nodes and the client.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">See the row above where Muskie begins streaming data.  The end of the corresponding phase indicates when this finished.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">The time for this phase is highly variable depending on how much data is requested and the bandwidth available to the client.  It&#8217;s more useful to compute throughput (as the total bytes sent divided by the latency of this phase) than look at the latency directly.  Low throughput here can be indicative of almost anything: a slow client, a slow network, overloaded Muskie, or an overloaded storage node.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie makes RPCs to save metadata.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Muskie</p></td>
++<td class="tableblock halign-left valign-top"><div class="content"><div class="paragraph">
++<p><a href="#_understanding_a_muskie_log_entry">Muskie log entry</a>, <code>req.timers</code>.  These requests most commonly occur during the <code>saveMetadata</code> phase.  For the actual start and end timestamps, you must compute them based on the latency of the other phases and the time the request completed (or finished).</p>
++</div>
++<div class="paragraph">
++<p>Another possible indicator of this timestamp may be given by the <code>mtime</code> stored in the object metadata, assuming it hasn&#8217;t been changed since the request you&#8217;re investigating completed.</p>
++</div></div></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">High latency here indicates a slow write RPC to the metadata tier.</p></td>
++</tr>
++<tr>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Load balancer indicates the TCP session ended.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Load balancer</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">Load balancer log, <code>syslog_date</code> field.</p></td>
++<td class="tableblock halign-left valign-top"><p class="tableblock">This is generally the last time the client heard anything from the server associated with this request.  Normally, this indicates the end of the request.  In pathological cases where metadata operation takes several minutes, the load balancer may terminate the request, logging this entry and sending a failure response to the client, even though Muskie is still processing the request.  This is typically followed by a Muskie log entry with a timestamp <em>after</em> this point.  The latency of the various phases in the Muskie request point to what took so long.</p></td>
++</tr>
++</tbody>
++</table>
++<div class="paragraph">
++<p>There&#8217;s loads more information available in the system.  Depending on your
++problem, you may need to get more creative.  Examples:</p>
++</div>
++<div class="ulist">
++<ul>
++<li>
++<p>The approximate time when any system (or zone) halted or booted can be
++determined from the output of <code>last reboot</code>, <code>uptime</code>, SMF service times, or
++process start times.</p>
++</li>
++<li>
++<p>The precise time when a process started can be extracted from <code>ps(1)</code>.</p>
++</li>
++<li>
++<p>The precise time when a system panicked can be extracted from a crash dump
++from the <code>panic_hrestime</code> and <code>panic_hrtime</code> variables.</p>
++</li>
++<li>
++<p>The time that a process crashed (dumped core) can be inferred from the mtime
++of the core file or entries in the SMF log file.</p>
++</li>
++</ul>
++</div>
++</div>
++<div class="sect3">
++<h4 id="_example_request_timeline">Example request timeline</h4>
++<div class="paragraph">
++<p>Let&#8217;s <a href="#_finding_or_generating_a_failed_request">make our own test request</a> and
++make a timeline for it:</p>
++</div>
++<div class="listingblock">
++<div class="content">
++<pre class="highlight"><code class="language-text" data-lang="text">$ mget -v /dap/stor/cmd.tgz 2&gt; &gt;(bunyan) &gt; /dev/null
++...
++[2019-05-22T18:22:55.329Z] TRACE: mget/MantaClient/12438 on blinky.local (/Users/dap/install/lib/node_modules/manta/node_modules/restify-clients/lib/HttpClient.js:210 in onResponse): Response received (client_res={})
++    HTTP/1.1 200 OK
++    etag: cb1036e4-3b57-c118-cd46-961f6ebe12d0
++    last-modified: Tue, 08 Apr 2014 21:56:13 GMT
++    accept-ranges: bytes
++    content-type: application/octet-stream
++    content-md5: vVRjo74mJquDRsoW2HJM/g==
++    content-length: 17062152
++    durability-level: 2
++    date: Wed, 22 May 2019 18:22:55 GMT
++    server: Manta
++    x-request-id: 0b241d9c-d076-4c9b-b954-3b65adb73c73
++    x-response-time: 187
++    x-server-name: 204ac483-7e7e-4083-9ea2-c9ea22f459fd
++    connection: keep-alive
++    x-request-received: 1558549375054
++    x-request-processing-time: 275</code></pre>
++</div>
++</div>
++<div class="paragraph">
++<p>With the debug output from the client command, we can easily find the Muskie
++instance (<code>204ac483-7e7e-4083-9ea2-c9ea22f459fd</code>) that handled this request and
++request-id (<code>0b241d9c-d076-4c9b-b954-3b65adb73c73</code>).  (This is just an example.
++If you don&#8217;t have these in your case, see
++<a href="#_finding_or_generating_a_failed_request">Finding (or generating) a failed request</a>.)</p>
++</div>
++<div class="paragraph">
++<p>To find the Muskie log entry, we must first find Muskie zone
++<code>204ac483-7e7e-4083-9ea2-c9ea22f459fd</code>.  We can see which datacenter it&#8217;s in
++using <code>manta-adm show</code>:</p>
++</div>
++<div class="listingblock">
++<div class="content">
++<pre class="highlight"><code class="language-text" data-lang="text">[root@headnode (staging-1) ~]# manta-adm show -a webapi
++SERVICE          SH DATACENTER ZONENAME
++webapi            1 staging-1  380920d9-ed44-4bcd-b61c-4b99f49c1329
++webapi            1 staging-2  204ac483-7e7e-4083-9ea2-c9ea22f459fd
++webapi            1 staging-3  6e59a763-6f6a-46a1-926e-90c1b7fc370b</code></pre>
++</div>
++</div>
++<div class="paragraph">
++<p>It&#8217;s in staging-2.  Following the
++<a href="#_if_you_have_the_x_request_id_and_x_server_name_headers">instructions above</a>,
++we can search for the log entry for this request:</p>
++</div>
++<div class="listingblock">
++<div class="content">
++<pre class="highlight"><code class="language-text" data-lang="text">[root@headnode (staging-2) ~]# manta-oneach -z 204ac483-7e7e-4083-9ea2-c9ea22f459fd 'grep 0b241d9c-d076-4c9b-b954-3b65adb73c73 /var/log/muskie.log'
++SERVICE          ZONE     OUTPUT
++webapi           204ac483 {"name":"muskie","hostname":"204ac483-7e7e-4083-9ea2-c9ea22f459fd","pid":969231,"component":"HttpServer","audit":true,"level":30,"_audit":true,"operation":"getstorage","billable_operation":"GET","bytesTransferred":"17062152","logicalRemoteAddress":"172.20.5.18","remoteAddress":"127.0.0.1","remotePort":53399,"reqHeaderLength":503,"req":{"method":"GET","url":"/dap/stor/cmd.tgz","headers":{"accept":"*/*","x-request-id":"0b241d9c-d076-4c9b-b954-3b65adb73c73","date":"Wed, 22 May 2019 18:22:55 GMT","authorization":"Signature keyId=\"/dap/keys/c0:24:6d:54:c4:5e:72:15:b5:65:21:80:69:81:cb:14\",algorithm=\"ecdsa-sha256\",headers=\"date\",signature=\"MEUCIBaFtaKwO2XwOfJGXPw2ITfr1C2v7fHi0lMcsCa4049FAiEAkaZ/oPTYNbYdVvAXJM9pFq3rJgZB2F7gUQjKu2UG1m4=\"","user-agent":"restify/1.4.1 (x64-darwin; v8/3.14.5.9; OpenSSL/1.0.1t) node/0.10.45","accept-version":"~1.0","host":"manta.staging.joyent.us","connection":"keep-alive","x-forwarded-for":"::ffff:172.20.5.18"},"httpVersion":"1.1","owner":"bc8cd146-fecb-11e1-bd8a-bb6f54b49808","caller":{"login":"dap","uuid":"bc8cd146-fecb-11e1-bd8a-bb6f54b49808","groups":[],"user":null},"timers":{"earlySetup":99,"parseDate":30,"parseQueryString":35,"handler-3":202,"checkIfPresigned":10,"enforceSSL":8,"ensureDependencies":10,"_authSetup":9,"preSignedUrl":7,"checkAuthzScheme":14,"parseAuthTokenHandler":300,"signatureHandler":152,"parseKeyId":149,"loadCaller":3396,"verifySignature":4258,"parseHttpAuthToken":15,"loadOwner":4353,"getActiveRoles":192,"gatherContext":34,"setup":303,"getMetadata":169779,"storageContext":17,"authorize":201,"ensureEntryExists":5,"assertMetadata":3,"getDirectoryCount":3,"getDirectory":3,"negotiateContent":65,"checkIfMatch":10,"checkIfNoneMatch":5,"checkIfModified":10,"checkIfUnmodified":5,"verifyRange":4,"streamFromSharks":576907}},"resHeaderLength":369,"res":{"statusCode":200,"headers":{"etag":"cb1036e4-3b57-c118-cd46-961f6ebe12d0","last-modified":"Tue, 08 Apr 2014 21:56:13 GMT","accept-ranges":"bytes","content-type":"application/octet-stream","content-md5":"vVRjo74mJquDRsoW2HJM/g==","content-length":"17062152","durability-level":2,"date":"Wed, 22 May 2019 18:22:55 GMT","server":"Manta","x-request-id":"0b241d9c-d076-4c9b-b954-3b65adb73c73","x-response-time":187,"x-server-name":"204ac483-7e7e-4083-9ea2-c9ea22f459fd"}},"latency":187,"objectId":"cb1036e4-3b57-c118-cd46-961f6ebe12d0","sharksContacted":[{"shark":"1.stor.staging.joyent.us","result":"ok","timeToFirstByte":2,"timeTotal":577,"_startTime":1558549375336}],"entryShard":"tcp://3.moray.staging.joyent.us:2020","route":"getstorage","_auditData":true,"dataLatency":762,"dataSize":17062152,"latencyToFirstByte":187,"msg":"handled: 200","time":"2019-05-22T18:22:55.914Z","v":0}</code></pre>
++</div>
++</div>
++<div class="paragraph">
++<p>or, formatted with bunyan:</p>
++</div>
++<div class="listingblock">
++<div class="content">
++<pre class="highlight"><code class="language-text" data-lang="text">[2019-05-22T18:22:55.914Z]  INFO: muskie/HttpServer/969231 on 204ac483-7e7e-4083-9ea2-c9ea22f459fd: handled: 200 (audit=true, _audit=true, operation=getstorage, billable_operation=GET, bytesTransferred=17062152, logicalRemoteAddress=172.20.5.18, remoteAddress=127.0.0.1, remotePort=53399, reqHeaderLength=503, resHeaderLength=369, latency=187, objectId=cb1036e4-3b57-c118-cd46-961f6ebe12d0, entryShard=tcp://3.moray.staging.joyent.us:2020, route=getstorage, _auditData=true, dataLatency=762, dataSize=17062152, latencyToFirstByte=187, req.owner=bc8cd146-fecb-11e1-bd8a-bb6f54b49808)
++    GET /dap/stor/cmd.tgz HTTP/1.1
++    accept: */*
++    x-request-id: 0b241d9c-d076-4c9b-b954-3b65adb73c73
++    date: Wed, 22 May 2019 18:22:55 GMT
++    authorization: Signature keyId="/dap/keys/c0:24:6d:54:c4:5e:72:15:b5:65:21:80:69:81:cb:14",algorithm="ecdsa-sha256",headers="date",signature="MEUCIBaFtaKwO2XwOfJGXPw2ITfr1C2v7fHi0lMcsCa4049FAiEAkaZ/oPTYNbYdVvAXJM9pFq3rJgZB2F7gUQjKu2UG1m4="
++    user-agent: restify/1.4.1 (x64-darwin; v8/3.14.5.9; OpenSSL/1.0.1t) node/0.10.45
++    accept-version: ~1.0
++    host: manta.staging.joyent.us
++    connection: keep-alive
++    x-forwarded-for: ::ffff:172.20.5.18
++    --
++    HTTP/1.1 200 OK
++    etag: cb1036e4-3b57-c118-cd46-961f6ebe12d0
++    last-modified: Tue, 08 Apr 2014 21:56:13 GMT
++    accept-ranges: bytes
++    content-type: application/octet-stream
++    content-md5: vVRjo74mJquDRsoW2HJM/g==
++    content-length: 17062152
++    durability-level: 2
++    date: Wed, 22 May 2019 18:22:55 GMT
++    server: Manta
++    x-request-id: 0b241d9c-d076-4c9b-b954-3b65adb73c73
++    x-response-time: 187
++    x-server-name: 204ac483-7e7e-4083-9ea2-c9ea22f459fd
++    --
++    sharksContacted: [
++      {
++        "shark": "1.stor.staging.joyent.us",
++        "result": "ok",
++        "timeToFirstByte": 2,
++        "timeTotal": 577,
++        "_startTime": 1558549375336
++      }
++    ]
++    --
++    req.caller: {
++      "login": "dap",
++      "uuid": "bc8cd146-fecb-11e1-bd8a-bb6f54b49808",
++      "groups": [],
++      "user": null
++    }
++    --
++    req.timers: {
++      "earlySetup": 99,
++      "parseDate": 30,
++      "parseQueryString": 35,
++      "handler-3": 202,
++      "checkIfPresigned": 10,
++      "enforceSSL": 8,
++      "ensureDependencies": 10,
++      "_authSetup": 9,
++      "preSignedUrl": 7,
++      "checkAuthzScheme": 14,
++      "parseAuthTokenHandler": 300,
++      "signatureHandler": 152,
++      "parseKeyId": 149,
++      "loadCaller": 3396,
++      "verifySignature": 4258,
++      "parseHttpAuthToken": 15,
++      "loadOwner": 4353,
++      "getActiveRoles": 192,
++      "gatherContext": 34,
++      "setup": 303,
++      "getMetadata": 169779,
++      "storageContext": 17,
++      "authorize": 201,
++      "ensureEntryExists": 5,
++      "assertMetadata": 3,
++      "getDirectoryCount": 3,
++      "getDirectory": 3,
++      "negotiateContent": 65,
++      "checkIfMatch": 10,
++      "checkIfNoneMatch": 5,
++      "checkIfModified": 10,
++      "checkIfUnmodified": 5,
++      "verifyRange": 4,
++      "streamFromSharks": 576907
++    }</code></pre>
++</div>
++</div>
++<div class="paragraph">
++<p>Similarly, we can <a href="#_finding_a_load_balancer_log_entry">look for a load balancer
++log entry</a>, which gets us this:</p>
++</div>
++<div class="listingblock">
++<div class="content">
++<pre class="highlight"><code class="language-text" data-lang="text">2019-05-22T18:22:56+00:00 710f85a9-6f13-4fcf-8f3f-a03c4a508714 haproxy[550758]: ::ffff:172.20.5.18:56707 [22/May/2019:18:22:55.125] https secure_api/be1 6/0/0/188/934 200 17062612 - - ---- 25/8/24/8/0 0/0 "GET /dap/stor/cmd.tgz HTTP/1.1"</code></pre>
++</div>
++</div>
++<div class="paragraph">
++<p>From these log entries, we can put together this timeline:</p>
++</div>
++<div class="listingblock">
++<div class="content">
++<pre class="highlight"><code class="language-text" data-lang="text">18:22:55    Z  Client generates "Date" header for request
++               (source: Muskie log entry, request headers)
++
++18:22:55.125Z  Load balancer haproxy accepts TCP request from client (172.20.5.18)
++               (source: Load balancer log entry, accept timestamp)
++
++18:22:55.153Z  Muskie begins processing request
++               (source: Muskie log entry timestamp minus the sum of all handler times)
++
++18:22:55.166Z  Muskie begins loading metadata for request
++               (source: Muskie log entry, inferred wall time for "getMetadata" handler start)
++
++18:22:55.336Z  Muskie begins HTTP request to storage node "1.stor.staging.joyent.us"
++               (source: Muskie log entry, "sharksContacted" object)
++
++18:22:55.337Z  Muskie begins streaming data from storage node
++               (source: Muskie log entry, inferred wall time for "streamFromSharks" handler start)
+ 
++18:22:55.913Z  Muskie finishes streaming data from storage node
++               (source: Muskie log entry, "sharksContacted" object)
++
++18:22:55.914Z  Muskie records the request completed
++               (source: Muskie log entry timestamp)
++
++18:22:56    Z  Load balancer haproxy terminates session
++               (source: haproxy log message timestamp)
++
++18:22:56.059Z  Load balancer haproxy terminates session
++               (source: accept time (see above) plus 934ms total latency reported by haproxy)</code></pre>
++</div>
++</div>
++</div>
+ </div>
+ <div class="sect2">
+ <h3 id="_details_about_specific_error_messages">Details about specific error messages</h3>

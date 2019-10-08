@@ -1,0 +1,933 @@
+commit c593fe046ae56d258dd3c0add1165baacf3e8676
+Author: Josh Wilsdon <jwilsdon@joyent.com>
+Date:   2019-05-08T20:31:35-07:00 (5 months ago)
+    
+    MANTA-4251 make garbage-collector capable of storing instructions to local files
+
+diff --git a/Makefile b/Makefile
+index 2102260..e26ab54 100644
+--- a/Makefile
++++ b/Makefile
+@@ -60,7 +60,7 @@ BOOT_DIR =			/opt/smartdc/boot
+ SAPI_MANIFESTS =		manta-garbage-collector
+ SAPI_MANIFEST_DIRS =		$(SAPI_MANIFESTS:%=$(PREFIX)/sapi_manifests/%)
+ 
+-SMF_MANIFESTS =			garbage-collector
++SMF_MANIFESTS =			garbage-collector rsyncd
+ SMF_MANIFESTS_DIR =		$(PREFIX)/smf/manifests
+ 
+ NODE_BITS =			bin/node
+@@ -81,6 +81,7 @@ INSTALL_FILES =			$(addprefix $(PROTO), \
+ 				$(SAPI_MANIFEST_DIRS:%=%/template) \
+ 				$(SAPI_MANIFEST_DIRS:%=%/manifest.json) \
+ 				$(PREFIX)/bin/garbage-collector \
++				$(PREFIX)/etc/rsyncd.conf \
+ 				)
+ 
+ INSTALL_DIRS =			$(addprefix $(PROTO), \
+@@ -93,6 +94,7 @@ INSTALL_DIRS =			$(addprefix $(PROTO), \
+ 				$(PREFIX)/cmd \
+ 				$(PREFIX)/bin \
+ 				$(PREFIX)/lib \
++				$(PREFIX)/etc \
+ 				$(SAPI_MANIFEST_DIRS) \
+ 				)
+ 
+@@ -173,6 +175,9 @@ $(PROTO)$(PREFIX)/bin/%:
+ $(PROTO)$(PREFIX)/bin/garbage-collector: scripts/garbage-collector.sh
+ 	$(INSTALL_EXEC)
+ 
++$(PROTO)$(PREFIX)/etc/rsyncd.conf: etc/rsyncd.conf
++	$(INSTALL_FILE)
++
+ $(PROTO)$(PREFIX)/lib/%.sh: lib/%.sh | $(INSTALL_DIRS)
+ 	$(INSTALL_EXEC)
+ 
+diff --git a/README.md b/README.md
+index 971c1a8..80365b0 100644
+--- a/README.md
++++ b/README.md
+@@ -323,9 +323,9 @@ GET /tunables
+ Response:
+ 
+ {
+-	"instr_upload_batch_size": integer,
+-	"instr_upload_flush_delay": integer,
+-	"instr_upload_path_prefix": string,
++	"instr_write_batch_size": integer,
++	"instr_write_flush_delay": integer,
++	"instr_write_path_prefix": string,
+ 	"record_read_batch_size": integer,
+ 	"record_read_wait_interval": integer (ms),
+ 	"record_read_sort_attr": "_mtime",
+@@ -342,9 +342,9 @@ POST /tunables
+ Content-Type: application/json
+ 
+ {
+-	"instr_upload_batch_size": integer,
+-	"instr_upload_flush_delay": integer,
+-	"instr_upload_path_prefix": string
++	"instr_write_batch_size": integer,
++	"instr_write_flush_delay": integer,
++	"instr_write_path_prefix": string
+ 	"record_read_batch_size": integer,
+ 	"record_read_wait_interval": integer (ms),
+ 	"record_read_sort_attr": "_mtime",
+diff --git a/boot/firstboot.sh b/boot/firstboot.sh
+index 48d6740..e7d845b 100644
+--- a/boot/firstboot.sh
++++ b/boot/firstboot.sh
+@@ -6,7 +6,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2018, Joyent, Inc.
++# Copyright (c) 2019, Joyent, Inc.
+ #
+ 
+ printf '==> firstboot @ %s\n' "$(date -u +%FT%TZ)"
+@@ -20,6 +20,7 @@ NAME=manta-garbage-collector
+ # (Installed as "setup.sh" to be executed by the "user-script")
+ #
+ 
++SPOOL_DIR="/var/spool/manta_gc"
+ SVC_ROOT="/opt/smartdc/$NAME"
+ 
+ #
+@@ -71,12 +72,39 @@ export PATH="$PATH"
+ w
+ EDSCRIPT
+ 
++
++#
++# Setup the delegated dataset for storing the garbage-collector instruction
++# queue. This way, if we get reprovisioned while instructions are sitting
++# around, they're not lost.
++#
++mkdir -p $SPOOL_DIR
++dataset=zones/$(zonename)/data
++if zfs list | grep $dataset; then
++    mountpoint=$(zfs get -Hp mountpoint $dataset | awk '{print $3}')
++    if [[ $mountpoint != $SPOOL_DIR ]]; then
++        zfs set mountpoint=$SPOOL_DIR $dataset
++        [[ $? -eq 0 ]] || fatal 'failed to set ZFS mountpoint'
++    fi
++else
++    fatal 'must have delegated dataset so we do not lose instructions'
++fi
++
++
+ #
+ # Import the garbage-collector SMF service.  The manifest file creates the service
+ # enabled by default.
+ #
+ if ! svccfg import "/opt/smartdc/$NAME/smf/manifests/garbage-collector.xml"; then
+-	fatal 'could not import SMF service'
++	fatal 'could not import garbage-collector SMF service'
++fi
++
++#
++# Import the rsyncd SMF service.  The manifest file creates the service
++# enabled by default.
++#
++if ! svccfg import "/opt/smartdc/$NAME/smf/manifests/rsyncd.xml"; then
++	fatal 'could not import rsyncd SMF service'
+ fi
+ 
+ manta_common_setup_end
+diff --git a/cmd/server.js b/cmd/server.js
+index f95a903..76756a1 100644
+--- a/cmd/server.js
++++ b/cmd/server.js
+@@ -13,7 +13,6 @@ var mod_assertplus = require('assert-plus');
+ var mod_bunyan = require('bunyan');
+ var mod_fs = require('fs');
+ var mod_jsprim = require('jsprim');
+-var mod_manta = require('manta');
+ var mod_moray = require('moray');
+ var mod_path = require('path');
+ var mod_restify = require('restify');
+@@ -203,22 +202,6 @@ load_manta_application(ctx, done)
+ }
+ 
+ 
+-function
+-setup_manta_client(ctx, done)
+-{
+-	var overrides = {
+-		log: ctx.ctx_log
+-	};
+-	var manta_cfg = mod_jsprim.mergeObjects(ctx.ctx_cfg.manta,
+-		overrides, null);
+-
+-	ctx.ctx_manta_client = mod_manta.createClient(manta_cfg);
+-	ctx.ctx_log.debug('created manta client');
+-
+-	setImmediate(done);
+-}
+-
+-
+ function
+ setup_metrics(ctx, done)
+ {
+@@ -257,8 +240,8 @@ setup_metrics(ctx, done)
+ 	});
+ 
+ 	metrics_manager.collector.histogram({
+-		name: 'gc_mako_instrs_uploaded',
+-		help: 'number of instructions uploaded per manta put'
++		name: 'gc_mako_instrs_written',
++		help: 'number of instructions written per local file'
+ 	});
+ 
+ 	metrics_manager.collector.histogram({
+@@ -343,11 +326,6 @@ main()
+ 		 */
+ 		load_manta_application,
+ 
+-		/*
+-		 * Create one manta client.
+-		 */
+-		setup_manta_client,
+-
+ 		/*
+ 		 * Create the gc manager
+ 		 */
+diff --git a/docs/basic.md b/docs/basic.md
+index c44815d..0b09809 100644
+--- a/docs/basic.md
++++ b/docs/basic.md
+@@ -371,7 +371,7 @@ easily isolate the instruction that we are looking for:
+ ```
+ manta-oneach -s garbage-collector "curl -X POST localhost:2020/mako -H 'content-type: application/json' 
+ 	-d '{
+-		\"instr_upload_batch_size\": 1
++		\"instr_write_batch_size\": 1
+ 	}'"
+ SERVICE           ZONE     OUTPUT
+ garbage-collector f812ef45 {"ok":true,"when":"2018-07-30T19:41:55.704Z"}
+diff --git a/etc/config.json.template b/etc/config.json.template
+index 825a2f0..30303e4 100644
+--- a/etc/config.json.template
++++ b/etc/config.json.template
+@@ -45,9 +45,9 @@
+         }
+     ],
+     "tunables": {
+-        "instr_upload_batch_size": 100,
+-        "instr_upload_flush_delay": 30000,
+-        "instr_upload_path_prefix": "/poseidon/stor/manta_gc/mako",
++        "instr_write_batch_size": 100,
++        "instr_write_flush_delay": 30000,
++        "instr_write_path_prefix": "/var/spool/manta_gc/mako",
+         "record_read_batch_size": 50,
+         "record_read_wait_interval": 3000,
+         "record_read_sort_attr": "_mtime",
+diff --git a/etc/rsyncd.conf b/etc/rsyncd.conf
+new file mode 100644
+index 0000000..d024006
+--- /dev/null
++++ b/etc/rsyncd.conf
+@@ -0,0 +1,9 @@
++uid = root
++gid = root
++use chroot = yes
++max connections = 1000
++
++[manta_gc]
++        path = /var/spool/manta_gc/
++        comment = manta_gc
++        read only = false
+diff --git a/etc/testconfig.json.template b/etc/testconfig.json.template
+index b0691f6..dff4faa 100644
+--- a/etc/testconfig.json.template
++++ b/etc/testconfig.json.template
+@@ -42,9 +42,9 @@
+         }
+     ],
+     "tunables": {
+-        "instr_upload_batch_size": 100,
+-        "instr_upload_flush_delay": 1000,
+-        "instr_upload_path_prefix": "/poseidon/stor/manta_gc_test/mako",
++        "instr_write_batch_size": 100,
++        "instr_write_flush_delay": 1000,
++        "instr_write_path_prefix": "/poseidon/stor/manta_gc_test/mako",
+         "record_read_batch_size": 50,
+         "record_read_wait_interval": 1000,
+         "record_read_sort_attr": "_mtime",
+diff --git a/lib/actors.js b/lib/actors.js
+index e74fba6..c002caf 100644
+--- a/lib/actors.js
++++ b/lib/actors.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -15,7 +15,7 @@
+ var mod_reader = require('./moray_delete_record_reader');
+ var mod_cleaner = require('./moray_delete_record_cleaner');
+ var mod_transformer = require('./delete_record_transformer');
+-var mod_uploader = require('./mako_instruction_uploader');
++var mod_writer = require('./mako_instruction_writer');
+ 
+ module.exports = {
+ 
+@@ -25,6 +25,6 @@ module.exports = {
+ 
+ 	DeleteRecordTransformer: mod_transformer.DeleteRecordTransformer,
+ 
+-	MakoInstructionUploader: mod_uploader.MakoInstructionUploader
++	MakoInstructionWriter: mod_writer.MakoInstructionWriter
+ 
+ };
+diff --git a/lib/delete_record_transformer.js b/lib/delete_record_transformer.js
+index 0646f09..836436d 100644
+--- a/lib/delete_record_transformer.js
++++ b/lib/delete_record_transformer.js
+@@ -9,8 +9,8 @@
+  */
+ 
+ /*
+- * Translates and batches delete records intro instructions that can be uploaded
+- * to Manta and interpreted by the ordinary Mako gc pipeline.
++ * Translates and batches delete records intro instructions that can be
++ * read by the Mako gc pipeline.
+  */
+ 
+ var mod_assertplus = require('assert-plus');
+@@ -86,21 +86,21 @@ _get_collector()
+ DeleteRecordTransformer.prototype._get_min_batch_size = function
+ _get_min_batch_size()
+ {
+-	return (this._get_tunables_ref().instr_upload_min_batch_size);
++	return (this._get_tunables_ref().instr_write_min_batch_size);
+ };
+ 
+ 
+ DeleteRecordTransformer.prototype._get_batch_size = function
+ _get_batch_size()
+ {
+-	return (this._get_tunables_ref().instr_upload_batch_size);
++	return (this._get_tunables_ref().instr_write_batch_size);
+ };
+ 
+ 
+ DeleteRecordTransformer.prototype._get_delay = function
+ _get_delay()
+ {
+-	return (this._get_tunables_ref().instr_upload_flush_delay);
++	return (this._get_tunables_ref().instr_write_flush_delay);
+ };
+ 
+ 
+diff --git a/lib/gc_worker.js b/lib/gc_worker.js
+index 29db04c..6e1c2bd 100644
+--- a/lib/gc_worker.js
++++ b/lib/gc_worker.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ var mod_assertplus = require('assert-plus');
+@@ -71,15 +71,13 @@ GCWorker(opts)
+ 	 *
+ 	 * DeleteRecordTransformer - listens for records received by the
+ 	 * MorayDeleteRecordReader and transforms them into instructions
+-	 * consumable by the MakoInstructionUploader.
++	 * consumable by the MakoInstructionWriter.
+ 	 *
+-	 * MakoInstructionUploader - listens for instructions transformed by
+-	 * the MorayDeleteTransformer and uses the node-manta client to to
+-	 * upload instructions to locations that are well-known by the
+-	 * corresponding Makos.
++	 * MakoInstructionWriter - listens for instructions transformed by
++	 * the MorayDeleteTransformer writes them out to disk.
+ 	 *
+ 	 * MorayDeleteRecordCleaner - listens for confirmation that delete
+-	 * instructions have been uploaded to Manta, and then uses a moray
++	 * instructions have been written out to disk, and then uses a moray
+ 	 * client to delete the corresponding records from the
+ 	 * manta_fastdelete_queue or the manta_delete_log.
+ 	 */
+@@ -94,18 +92,18 @@ GCWorker(opts)
+ 			self.gcw_pipeline.unshift(cleaner);
+ 			next(null, cleaner);
+ 		},
+-		function init_mako_uploader(listener, next) {
+-			var mako_uploader_opts = mod_jsprim.mergeObjects(opts,
++		function init_mako_writer(listener, next) {
++			var mako_writer_opts = mod_jsprim.mergeObjects(opts,
+ 				self.actor_cfg_overrides,
+ 				self.moray_actor_defaults);
+-			mako_uploader_opts.listener = listener;
++			mako_writer_opts.listener = listener;
+ 
+-			var uploader = new mod_actors.MakoInstructionUploader(
+-				mako_uploader_opts);
++			var writer = new mod_actors.MakoInstructionWriter(
++				mako_writer_opts);
+ 
+-			self.gcw_pipeline.unshift(uploader);
++			self.gcw_pipeline.unshift(writer);
+ 
+-			next(null, listener, uploader);
++			next(null, listener, writer);
+ 		},
+ 		function init_record_transformer(moray_listener, mako_listener,
+ 			next) {
+diff --git a/lib/mako_instruction_uploader.js b/lib/mako_instruction_writer.js
+similarity index 55%
+rename from lib/mako_instruction_uploader.js
+rename to lib/mako_instruction_writer.js
+index ce527af..25bc87e 100644
+--- a/lib/mako_instruction_uploader.js
++++ b/lib/mako_instruction_writer.js
+@@ -14,15 +14,16 @@
+  */
+ var mod_assertplus = require('assert-plus');
+ var mod_events = require('events');
++var mod_fs = require('fs');
+ var mod_fsm = require('mooremachine');
++var mod_mkdirp = require('mkdirp');
+ var mod_path = require('path');
+ var mod_util = require('util');
+ var mod_uuidv4 = require('uuid/v4');
+-
+-var MemoryStream = require('stream').PassThrough;
++var mod_vasync = require('vasync');
+ 
+ function
+-MakoInstructionUploader(opts)
++MakoInstructionWriter(opts)
+ {
+ 	var self = this;
+ 
+@@ -31,54 +32,55 @@ MakoInstructionUploader(opts)
+ 	mod_assertplus.object(opts.ctx, 'opts.ctx');
+ 	mod_assertplus.object(opts.listener, 'opts.listener');
+ 
+-	self.mu_ctx = opts.ctx;
+-	self.mu_log = opts.log.child({
+-		component: 'MakoInstructionUploader'
++	self.mw_ctx = opts.ctx;
++	self.mw_log = opts.log.child({
++		component: 'MakoInstructionWriter'
+ 	});
+-	self.mu_listener = opts.listener;
++	self.mw_listener = opts.listener;
++
++	mod_mkdirp(self._get_instr_path_prefix(), function _onMkdir(err) {
++		if (err) {
++			throw new Error('unable to mkdir ' +
++			    self._get_instr_path_prefix() + ': ' +
++			    err.message);
++		}
+ 
+-	mod_fsm.FSM.call(self, 'running');
++		mod_fsm.FSM.call(self, 'running');
++	});
+ }
+-mod_util.inherits(MakoInstructionUploader, mod_fsm.FSM);
++mod_util.inherits(MakoInstructionWriter, mod_fsm.FSM);
+ 
+ 
+-MakoInstructionUploader.prototype._get_tunables_ref = function
++MakoInstructionWriter.prototype._get_tunables_ref = function
+ _get_tunables_ref()
+ {
+-	return (this.mu_ctx.ctx_cfg.tunables);
++	return (this.mw_ctx.ctx_cfg.tunables);
+ };
+ 
+ 
+-MakoInstructionUploader.prototype._get_instr_path_prefix = function
++MakoInstructionWriter.prototype._get_instr_path_prefix = function
+ _get_instr_path_prefix()
+ {
+-	return (this._get_tunables_ref().instr_upload_path_prefix);
++	return (this._get_tunables_ref().instr_write_path_prefix);
+ };
+ 
+ 
+-MakoInstructionUploader.prototype._get_instance = function
++MakoInstructionWriter.prototype._get_instance = function
+ _get_instance()
+ {
+-	return (this.mu_ctx.ctx_cfg.instance);
+-};
+-
+-
+-MakoInstructionUploader.prototype._get_manta_client = function
+-_get_manta_client()
+-{
+-	return (this.mu_ctx.ctx_manta_client);
++	return (this.mw_ctx.ctx_cfg.instance);
+ };
+ 
+ 
+-MakoInstructionUploader.prototype._get_collector = function
++MakoInstructionWriter.prototype._get_collector = function
+ _get_collector()
+ {
+-	return (this.mu_ctx.ctx_metrics_manager.collector);
++	return (this.mw_ctx.ctx_metrics_manager.collector);
+ };
+ 
+ 
+-MakoInstructionUploader.prototype._get_manta_instruction_path = function
+-_get_manta_instruction_path(storage_id)
++MakoInstructionWriter.prototype._get_instruction_path = function
++_get_instruction_path(storage_id)
+ {
+ 	var self = this;
+ 	/*
+@@ -112,7 +114,7 @@ _get_manta_instruction_path(storage_id)
+ };
+ 
+ 
+-MakoInstructionUploader.prototype._format_object_lines = function
++MakoInstructionWriter.prototype._format_object_lines = function
+ _format_object_lines(storage_id, lines)
+ {
+ 	var self = this;
+@@ -122,8 +124,8 @@ _format_object_lines(storage_id, lines)
+ 		 * If account or object information is not present, log it.
+ 		 */
+ 		if (!line[0] || !line[1]) {
+-			self.mu_log.error({line: line},
+-			    'MakoInstructionUploader: missing information.');
++			self.mw_log.error({line: line},
++			    'MakoInstructionWriter: missing information.');
+ 		}
+ 
+ 		return (['mako', storage_id].concat(line)).join('\t');
+@@ -131,7 +133,89 @@ _format_object_lines(storage_id, lines)
+ };
+ 
+ 
+-MakoInstructionUploader.prototype._listen_for_instructions = function
++MakoInstructionWriter.prototype._write_file = function
++_write_file(opts, callback)
++{
++	var self = this;
++
++	mod_assertplus.object(opts, 'opts');
++	mod_assertplus.string(opts.data, 'opts.data');
++	mod_assertplus.string(opts.path, 'opts.path');
++
++	var basename = mod_path.basename(opts.path);
++	var dir = mod_path.dirname(opts.path);
++	var dir_tmp = dir + '.tmp';
++	var path_tmp = mod_path.join(dir_tmp, basename);
++
++	// When writing files, we first create a file in the <dir>.tmp
++	// directory and then "rename" it so that it shows up in the
++	// spool directory atomically. This way clients that are
++	// rsyncing will never see partially written files.
++	mod_vasync.pipeline({
++		funcs: [
++			// We already did a mkdirp on the instr_path_prefix
++			// above so we're just creating the mako's subdir and
++			// the tmp directory here.
++			function _mkMakoDir(_, cb) {
++				mod_fs.mkdir(dir, function _onMkdir(e) {
++					if (e && e.code === 'EEXIST') {
++						self.mw_log.trace({
++							dir: dir
++						}, 'mkdir: dir already exists');
++						cb();
++						return;
++					}
++					self.mw_log.trace({
++						dir: dir,
++						err: e
++					}, 'fs.mkdir');
++					cb(e);
++				});
++			}, function _mkMakoDirTmp(_, cb) {
++				mod_fs.mkdir(dir_tmp, function _onMkdirTmp(e) {
++					if (e && e.code === 'EEXIST') {
++						self.mw_log.trace({
++							dir: dir_tmp
++						}, 'mkdir: dir_tmp already ' +
++						    'exists');
++						cb();
++						return;
++					}
++					self.mw_log.trace({
++						dir: dir_tmp,
++						err: e
++					}, 'fs.mkdir dir_tmp');
++					cb(e);
++				});
++			}, function _writeFile(_, cb) {
++				mod_fs.writeFile(
++				    path_tmp,
++				    opts.data,
++				    {flag: 'wx'},
++				    function _onWritten(e) {
++					self.mw_log.trace({
++					    err: e,
++					    path: path_tmp
++					}, 'fs.writeFile');
++					cb(e);
++				    });
++			}, function _renameFile(_, cb) {
++				mod_fs.rename(path_tmp, opts.path,
++				    function _onRename(e) {
++					self.mw_log.trace({
++					    dest: opts.path,
++					    err: e,
++					    src: path_tmp
++					}, 'fs.rename');
++					cb(e);
++				    });
++			}
++		]
++	}, callback);
++};
++
++
++MakoInstructionWriter.prototype._listen_for_instructions = function
+ _listen_for_instructions()
+ {
+ 	var self = this;
+@@ -158,29 +242,22 @@ _listen_for_instructions()
+ 			lines.push(elem.line);
+ 		});
+ 
+-		self.mu_log.debug({
+-			manta_storage_id: storage_id,
+-			count: lines.length
+-		}, 'Received instructions to upload.');
+-
+-		var path = self._get_manta_instruction_path(storage_id);
++		var path = self._get_instruction_path(storage_id);
+ 		var data = self._format_object_lines(storage_id, lines);
+ 
+-		var client = self._get_manta_client();
+-		var stream = new MemoryStream();
+-
+-		/*
+-		 * We make the storage directory if it doesn't already exist.
+-		 */
+-		var opts = {
+-			copies: 2,
+-			type: 'text/plain',
+-			mkdirs: true
+-		};
++		self.mw_log.debug({
++			manta_storage_id: storage_id,
++			count: lines.length,
++			path: path,
++			data: data
++		}, 'Received instructions to write.');
+ 
+-		client.put(path, stream, opts, function (err) {
++		self._write_file({
++			data: data,
++			path: path
++		}, function _onFileWritten(err) {
+ 			if (err) {
+-				self.mu_log.error({
++				self.mw_log.error({
+ 					path: path,
+ 					err: err.message,
+ 					numlines: lines.length
+@@ -189,18 +266,18 @@ _listen_for_instructions()
+ 				return;
+ 			}
+ 
+-			self.mu_log.debug({
++			self.mw_log.debug({
+ 				path: path,
+ 				keys: keys,
+ 				storage_id: storage_id
+-			}, 'Uploaded Mako GC instruction object to Manta.');
++			}, 'Wrote Mako GC instruction object to spool dir.');
+ 
+-			if (self.mu_ctx.ctx_metrics_manager) {
+-				self._get_collector().getCollector(
+-					'gc_mako_instrs_uploaded').observe(
+-					lines.length, {
++			if (self.mw_ctx.ctx_metrics_manager) {
++				self._get_collector()
++				    .getCollector('gc_mako_instrs_written')
++				    .observe(lines.length, {
+ 					manta_storage_id: storage_id
+-				});
++				    });
+ 			}
+ 
+ 			var clean = [];
+@@ -235,20 +312,18 @@ _listen_for_instructions()
+ 				}
+ 			});
+ 
+-			self.mu_listener.emit('cleanup', clean);
+-		});
+-
+-		stream.end(data);
++			self.mw_listener.emit('cleanup', clean);
+ 
+-		self.mu_log.debug({
+-			path: path,
+-			key: keys
+-		}, 'Finished writing instruction data.');
++			self.mw_log.debug({
++				path: path,
++				key: keys
++			}, 'Finished writing instruction data.');
++		});
+ 	});
+ };
+ 
+ 
+-MakoInstructionUploader.prototype._stop_listening_for_instructions = function
++MakoInstructionWriter.prototype._stop_listening_for_instructions = function
+ _stop_listening_for_instructions()
+ {
+ 	var self = this;
+@@ -257,7 +332,7 @@ _stop_listening_for_instructions()
+ };
+ 
+ 
+-MakoInstructionUploader.prototype.state_running = function
++MakoInstructionWriter.prototype.state_running = function
+ state_running(S)
+ {
+ 	var self = this;
+@@ -265,7 +340,7 @@ state_running(S)
+ 	self._listen_for_instructions();
+ 
+ 	S.on(self, 'assertPause', function () {
+-		self.mu_log.debug('Pausing mako instruction uploader');
++		self.mw_log.debug('Pausing mako instruction writer');
+ 		S.gotoState('paused');
+ 	});
+ 
+@@ -282,7 +357,7 @@ state_running(S)
+ };
+ 
+ 
+-MakoInstructionUploader.prototype.state_paused = function
++MakoInstructionWriter.prototype.state_paused = function
+ state_paused(S)
+ {
+ 	var self = this;
+@@ -305,26 +380,26 @@ state_paused(S)
+ };
+ 
+ 
+-MakoInstructionUploader.prototype.state_shutdown = function
++MakoInstructionWriter.prototype.state_shutdown = function
+ state_shutdown(S)
+ {
+ 	var self = this;
+ 	self.emit('shutdown');
+ 
+ 	S.on(self, 'assertShutdown', function () {
+-		self.mu_log.debug('Received shutdown event ' +
++		self.mw_log.debug('Received shutdown event ' +
+ 			'multiple times!');
+ 	});
+ };
+ 
+ 
+-MakoInstructionUploader.prototype.describe = function
++MakoInstructionWriter.prototype.describe = function
+ describe()
+ {
+ 	var self = this;
+ 
+ 	var descr = {
+-		component: 'instruction uploader',
++		component: 'instruction writer',
+ 		state: self.getState()
+ 	};
+ 
+@@ -334,6 +409,6 @@ describe()
+ 
+ module.exports = {
+ 
+-	MakoInstructionUploader: MakoInstructionUploader
++	MakoInstructionWriter: MakoInstructionWriter
+ 
+ };
+diff --git a/lib/schema.js b/lib/schema.js
+index 077705a..d1c3c92 100644
+--- a/lib/schema.js
++++ b/lib/schema.js
+@@ -35,19 +35,19 @@ var SORT_ORDERS = [
+ ];
+ 
+ var tunables_cfg_properties = {
+-	'instr_upload_min_batch_size': {
++	'instr_write_min_batch_size': {
+ 		'type': 'integer',
+ 		'minimum': 1
+ 	},
+-	'instr_upload_batch_size': {
++	'instr_write_batch_size': {
+ 		'type': 'integer',
+ 		'minimum': 1
+ 	},
+-	'instr_upload_flush_delay': {
++	'instr_write_flush_delay': {
+ 		'type': 'integer',
+ 		'minimum': 1
+ 	},
+-	'instr_upload_path_prefix': {
++	'instr_write_path_prefix': {
+ 		'type': 'string',
+ 		'minLength': 1
+ 	},
+diff --git a/package.json b/package.json
+index 2958ff7..a425194 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "manta-garbage-collector",
+   "description": "Manta Garbage Collector",
+-  "version": "1.0.1",
++  "version": "2.0.0",
+   "repository": {
+     "type": "git",
+     "url": "git+https://github.com/joyent/manta-garbage-collector.git"
+@@ -16,7 +16,7 @@
+     "cmdutil": "1.1.0",
+     "jsprim": "^2.0.0",
+     "posix-getopt": "1.2.0",
+-    "manta": "5.1.1",
++    "mkdirp": "0.5.1",
+     "mooremachine": "2.2.1",
+     "moray": "^3.3.0",
+     "moray-filter": "1.0.0",
+diff --git a/sapi_manifests/manta-garbage-collector/template b/sapi_manifests/manta-garbage-collector/template
+index 88ff60b..6652ab9 100644
+--- a/sapi_manifests/manta-garbage-collector/template
++++ b/sapi_manifests/manta-garbage-collector/template
+@@ -52,9 +52,10 @@
+ 	],
+ 	"tunables": {
+ 		"instr_upload_min_batch_size": {{#GC_INSTR_UPLOAD_MIN_BATCH_SIZE}}{{GC_INSTR_UPLOAD_MIN_BATCH_SIZE}}{{/GC_INSTR_UPLOAD_MIN_BATCH_SIZE}}{{^GC_INSTR_UPLOAD_MIN_BATCH_SIZE}}1{{/GC_INSTR_UPLOAD_MIN_BATCH_SIZE}},
+-		"instr_upload_batch_size": {{GC_INSTR_UPLOAD_BATCH_SIZE}},
+-		"instr_upload_flush_delay": {{GC_INSTR_UPLOAD_FLUSH_DELAY}},
+-		"instr_upload_path_prefix": "{{GC_INSTR_UPLOAD_PATH_PREFIX}}",
++		"instr_write_batch_size": {{GC_INSTR_UPLOAD_BATCH_SIZE}},
++		"instr_write_min_batch_size": {{GC_INSTR_UPLOAD_MIN_BATCH_SIZE}},
++		"instr_write_flush_delay": {{GC_INSTR_UPLOAD_FLUSH_DELAY}},
++		"instr_write_path_prefix": "/var/spool/manta_gc/mako",
+ 		"record_read_batch_size": {{GC_RECORD_READ_BATCH_SIZE}},
+ 		"record_read_wait_interval": {{GC_RECORD_READ_WAIT_INTERVAL}},
+ 		"record_read_sort_attr": "{{GC_RECORD_READ_SORT_ATTR}}",
+diff --git a/smf/manifests/rsyncd.xml b/smf/manifests/rsyncd.xml
+new file mode 100644
+index 0000000..0fb2087
+--- /dev/null
++++ b/smf/manifests/rsyncd.xml
+@@ -0,0 +1,20 @@
++<?xml version="1.0"?>
++<!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
++<!--
++    Manifest automatically generated by smfgen.
++ -->
++<service_bundle type="manifest" name="application-site-rsyncd" >
++    <service name="application/site/rsyncd" type="service" version="1" >
++        <create_default_instance enabled="true" />
++        <dependency name="dep0" grouping="require_all" restart_on="error" type="service" >
++            <service_fmri value="svc:/milestone/multi-user:default" />
++        </dependency>
++        <exec_method type="method" name="start" exec="/usr/bin/rsync --daemon --no-detach --config=/opt/smartdc/manta-garbage-collector/etc/rsyncd.conf --verbose --log-file=/dev/stdout &amp;" timeout_seconds="10" />
++        <exec_method type="method" name="stop" exec=':kill' timeout_seconds="30" />
++        <template >
++            <common_name >
++                <loctext xml:lang="C" >rsync daemon</loctext>
++            </common_name>
++        </template>
++    </service>
++</service_bundle>
+diff --git a/test/common.js b/test/common.js
+index f4c9f63..135b6c9 100644
+--- a/test/common.js
++++ b/test/common.js
+@@ -13,7 +13,6 @@ var mod_bunyan = require('bunyan');
+ var mod_fs = require('fs');
+ var mod_jsprim = require('jsprim');
+ var mod_path = require('path');
+-var mod_manta = require('manta');
+ var mod_moray = require('moray');
+ var mod_verror = require('verror');
+ var mod_vasync = require('vasync');
+@@ -21,7 +20,7 @@ var mod_vasync = require('vasync');
+ var VE = mod_verror.VError;
+ var MorayDeleteRecordReader = require('../lib/moray_delete_record_reader').MorayDeleteRecordReader;
+ var MorayDeleteRecordCleaner = require('../lib/moray_delete_record_cleaner').MorayDeleteRecordCleaner;
+-var MakoInstructionUploader = require('../lib/mako_instruction_uploader').MakoInstructionUploader;
++var MakoInstructionWriter = require('../lib/mako_instruction_writer').MakoInstructionWriter;
+ var DeleteRecordTransformer = require('../lib/delete_record_transformer').DeleteRecordTransformer;
+ 
+ var GCWorker = require('../lib/gc_worker').GCWorker;
+@@ -109,15 +108,6 @@ create_mock_context(opts, done)
+ 				next(err);
+ 			});
+ 		},
+-		function create_manta_client(next) {
+-			if (opts.skip_manta_client) {
+-				next();
+-				return;
+-			}
+-			ctx.ctx_manta_client = mod_manta.createClient(
+-			    ctx.ctx_cfg.manta);
+-			next();
+-		}
+ 	], function (err) {
+ 		if (err) {
+ 			console.log(err, 'unable to created mock context');
+@@ -157,7 +147,7 @@ create_moray_delete_record_cleaner(ctx, shard)
+ 
+ 
+ function
+-create_mako_instruction_uploader(ctx, listener)
++create_mako_instruction_writer(ctx, listener)
+ {
+ 	var opts = {
+ 		ctx: ctx,
+@@ -247,7 +237,7 @@ create_gc_worker(ctx, shard, bucket, log) {
+ 
+ /*
+  * Given an object mapping storage ids to arrays identifying individual objects.
+- * Verify that mako cleanup instructions have been uploaded for those objects
++ * Verify that mako cleanup instructions have been written for those objects
+  * and only appear once in the object data uploaded by this GC worker.
+  */
+ function
+diff --git a/tools/records.js b/tools/records.js
+index 75d4f4f..7ee8614 100644
+--- a/tools/records.js
++++ b/tools/records.js
+@@ -5,13 +5,12 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ var mod_assertplus = require('assert-plus');
+ var mod_cmdutil = require('cmdutil');
+ var mod_jsprim = require('jsprim');
+-var mod_manta = require('manta');
+ var mod_moray = require('moray');
+ var mod_getopt = require('posix-getopt');
+ var mod_util = require('util');

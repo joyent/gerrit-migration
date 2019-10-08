@@ -1,0 +1,495 @@
+commit 39324c3c3e700905593cf884cb6987cf0db01381
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2019-04-15T21:58:02+00:00 (6 months ago)
+    
+    OS-7727 want mac rx barrier function
+    Reviewed by: Robert Mustacchi <rm@joyent.com>
+    Reviewed by: Ryan Zezeski <rpz@joyent.com>
+    Approved by: Ryan Zezeski <rpz@joyent.com>
+
+diff --git a/usr/src/uts/common/io/mac/mac.c b/usr/src/uts/common/io/mac/mac.c
+index a63a6a5c61..0192e2d0d1 100644
+--- a/usr/src/uts/common/io/mac/mac.c
++++ b/usr/src/uts/common/io/mac/mac.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  * Copyright 2015 Garrett D'Amore <garrett@damore.org>
+  */
+ 
+@@ -707,12 +707,45 @@ mac_callback_remove_wait(mac_cb_info_t *mcbi)
+ 	}
+ }
+ 
++void
++mac_callback_barrier(mac_cb_info_t *mcbi)
++{
++	ASSERT(MUTEX_HELD(mcbi->mcbi_lockp));
++	ASSERT3U(mcbi->mcbi_barrier_cnt, <, UINT_MAX);
++
++	if (mcbi->mcbi_walker_cnt == 0) {
++		return;
++	}
++
++	mcbi->mcbi_barrier_cnt++;
++	do {
++		cv_wait(&mcbi->mcbi_cv, mcbi->mcbi_lockp);
++	} while (mcbi->mcbi_walker_cnt > 0);
++	mcbi->mcbi_barrier_cnt--;
++	cv_broadcast(&mcbi->mcbi_cv);
++}
++
++void
++mac_callback_walker_enter(mac_cb_info_t *mcbi)
++{
++	mutex_enter(mcbi->mcbi_lockp);
++	/*
++	 * Incoming walkers should give precedence to timely clean-up of
++	 * deleted callback entries and requested barriers.
++	 */
++	while (mcbi->mcbi_del_cnt > 0 || mcbi->mcbi_barrier_cnt > 0) {
++		cv_wait(&mcbi->mcbi_cv, mcbi->mcbi_lockp);
++	}
++	mcbi->mcbi_walker_cnt++;
++	mutex_exit(mcbi->mcbi_lockp);
++}
++
+ /*
+  * The last mac callback walker does the cleanup. Walk the list and unlik
+  * all the logically deleted entries and construct a temporary list of
+  * removed entries. Return the list of removed entries to the caller.
+  */
+-mac_cb_t *
++static mac_cb_t *
+ mac_callback_walker_cleanup(mac_cb_info_t *mcbi, mac_cb_t **mcb_head)
+ {
+ 	mac_cb_t	*p;
+@@ -741,7 +774,90 @@ mac_callback_walker_cleanup(mac_cb_info_t *mcbi, mac_cb_t **mcb_head)
+ 	return (rmlist);
+ }
+ 
+-boolean_t
++void
++mac_callback_walker_exit(mac_cb_info_t *mcbi, mac_cb_t **headp,
++    boolean_t is_promisc)
++{
++	boolean_t do_wake = B_FALSE;
++
++	mutex_enter(mcbi->mcbi_lockp);
++
++	/* If walkers remain, nothing more can be done for now */
++	if (--mcbi->mcbi_walker_cnt != 0) {
++		mutex_exit(mcbi->mcbi_lockp);
++		return;
++	}
++
++	if (mcbi->mcbi_del_cnt != 0) {
++		mac_cb_t *rmlist;
++
++		rmlist = mac_callback_walker_cleanup(mcbi, headp);
++
++		if (!is_promisc) {
++			/* The "normal" non-promisc callback clean-up */
++			mac_callback_free(rmlist);
++		} else {
++			mac_cb_t *mcb, *mcb_next;
++
++			/*
++			 * The promisc callbacks are in 2 lists, one off the
++			 * 'mip' and another off the 'mcip' threaded by
++			 * mpi_mi_link and mpi_mci_link respectively.  There
++			 * is, however, only a single shared total walker
++			 * count, and an entry cannot be physically unlinked if
++			 * a walker is active on either list. The last walker
++			 * does this cleanup of logically deleted entries.
++			 *
++			 * With a list of callbacks deleted from above from
++			 * mi_promisc_list (headp), remove the corresponding
++			 * entry from mci_promisc_list (headp_pair) and free
++			 * the structure.
++			 */
++			for (mcb = rmlist; mcb != NULL; mcb = mcb_next) {
++				mac_promisc_impl_t *mpip;
++				mac_client_impl_t *mcip;
++
++				mcb_next = mcb->mcb_nextp;
++				mpip = (mac_promisc_impl_t *)mcb->mcb_objp;
++				mcip = mpip->mpi_mcip;
++
++				ASSERT3P(&mcip->mci_mip->mi_promisc_cb_info,
++				    ==, mcbi);
++				ASSERT3P(&mcip->mci_mip->mi_promisc_list,
++				    ==, headp);
++
++				VERIFY(mac_callback_remove(mcbi,
++				    &mcip->mci_promisc_list,
++				    &mpip->mpi_mci_link));
++				mcb->mcb_flags = 0;
++				mcb->mcb_nextp = NULL;
++				kmem_cache_free(mac_promisc_impl_cache, mpip);
++			}
++		}
++
++		/*
++		 * Wake any walker threads that could be waiting in
++		 * mac_callback_walker_enter() until deleted items have been
++		 * cleaned from the list.
++		 */
++		do_wake = B_TRUE;
++	}
++
++	if (mcbi->mcbi_barrier_cnt != 0) {
++		/*
++		 * One or more threads are waiting for all walkers to exit the
++		 * callback list.  Notify them, now that the list is clear.
++		 */
++		do_wake = B_TRUE;
++	}
++
++	if (do_wake) {
++		cv_broadcast(&mcbi->mcbi_cv);
++	}
++	mutex_exit(mcbi->mcbi_lockp);
++}
++
++static boolean_t
+ mac_callback_lookup(mac_cb_t **mcb_headp, mac_cb_t *mcb_elem)
+ {
+ 	mac_cb_t	*mcb;
+@@ -755,7 +871,7 @@ mac_callback_lookup(mac_cb_t **mcb_headp, mac_cb_t *mcb_elem)
+ 	return (B_FALSE);
+ }
+ 
+-boolean_t
++static boolean_t
+ mac_callback_find(mac_cb_info_t *mcbi, mac_cb_t **mcb_headp, mac_cb_t *mcb_elem)
+ {
+ 	boolean_t	found;
+@@ -780,40 +896,6 @@ mac_callback_free(mac_cb_t *rmlist)
+ 	}
+ }
+ 
+-/*
+- * The promisc callbacks are in 2 lists, one off the 'mip' and another off the
+- * 'mcip' threaded by mpi_mi_link and mpi_mci_link respectively. However there
+- * is only a single shared total walker count, and an entry can't be physically
+- * unlinked if a walker is active on either list. The last walker does this
+- * cleanup of logically deleted entries.
+- */
+-void
+-i_mac_promisc_walker_cleanup(mac_impl_t *mip)
+-{
+-	mac_cb_t	*rmlist;
+-	mac_cb_t	*mcb;
+-	mac_cb_t	*mcb_next;
+-	mac_promisc_impl_t	*mpip;
+-
+-	/*
+-	 * Construct a temporary list of deleted callbacks by walking the
+-	 * the mi_promisc_list. Then for each entry in the temporary list,
+-	 * remove it from the mci_promisc_list and free the entry.
+-	 */
+-	rmlist = mac_callback_walker_cleanup(&mip->mi_promisc_cb_info,
+-	    &mip->mi_promisc_list);
+-
+-	for (mcb = rmlist; mcb != NULL; mcb = mcb_next) {
+-		mcb_next = mcb->mcb_nextp;
+-		mpip = (mac_promisc_impl_t *)mcb->mcb_objp;
+-		VERIFY(mac_callback_remove(&mip->mi_promisc_cb_info,
+-		    &mpip->mpi_mcip->mci_promisc_list, &mpip->mpi_mci_link));
+-		mcb->mcb_flags = 0;
+-		mcb->mcb_nextp = NULL;
+-		kmem_cache_free(mac_promisc_impl_cache, mpip);
+-	}
+-}
+-
+ void
+ i_mac_notify(mac_impl_t *mip, mac_notify_type_t type)
+ {
+@@ -3168,7 +3250,7 @@ mactype_unregister(const char *ident)
+ {
+ 	mactype_t	*mtp;
+ 	mod_hash_val_t	val;
+-	int 		err;
++	int		err;
+ 
+ 	/*
+ 	 * Let's not allow MAC drivers to use this plugin while we're
+diff --git a/usr/src/uts/common/io/mac/mac_client.c b/usr/src/uts/common/io/mac/mac_client.c
+index de5ef6121f..88b29c0e8f 100644
+--- a/usr/src/uts/common/io/mac/mac_client.c
++++ b/usr/src/uts/common/io/mac/mac_client.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  * Copyright 2017 RackTop Systems.
+  */
+ 
+@@ -610,10 +610,10 @@ mac_client_link_state(mac_client_impl_t *mcip)
+ uint64_t
+ mac_client_stat_get(mac_client_handle_t mch, uint_t stat)
+ {
+-	mac_client_impl_t 	*mcip = (mac_client_impl_t *)mch;
+-	mac_impl_t 		*mip = mcip->mci_mip;
+-	flow_entry_t 		*flent = mcip->mci_flent;
+-	mac_soft_ring_set_t 	*mac_srs;
++	mac_client_impl_t	*mcip = (mac_client_impl_t *)mch;
++	mac_impl_t		*mip = mcip->mci_mip;
++	flow_entry_t		*flent = mcip->mci_flent;
++	mac_soft_ring_set_t	*mac_srs;
+ 	mac_rx_stats_t		*mac_rx_stat, *old_rx_stat;
+ 	mac_tx_stats_t		*mac_tx_stat, *old_tx_stat;
+ 	int i;
+@@ -1632,6 +1632,32 @@ mac_rx_clear(mac_client_handle_t mch)
+ 	mac_rx_set(mch, mac_rx_def, NULL);
+ }
+ 
++void
++mac_rx_barrier(mac_client_handle_t mch)
++{
++	mac_client_impl_t *mcip = (mac_client_impl_t *)mch;
++	mac_impl_t *mip = mcip->mci_mip;
++
++	i_mac_perim_enter(mip);
++
++	/* If a RX callback is set, quiesce and restart that datapath */
++	if (mcip->mci_rx_fn != mac_rx_def) {
++		mac_rx_client_quiesce(mch);
++		mac_rx_client_restart(mch);
++	}
++
++	/* If any promisc callbacks are registered, perform a barrier there */
++	if (mcip->mci_promisc_list != NULL || mip->mi_promisc_list != NULL) {
++		mac_cb_info_t *mcbi =  &mip->mi_promisc_cb_info;
++
++		mutex_enter(mcbi->mcbi_lockp);
++		mac_callback_barrier(mcbi);
++		mutex_exit(mcbi->mcbi_lockp);
++	}
++
++	i_mac_perim_exit(mip);
++}
++
+ void
+ mac_secondary_dup(mac_client_handle_t smch, mac_client_handle_t dmch)
+ {
+@@ -1801,7 +1827,7 @@ mac_client_set_rings_prop(mac_client_impl_t *mcip, mac_resource_props_t *mrp,
+ 				if (mac_check_macaddr_shared(mcip->mci_unicast))
+ 					return (0);
+ 
+-				ngrp = 	mac_reserve_rx_group(mcip, mac_addr,
++				ngrp = mac_reserve_rx_group(mcip, mac_addr,
+ 				    B_TRUE);
+ 				/* Couldn't give it a group, that's fine */
+ 				if (ngrp == NULL)
+@@ -1833,7 +1859,7 @@ mac_client_set_rings_prop(mac_client_impl_t *mcip, mac_resource_props_t *mrp,
+ 			if (mac_check_macaddr_shared(mcip->mci_unicast))
+ 				return (EINVAL);
+ 
+-			ngrp = 	mac_reserve_rx_group(mcip, mac_addr, B_TRUE);
++			ngrp = mac_reserve_rx_group(mcip, mac_addr, B_TRUE);
+ 			if (ngrp == NULL)
+ 				return (ENOSPC);
+ 
+@@ -1976,7 +2002,7 @@ mac_client_set_rings_prop(mac_client_impl_t *mcip, mac_resource_props_t *mrp,
+ 
+ 		/* Switch to H/W */
+ 		if (group == defgrp && ((mrp->mrp_ntxrings > 0) || unspec)) {
+-			ngrp = 	mac_reserve_tx_group(mcip, B_TRUE);
++			ngrp = mac_reserve_tx_group(mcip, B_TRUE);
+ 			if (ngrp == NULL)
+ 				return (ENOSPC);
+ 			mac_tx_client_quiesce((mac_client_handle_t)mcip);
+@@ -2041,7 +2067,7 @@ mac_client_set_rings_prop(mac_client_impl_t *mcip, mac_resource_props_t *mrp,
+ static int
+ mac_resource_ctl_set(mac_client_handle_t mch, mac_resource_props_t *mrp)
+ {
+-	mac_client_impl_t 	*mcip = (mac_client_impl_t *)mch;
++	mac_client_impl_t	*mcip = (mac_client_impl_t *)mch;
+ 	mac_impl_t		*mip = (mac_impl_t *)mcip->mci_mip;
+ 	mac_impl_t		*umip = mcip->mci_upper_mip;
+ 	int			err = 0;
+@@ -4712,7 +4738,7 @@ mac_set_resources(mac_handle_t mh, mac_resource_props_t *mrp)
+ void
+ mac_get_resources(mac_handle_t mh, mac_resource_props_t *mrp)
+ {
+-	mac_impl_t 		*mip = (mac_impl_t *)mh;
++	mac_impl_t		*mip = (mac_impl_t *)mh;
+ 	mac_client_impl_t	*mcip;
+ 
+ 	mcip = mac_primary_client_handle(mip);
+@@ -4730,7 +4756,7 @@ mac_get_resources(mac_handle_t mh, mac_resource_props_t *mrp)
+ void
+ mac_get_effective_resources(mac_handle_t mh, mac_resource_props_t *mrp)
+ {
+-	mac_impl_t 		*mip = (mac_impl_t *)mh;
++	mac_impl_t		*mip = (mac_impl_t *)mh;
+ 	mac_client_impl_t	*mcip;
+ 
+ 	mcip = mac_primary_client_handle(mip);
+diff --git a/usr/src/uts/common/sys/mac_client.h b/usr/src/uts/common/sys/mac_client.h
+index 3290db92e6..8fff314bfe 100644
+--- a/usr/src/uts/common/sys/mac_client.h
++++ b/usr/src/uts/common/sys/mac_client.h
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2018 Joyent, Inc.  All rights reserved.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -138,6 +138,7 @@ extern void mac_multicast_remove(mac_client_handle_t, const uint8_t *);
+ 
+ extern void mac_rx_set(mac_client_handle_t, mac_rx_t, void *);
+ extern void mac_rx_clear(mac_client_handle_t);
++extern void mac_rx_barrier(mac_client_handle_t);
+ extern void mac_secondary_dup(mac_client_handle_t, mac_client_handle_t);
+ extern void mac_secondary_cleanup(mac_client_handle_t);
+ extern mac_tx_cookie_t mac_tx(mac_client_handle_t, mblk_t *,
+diff --git a/usr/src/uts/common/sys/mac_impl.h b/usr/src/uts/common/sys/mac_impl.h
+index 593322b990..ce09304699 100644
+--- a/usr/src/uts/common/sys/mac_impl.h
++++ b/usr/src/uts/common/sys/mac_impl.h
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #ifndef	_SYS_MAC_IMPL_H
+@@ -108,6 +108,7 @@ typedef struct mac_cb_info_s {
+ 	kcondvar_t	mcbi_cv;
+ 	uint_t		mcbi_del_cnt;		/* Deleted callback cnt */
+ 	uint_t		mcbi_walker_cnt;	/* List walker count */
++	uint_t		mcbi_barrier_cnt;	/* Barrier waiter count */
+ } mac_cb_info_t;
+ 
+ typedef struct mac_notify_cb_s {
+@@ -123,40 +124,18 @@ typedef struct mac_notify_cb_s {
+  */
+ typedef boolean_t (*mcb_func_t)(mac_cb_info_t *, mac_cb_t **, mac_cb_t *);
+ 
+-#define	MAC_CALLBACK_WALKER_INC(mcbi) {				\
+-	mutex_enter((mcbi)->mcbi_lockp);			\
+-	(mcbi)->mcbi_walker_cnt++;				\
+-	mutex_exit((mcbi)->mcbi_lockp);				\
+-}
++#define	MAC_CALLBACK_WALKER_INC(mcbi) \
++	mac_callback_walker_enter(mcbi)
+ 
+-#define	MAC_CALLBACK_WALKER_INC_HELD(mcbi)	(mcbi)->mcbi_walker_cnt++;
+-
+-#define	MAC_CALLBACK_WALKER_DCR(mcbi, headp) {			\
+-	mac_cb_t	*rmlist;				\
+-								\
+-	mutex_enter((mcbi)->mcbi_lockp);			\
+-	if (--(mcbi)->mcbi_walker_cnt == 0 && (mcbi)->mcbi_del_cnt != 0) { \
+-		rmlist = mac_callback_walker_cleanup((mcbi), headp);	\
+-		mac_callback_free(rmlist);			\
+-		cv_broadcast(&(mcbi)->mcbi_cv);			\
+-	}							\
+-	mutex_exit((mcbi)->mcbi_lockp);				\
+-}
++#define	MAC_CALLBACK_WALKER_DCR(mcbi, headp) \
++	mac_callback_walker_exit(mcbi, headp, B_FALSE)
+ 
+-#define	MAC_PROMISC_WALKER_INC(mip)				\
+-	MAC_CALLBACK_WALKER_INC(&(mip)->mi_promisc_cb_info)
+-
+-#define	MAC_PROMISC_WALKER_DCR(mip) {				\
+-	mac_cb_info_t	*mcbi;					\
+-								\
+-	mcbi = &(mip)->mi_promisc_cb_info;			\
+-	mutex_enter(mcbi->mcbi_lockp);				\
+-	if (--mcbi->mcbi_walker_cnt == 0 && mcbi->mcbi_del_cnt != 0) { \
+-		i_mac_promisc_walker_cleanup(mip);		\
+-		cv_broadcast(&mcbi->mcbi_cv);			\
+-	}							\
+-	mutex_exit(mcbi->mcbi_lockp);				\
+-}
++#define	MAC_PROMISC_WALKER_INC(mip) \
++	mac_callback_walker_enter(&(mip)->mi_promisc_cb_info)
++
++#define	MAC_PROMISC_WALKER_DCR(mip) \
++	mac_callback_walker_exit(&(mip)->mi_promisc_cb_info, \
++	    &(mip)->mi_promisc_list, B_TRUE)
+ 
+ typedef struct mactype_s {
+ 	const char	*mt_ident;
+@@ -253,7 +232,7 @@ struct mac_ring_s {
+ 	(mr)->mr_refcnt++;				\
+ }
+ 
+-#define	MR_REFRELE(mr)		{	 		\
++#define	MR_REFRELE(mr)		{			\
+ 	mutex_enter(&(mr)->mr_lock);			\
+ 	ASSERT((mr)->mr_refcnt != 0);			\
+ 	(mr)->mr_refcnt--;				\
+@@ -314,7 +293,7 @@ struct mac_group_s {
+ 	mac_ring_handle_t mrh = rh;					\
+ 	mac_impl_t *mimpl = (mac_impl_t *)mhp;				\
+ 	/*								\
+-	 * Send packets through a selected tx ring, or through the 	\
++	 * Send packets through a selected tx ring, or through the	\
+ 	 * default handler if there is no selected ring.		\
+ 	 */								\
+ 	if (mrh == NULL)						\
+@@ -336,9 +315,9 @@ struct mac_group_s {
+ #define	MAC_TX(mip, rh, mp, src_mcip) {					\
+ 	mac_ring_handle_t	rhandle = (rh);				\
+ 	/*								\
+-	 * If there is a bound Hybrid I/O share, send packets through 	\
++	 * If there is a bound Hybrid I/O share, send packets through	\
+ 	 * the default tx ring. (When there's a bound Hybrid I/O share,	\
+-	 * the tx rings of this client are mapped in the guest domain 	\
++	 * the tx rings of this client are mapped in the guest domain	\
+ 	 * and not accessible from here.)				\
+ 	 */								\
+ 	_NOTE(CONSTANTCONDITION)					\
+@@ -347,7 +326,7 @@ struct mac_group_s {
+ 	if (mip->mi_promisc_list != NULL)				\
+ 		mac_promisc_dispatch(mip, mp, src_mcip);		\
+ 	/*								\
+-	 * Grab the proper transmit pointer and handle. Special 	\
++	 * Grab the proper transmit pointer and handle. Special		\
+ 	 * optimization: we can test mi_bridge_link itself atomically,	\
+ 	 * and if that indicates no bridge send packets through tx ring.\
+ 	 */								\
+@@ -765,12 +744,13 @@ extern void mac_rx_deliver(void *, mac_resource_handle_t, mblk_t *,
+     mac_header_info_t *);
+ extern void mac_tx_notify(mac_impl_t *);
+ 
+-extern	boolean_t mac_callback_find(mac_cb_info_t *, mac_cb_t **, mac_cb_t *);
+-extern	void	mac_callback_add(mac_cb_info_t *, mac_cb_t **, mac_cb_t *);
+-extern	boolean_t mac_callback_remove(mac_cb_info_t *, mac_cb_t **, mac_cb_t *);
+-extern	void	mac_callback_remove_wait(mac_cb_info_t *);
+-extern	void	mac_callback_free(mac_cb_t *);
+-extern	mac_cb_t *mac_callback_walker_cleanup(mac_cb_info_t *, mac_cb_t **);
++extern void mac_callback_add(mac_cb_info_t *, mac_cb_t **, mac_cb_t *);
++extern boolean_t mac_callback_remove(mac_cb_info_t *, mac_cb_t **, mac_cb_t *);
++extern void mac_callback_remove_wait(mac_cb_info_t *);
++extern void mac_callback_barrier(mac_cb_info_t *);
++extern void mac_callback_free(mac_cb_t *);
++extern void mac_callback_walker_enter(mac_cb_info_t *);
++extern void mac_callback_walker_exit(mac_cb_info_t *, mac_cb_t **, boolean_t);
+ 
+ /* in mac_bcast.c */
+ extern void mac_bcast_init(void);
+@@ -884,7 +864,6 @@ extern void mac_tx_client_block(mac_client_impl_t *);
+ extern void mac_tx_client_unblock(mac_client_impl_t *);
+ extern void mac_tx_invoke_callbacks(mac_client_impl_t *, mac_tx_cookie_t);
+ extern int i_mac_promisc_set(mac_impl_t *, boolean_t);
+-extern void i_mac_promisc_walker_cleanup(mac_impl_t *);
+ extern mactype_t *mactype_getplugin(const char *);
+ extern void mac_addr_factory_init(mac_impl_t *);
+ extern void mac_addr_factory_fini(mac_impl_t *);

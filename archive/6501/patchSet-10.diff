@@ -1,0 +1,718 @@
+commit fa1a279d1b93731c4e08bead5eec0bb6e6b3669e
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2019-07-11T21:33:04+00:00 (3 months ago)
+    
+    MANTA-4373 muppet should use the stats/control socket to disable backends
+    Reviewed by: John Levon <john.levon@joyent.com>
+    Approved by: Robert Mustacchi <rm@joyent.com>
+
+diff --git a/lib/app.js b/lib/app.js
+index 8a95ca6..e245d3e 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -24,6 +24,7 @@ const FSM = require('mooremachine').FSM;
+ 
+ const lib_lbman = require('./lb_manager');
+ const lib_watch = require('./watch');
++const lib_hasock = require('./haproxy_sock');
+ 
+ function domainToPath(domain) {
+     return ('/' + domain.split('.').reverse().join('/'));
+@@ -31,6 +32,8 @@ function domainToPath(domain) {
+ 
+ const MDATA_TIMEOUT = 30000;
+ const SETUP_RETRY_TIMEOUT = 30000;
++const BESTATE_DOUBLECHECK = 30000;
++const MAX_DIRTY_TIME = 6*3600*1000;
+ 
+ function AppFSM(cfg) {
+     this.a_log = cfg.log;
+@@ -45,6 +48,10 @@ function AppFSM(cfg) {
+     this.a_name = cfg.name;
+     this.a_path = domainToPath(cfg.name);
+     this.a_lastError = null;
++    this.a_lastCleanTime = 0;
++    this.a_beIdx = {};
++    this.a_lastServersMap = null;
++    this.a_hosts = null;
+ 
+     this.a_reloadCmd = cfg.reload;
+ 
+@@ -177,27 +184,267 @@ AppFSM.prototype.state_running = function (S) {
+         self.a_nsf.childrenChanged(kids);
+     });
+ 
+-    S.on(this.a_nsf, 'hostsChanged', function (hosts) {
+-        const opts = {
+-            trustedIP: self.a_trustedIP,
+-            untrustedIPs: self.a_untrustedIPs,
+-            hosts: hosts,
+-            log: self.a_log.child({component: 'lb_manager'}),
+-            reload: self.a_reloadCmd
++    S.on(this.a_zk, 'session', function () {
++        S.gotoState('watch');
++    });
++
++    S.on(this.a_nsf, 'hostsChanged', function (hosts, diff) {
++        var newHosts = diff.added.filter(function (h) {
++            return (self.a_beIdx[h] === undefined);
++        });
++        /*
++         * If new hosts have been added that we've never seen before, we must
++         * regenerate the configuration.
++         */
++        if (newHosts.length > 0) {
++            self.a_hosts = hosts;
++            S.gotoState('running.reload');
++        } else {
++            /*
++             * But, if that's not the case, we can apply the change using the
++             * stats socket. This makes us "dirty" because there are in-memory
++             * changes not in the config file.
++             */
++            self.a_hosts = hosts;
++            S.gotoState('running.dirty');
++        }
++    });
++
++    /*
++     * Periodically uses the stats socket to double-check that the haproxy
++     * state in memory matches what we expect.
++     */
++    S.interval(BESTATE_DOUBLECHECK, function () {
++        if (!self.a_beIdx)
++            return;
++        const statopts = {
++            log: self.a_log.child({ component: 'haproxy_sock' })
+         };
+-        log.trace({ hosts: hosts }, 'going to reload lb config');
+-        lib_lbman.reload(opts, function (err) {
++        log.trace('doing periodic double-check of haproxy servers');
++        lib_hasock.serverStats(statopts, function (err, srvs) {
+             if (err) {
+-                log.error(err, 'lb reload failed');
++                log.error(err, 'failed to check server state with ' +
++                    'haproxy control socket during periodic check');
++                S.gotoState('running.dirty');
+                 return;
+             }
+-            log.info({ hosts: hosts }, 'lb config reloaded');
++            var res = self.checkStats(srvs);
++            if (res.wrong.length > 0 || res.reload) {
++                log.warn(res, 'haproxy server state was out of sync during ' +
++                    'periodic check');
++
++                if (res.reload) {
++                    S.gotoState('running.reload');
++                } else {
++                    S.gotoState('running.dirty');
++                }
++            } else {
++                log.trace('periodic check ok');
++            }
+         });
+     });
++};
+ 
+-    S.on(this.a_zk, 'session', function () {
+-        S.gotoState('watch');
++AppFSM.prototype.state_running.clean = function (S) {
++    var self = this;
++    this.a_lastServersMap = null;
++    this.a_lastCleanTime = Date.now();
++    /*
++     * We use lastCleanTime in running.dirty to decide how long it has been
++     * since we were "last clean". That means it really needs to reflect when
++     * we were last *in* running.clean, as opposed to when we last *entered*
++     * it.
++     *
++     * If we only set it at the top of this state entry function then we won't
++     * get this the way we want. Since we don't have state exit triggers in
++     * mooremachine, just set up an interval timer here.
++     */
++    S.interval(5000, function () {
++        self.a_lastCleanTime = Date.now();
++    });
++};
++
++/*
++ * Reload the config and then return to "running.clean" if everything is ok.
++ *
++ * Note that this is a sub-state of running, so it has all of its handlers.
++ */
++AppFSM.prototype.state_running.reload = function (S) {
++    var self = this;
++    var log = this.a_log;
++    var hosts = this.a_hosts;
++    const opts = {
++        trustedIP: self.a_trustedIP,
++        untrustedIPs: self.a_untrustedIPs,
++        hosts: hosts,
++        log: self.a_log.child({ component: 'lb_manager' }),
++        reload: self.a_reloadCmd
++    };
++    log.trace({ hosts: hosts }, 'going to reload lb config');
++    lib_lbman.reload(opts, S.callback(function (err, beIdx) {
++        if (err) {
++            log.error(err, 'lb reload failed');
++            S.gotoState('running.dirty');
++            return;
++        }
++        self.a_beIdx = beIdx;
++        log.info({ hosts: hosts }, 'lb config reloaded');
++        S.gotoState('running.clean');
++    }));
++};
++
++function hasDisabledServers(map) {
++    for (var svname in map) {
++        if (map[svname] === false) {
++            return (true);
++        }
++    }
++    return (false);
++}
++
++/*
++ * We sit in this state when things are "dirty" (there has been a change to
++ * the set of enabled backends that isn't in the config file).
++ *
++ * This state applies the change to the haproxy in-memory state and waits
++ * for at most MAX_DIRTY_TIME before reloading.
++ */
++AppFSM.prototype.state_running.dirty = function (S) {
++    var self = this;
++    var log = this.a_log;
++
++    /*
++     * The syncServerState call takes a map of server name => bool
++     * where 'true' indicates that a server should be enabled, and
++     * 'false' indicates that it should be disabled (in MAINT).
++     */
++    var servers = {};
++    /*
++     * Start with all of the hosts that we set up last time generated
++     * a new config set to false
++     */
++    for (var host in self.a_beIdx) {
++        servers[self.a_beIdx[host]] = false;
++    }
++    /* Then set just the hosts we actually want enabled to true. */
++    this.a_hosts.forEach(function (h) {
++        servers[self.a_beIdx[h]] = true;
++    });
++
++    var now = Date.now();
++    var delta = now - this.a_lastCleanTime;
++    if (delta > MAX_DIRTY_TIME && hasDisabledServers(servers)) {
++        S.gotoState('running.reload');
++        return;
++    }
++
++    var timeout = MAX_DIRTY_TIME - delta;
++    S.timeout(timeout, function () {
++        if (hasDisabledServers(servers)) {
++            log.info('dirty changes to haproxy backend set have persisted ' +
++                'for MAX_DIRTY_TIME, will now reload');
++            S.gotoState('running.reload');
++        }
++    });
++
++    const syncopts = {
++        log: self.a_log.child({ component: 'haproxy_sock' }),
++        servers: servers
++    };
++    lib_hasock.syncServerState(syncopts, function (err) {
++        if (err) {
++            log.error(err, 'failed to sync server state with ' +
++                'haproxy control socket; falling back to new config');
++            S.gotoState('running.reload');
++            return;
++        }
++        self.a_lastServersMap = servers;
++        log.info({ hosts: self.a_hosts }, 'lb updated using control socket');
++        /*
++         * If we changed to a state where no servers are disabled then we're
++         * back to being "clean" with respect to the config file.
++         */
++        if (!hasDisabledServers(servers))
++            S.gotoState('running.clean');
++    });
++};
++
++/*
++ * Matches the output of lib_hasock.serverStats() against our idea of which
++ * servers are in the haproxy config and whether they are enabled or disabled.
++ */
++AppFSM.prototype.checkStats = function (stats) {
++    var self = this;
++    var invmap = {};
++    for (var x in this.a_beIdx) {
++        invmap[this.a_beIdx[x]] = x;
++    }
++    var wrong = [];
++    var reload = false;
++    stats.forEach(function (srv) {
++        /*
++         * Keep only select fields from the stat structure, so we can print
++         * this out in the logs without it being ridiculously noisy.
++         *
++         * We replace the local so we make sure all fields we use for making
++         * decisions here are in the log.
++         */
++        srv = {
++            pxname: srv.pxname,
++            svname: srv.svname,
++            status: srv.status,
++            addr: srv.addr
++        };
++        var host = invmap[srv.svname];
++        /*
++         * If we've never heard of the svname, that means the config must be
++         * really badly out of sync (not even same number of backends).
++         */
++        if (host === undefined) {
++            wrong.push(srv);
++            srv.reason = 'no-host';
++            reload = true;
++            return;
++        }
++        /*
++         * The "addr" field was added in newer haproxy versions, if we have
++         * it, check that our expected IP address is there.
++         */
++        if (srv.addr && srv.addr.indexOf(host + ':') === -1) {
++            wrong.push(srv);
++            srv.reason = 'addr-mismatch';
++            reload = true;
++            return;
++        }
++        /*
++         * Finally check that it's in our enabled/disabled map, if we have
++         * one (if we're dirty).
++         */
++        if (self.a_lastServersMap) {
++            var ena = self.a_lastServersMap[srv.svname];
++            if (ena === true && srv.status === 'MAINT') {
++                wrong.push(srv);
++                srv.reason = 'want-enabled';
++                return;
++            }
++            if (ena === false && srv.status !== 'MAINT') {
++                wrong.push(srv);
++                srv.reason = 'want-disabled';
++                return;
++            }
++            if (ena === undefined) {
++                wrong.push(srv);
++                srv.reason = 'no-map';
++                reload = true;
++                return;
++            }
++        } else if (srv.status === 'MAINT') {
++            wrong.push(srv);
++            srv.reason = 'disabled-but-not-dirty';
++            return;
++        }
+     });
++    return ({ wrong: wrong, reload: reload });
+ };
+ 
+ module.exports = {
+diff --git a/lib/haproxy_sock.js b/lib/haproxy_sock.js
+new file mode 100644
+index 0000000..b625047
+--- /dev/null
++++ b/lib/haproxy_sock.js
+@@ -0,0 +1,346 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++/*jsl:ignore*/
++'use strict';
++/*jsl:end*/
++
++const mod_fs = require('fs');
++const mod_assert = require('assert-plus');
++const mod_forkexec = require('forkexec');
++const mod_net = require('net');
++const mod_util = require('util');
++const mod_vasync = require('vasync');
++const VError = require('verror');
++const FSM = require('mooremachine').FSM;
++
++/* This should be kept in sync with haproxy.cfg.in */
++const HAPROXY_SOCK_PATH = '/tmp/haproxy';
++
++const CONNECT_TIMEOUT = 3000;
++const COMMAND_TIMEOUT = 30000;
++
++function HaproxyCmdFSM(opts) {
++    mod_assert.string(opts.command, 'opts.command');
++    this.hcf_cmd = opts.command;
++
++    mod_assert.object(opts.log, 'opts.log');
++    this.hcf_log = opts.log;
++
++    this.hcf_sock = null;
++    this.hcf_lastError = null;
++    this.hcf_buf = '';
++
++    FSM.call(this, 'connecting');
++}
++mod_util.inherits(HaproxyCmdFSM, FSM);
++
++HaproxyCmdFSM.prototype.state_connecting = function (S) {
++    var self = this;
++
++    this.hcf_sock = mod_net.connect(HAPROXY_SOCK_PATH);
++
++    S.gotoStateOn(this.hcf_sock, 'connect', 'writing');
++    S.on(this.hcf_sock, 'error', function (err) {
++        self.hcf_lastError = new VError(err,
++            'socket emitted error while connecting to %s',
++            HAPROXY_SOCK_PATH);
++        S.gotoState('error');
++    });
++    S.timeout(CONNECT_TIMEOUT, function () {
++        self.hcf_lastError = new VError(
++            'timed out while connecting to %s',
++            HAPROXY_SOCK_PATH);
++        S.gotoState('error');
++    });
++};
++
++HaproxyCmdFSM.prototype.state_error = function (S) {
++    var self = this;
++    this.hcf_log.warn({ err: this.hcf_lastError, cmd: this.hcf_cmd },
++        'haproxy command failed');
++    S.immediate(function () {
++        self.emit('error', self.hcf_lastError);
++    });
++};
++
++HaproxyCmdFSM.prototype.state_writing = function (S) {
++    this.hcf_log.trace({ cmd: this.hcf_cmd }, 'executing haproxy cmd');
++    this.hcf_sock.write(this.hcf_cmd + '\n');
++    this.hcf_sock.end();
++    S.gotoState('reading');
++};
++
++HaproxyCmdFSM.prototype.state_reading = function (S) {
++    var self = this;
++    this.hcf_log.trace({ cmd: this.hcf_cmd }, 'waiting for results');
++    S.on(this.hcf_sock, 'readable', function () {
++        var chunk;
++        while ((chunk = self.hcf_sock.read()) !== null) {
++            self.hcf_buf += chunk.toString('ascii');
++        }
++    });
++    S.on(this.hcf_sock, 'end', function () {
++        S.gotoState('finished');
++    });
++    S.on(this.hcf_sock, 'error', function (err) {
++        self.hcf_lastError = new VError(err,
++            'socket emitted error while waiting for reply to command "%s"',
++            self.hcf_cmd);
++        S.gotoState('error');
++    });
++    S.timeout(COMMAND_TIMEOUT, function () {
++        self.hcf_lastError = new VError(
++            'timed out while executing command "%s"',
++            self.hcf_cmd);
++        S.gotoState('error');
++    });
++};
++
++HaproxyCmdFSM.prototype.state_finished = function (S) {
++    var self = this;
++    this.hcf_log.trace({ cmd: this.hcf_cmd, result: this.hcf_buf },
++        'command results received');
++    S.immediate(function () {
++        self.emit('result', self.hcf_buf);
++    });
++};
++
++function disableServer(opts, cb) {
++    mod_assert.object(opts, 'options');
++    mod_assert.func(cb, 'callback');
++    mod_assert.string(opts.backend, 'opts.backend');
++    mod_assert.string(opts.server, 'opts.server');
++    mod_assert.object(opts.log, 'opts.log');
++
++    var fsm = new HaproxyCmdFSM({
++        command: mod_util.format('disable server %s/%s',
++            opts.backend, opts.server),
++        log: opts.log
++    });
++    fsm.on('result', function (output) {
++        if (/[^\s]/.test(output)) {
++            cb(new VError('haproxy returned unexpected output: %j', output));
++        } else {
++            cb(null);
++        }
++    });
++    fsm.on('error', function (err) {
++        cb(err);
++    });
++}
++
++function enableServer(opts, cb) {
++    mod_assert.object(opts, 'options');
++    mod_assert.func(cb, 'callback');
++    mod_assert.string(opts.backend, 'opts.backend');
++    mod_assert.string(opts.server, 'opts.server');
++    mod_assert.object(opts.log, 'opts.log');
++
++    var fsm = new HaproxyCmdFSM({
++        command: mod_util.format('enable server %s/%s',
++            opts.backend, opts.server),
++        log: opts.log
++    });
++    fsm.on('result', function (output) {
++        if (/[^\s]/.test(output)) {
++            cb(new VError('haproxy returned unexpected output: %j', output));
++        } else {
++            cb(null);
++        }
++    });
++    fsm.on('error', function (err) {
++        cb(err);
++    });
++}
++
++function disconnectServer(opts, cb) {
++    mod_assert.object(opts, 'options');
++    mod_assert.func(cb, 'callback');
++    mod_assert.string(opts.backend, 'opts.backend');
++    mod_assert.string(opts.server, 'opts.server');
++    mod_assert.object(opts.log, 'opts.log');
++
++    var fsm = new HaproxyCmdFSM({
++        command: mod_util.format('shutdown sessions server %s/%s',
++            opts.backend, opts.server),
++        log: opts.log
++    });
++    fsm.on('result', function (output) {
++        if (/[^\s]/.test(output)) {
++            cb(new VError('haproxy returned unexpected output: %j', output));
++        } else {
++            cb(null);
++        }
++    });
++    fsm.on('error', function (err) {
++        cb(err);
++    });
++}
++
++function serverStats(opts, cb) {
++    mod_assert.object(opts, 'options');
++    mod_assert.func(cb, 'callback');
++    mod_assert.object(opts.log, 'opts.log');
++
++    var fsm = new HaproxyCmdFSM({
++        command: 'show stat -1 4 -1',
++        log: opts.log
++    });
++    fsm.on('result', function (output) {
++        var lines = output.split('\n');
++        if (!/^#/.test(lines[0])) {
++            cb(new VError('haproxy returned unexpected output: %j', output));
++            return;
++        }
++        var headings = lines[0].slice(2).split(',');
++        var objs = [];
++        lines.slice(1).forEach(function (line) {
++            var parts = line.split(',');
++            if (parts.length < headings.length)
++                return;
++            var obj = {};
++            for (var i = 0; i < parts.length; ++i) {
++                if (parts[i].length > 0)
++                    obj[headings[i]] = parts[i];
++            }
++            objs.push(obj);
++        });
++        cb(null, objs);
++    });
++    fsm.on('error', function (err) {
++        cb(err);
++    });
++}
++
++/*
++ * Note that this makes some assumptions about the haproxy config structure
++ * (particularly that server naming is consistent across all the frontends
++ * present). These assumptions are safe within muppet, but not for general use.
++ *
++ * The "opt.servers" argument is a map of server name => true/false, where
++ * server name is the second part of an haproxy server spec (<pxname>/<svname>)
++ * and 'true' indicates that a server should be enabled, while false indicates
++ * that it should be disabled (put into MAINT).
++ */
++function syncServerState(opts, cb) {
++    mod_assert.object(opts, 'options');
++    mod_assert.func(cb, 'callback');
++    mod_assert.object(opts.servers, 'opts.servers');
++    mod_assert.object(opts.log, 'opts.log');
++
++    var servers = opts.servers;
++
++    serverStats({ log: opts.log }, function (err, stats) {
++        var toDisable = [];
++        var toEnable = [];
++
++        if (err) {
++            cb(new VError(err, 'unable to sync server state: stats command ' +
++                'failed'));
++            return;
++        }
++
++        stats.forEach(function (stat) {
++            if (servers[stat.svname] === false &&
++                stat.status !== 'MAINT') {
++
++                toDisable.push({
++                    log: opts.log,
++                    backend: stat.pxname,
++                    server: stat.svname
++                });
++            } else if (servers[stat.svname] === true &&
++                stat.status === 'MAINT') {
++
++                toEnable.push({
++                    log: opts.log,
++                    backend: stat.pxname,
++                    server: stat.svname
++                });
++            } else if (servers[stat.svname] === undefined) {
++                /*
++                 * haproxy config is probably out of sync with what we think it
++                 * is. This is bad, and we should restart muppet and re-do
++                 * everything.
++                 */
++                err = new VError('unmapped server: "%s/%s"', stat.pxname,
++                    stat.svname);
++            }
++        });
++
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        opts.log.debug({ disable: toDisable, enable: toEnable },
++            'sync server state with haproxy');
++
++        /*
++         * We do a separate socket connection and command for each change we
++         * need to make -- the alternative would be to concat them all together
++         * with semicolons, which would then stop us from being able to tell
++         * which command failed.
++         */
++        opts.enableState = mod_vasync.forEachPipeline({
++            inputs: toEnable,
++            func: enableServer
++        }, function (err2) {
++            if (err2) {
++                cb(err2);
++                return;
++            }
++
++            opts.disableState = mod_vasync.forEachPipeline({
++                inputs: toDisable,
++                func: disableServer
++            }, function (err3) {
++                if (err3) {
++                    cb(err3);
++                    return;
++                }
++
++                /*
++                 * Kill the existing connections to the disabled servers
++                 * right away. When we eventually have drain support in muskie
++                 * we won't need to do this.
++                 */
++                opts.killState = mod_vasync.forEachPipeline({
++                    inputs: toDisable,
++                    func: disconnectServer
++                }, function (err4) {
++                    if (err4) {
++                        cb(err4);
++                        return;
++                    }
++                    /* Don't include the logger in the results. */
++                    toEnable.forEach(function (job) {
++                        delete (job.log);
++                    });
++                    toDisable.forEach(function (job) {
++                        delete (job.log);
++                    });
++                    cb(null, toEnable, toDisable);
++                });
++            });
++        });
++    });
++}
++
++module.exports = {
++    /* Exported for testing */
++    disableServer: disableServer,
++    enableServer: enableServer,
++    disconnectServer: disconnectServer,
++    /* Used by app.js */
++    serverStats: serverStats,
++    syncServerState: syncServerState
++};
+diff --git a/lib/lb_manager.js b/lib/lb_manager.js
+index 26812f6..8444715 100644
+--- a/lib/lb_manager.js
++++ b/lib/lb_manager.js
+@@ -73,15 +73,18 @@ function writeHaproxyConfig(opts, cb) {
+ 
+     var clear = '';
+     var ssl = '';
++    var index = {};
+     // Fail fast if there are no backend hosts given
+     if (opts.hosts.length > 0) {
+         opts.hosts.forEach(function (h, i) {
+             clear += sprintf(CLEAR_SERVER_LINE, i, h);
+             ssl += sprintf(SSL_SERVER_LINE, i, h);
++            index[h] = sprintf('be%d', i);
+         });
+     } else {
+         return (cb(new Error('Haproxy config error: No hosts given')));
+     }
++    opts.backendIndex = index;
+ 
+     var untrusted = '';
+     if (opts.untrustedIPs.length > 0) {
+@@ -304,7 +307,7 @@ function reload(opts, cb) {
+             opts.log.error(err, 'Error reconfiguring haproxy');
+             cb(err);
+         } else {
+-            cb(null);
++            cb(null, tmpOpts.backendIndex);
+         }
+ 
+         // Clear the lock now that we are finished
+diff --git a/lib/watch.js b/lib/watch.js
+index 29a9ad2..7c24160 100644
+--- a/lib/watch.js
++++ b/lib/watch.js
+@@ -379,7 +379,7 @@ HostWatcherFSM.prototype.state_fetch = function (S) {
+                 'throttle and hold)');
+             self.hw_lastHosts = hosts;
+             setImmediate(function () {
+-                self.emit('hostsChanged', hosts);
++                self.emit('hostsChanged', hosts, hostDiff);
+             });
+         } else {
+             log.info('no net change to hosts detected, will not reload lb');

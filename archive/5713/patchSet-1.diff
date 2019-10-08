@@ -1,0 +1,624 @@
+commit b3079940e6a16c43ed0ecbb8cba8c206e08d8025
+Author: Pedro Palazon Candel <pedro@joyent.com>
+Date:   2019-03-05T16:28:24+01:00 (7 months ago)
+    
+    TRITON-898 Add CloudAPI endpoints for triton instance migration
+
+diff --git a/lib/app.js b/lib/app.js
+index da9a7c677a..7915d1b09f 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -44,6 +44,7 @@ var docs = require('./docs');
+ var disks = require('./endpoints/disks');
+ var keys = require('./keys');
+ var machines = require('./machines');
++var migrations = require('./migrations');
+ var metadata = require('./metadata');
+ var nics = require('./nics');
+ var packages = require('./packages');
+@@ -548,6 +549,7 @@ module.exports = {
+             machineThrottle = userThrottle(config, 'machines');
+             machines.mount(server, machineThrottle);
+             metadata.mount(server, machineThrottle);
++            migrations.mount(server, machineThrottle);
+             snapshots.mount(server, machineThrottle);
+             disks.mount(server, machineThrottle);
+             tags.mount(server, machineThrottle);
+diff --git a/lib/migrations.js b/lib/migrations.js
+new file mode 100644
+index 0000000000..71485beb23
+--- /dev/null
++++ b/lib/migrations.js
+@@ -0,0 +1,308 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2019, Joyent, Inc.
++ */
++
++var util = require('util');
++
++var assert = require('assert-plus');
++var restify = require('restify');
++var vasync = require('vasync');
++
++/*
++ * This is a sample migration object from VMAPI:
++ * {
++ *      automatic: false,
++ *      created_timestamp: '2018-12-03T17:48:28.078Z',
++ *      finished_timestamp: '2018-12-03T17:48:57.837Z',
++ *      phase: 'start',
++ *      state: 'paused',
++ *      vm_uuid: '73f3db90-3fc3-46c7-92e9-b0cd337b9f7a',
++ *      progress_history:
++ *      [ {
++ *          current_progress: 100,
++ *          finished_timestamp: '2018-12-03T17:48:57.837Z',
++ *          message: 'reserving instance',
++ *          phase: 'start',
++ *          state: 'success',
++ *          started_timestamp: '2018-12-03T17:48:35.612Z',
++ *          total_progress: 100
++ *      } ]
++ * }
++ *
++ * The only thing we are 'translating' so far is 'vm_uuid' with
++ * 'machine'. We're not doing the mapping of "*whatever*_timestamp"
++ * to just "*whatever*" in the traditional CloudAPI style, but keeping
++ * the "_timestamp" string, since seems to be more clear.
++ */
++
++function translate(vmapiMigration) {
++    assert.ok(vmapiMigration);
++    assert.ok(vmapiMigration.vm_uuid);
++
++    vmapiMigration.machine = vmapiMigration.vm_uuid;
++    delete vmapiMigration.vm_uuid;
++
++    return vmapiMigration;
++}
++
++
++
++function loadVmMigration(req, callback) {
++    var vmUuid = req.params.machine;
++    req.sdc.vmapi.get({
++        path: util.format('/migrations/%s', vmUuid),
++        query: {
++            owner_uuid: req.account.uuid
++        },
++        headers: {
++            'x-request-id': req.getId()
++        }
++    }, function loadVmMigrationCb(err, migration) {
++        if (err) {
++            if (err.name === 'ResourceNotFoundError') {
++                callback(null, null);
++            } else {
++                callback(err);
++            }
++            return;
++        }
++
++        callback(null, migration);
++    });
++}
++
++function loadMigrations(req, res, next) {
++    req.sdc.vmapi.get({
++        path: '/migrations',
++        query: {
++            owner_uuid: req.account.uuid
++        },
++        headers: {
++            'x-request-id': req.getId()
++        }
++    }, function loadMigrationsCb(err, migrations) {
++        if (err) {
++            next(err);
++            return;
++        }
++
++        req.migrations = migrations || [];
++        next();
++    });
++}
++
++function list(req, res, next) {
++    assert.ok(req.sdc);
++    assert.ok(req.migrations);
++
++    var migrations = req.migrations.map(translate);
++
++    req.log.debug('GET /%s/migrations -> %j',
++                req.account.login, migrations);
++
++    res.send(migrations);
++    next();
++}
++
++function estimate(req, res, next) {
++    assert.ok(req.sdc);
++
++    var ownerUuid = req.account.uuid;
++    var vmapi = req.sdc.vmapi;
++    var vmUuid = req.params.machine;
++
++    var opts = {
++        action: 'migrate',
++        migration_action: 'estimate',
++        owner_uuid: ownerUuid,
++        headers: {
++            'x-request-id': req.getId()
++        }
++    };
++
++    var vmapiPath = util.format('/vms/%s', vmUuid);
++
++    vmapi.post(vmapiPath, opts, function estCb(err, estimation) {
++        if (err) {
++            next(err);
++            return;
++        }
++        res.send(200, estimation);
++        next();
++    });
++}
++
++function watch(req, res, next) {
++    assert.ok(req.sdc);
++
++    var vmapi = req.sdc.vmapi;
++    var params = req.params;
++    var vmUuid = params.machine;
++
++    if (params.action !== 'watch') {
++        next();
++        return;
++    }
++
++    var httpVmapi = restify.createHttpClient({url: vmapi.url});
++    var requestPath = util.format('/migrations/%s/watch', vmUuid);
++
++    httpVmapi.get(requestPath, function onMigrateWatchGet(getErr, vmapiReq) {
++        if (getErr) {
++            next(getErr);
++            return;
++        }
++
++        res.writeHead(200, { 'Content-Type': 'application/x-json-stream' });
++
++        vmapiReq.on('result', function onMigrateWatchResult(err, aRes) {
++            if (err) {
++                next(err);
++                return;
++            }
++            aRes.on('data', function grabChunk(chunk) {
++                console.log('Chunk: ' + chunk);
++                res.write(chunk);
++            });
++            aRes.on('end', function resEndCb() {
++                next();
++            });
++            res.pipe(aRes);
++
++        });
++
++        vmapiReq.end();
++
++    });
++}
++
++function doAction(req, res, next) {
++    assert.ok(req.sdc);
++
++    var ownerUuid = req.account.uuid;
++    var vmapi = req.sdc.vmapi;
++    var params = req.params;
++    var vmUuid = params.machine;
++
++    if (!params.action) {
++        next(new restify.MissingParameterError(
++            '"action" must be specified'));
++        return;
++    }
++
++    assert.string(params.action, 'params.action');
++
++    if (params.action === 'watch') {
++        next();
++        return;
++    }
++
++    var KNOWN_MIGRATION_ACTIONS = [
++        'begin',
++        'sync',
++        'switch',
++        'automatic',
++        'abort',
++        'pause',
++        'schedule'
++    ];
++
++    if (KNOWN_MIGRATION_ACTIONS.indexOf(params.action) === -1) {
++        next(new restify.InvalidArgumentError(
++            '%s is not a valid migration action',
++            params.action));
++        return;
++    }
++
++    var action = (params.action === 'automatic') ? 'full' : params.action;
++
++    var opts = {
++        action: 'migrate',
++        migration_action: action,
++        owner_uuid: ownerUuid,
++        headers: {
++            'x-request-id': req.getId()
++        }
++    };
++
++    if (['begin', 'full', 'schedule'].indexOf(action) && params.affinity) {
++        if (Array.isArray(params.affinity)) {
++            opts.affinity = params.affinity;
++        } else {
++            opts.affinity = [params.affinity];
++        }
++    }
++
++    var vmapiPath = util.format('/vms/%s', vmUuid);
++
++    vasync.pipeline({
++        funcs: [
++            function doMigrationAction(_, cb) {
++                vmapi.post(vmapiPath, opts, function doActionCb(err, out) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++                    if (!out.job_uuid) {
++                        cb(new restify.InternalError(
++                            'Unable to execute "%s" migration action',
++                            params.action));
++                        return;
++                    }
++                    req.log.debug({
++                        job_uuid: out.job_uuid,
++                        opts: opts
++                    }, 'VMAPI Migration job_uuid');
++                    cb();
++                });
++            },
++            function loadMigration(_, cb) {
++                loadVmMigration(req, function (loadErr, migration) {
++                    if (loadErr) {
++                        cb(loadErr);
++                        return;
++                    }
++                    res.send(201, migration);
++                    cb();
++                });
++            }
++        ]
++    }, next);
++
++}
++
++function mount(server, before) {
++    assert.object(server);
++    assert.ok(before);
++
++    server.get({
++        path: '/:account/migrations',
++        name: 'ListMigrations'
++    }, before, loadMigrations, list);
++
++    server.get({
++        path: '/:account/machines/:machine/migrate',
++        name: 'MigrateMachineEstimate'
++    }, before, estimate);
++
++    server.post({
++        path: '/:account/machines/:machine/migrate',
++        name: 'Migrate'
++    }, before, watch, doAction);
++
++    return server;
++}
++
++
++
++// --- Exports
++
++module.exports = {
++    mount: mount
++};
+diff --git a/test/machines.80.test.js b/test/machines.80.test.js
+index ad8f3bdeb1..f626de2fea 100644
+--- a/test/machines.80.test.js
++++ b/test/machines.80.test.js
+@@ -5,10 +5,9 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+-var util = require('util');
+ var test = require('@smaller/tap').test;
+ var common = require('./common');
+ var uuid = common.uuid;
+@@ -23,7 +22,6 @@ var SDC_128 = common.sdc_128_package;
+ 
+ var IMAGE_UUID;
+ var SERVER_UUID;
+-var PROVISIONABLE_NET_UUID;
+ var MACHINE_UUID;
+ 
+ var CLIENTS;
+@@ -142,6 +140,14 @@ test('Deletion Protection tests', function (t) {
+ });
+ 
+ 
++test('Migrations tests', function (t) {
++    var testMigrations = require('./machines/migrations');
++    testMigrations(t, CLIENT, OTHER, MACHINE_UUID, function () {
++        t.end();
++    });
++});
++
++
+ test('Delete tests', function (t) {
+     var deleteTest = require('./machines/delete');
+     deleteTest(t, CLIENT, OTHER, MACHINE_UUID, function () {
+diff --git a/test/machines/migrations.js b/test/machines/migrations.js
+new file mode 100644
+index 0000000000..f2738432ac
+--- /dev/null
++++ b/test/machines/migrations.js
+@@ -0,0 +1,230 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2019, Joyent, Inc.
++ */
++
++// var util = require('util');
++
++var restify = require('restify');
++
++var common = require('../common');
++var checkHeaders = common.checkHeaders;
++
++var waitForJob = require('./common').waitForJob;
++
++// --- Helpers
++
++
++function checkMigration(t, migration) {
++    t.ok(migration, 'migration ok');
++    t.ok(migration.vm_uuid, 'migration vm_uuid ok');
++    t.ok(migration.state, 'migration state ok');
++    t.ok(migration.phase, 'migration phase ok');
++    t.ok(migration.created_timestamp, 'migration created_timestamp ok');
++}
++
++
++// --- Tests
++
++
++module.exports = function (suite, client, _other, machine, callback) {
++    if (!machine) {
++        callback();
++        return;
++    }
++
++    var migrationFailed = false;
++
++    var httpClient = restify.createHttpClient({
++        url: client.url.href,
++        version: client.headers['accept-version'],
++        retryOptions: {
++            retry: 0
++        },
++        log: client.log,
++        rejectUnauthorized: false,
++        signRequest: client.signRequest
++    });
++    httpClient.keyId = client.keyId;
++    httpClient.privateKey = client.privateKey;
++    httpClient.publicKey = client.publicKey;
++
++    var watcher = {
++        done: false,
++        started: false,
++        error: null,
++        events: []
++    };
++
++
++    function watch() {
++        watcher.done = false;
++
++        var p = '/my/machines/' + machine + '/migrate?action=watch';
++
++        httpClient.post(p, function reqCb(reqErr, req) {
++            if (reqErr) {
++                watcher.error = reqErr;
++                watcher.done = true;
++                return;
++            }
++
++            req.on('result', function resultCb(resErr, res) {
++                if (resErr) {
++                    watcher.error = resErr;
++                    watcher.done = true;
++                    return;
++                }
++
++                res.body = '';
++                res.setEncoding('utf8');
++                res.on('data', function onDataCb(chunk) {
++                    res.body += chunk;
++                });
++
++                res.on('end', function onEndCb() {
++                    res.body = res.body.trim().split('\n')
++                        .map(function toJson(chunk) {
++                            return JSON.parse(chunk);
++                        });
++
++                    watcher.events.push(res.body);
++                    watcher.done = true;
++                });
++            });
++
++            req.end();
++        });
++    }
++
++    suite.test('estimate migration', function (t) {
++        var url = '/my/machines/' + machine + '/migrate';
++        client.get(url, function (err, req, res, body) {
++            t.ifError(err, 'migration estimate error');
++            t.ok(body, 'migration estimate');
++            t.ok(body.size, 'migration size');
++            // TODO: Add other estimation fields when added
++            t.end();
++        });
++    });
++
++
++    var actions = ['begin', 'sync', 'sync', 'switch'];
++
++    actions.forEach(function testMigrationAction(action) {
++        suite.test(action + ' migration', function (t) {
++            if (migrationFailed) {
++                t.end();
++                return;
++            }
++            var url = '/my/machines/' + machine + '/migrate';
++            client.post(url, {
++                action: action
++            }, function (err, req, res, body) {
++                t.ifError(err);
++                if (err) {
++                    migrationFailed = true;
++                    t.end();
++                    return;
++                }
++                t.equal(res.statusCode, 201);
++                checkHeaders(t, res.headers);
++                t.ok(body);
++                checkMigration(t, body);
++                if (!watcher.started) {
++                    watcher.started = true;
++                }
++                watch();
++                t.end();
++            });
++        });
++
++        suite.test('Wait for migrate ' + action, function (t) {
++            if (migrationFailed) {
++                t.end();
++                return;
++            }
++            client.vmapi.listJobs({
++                vm_uuid: machine,
++                task: 'migrate-' + action
++            }, function (err, jobs) {
++                t.ifError(err, 'list jobs error');
++                t.ok(jobs, 'list jobs OK');
++                t.ok(jobs.length, 'migrate jobs is array');
++                var migrate_job = jobs[0];
++                waitForJob(client, migrate_job.uuid, function (err2) {
++                    if (err2) {
++                        migrationFailed = true;
++                    }
++                    t.ifError(err2, 'Check state error');
++                    t.end();
++                });
++            });
++        });
++
++        suite.test('Check watcher entries after ' + action, function (t) {
++            var count = 0;
++            var maxSecs = 5 * 60; // 5 minutes
++
++            function waitForWatcherEnd() {
++                count += 5;
++                if (!watcher.done) {
++                    if (count > maxSecs) {
++                        t.ok(false, 'Timed out waiting for the watcher to end');
++                        t.done();
++                        return;
++                    }
++                    setTimeout(waitForWatcherEnd, 5000);
++                    return;
++                }
++
++                var events = watcher.events.pop();
++                t.ok(events.length > 0, 'Should have seen events');
++                var endEvent = events.filter(function filterEnd(evt) {
++                    return evt.type === 'end';
++                })[0];
++                t.ok(endEvent, 'Should have seen end event');
++                t.equal(endEvent.phase, action, 'Phase should be ' + action);
++                var progressEvents = events.filter(function filterProgr(evt) {
++                    return evt.type === 'progress';
++                });
++                progressEvents.forEach(function testPrgrEvt(evt) {
++                    t.ok(evt.current_progress, 'Should have current_progress');
++                    t.ok(evt.message, 'Should have a message');
++                    t.ok(evt.state, 'Should have event state');
++                    t.ok(evt.total_progress, 'Should have total_progress');
++                    if (evt.started_timestamp) {
++                        t.ok(evt.duration_ms,
++                            'Should have duration_ms and started_timestamp');
++                    }
++                });
++                t.done();
++            }
++
++            waitForWatcherEnd();
++        });
++
++        suite.test('List migrations after ' + action, function (t) {
++            var url = '/my/migrations';
++            // Should get at least a migration.
++            client.get(url, function (err, req, res, body) {
++                t.ifError(err, 'list migrations error');
++                t.ok(body, 'migrations list');
++                t.ok(body.length, 'migrations length');
++                t.end();
++            });
++        });
++    });
++
++    suite.test('Close migrations watch client', function (t) {
++        httpClient.close();
++        t.end();
++    });
++
++    callback();
++};

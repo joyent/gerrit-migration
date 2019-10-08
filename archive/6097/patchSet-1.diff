@@ -1,0 +1,432 @@
+commit bce34e6ace0d668f50f9e02a2148173707eb6423
+Author: Richard Bradley <richard.bradley@joyent.com>
+Date:   2019-04-11T16:14:06+01:00 (6 months ago)
+    
+    MANTA-4020 Add version-based configuration option to pgprefaulter
+    MANTA-4217 Prefaulter development tooling should not use default postgres port
+
+diff --git a/GNUmakefile b/GNUmakefile
+index c7e52be..1a15eec 100644
+--- a/GNUmakefile
++++ b/GNUmakefile
+@@ -87,6 +87,11 @@ PG_BASEBACKUP?=$(wildcard /usr/local/bin/pg_basebackup /opt/local/lib/postgresql
+ INITDB?=$(wildcard /usr/local/bin/initdb /opt/local/lib/postgresql$(PGVERSION)/bin/initdb /opt/local/bin/initdb)
+ PG_CONTROLDATA?=$(wildcard /usr/local/bin/pg_controldata /opt/local/lib/postgresql$(PGVERSION)/bin/pg_controldata /opt/local/bin/pg_controldata)
+ PWFILE?=.pwfile
++ifeq ($(PGVERSION),96)
++	WAL=xlog
++else
++	WAL=wal
++endif
+ 
+ PGBENCH?=$(wildcard /usr/local/bin/pgbench /opt/local/lib/postgresql$(PGVERSION)/bin/pgbench /opt/local/bin/pgbench)
+ PGBENCH_ARGS?=-j 64 -P 60 -r -T 900 --no-vacuum --protocol=prepared
+@@ -96,7 +101,8 @@ GOPATH?=$(shell go env GOPATH)
+ PGDATA_PRIMARY?=$(GOPATH)/src/github.com/joyent/pg_prefaulter/.pgdata_primary
+ PGDATA_FOLLOWER?=$(GOPATH)/src/github.com/joyent/pg_prefaulter/.pgdata_follower
+ 
+-PGFOLLOWPORT=5433
++PGPRIMARYPORT?=5442
++PGFOLLOWPORT?=5452
+ 
+ .PHONY: check-pg_controldata
+ check-pg_controldata::
+@@ -156,7 +162,7 @@ initdb-primary:: $(PWFILE) check-initdb ## 30 initdb(1) a primary database
+ 
+ .PHONY: initdb-follower
+ initdb-follower:: $(PWFILE) check-pg_basebackup ## 40 initdb(1) a follower database
+-	env PGPASSWORD="`cat \"$(PWFILE)\"`" $(PG_BASEBACKUP) -R -h localhost -D $(PGDATA_FOLLOWER) -P -U postgres --xlog-method=stream
++	env PGPASSWORD="`cat \"$(PWFILE)\"`" $(PG_BASEBACKUP) -R -h localhost -p $(PGPRIMARYPORT) -D $(PGDATA_FOLLOWER) -P -U postgres --$(WAL)-method=stream
+ 	mkdir -p $(PGDATA_FOLLOWER)/archive || true
+ 
+ .PHONY: startdb-primary
+@@ -164,6 +170,7 @@ startdb-primary:: check-postgres ## 30 Start the primary database
+ 	2>&1 \
+ 	exec $(POSTGRES) \
+ 		-D "$(PGDATA_PRIMARY)" \
++		-p "$(PGPRIMARYPORT)" \
+ 		-c log_connections=off \
+ 		-c log_disconnections=off \
+ 		-c log_duration=off \
+@@ -314,11 +321,11 @@ psql-both:: ## 70 Send a psql(1) command to both using -c
+ 
+ .PHONY: psql-primary
+ psql-primary:: check-psql ## 30 Open a psql(1) shell to the primary
+-	@exec env PGPASSWORD="`cat \"$(PWFILE)\"`" "$(PSQL)" -E postgres postgres $(PSQL_ARGS)
++	@exec env PGPASSWORD="`cat \"$(PWFILE)\"`" "$(PSQL)" -p $(PGPRIMARYPORT) -E postgres postgres $(PSQL_ARGS)
+ 
+ .PHONY: psql-follower
+ psql-follower:: check-psql ## 40 Open a psql(1) shell to the follower
+-	@exec env PGPASSWORD="`cat \"$(PWFILE)\"`" "$(PSQL)" -p 5433 -E postgres postgres $(PSQL_ARGS)
++	@exec env PGPASSWORD="`cat \"$(PWFILE)\"`" "$(PSQL)" -p $(PGFOLLOWPORT) -E postgres postgres $(PSQL_ARGS)
+ 
+ .PHONY: help
+ help:: ## 99 This help message
+diff --git a/agent/agent.go b/agent/agent.go
+index dd5a793..82f555d 100644
+--- a/agent/agent.go
++++ b/agent/agent.go
+@@ -1,4 +1,4 @@
+-// Copyright © 2017 Joyent, Inc.
++// Copyright © 2019 Joyent, Inc.
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+ // You may obtain a copy of the License at
+@@ -61,6 +61,8 @@ type Agent struct {
+ 	fileHandleCache *fhcache.FileHandleCache
+ 	ioCache         *iocache.IOCache
+ 	walCache        *walcache.WALCache
++	walTranslations pg.WALTranslations
++	pgVersion       uint32
+ }
+ 
+ func New(cfg *config.Config) (a *Agent, err error) {
+@@ -102,7 +104,7 @@ func New(cfg *config.Config) (a *Agent, err error) {
+ 	}
+ 
+ 	{
+-		walCache, err := walcache.New(a, a.shutdownCtx, cfg, a.metrics, a.ioCache)
++		walCache, err := walcache.New(a, a.shutdownCtx, cfg, a.metrics, a.ioCache, a.walTranslations.Directory)
+ 		if err != nil {
+ 			return nil, errors.Wrap(err, "unable to initialize WAL cache")
+ 		}
+@@ -163,12 +165,13 @@ func (a *Agent) Start() {
+ 	// 1) Shutdown if we've been told to shutdown.
+ 	// 2) Sleep if we've been told to sleep in the previous iteration.
+ 	// 3) Dump caches if a cache-invalidation event occurred.
+-	// 4) Attempt to find WAL files.
+-	// 4a) Attempt to query the DB to find the WAL files.
+-	// 4b) Attempt to query the process args to find the WAL files.
+-	// 5) Fault pages in from the heap if we have found any WAL files.
+-	// 5a) Fault into PG using pg_prewarm() if detected.
+-	// 5b) Fault into the filesystem cache using pread(2) if pg_prewarm is not
++	// 4) Determine version of postgres and translate WAL interactions
++	// 5) Attempt to find WAL files.
++	// 5a) Attempt to query the DB to find the WAL files.
++	// 5b) Attempt to query the process args to find the WAL files.
++	// 6) Fault pages in from the heap if we have found any WAL files.
++	// 6a) Fault into PG using pg_prewarm() if detected.
++	// 6b) Fault into the filesystem cache using pread(2) if pg_prewarm is not
+ 	//     available.
+ 
+ 	sleepBetweenIterations := true
+@@ -223,7 +226,17 @@ RETRY:
+ 			purgeCache = false
+ 		}
+ 
+-		// 4) Get WAL files
++		// 4) Determine version of postgres and translate WAL interactions.
++		if err := a.setWALTranslations(); err != nil {
++			retry := handleErrors(err, "unable to translate WAL interactions")
++			if retry {
++				goto RETRY
++			} else {
++				break RETRY
++			}
++		}
++
++		// 5) Get WAL files
+ 		var walFiles []pg.WALFilename
+ 		walFiles, err = a.getWALFiles()
+ 		if err != nil {
+@@ -235,7 +248,7 @@ RETRY:
+ 			}
+ 		}
+ 
+-		// 5) Fault in PostgreSQL heap pages identified in the WAL files
++		// 6) Fault in PostgreSQL heap pages identified in the WAL files
+ 		if sleepBetweenIterations, err = a.prefaultWALFiles(walFiles); err != nil {
+ 			retry := handleErrors(err, "unable to prefault WAL files")
+ 			if retry {
+@@ -281,6 +294,16 @@ func (a *Agent) Wait() error {
+ 	return nil
+ }
+ 
++func (a *Agent) setWALTranslations() (error) {
++	if err := a.ensureDBPool(); err != nil {
++		return newVersionError(err, true)
++	}
++
++	a.walTranslations = pg.Translate(a.pgVersion)
++
++	return nil
++}
++
+ // getWALFiles returns a list of WAL files to be processed for prefaulting.
+ // getWALFiles attempts to connect to the database to find the active WAL file
+ // being applied.  If the database is starting up and can not accept new
+diff --git a/agent/db.go b/agent/db.go
+index 3d3d206..3e7a0a4 100644
+--- a/agent/db.go
++++ b/agent/db.go
+@@ -1,4 +1,4 @@
+-// Copyright © 2017 Joyent, Inc.
++// Copyright © 2019 Joyent, Inc.
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+ // You may obtain a copy of the License at
+@@ -167,7 +167,7 @@ func (a *Agent) getWALFilesDB() (pg.WALFiles, error) {
+ 		return nil, errors.Wrap(err, "unable to get WAL db files")
+ 	}
+ 
+-	timelineID, oldLSNs, err := pg.QueryOldestLSNs(a.shutdownCtx, a.pool, a.walCache)
++	timelineID, oldLSNs, err := pg.QueryOldestLSNs(a.shutdownCtx, a.pool, a.walCache, a.walTranslations)
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "unable to query PostgreSQL checkpoint information")
+ 	}
+@@ -235,8 +235,21 @@ func (a *Agent) initDBPool(cfg *config.Config) (err error) {
+ 		if err := conn.QueryRowEx(a.shutdownCtx, sql, nil).Scan(&version); err != nil {
+ 			return errors.Wrap(err, "unable to query DB version")
+ 		}
+-		log.Debug().Uint32("backend-pid", conn.PID()).Str("version", version).Msg("established DB connection")
++
++		var server_version_num uint32
++		sql_num := `SELECT current_setting('server_version_num')::integer`
++		if err := conn.QueryRowEx(a.shutdownCtx, sql_num, nil).Scan(&server_version_num); err != nil {
++			return errors.Wrap(err, "unable to query DB version number")
++		}
++
++		log.Debug().
++			Uint32("backend-pid", conn.PID()).
++			Str("version", version).
++			Uint32("server-version-num", server_version_num).
++			Msg("established DB connection")
++
+ 		a.metrics.SetTextValue(metrics.DBVersionPG, version)
++		a.pgVersion = server_version_num
+ 
+ 		return nil
+ 	}
+@@ -266,26 +279,9 @@ func (a *Agent) queryLag(lagQuery _QueryLag) (units.Base2Bytes, error) {
+ 	var sql string
+ 	switch lagQuery {
+ 	case _QueryLagPrimary:
+-		sql = `SELECT
+-  state,
+-  sync_state,
+-  (pg_xlog_location_diff(sent_location, write_location))::FLOAT8 AS durability_lag_bytes,
+-  (pg_xlog_location_diff(sent_location, flush_location))::FLOAT8 AS flush_lag_bytes,
+-  (pg_xlog_location_diff(sent_location, replay_location))::FLOAT8 AS visibility_lag_bytes,
+-  COALESCE(EXTRACT(EPOCH FROM '0'::INTERVAL), 0.0)::FLOAT8 AS visibility_lag_ms
+-FROM
+-  pg_catalog.pg_stat_replication
+-ORDER BY visibility_lag_bytes
+-LIMIT 1`
++		sql = a.walTranslations.Queries.LagPrimary
+ 	case _QueryLagFollower:
+-		sql = `SELECT
+-  'receiving' AS state,
+-  'applying' AS sync_state,
+-  0.0::FLOAT8 AS durability_lag_bytes,
+-  0.0::FLOAT8 AS flush_lag_bytes,
+-  COALESCE((pg_xlog_location_diff(pg_last_xlog_receive_location(), pg_last_xlog_replay_location()))::FLOAT8, 0.0)::FLOAT8 AS visibility_lag_bytes,
+-  COALESCE(EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp())::INTERVAL), 0.0)::FLOAT8 AS visibility_lag_ms
+-LIMIT 1`
++		sql = a.walTranslations.Queries.LagFollower
+ 	default:
+ 		panic(fmt.Sprintf("unsupported query: %v", lagQuery))
+ 	}
+diff --git a/agent/errors.go b/agent/errors.go
+index 969ea8b..6190829 100644
+--- a/agent/errors.go
++++ b/agent/errors.go
+@@ -29,6 +29,11 @@ type walError struct {
+ 	_purgeCache bool
+ }
+ 
++type versionError struct {
++	_err    error
++	_retry  bool
++}
++
+ func newWALError(err error, retry bool, purge bool) walError {
+ 	return walError{
+ 		_err:        err,
+@@ -37,6 +42,13 @@ func newWALError(err error, retry bool, purge bool) walError {
+ 	}
+ }
+ 
++func newVersionError(err error, retry bool) versionError {
++	return versionError{
++		_err:    err,
++		_retry:  retry,
++	}
++}
++
+ // Error returns the error message
+ func (walErr walError) Error() string {
+ 	return fmt.Sprintf("%v: (retriable: %t, purge cache: %t", walErr._err, walErr._retry, walErr._purgeCache)
+@@ -49,3 +61,11 @@ func (walErr walError) retry() bool {
+ func (walErr walError) purgeCache() bool {
+ 	return walErr._purgeCache
+ }
++
++func (versionErr versionError) Error() string {
++	return fmt.Sprintf("%v (retriable: %t)", versionErr._err, versionErr._retry)
++}
++
++func (versionErr versionError) retry() bool {
++	return versionErr._retry
++}
+diff --git a/agent/walcache/cache.go b/agent/walcache/cache.go
+index 362a9fe..8263254 100644
+--- a/agent/walcache/cache.go
++++ b/agent/walcache/cache.go
+@@ -1,4 +1,4 @@
+-// Copyright © 2017 Joyent, Inc.
++// Copyright © 2019 Joyent, Inc.
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+ // You may obtain a copy of the License at
+@@ -74,6 +74,7 @@ type WALCache struct {
+ 	shutdownCtx       context.Context
+ 	wg                sync.WaitGroup
+ 	cfg               *config.WALCacheConfig
++	walDirectory      string
+ 
+ 	purgeLock sync.Mutex
+ 	c         gcache.Cache
+@@ -94,7 +95,7 @@ var (
+ 
+ func New(pgConnCtxAcquirer ConnContextAcquirer, shutdownCtx context.Context,
+ 	cfg *config.Config, circMetrics *cgm.CirconusMetrics,
+-	ioCache *iocache.IOCache) (*WALCache, error) {
++	ioCache *iocache.IOCache, walDirectory string) (*WALCache, error) {
+ 	walWorkers := pg.NumOldLSNs * int(math.Ceil(float64(cfg.ReadaheadBytes)/float64(pg.WALSegmentSize)))
+ 
+ 	wc := &WALCache{
+@@ -102,6 +103,7 @@ func New(pgConnCtxAcquirer ConnContextAcquirer, shutdownCtx context.Context,
+ 		shutdownCtx:       shutdownCtx,
+ 		metrics:           circMetrics,
+ 		cfg:               &cfg.WALCacheConfig,
++		walDirectory:      walDirectory,
+ 
+ 		inFlightWALFiles: make(map[pg.WALFilename]struct{}, walWorkers),
+ 		ioCache:          ioCache,
+@@ -280,7 +282,7 @@ func (wc *WALCache) prefaultWALFile(walFile pg.WALFilename) (err error) {
+ 	var blocksMatched, linesMatched, linesScanned, walFilesProcessed, xlogdumpBytes uint64
+ 	var ioCacheHit, ioCacheMiss uint64
+ 
+-	walFileAbs := path.Join(wc.cfg.PGDataPath, "pg_xlog", string(walFile))
++	walFileAbs := path.Join(wc.cfg.PGDataPath, wc.walDirectory, string(walFile))
+ 	_, err = os.Stat(walFileAbs)
+ 	if err != nil {
+ 		// log.Debug().Err(err).Str("walfile", string(walFile)).Msg("stat")
+diff --git a/pg/lag.go b/pg/lag.go
+index a781527..0445ea6 100644
+--- a/pg/lag.go
++++ b/pg/lag.go
+@@ -1,4 +1,4 @@
+-// Copyright © 2017 Joyent, Inc.
++// Copyright © 2019 Joyent, Inc.
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+ // You may obtain a copy of the License at
+@@ -31,7 +31,7 @@ const (
+ 
+ // QueryOldestLSNs queries the database to obtain the current TimelineID and the
+ // oldest LSNs that it is processing.
+-func QueryOldestLSNs(ctx context.Context, pool *pgx.ConnPool, inProcess WALStatusChecker) (TimelineID, []LSN, error) {
++func QueryOldestLSNs(ctx context.Context, pool *pgx.ConnPool, inProcess WALStatusChecker, walTranslations WALTranslations) (TimelineID, []LSN, error) {
+ 	const (
+ 		errTimelineID TimelineID = 0
+ 	)
+@@ -44,8 +44,7 @@ func QueryOldestLSNs(ctx context.Context, pool *pgx.ConnPool, inProcess WALStatu
+ 
+ 	// NOTE(seanc@): keep the number of LSN values in this query with
+ 	// the NumOldLSNs constant.
+-	const lagSQL = "SELECT timeline_id, redo_location, pg_last_xlog_replay_location() FROM pg_control_checkpoint()"
+-	rows, err := pool.QueryEx(ctx, lagSQL, nil)
++	rows, err := pool.QueryEx(ctx, walTranslations.Queries.OldestLSNs, nil)
+ 	if err != nil {
+ 		return errTimelineID, nil, err
+ 	}
+diff --git a/pg/translate.go b/pg/translate.go
+new file mode 100644
+index 0000000..6001001
+--- /dev/null
++++ b/pg/translate.go
+@@ -0,0 +1,83 @@
++// Copyright © 2019 Joyent, Inc.
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package pg
++
++import (
++	"fmt"
++)
++
++type WALTranslations struct {
++	Version    uint32
++	Directory  string
++	Lsn        string
++	Wal        string
++	Queries    WALQueries
++}
++
++type WALQueries struct {
++	OldestLSNs   string
++	LagPrimary   string
++	LagFollower  string
++}
++
++func Translate(pgVersion uint32) (WALTranslations) {
++	var translations WALTranslations
++	var translateHorizon uint32 = 100000 // PostgreSQL version 10
++
++	var lagPrimaryFmt = `SELECT
++	    state,
++	    sync_state,
++	    (pg_%[2]s_%[1]s_diff(sent_%[1]s, write_%[1]s))::FLOAT8 AS durability_lag_bytes,
++	    (pg_%[2]s_%[1]s_diff(sent_%[1]s, flush_%[1]s))::FLOAT8 AS flush_lag_bytes,
++	    (pg_%[2]s_%[1]s_diff(sent_%[1]s, replay_%[1]s))::FLOAT8 AS visibility_lag_bytes,
++	    COALESCE(EXTRACT(EPOCH FROM '0'::INTERVAL), 0.0)::FLOAT8 AS visibility_lag_ms
++	    FROM
++	    pg_catalog.pg_stat_replication
++	    ORDER BY visibility_lag_bytes
++	    LIMIT 1`
++
++	var lagFollowerFmt = `SELECT
++	    'receiving' AS state,
++	    'applying' AS sync_state,
++	    0.0::FLOAT8 AS durability_lag_bytes,
++	    0.0::FLOAT8 AS flush_lag_bytes,
++	    COALESCE((pg_%[2]s_%[1]s_diff(pg_last_%[2]s_receive_%[1]s(), pg_last_%[2]s_replay_%[1]s()))::FLOAT8, 0.0)::FLOAT8 AS visibility_lag_bytes,
++	    COALESCE(EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp())::INTERVAL), 0.0)::FLOAT8 AS visibility_lag_ms
++	    LIMIT 1`
++
++	translations = WALTranslations{}
++	{
++		queries := WALQueries{}
++		if pgVersion < translateHorizon {
++			translations.Version = pgVersion
++			translations.Directory = "pg_xlog"
++			translations.Lsn = "location"
++			translations.Wal = "xlog"
++			queries.OldestLSNs = "SELECT timeline_id, redo_location, pg_last_xlog_replay_location() FROM pg_control_checkpoint()"
++		} else {
++			translations.Version = pgVersion
++			translations.Directory = "pg_wal"
++			translations.Lsn = "lsn"
++			translations.Wal = "wal"
++			queries.OldestLSNs = "SELECT timeline_id, redo_lsn, pg_last_wal_receive_lsn() FROM pg_control_checkpoint()"
++		}
++
++		queries.LagPrimary = fmt.Sprintf(lagPrimaryFmt, translations.Lsn, translations.Wal)
++		queries.LagFollower = fmt.Sprintf(lagFollowerFmt, translations.Lsn, translations.Wal)
++
++		translations.Queries = queries
++	}
++
++	return translations
++}

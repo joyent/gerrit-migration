@@ -1,0 +1,296 @@
+commit b945c71f3af58c1a34c635c19f03284591b8211a
+Author: Mike Zeller <mike@mikezeller.net>
+Date:   2019-07-17T18:18:55+00:00 (3 months ago)
+    
+    TON-1787 cfwlogd should switch to bounded logging queues
+
+diff --git a/cfwlogd/src/events.rs b/cfwlogd/src/events.rs
+index d8e8105..03dbb38 100644
+--- a/cfwlogd/src/events.rs
++++ b/cfwlogd/src/events.rs
+@@ -67,7 +67,7 @@ fn clamp_ring_size(min: usize, max: usize, value: usize) -> usize {
+ /// The consumed events will be sent to the returned `Receiver`.
+ pub fn start_event_reader<T: EventSource + 'static>(
+     mut device: T,
+-) -> (Receiver<CfwEvent>, thread::JoinHandle<()>) {
++) -> (Receiver<Box<CfwEvent>>, thread::JoinHandle<()>) {
+     let (max, ringsize) = device.event_sizing().unwrap_or_else(|e| {
+         error!("failed to get ring size from device: {}", e);
+         std::process::exit(e.raw_os_error().unwrap_or(-1));
+@@ -127,7 +127,7 @@ pub fn start_event_reader<T: EventSource + 'static>(
+ 
+ /// Takes a buffer of bytes and slices them up into `CfwEvent`s that are then sent to the provided
+ /// `Sender`.
+-fn parse_events(bytes: &[u8], sender: &Sender<CfwEvent>) -> bool {
++fn parse_events(bytes: &[u8], sender: &Sender<Box<CfwEvent>>) -> bool {
+     let mut bytes = bytes;
+     loop {
+         // Leaving this as an expect call because if we ever get out of sync or the device returns
+@@ -161,7 +161,7 @@ fn parse_events(bytes: &[u8], sender: &Sender<CfwEvent>) -> bool {
+ 
+ /// Starts a thread that will receive `CfwEvent`s and fan them out to per zone logging threads.
+ pub fn start_event_fanout(
+-    events: Receiver<CfwEvent>,
++    events: Receiver<Box<CfwEvent>>,
+     shutdown: Receiver<()>,
+     vmobjs: Vmobjs,
+ ) -> (Loggers, thread::JoinHandle<()>) {
+@@ -179,7 +179,7 @@ pub fn start_event_fanout(
+ /// Fanout events coming from the Receiver into the appropriate Logger, creating a new Logger if
+ /// one does not yet exist.
+ fn fanout_events(
+-    events: Receiver<CfwEvent>,
++    events: Receiver<Box<CfwEvent>>,
+     shutdown: Receiver<()>,
+     vmobjs: Vmobjs,
+     mut loggers: Loggers,
+@@ -230,10 +230,11 @@ fn fanout_events(
+ 
+ /// For a given cfw event, find or create a `Logger` thats responsible for serializing the event to
+ /// disk.
+-fn queue_zone_events(events: Vec<CfwEvent>, vmobjs: &Vmobjs, loggers: &mut Loggers) {
++#[allow(clippy::vec_box)] // The bounded channel operates on Box<CfwEvent> already.
++fn queue_zone_events(events: Vec<Box<CfwEvent>>, vmobjs: &Vmobjs, loggers: &mut Loggers) {
+     let mut loggers = loggers.lock().unwrap();
+     for event in events {
+-        if let CfwEvent::Unknown(_) = event {
++        if let CfwEvent::Unknown(_) = *event {
+             continue;
+         };
+         let zonedid = event.zone();
+@@ -254,15 +255,23 @@ fn queue_zone_events(events: Vec<CfwEvent>, vmobjs: &Vmobjs, loggers: &mut Logge
+                 }
+             },
+         };
+-        if logger.send(event).is_err() {
+-            // Receive side of the log was disconnected somehow, so we drop the entry allowing it
+-            // to be recreated on the next event.
+-            // CMON TRITON-1755
+-            error!(
+-                "failed to log event for zone {} (logger channel disconnected)",
+-                zonedid
+-            );
+-            loggers.remove(&zonedid);
++        if let Err(e) = logger.try_send(event) {
++            match e {
++                TrySendError::Disconnected(_) => {
++                    warn!(
++                        "failed to log event for zone {} (logger channel disconnected)",
++                        zonedid
++                    );
++                    loggers.remove(&zonedid);
++                }
++                TrySendError::Full(_) => {
++                    // CMON TRITON-1755
++                    warn!(
++                        "failed to log event for zone {} (logger channel is full)",
++                        zonedid
++                    );
++                }
++            }
+         }
+     }
+ }
+diff --git a/cfwlogd/src/logger.rs b/cfwlogd/src/logger.rs
+index 9e3cbbc..ad5c800 100644
+--- a/cfwlogd/src/logger.rs
++++ b/cfwlogd/src/logger.rs
+@@ -12,8 +12,9 @@
+ 
+ use crate::parser::CfwEvent;
+ use crate::zones::{Vmobjs, Zonedid};
+-use crossbeam::channel::{self, Select, SendError};
++use crossbeam::channel::{self, Select, SendError, TrySendError};
+ use serde::Serialize;
++use std::boxed::Box;
+ use std::fs::File;
+ use std::fs::OpenOptions;
+ use std::io::{BufWriter, Write};
+@@ -34,7 +35,7 @@ const BUF_SIZE: usize = 1024 * 1024;
+ #[derive(Debug, Serialize)]
+ struct LogEvent<'a> {
+     #[serde(flatten)]
+-    event: CfwEvent,
++    event: &'a CfwEvent,
+     vm: &'a str,
+     alias: &'a str,
+ }
+@@ -58,15 +59,15 @@ pub struct Logger {
+     /// Threads handle
+     handle: thread::JoinHandle<()>,
+     /// Send half of a channel that's used to get CfwEvents into the Logger
+-    sender: channel::Sender<CfwEvent>,
++    sender: channel::Sender<Box<CfwEvent>>,
+     /// Send half of a channel that's used to signal the Logger to perform specific actions
+     signal: channel::Sender<LoggerSignal>,
+ }
+ 
+ impl Logger {
+     /// Send an event to the logger to be logged out to disk
+-    pub fn send(&self, e: CfwEvent) -> Result<(), SendError<CfwEvent>> {
+-        self.sender.send(e)
++    pub fn try_send(&self, e: Box<CfwEvent>) -> Result<(), TrySendError<Box<CfwEvent>>> {
++        self.sender.try_send(e)
+     }
+ 
+     /// Flushes the logger's internal `BufWriter` to disk
+@@ -98,7 +99,8 @@ fn open_file(vm: &str, customer: &str) -> std::io::Result<File> {
+ }
+ 
+ /// Given a collection of `CfwEvent`, serialize them out to disk as JSON formatted logs.
+-fn log_events<W: Write>(events: Vec<CfwEvent>, mut writer: W, vmobjs: &Vmobjs) {
++#[allow(clippy::vec_box)] // The bounded channel operates on Box<CfwEvent> already.
++fn log_events<W: Write>(events: Vec<Box<CfwEvent>>, mut writer: W, vmobjs: &Vmobjs) {
+     // force the event type for now
+     let vmobjs = vmobjs.read().unwrap();
+     for event in events {
+@@ -109,7 +111,7 @@ fn log_events<W: Write>(events: Vec<CfwEvent>, mut writer: W, vmobjs: &Vmobjs) {
+         // Note instead of String::as_ref we could also use "|s| &**s"
+         let alias = vmobj.alias.as_ref().map_or("", String::as_ref);
+         let event = LogEvent {
+-            event,
++            event: &event,
+             vm: &vmobj.uuid,
+             alias: &alias,
+         };
+@@ -163,7 +165,7 @@ fn _start_logger(
+     vm: String,
+     customer: String,
+     vmobjs: Vmobjs,
+-    events: channel::Receiver<CfwEvent>,
++    events: channel::Receiver<Box<CfwEvent>>,
+     signal: channel::Receiver<LoggerSignal>,
+ ) -> thread::JoinHandle<()> {
+     thread::Builder::new()
+@@ -220,8 +222,13 @@ fn _start_logger(
+ 
+ /// Return a Logger if we have information for the zone already otherwise return None
+ pub fn start_logger(zonedid: Zonedid, vmobjs: Vmobjs) -> Option<Logger> {
+-    // TODO TRITON-1787
+-    let (event_tx, event_rx) = channel::unbounded();
++    // We bound the loggers incoming queue so that we don't endlessly consume memory, since the
++    // event reading thread is able to geenrate events faster than we can serialize to JSON and
++    // write to disk.  This means each thread can consume somewhere around:
++    // (channel-capacity * sizeof (CfwEvent)) + (channel-capacity * sizeof (CfwEvent *))
++    // In addition to other things such as the BufWriter buffer size and umem PTC which is enabled
++    // in the SMF manifest.
++    let (event_tx, event_rx) = channel::bounded(500_000);
+     let (signal_tx, signal_rx) = channel::bounded(1);
+     let vms = vmobjs.read().unwrap();
+     if let Some(vm) = vms.get(&zonedid) {
+diff --git a/cfwlogd/src/parser.rs b/cfwlogd/src/parser.rs
+index cb270e3..9b91c15 100644
+--- a/cfwlogd/src/parser.rs
++++ b/cfwlogd/src/parser.rs
+@@ -12,6 +12,7 @@ use nom::error::VerboseError;
+ use nom::number::complete::{be_u128, be_u16, le_i64, le_u16, le_u32, le_u8};
+ use nom::IResult;
+ use serde::Serialize;
++use std::boxed::Box;
+ use uuid::Uuid;
+ 
+ #[derive(Debug, PartialEq, Serialize)]
+@@ -141,17 +142,17 @@ fn cfwevent_parse_header<'a>(
+ fn cfwevent_parse_unknown<'a>(
+     header: CfwEventHeader,
+     bytes: &'a [u8],
+-) -> IResult<&'a [u8], CfwEvent, VerboseError<&'a [u8]>> {
++) -> IResult<&'a [u8], Box<CfwEvent>, VerboseError<&'a [u8]>> {
+     // Take everything after the first 8 bytes (event + length + zonedid).
+     let (bytes, _skip) = take(header.1 - 8)(bytes)?;
+     Ok((
+         bytes,
+-        CfwEvent::Unknown(UnknownEvent {
++        Box::new(CfwEvent::Unknown(UnknownEvent {
+             event: CfwEvType::Unknown,
+             raw_event: header.0,
+             length: header.1,
+             zonedid: header.2,
+-        }),
++        })),
+     ))
+ }
+ 
+@@ -160,7 +161,7 @@ fn cfwevent_parse_traffic<'a>(
+     evtype: CfwEvType,
+     header: CfwEventHeader,
+     bytes: &'a [u8],
+-) -> IResult<&'a [u8], CfwEvent, VerboseError<&'a [u8]>> {
++) -> IResult<&'a [u8], Box<CfwEvent>, VerboseError<&'a [u8]>> {
+     let (bytes, rule_id) = le_u32(bytes)?;
+     let (bytes, source_port) = be_u16(bytes)?;
+     let (bytes, destination_port) = be_u16(bytes)?;
+@@ -174,7 +175,7 @@ fn cfwevent_parse_traffic<'a>(
+     let (bytes, rule_uuid) = take(16usize)(bytes)?;
+     Ok((
+         bytes,
+-        CfwEvent::Traffic(TrafficEvent {
++        Box::new(CfwEvent::Traffic(TrafficEvent {
+             event: evtype,
+             length: header.1,
+             zonedid: header.2,
+@@ -187,13 +188,15 @@ fn cfwevent_parse_traffic<'a>(
+             destination_ip: Ipv6Addr::from(destination_ip),
+             timestamp: Utc.timestamp(time_sec, (time_usec * 1000) as u32),
+             rule_uuid: Uuid::from_slice(rule_uuid).expect("we should have 16 bytes exactly"),
+-        }),
++        })),
+     ))
+ }
+ 
+ /// Parse a single CfwEvent out of the provided bytes returning a slice that points at the next
+ /// event.
+-pub fn cfwevent_parse<'a>(bytes: &'a [u8]) -> IResult<&'a [u8], CfwEvent, VerboseError<&'a [u8]>> {
++pub fn cfwevent_parse<'a>(
++    bytes: &'a [u8],
++) -> IResult<&'a [u8], Box<CfwEvent>, VerboseError<&'a [u8]>> {
+     let (bytes, header) = cfwevent_parse_header(bytes)?;
+     let event_type = CfwEvType::from(header.0);
+     match event_type {
+@@ -209,7 +212,6 @@ mod tests {
+     #[test]
+     fn parse_traffic_event() {
+         let mut event = testutils::generate_event();
+-        std::dbg!(&event);
+         let now = chrono::offset::Utc::now();
+         let ts = Utc.timestamp(now.timestamp(), now.timestamp_subsec_micros() * 1000);
+         let uuid = Uuid::parse_str("a7963143-14da-48d6-bef0-422f305d1556").unwrap();
+@@ -227,7 +229,7 @@ mod tests {
+         let cfw_event = cfw_event.unwrap();
+ 
+         assert!(cfw_event.0.is_empty(), "no bytes left over");
+-        match cfw_event.1 {
++        match *cfw_event.1 {
+             CfwEvent::Traffic(e) => {
+                 assert_eq!(e.event, CfwEvType::from(event.event));
+                 assert_eq!(e.length, event.length);
+@@ -260,7 +262,7 @@ mod tests {
+         let cfw_event = cfw_event.unwrap();
+ 
+         assert!(cfw_event.0.is_empty(), "no bytes left over");
+-        match cfw_event.1 {
++        match *cfw_event.1 {
+             CfwEvent::Unknown(e) => {
+                 assert_eq!(e.event, CfwEvType::from(event.event));
+                 assert_eq!(e.length, event.length);
+@@ -291,7 +293,7 @@ mod tests {
+         let mut bytes: &[u8] = &mixed;
+         loop {
+             let (leftover, event) = cfwevent_parse(bytes).expect("failed to parse CfwEvents");
+-            match event {
++            match *event {
+                 CfwEvent::Traffic(_) => traffic_count += 1,
+                 CfwEvent::Unknown(_) => unknown_count += 1,
+             };
+diff --git a/cfwlogd/src/zones.rs b/cfwlogd/src/zones.rs
+index 81211ee..f0624dd 100644
+--- a/cfwlogd/src/zones.rs
++++ b/cfwlogd/src/zones.rs
+@@ -23,7 +23,6 @@ fn insert_vmobj(zone: Zone, vmobjs: &Vmobjs) {
+ /// Search through a vminfod changes payload and see if the alias was a part of the update
+ fn alias_changed(changes: &[Changes]) -> bool {
+     changes.iter().any(|change| {
+-        dbg!(change.path.first().map(|v| v.as_ref()));
+         change
+             .path
+             .first()

@@ -1,0 +1,402 @@
+commit 7f91b5f034419aac2d4a1a432962876e70d1bfa2
+Author: Robert Bogart <robert.bogart@joyent.com>
+Date:   2019-05-03T20:08:44+00:00 (5 months ago)
+    
+    MANTA-4238 Implement low water level mark for GC flushing
+
+diff --git a/Makefile b/Makefile
+index da96a1f..2102260 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,7 +15,7 @@
+ NAME :=				manta-garbage-collector
+ CATEST :=			deps/catest/catest
+ 
+-NODE_PREBUILT_TAG =		gz
++NODE_PREBUILT_TAG =		zone64
+ NODE_PREBUILT_VERSION =		v4.8.7
+ NODE_PREBUILT_IMAGE =		18b094b0-eb01-11e5-80c1-175dac7ddf02
+ 
+@@ -63,9 +63,7 @@ SAPI_MANIFEST_DIRS =		$(SAPI_MANIFESTS:%=$(PREFIX)/sapi_manifests/%)
+ SMF_MANIFESTS =			garbage-collector
+ SMF_MANIFESTS_DIR =		$(PREFIX)/smf/manifests
+ 
+-NODE_BITS =			bin/node \
+-				lib/libgcc_s.so.1 \
+-				lib/libstdc++.so.6
++NODE_BITS =			bin/node
+ NODE_DIR =			$(PREFIX)/node
+ NODE_MODULE_INSTALL =		$(PREFIX)/node_modules/.ok
+ 
+diff --git a/README.md b/README.md
+index 32d108d..e4f8126 100644
+--- a/README.md
++++ b/README.md
+@@ -170,8 +170,14 @@ accel-gc` attempts to help with these decisions -- see
+ 
+ ### Instruction Upload
+ 
+-* `GC_INSTR_UPLOAD_BATCH_SIZE` - The number of delete instructions (lines) to
+-  include per instruction object.
++* `GC_INSTR_UPLOAD_MIN_BATCH_SIZE` - The minimum number of delete instructions
++  (lines) to include per instruction object.  This ensures that instruction
++  files can never have less than a pre-configured number of lines.  This is
++  important because performance on the mako side will deteriorate with
++  numerous, small instruction files to process.
++* `GC_INSTR_UPLOAD_BATCH_SIZE` - The maximum number of delete instructions
++  (lines) to include per instruction object.  Note that there is no guarantee
++  that all instruction files will reach this size.
+ * `GC_INSTR_UPLOAD_FLUSH_DELAY` - The number of milliseconds to wait between
+   attempt to upload an instruction object.
+ * `GC_INSTR_UPLOAD_PATH_PREFIX` - The location in which to upload delete
+@@ -194,6 +200,15 @@ accel-gc` attempts to help with these decisions -- see
+ Each of these SAPI values can be overridden in the instance object of a single
+ collector.
+ 
++### Example of how to set a tunable parameter
++
++The following example will set the instruction upload batch size to 300:
++
++```
++GCID=$(sdc-sapi /services?name=garbage-collector | json -Ha uuid)
++echo '{ "metadata": {"GC_INSTR_UPLOAD_BATCH_SIZE": 300 } }' | sapiadm update $GCID
++```
++
+ # Metrics
+ 
+ The garbage collector exposes a number of application-level metrics, in addition
+diff --git a/lib/delete_record_transformer.js b/lib/delete_record_transformer.js
+index 5379a60..f6243bc 100644
+--- a/lib/delete_record_transformer.js
++++ b/lib/delete_record_transformer.js
+@@ -83,6 +83,13 @@ _get_collector()
+ };
+ 
+ 
++DeleteRecordTransformer.prototype._get_min_batch_size = function
++_get_min_batch_size()
++{
++	return (this._get_tunables_ref().instr_upload_min_batch_size);
++};
++
++
+ DeleteRecordTransformer.prototype._get_batch_size = function
+ _get_batch_size()
+ {
+@@ -233,9 +240,19 @@ _process_record(record, done)
+ 				self._incr_cache_counts();
+ 			}
+ 
+-
++			/*
++			 * If a given shark has reached (or exceeded) the
++			 * upload batch size, add it to the list of sharks
++			 * that will be flushed immediately (i.e. outside of
++			 * the periodic / regularly scheduled flush).
++			 */
+ 			if (Object.keys(cache[storage_id]).length >=
+ 			    self._get_batch_size()) {
++				self.mt_log.info({
++					shark: storage_id,
++					lines: (cache[storage_id]).length,
++					batchsize: self._get_batch_size()
++				}, 'Mako has reached batch size.');
+ 				sharks.push(storage_id);
+ 			}
+ 			finished();
+@@ -245,7 +262,12 @@ _process_record(record, done)
+ 	});
+ };
+ 
+-
++/*
++ * Flush cached instructions from memory out to storage.  This function can be
++ * called either during a periodic flush or if any given storage node
++ * accumulates a number of instructions greater than or equal to the upload
++ * batch size.
++ */
+ DeleteRecordTransformer.prototype._flush = function
+ _flush(storage_ids, done)
+ {
+@@ -279,7 +301,22 @@ _flush(storage_ids, done)
+ 				return (self.mt_cache[storage_id][key]);
+ 			});
+ 
+-			if ((lines || []).length === 0) {
++			/*
++			 * In order to ensure that instruction files maintain
++			 * at least a minimum number of lines, we will not
++			 * perform a periodic flush unless the mako has
++			 * accumulated at least a certain amount of lines.
++			 * What exactly the floor is is dictated by the
++			 * configuration information passed to us, tunable
++			 * through SAPI.
++			 */
++			if ((lines || []).length < self._get_min_batch_size()) {
++				self.mt_log.info({
++					storage_id: storage_id,
++					lines: lines.length
++				}, 'Skipping flush.  Mako has less than the ' +
++				'minimum number of lines required.');
++
+ 				finished();
+ 				return;
+ 			}
+@@ -403,10 +440,19 @@ _listen_for_records()
+ 				});
+ 				return;
+ 			}
+-			if (sharks.length === 0) {
+-				self.mt_log.info('Skipping no-op flush.');
++
++			/*
++			 * If the list of sharks that have reached their batch
++			 * size is empty, then return.
++			 */
++			if (sharks.length === 0)
+ 				return;
+-			}
++
++			/*
++			 * Perform a flush on all sharks that have accumulated
++			 * a number of instructions greater than or equal to our
++			 * upload batch size.
++			 */
+ 			self._flush(sharks, function (ferr) {
+ 				if (ferr) {
+ 					self.mt_log.warn({
+diff --git a/lib/mako_instruction_uploader.js b/lib/mako_instruction_uploader.js
+index 7c80f3a..ce527af 100644
+--- a/lib/mako_instruction_uploader.js
++++ b/lib/mako_instruction_uploader.js
+@@ -143,6 +143,17 @@ _listen_for_instructions()
+ 		var lines = [];
+ 
+ 		instruction.lines.forEach(function (elem) {
++			/*
++			 * Remove the current storage_id from the list of
++			 * makos on which it resides.  Once the array is
++			 * empty, we are free to delete this record from the
++			 * table.
++			 */
++			var index = elem.sharks.findIndex(function (shark) {
++				return (shark.manta_storage_id ===
++				    instruction.storage_id);
++			});
++			elem.sharks.splice(index, 1);
+ 			keys.push(elem.key);
+ 			lines.push(elem.line);
+ 		});
+@@ -195,13 +206,32 @@ _listen_for_instructions()
+ 			var clean = [];
+ 
+ 			instruction.lines.forEach(function (line) {
+-				if (!line.cleaned_state.cleaned) {
++				/*
++				 * In the process of serving a record up to the
++				 * cleaner for deletion from the table, it must
++				 * be the last one of its kind.  That is, it has
++				 * been flushed out to all makos to which it
++				 * relates and nothing else depends on it.
++				 * Removal of a record from the table means that
++				 * we do not plan to need it or see it ever
++				 * again.  This is why it's important to remove
++				 * it from the table after uploading our last
++				 * one rather than our first.  Doing otherwise
++				 * could have serious consequences if garbage
++				 * collection restarted for any reason (planned
++				 * or unplanned).  Unflushed records that have
++				 * been deleted from the table will never be
++				 * found upon restart and would result in the
++				 * leak of an object.
++				 */
++				if (!line.cleaned_state.cleaned &&
++				    line.sharks.length === 0) {
++					line.cleaned_state.cleaned = true;
+ 					clean.push({
+ 						key: line.key,
+ 						storage: line.size,
+ 						sharks: line.sharks
+ 					});
+-					line.cleaned_state.cleaned = true;
+ 				}
+ 			});
+ 
+diff --git a/lib/moray_delete_record_cleaner.js b/lib/moray_delete_record_cleaner.js
+index 3901650..9c10337 100644
+--- a/lib/moray_delete_record_cleaner.js
++++ b/lib/moray_delete_record_cleaner.js
+@@ -249,6 +249,14 @@ _batch_delete(done)
+ 				count: keys.length
+ 			}, 'Cleaned delete records.');
+ 			self._report(keys);
++
++			/*
++			 * Signal our record reader letting it know how many
++			 * records were just removed form the table, so that
++			 * it can update its current offset within the table
++			 * based on this information.
++			 */
++			self.emit('delete', keys.length);
+ 		}
+ 
+ 		for (var i = 0; i < keys.length; i++) {
+diff --git a/lib/moray_delete_record_reader.js b/lib/moray_delete_record_reader.js
+index 5eacfe6..e08ee7c 100644
+--- a/lib/moray_delete_record_reader.js
++++ b/lib/moray_delete_record_reader.js
+@@ -76,6 +76,32 @@ MorayDeleteRecordReader(opts)
+ 	 */
+ 	self.mr_listener = opts.listener;
+ 
++	/*
++	 * Line of communication between the component that deletes records
++	 * from the shard and the reader.  When the record cleaner removes
++	 * rows from the table, we should decrement our offset within it
++	 * by the number of rows removed.  In theory, our offset within the
++	 * table should be equal to the number of records that we have
++	 * cached.  Flushing part (or all) of our cache and removing those
++	 * rows from the table is essentially the removal of some (or all) rows
++	 * between offset 0 and our current offset.  This means that any new
++	 * records (where "new" means anything that has not been cached yet
++	 * either because it has not yet arrived in the table or we have not
++	 * advanced far enough within the table yet to read it) will start at
++	 * the following location:
++	 *
++	 *  (<current offset> - <number of entries removed>)
++	 *
++	 *  Because we can not cache (and later remove) rows from the table that
++	 *  it does not have, it follows that using the above heuristic will
++	 *  ensure that our offset never goes below zero.
++	 */
++	self.mr_moray_listener = opts.listener.mt_moray_listener;
++
++	self.mr_moray_listener.on('delete', function (num_entries) {
++		self._decr_offset(num_entries);
++	});
++
+ 	mod_fsm.FSM.call(self, 'running');
+ }
+ mod_util.inherits(MorayDeleteRecordReader, mod_fsm.FSM);
+@@ -142,29 +168,29 @@ _get_offset()
+ };
+ 
+ 
+-MorayDeleteRecordReader.prototype._get_and_set_offset = function
+-_get_and_set_offset(delta)
++MorayDeleteRecordReader.prototype._incr_offset = function
++_incr_offset(delta)
+ {
+-	var self = this;
+-
+-	var offset = this._get_bucket_ref().record_read_offset;
+-	self._get_bucket_ref().record_read_offset += delta;
+-
+-	return (offset);
++	this._get_bucket_ref().record_read_offset += delta;
+ };
+ 
+ 
+-MorayDeleteRecordReader.prototype._reset_offset = function
+-_reset_offset()
++MorayDeleteRecordReader.prototype._decr_offset = function
++_decr_offset(delta)
+ {
+-	this._get_bucket_ref().record_read_offset = 0;
++	var offset = this._get_bucket_ref().record_read_offset;
++
++	this.mr_log.debug('Reducing table offset from %d to %d.',
++	    offset, offset - delta);
++
++	this._get_bucket_ref().record_read_offset -= delta;
+ };
+ 
+ 
+ MorayDeleteRecordReader.prototype._get_sort_attr = function
+ _get_sort_attr()
+ {
+-	return (this._get_tunables_ref().record_reader_sort_attr);
++	return (this._get_tunables_ref().record_read_sort_attr);
+ };
+ 
+ 
+@@ -237,7 +263,7 @@ _find_objects() {
+ 	mod_assertplus.object(moray_client, 'moray_client');
+ 
+ 	var batch = self._get_batch_size();
+-	var offset = self._get_and_set_offset(batch);
++	var offset = self._get_offset();
+ 
+ 	var find_objects_opts = {
+ 		limit: batch,
+@@ -321,7 +347,7 @@ state_running(S)
+ 
+ 		if (self._is_allowed_creator(creator)) {
+ 			self.mr_listener.emit('record', record);
+-			self.mr_log.info({ record: record.key },
++			self.mr_log.debug({ record: record.key },
+ 			    'Received key.');
+ 			num_seen++;
+ 		}
+@@ -344,25 +370,23 @@ state_running(S)
+ 		if (num_seen === 0) {
+ 			/*
+ 			 * Back off exponentially each time we consecutively
+-			 * receive 0 delete records. The queue is not
++			 * receive 0 delete records. The table is not
+ 			 * necessarily empty at this point.
+ 			 */
+-			if (self.mr_prev_records_received === 0) {
++			if (self.mr_prev_records_received === 0)
+ 				self._update_empty_backoff();
+-			}
+-
++		} else {
+ 			/*
+-			 * If we have reached the ceiling on backoff without
+-			 * receiving any new records, the queue is most likely
+-			 * empty and we can reset our offset within the table.
++			 * Increment our current offset by the number of
++			 * records we just received.
+ 			 */
+-			if (self.mr_empty_backoff >= self.mr_empty_backoff_ceil)
+-				self._reset_offset();
+-		} else {
++			self._incr_offset(num_seen);
++
+ 			self.mr_log.info({
+ 				bucket: self.mr_bucket,
+ 				shard: self.mr_shard,
+-				num: num_seen
++				num: num_seen,
++				offset: self._get_offset()
+ 			}, 'Received records.');
+ 
+ 			/*
+diff --git a/lib/schema.js b/lib/schema.js
+index 20c9136..077705a 100644
+--- a/lib/schema.js
++++ b/lib/schema.js
+@@ -35,6 +35,10 @@ var SORT_ORDERS = [
+ ];
+ 
+ var tunables_cfg_properties = {
++	'instr_upload_min_batch_size': {
++		'type': 'integer',
++		'minimum': 1
++	},
+ 	'instr_upload_batch_size': {
+ 		'type': 'integer',
+ 		'minimum': 1
+diff --git a/sapi_manifests/manta-garbage-collector/template b/sapi_manifests/manta-garbage-collector/template
+index e666713..2aa89df 100644
+--- a/sapi_manifests/manta-garbage-collector/template
++++ b/sapi_manifests/manta-garbage-collector/template
+@@ -51,6 +51,7 @@
+ 		}{{^last}},{{/last}}{{/ACCOUNTS_SNAPLINKS_DISABLED}}
+ 	],
+ 	"tunables": {
++		"instr_upload_min_batch_size": {{GC_INSTR_UPLOAD_MIN_BATCH_SIZE}},
+ 		"instr_upload_batch_size": {{GC_INSTR_UPLOAD_BATCH_SIZE}},
+ 		"instr_upload_flush_delay": {{GC_INSTR_UPLOAD_FLUSH_DELAY}},
+ 		"instr_upload_path_prefix": "{{GC_INSTR_UPLOAD_PATH_PREFIX}}",

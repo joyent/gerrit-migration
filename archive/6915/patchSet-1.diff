@@ -1,0 +1,4924 @@
+commit a6e18282e4c44a9da8faff90c05180f07f2c3473
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2019-09-17T11:04:37-06:00 (3 weeks ago)
+    
+    MANTA-4556 "update buckets object metadata" response is missing some headers
+
+diff --git a/docs/index.md b/docs/index.md
+index 7bb3c30..3959437 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -10,7 +10,7 @@ apisections: Directories, Objects, Jobs, SnapLinks, Multipart Uploads
+ -->
+ 
+ <!--
+-    Copyright (c) 2018, Joyent, Inc.
++    Copyright 2019 Joyent, Inc.
+ -->
+ 
+ # REST API
+@@ -123,17 +123,17 @@ with a bash function.
+ Copy all of below:
+ 
+       function manta {
+-		    local alg=rsa-sha256
+-		    local keyId=/$MANTA_USER/keys/$MANTA_KEY_ID
+-		    local now=$(date -u "+%a, %d %h %Y %H:%M:%S GMT")
+-		    local sig=$(echo "date:" $now | \
+-		                tr -d '\n' | \
+-		                openssl dgst -sha256 -sign $HOME/.ssh/id_rsa | \
+-		                openssl enc -e -a | tr -d '\n')
+-
+-		    curl -sS $MANTA_URL"$@" -H "date: $now"  \
+-		        -H "Authorization: Signature keyId=\"$keyId\",algorithm=\"$alg\",signature=\"$sig\""
+-		}
++            local alg=rsa-sha256
++            local keyId=/$MANTA_USER/keys/$MANTA_KEY_ID
++            local now=$(date -u "+%a, %d %h %Y %H:%M:%S GMT")
++            local sig=$(echo "date:" $now | \
++                        tr -d '\n' | \
++                        openssl dgst -sha256 -sign $HOME/.ssh/id_rsa | \
++                        openssl enc -e -a | tr -d '\n')
++
++            curl -sS $MANTA_URL"$@" -H "date: $now"  \
++                -H "Authorization: Signature keyId=\"$keyId\",algorithm=\"$alg\",signature=\"$sig\""
++        }
+ 
+ Paste into `~/.bash_profile` or `~/.bashrc` and restart your terminal to pick up the changes.
+ 
+@@ -170,6 +170,9 @@ The complete list of codes that will be sent are:
+ - AuthSchemeError
+ - AuthorizationError
+ - BadRequestError
++- BucketAlreadyExists
++- BucketNotEmpty
++- BucketNotFound
+ - ChecksumError
+ - ConcurrentRequestError
+ - ContentLengthError
+@@ -200,6 +203,8 @@ The complete list of codes that will be sent are:
+ - LinkNotFoundError
+ - LinkNotObjectError
+ - LinkRequiredError
++- ParentNotBucketError
++- ParentNotBucketRootError
+ - ParentNotDirectoryError
+ - PreconditionFailedError
+ - PreSignedRequestError
+diff --git a/lib/audit.js b/lib/audit.js
+index 680ba39..5a5fd54 100644
+--- a/lib/audit.js
++++ b/lib/audit.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/auth.js b/lib/auth.js
+index a425919..0788e30 100644
+--- a/lib/auth.js
++++ b/lib/auth.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ //
+@@ -929,7 +929,7 @@ function getActiveRoles(req, res, next) {
+         var i, names;
+         /* JSSTYLED */
+         names = requestedRoles.split(/\s*,\s*/);
+-        for (var i = 0; i < names.length; ++i) {
++        for (i = 0; i < names.length; ++i) {
+             var roles = lookup[names[i]];
+             if (roles === undefined || roles.length < 1) {
+                 next(new InvalidRoleError(names[i]));
+diff --git a/lib/buckets/boray.js b/lib/buckets/boray.js
+new file mode 100644
+index 0000000..3364173
+--- /dev/null
++++ b/lib/buckets/boray.js
+@@ -0,0 +1,170 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++//
++// A wrapper for a Boray client connection
++//
++
++var EventEmitter = require('events').EventEmitter;
++var fs = require('fs');
++var jsprim = require('jsprim');
++var path = require('path');
++var util = require('util');
++
++var assert = require('assert-plus');
++var backoff = require('backoff');
++var boray = require('boray');
++var once = require('once');
++var vasync = require('vasync');
++var VError = require('verror');
++
++var utils = require('../utils');
++
++
++///--- API
++
++function Boray(options) {
++    var self = this;
++
++    EventEmitter.call(this);
++
++    this.client = null;
++
++    if (options.hasOwnProperty('borayOptions')) {
++        this.borayOptions = jsprim.deepCopy(options.borayOptions);
++    } else {
++        this.borayOptions = {
++            'host': options.host,
++            'port': parseInt(options.port || 2020, 10),
++            'retry': options.retry,
++            'connectTimeout': options.connectTimeout || 1000
++        };
++    }
++
++    this.log = options.log.child({ component: 'BorayClient' }, true);
++    this.borayOptions.log = this.log;
++    this.borayOptions.unwrapErrors = true;
++    this.initBarrier = vasync.barrier();
++
++    /*
++     * Configure the exponential backoff object we use to manage backoff during
++     * initialization.
++     */
++    this.initBackoff = new backoff.exponential({
++        'randomisationFactor': 0.5,
++        'initialDelay': 1000,
++        'maxDelay': 300000
++    });
++
++    this.initBackoff.on('backoff', function (which, delay, error) {
++        assert.equal(which + 1, self.initAttempts);
++        self.log.warn({
++            'nfailures': which + 1,
++            'willRetryAfterMilliseconds': delay,
++            'error': error
++        }, 'Boray.initAttempt failed (will retry)');
++    });
++
++    this.initBackoff.on('ready', function () {
++        this.initBarrier = vasync.barrier();
++        this.initBarrier.start('initAttempt');
++        self.initAttempt();
++    });
++
++    /*
++     * Define event handlers for the Boray client used at various parts during
++     * initialization.
++     *
++     * The Boray client should generally not emit errors, but it's known to do
++     * so under some conditions.  Our response depends on what phases of
++     * initialization we've already completed:
++     *
++     * (1) Before we've established a connection to the client: if an error is
++     *     emitted at this phase, we assume that we failed to establish a
++     *     connection and we abort the current initialization attempt.  We will
++     *     end up retrying with exponential backoff.
++     *
++     * (2) After we've established a connection, but before initialization has
++     *     completed: if an error is emitted at this phase, we'll log it but
++     *     otherwise ignore it because we assume that whatever operations we
++     *     have outstanding will also fail.
++     *
++     * (3) After we've initialized, errors are passed through to our consumer.
++     */
++    this.onErrorDuringInit = function onErrorDuringInit(err) {
++        self.log.warn(err, 'ignoring client-level error during init');
++    };
++    this.onErrorPostInit = function onErrorPostInit(err) {
++        self.log.warn(err, 'boray client error');
++        self.emit('error', err);
++    };
++
++    /* These fields exist only for debugging. */
++    this.initAttempts = 0;
++
++
++    this.initBarrier.start('initAttempt');
++    this.initAttempt();
++}
++
++util.inherits(Boray, EventEmitter);
++
++Boray.prototype.initAttempt = function initAttempt() {
++    var self = this;
++    var log = this.log;
++
++    assert.ok(this.client === null, 'previous initAttempt did not complete');
++
++    this.initAttempts++;
++    log.debug({
++        'attempt': this.initAttempts
++    }, 'Boray.initAttempt: entered');
++
++    /*
++     * Define vasync waterfall steps such that we can
++     * decide which ones to add to the waterfall depending
++     * on whether or not this is a read-only client.
++     */
++    self.client = boray.createClient(self.borayOptions);
++
++    var onErrorDuringConnect = function onErrDuringConnect(err) {
++        self.client = null;
++        err = new VError(err, 'Boray.initAttempt');
++        self.initBackoff.backoff(err);
++    };
++
++    self.client.on('error', onErrorDuringConnect);
++    self.client.once('connect', function onConnect() {
++        self.client.removeListener('error', onErrorDuringConnect);
++
++        /*
++         * We could reset the "backoff" object in the success case, or
++         * even null it out since we're never going to use it again.
++         * But it's not that large, and it may be useful for debugging,
++         * so we just leave it alone.
++         */
++        self.client.on('error', self.onErrorPostInit);
++        self.client.on('close', self.emit.bind(self, 'close'));
++        self.client.on('connect', self.emit.bind(self, 'connect'));
++        log.info({ 'attempt': self.initAttempts },
++                 'Boray.initAttempt: done');
++        self.emit('connect');
++        self.initBarrier.done('initAttempt');
++    });
++};
++
++
++///--- Exports
++
++module.exports = {
++    createClient: function createClient(opts) {
++        return (new Boray(opts));
++    }
++};
+diff --git a/lib/buckets/buckets.js b/lib/buckets/buckets.js
+new file mode 100644
+index 0000000..78312c3
+--- /dev/null
++++ b/lib/buckets/buckets.js
+@@ -0,0 +1,347 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var common = require('../common');
++var errors = require('../errors');
++
++function loadRequest(req, res, next) {
++
++    var resource = {};
++    var requestType;
++    req.metadata = {};
++
++    if (req.params.bucket_name) {
++        req.bucket = new Bucket(req);
++        requestType = 'bucket';
++        resource.key = req.bucket.name;
++    }
++
++    if (req.params.object_name) {
++        req.bucketObject = new BucketObject(req);
++        requestType = 'object';
++        resource.key = req.bucketObject.name;
++    }
++
++    resource.owner = req.owner;
++
++    switch (req.method) {
++    case 'GET':
++        /* falls through */
++    case 'HEAD':
++        req.authContext.action = 'get' + requestType;
++        break;
++    case 'DELETE':
++        req.authContext.action = 'delete' + requestType;
++        break;
++    default:
++        req.authContext.action = 'put' + requestType;
++        break;
++    }
++
++    // TODO: Populate roles from headers
++    resource.roles = [];
++    req.authContext.resource = resource;
++
++    next();
++
++}
++
++/* This is a function used before bucket object operations */
++function getBucketIfExists(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var log = req.log;
++    var requestId = req.getId();
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name
++    }, 'getBucketIfExists: requested');
++
++    var onGetBucket = function onGet(err, bucket_data) {
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name
++            }, 'getBucketIfExists: failed');
++            next(err);
++            return;
++        } else {
++            if (bucket_data.error && bucket_data.error.name ===
++                'BucketNotFound') {
++                req.resource_exists = false;
++                var not_found_error =
++                    new errors.BucketNotFoundError(bucket.name);
++                next(not_found_error);
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name
++                }, 'getBucketIfExists: done');
++                req.bucket.id = bucket_data.id;
++
++                next(null, bucket_data);
++            }
++        }
++    };
++
++    req.boray.client.getBucketNoVnode(owner, bucket.name, requestId,
++        onGetBucket);
++}
++
++function Bucket(req) {
++
++    var self = this;
++
++    assert.object(req, 'req');
++    if (req.params.bucket_name) {
++        self.name = req.params.bucket_name;
++    }
++    self.type = 'bucket';
++
++    return (self);
++
++}
++
++function BucketObject(req) {
++
++    var self = this;
++
++    assert.object(req, 'req');
++    assert.string(req.params.bucket_name, 'req.params.bucket_name');
++    self.bucket_name = req.params.bucket_name;
++    if (req.params.object_name) {
++        self.name = req.params.object_name;
++    }
++    self.type = 'bucketobject';
++
++    return (self);
++
++}
++
++
++// TODO: Break this up into smaller pieces
++function createObjectMetadata(req, type, cb) {
++    var names;
++    var md = {
++        headers: {},
++        roles: [],
++        type: 'bucketobject'
++    };
++
++    common.CORS_RES_HDRS.forEach(function (k) {
++        var h = req.header(k);
++        if (h) {
++            md.headers[k] = h;
++        }
++    });
++
++    if (req.headers['cache-control'])
++        md.headers['Cache-Control'] = req.headers['cache-control'];
++
++    if (req.headers['surrogate-key'])
++        md.headers['Surrogate-Key'] = req.headers['surrogate-key'];
++
++    var hdrSize = 0;
++    Object.keys(req.headers).forEach(function (k) {
++        if (/^m-\w+/.test(k)) {
++            hdrSize += Buffer.byteLength(req.headers[k]);
++            if (hdrSize < common.MAX_HDRSIZE)
++                md.headers[k] = req.headers[k];
++        }
++    });
++
++    md.contentLength = req._size;
++    md.contentMD5 = req._contentMD5;
++    md.contentType = req.header('content-type') ||
++        'application/octet-stream';
++    md.objectId = req.objectId;
++
++    if (md.contentLength === 0) { // Chunked requests
++        md.sharks = [];
++    } else if (req.sharks && req.sharks.length) { // Normal requests
++        md.sharks = req.sharks.map(function (s) {
++            return ({
++                datacenter: s._shark.datacenter,
++                manta_storage_id: s._shark.manta_storage_id
++            });
++        });
++    } else { // Take from the prev is for things like mchattr
++        md.sharks = [];
++    }
++
++    // mchattr
++    var requestedRoleTags;
++    if (req.auth && typeof (req.auth['role-tag']) === 'string') { // from URL
++        requestedRoleTags = req.auth['role-tag'];
++    } else {
++        requestedRoleTags = req.headers['role-tag'];
++    }
++
++    if (requestedRoleTags) {
++        /* JSSTYLED */
++        names = requestedRoleTags.split(/\s*,\s*/);
++        req.mahi.getUuid({
++            account: req.owner.account.login,
++            type: 'role',
++            names: names
++        }, function (err, lookup) {
++            if (err) {
++                cb(err);
++                return;
++            }
++            var i;
++            for (i = 0; i < names.length; i++) {
++                if (!lookup.uuids[names[i]]) {
++                    cb(new InvalidRoleTagError(names[i]));
++                    return;
++                }
++                md.roles.push(lookup.uuids[names[i]]);
++            }
++            cb(null, md);
++        });
++    // apply all active roles if no other roles are specified
++    } else if (req.caller.user) {
++        md.roles = req.activeRoles;
++        setImmediate(function () {
++            cb(null, md);
++        });
++    } else {
++        setImmediate(function () {
++            cb(null, md);
++        });
++    }
++}
++
++function notFoundHandler(req, res, next) {
++    if (req.not_found_error) {
++        next(req.not_found_error);
++    } else {
++        next();
++    }
++}
++
++function successHandler(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var log = req.log;
++
++    log.debug({
++        owner: owner
++    }, 'successHandler: entered');
++
++    if (req.method == 'PUT' || req.method == 'POST' || req.method == 'DELETE') {
++        res.send(204);
++    } else {
++        res.send(200);
++    }
++
++    log.debug({
++        owner: owner
++    }, 'successHandler: done');
++
++    next();
++}
++
++function isConditional(req) {
++    return (req.headers['if-match'] !== undefined ||
++            req.headers['if-none-match'] !== undefined ||
++            req.headers['if-modified-since'] !== undefined ||
++            req.headers['if-unmodified-since'] !== undefined);
++}
++
++function getObject(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var bucketObject = req.bucketObject;
++    var requestId = req.getId();
++    var log = req.log;
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name,
++        bucket_id: bucket.id,
++        object: bucketObject.name,
++        requestId: requestId
++    }, 'getBucketObject: requested');
++
++
++    var onGetObject = function onGet(err, object_data) {
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name,
++                bucket_id: bucket.id,
++                object: bucketObject.name
++            }, 'getObject: error reading object metadata');
++
++            next(err);
++            return;
++        } else {
++            // There is only one error type returned by this RPC
++            if (object_data.error && object_data.error.name ===
++               'ObjectNotFound') {
++                    req.resource_exists = false;
++                    req.not_found_error =
++                        new errors.ObjectNotFoundError(bucketObject.name);
++                    next();
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name,
++                    bucket_id: bucket.id,
++                    object: bucketObject.name
++                }, 'getObject: done');
++
++                req.resource_exists = true;
++                req.metadata = object_data;
++                req.metadata.type = 'bucketobject';
++                req.metadata.objectId = object_data.id;
++                req.metadata.contentMD5 = object_data.content_md5;
++                req.metadata.contentLength = object_data.content_length;
++                req.metadata.contentType = object_data.content_type;
++
++                // Add other needed response headers
++                res.set('Etag', object_data.id);
++                res.set('Last-Modified', new Date(object_data.modified));
++
++                next(null, object_data);
++            }
++        }
++    };
++
++    req.boray.client.getObjectNoVnode(owner, bucket.id, bucketObject.name,
++        requestId, onGetObject);
++}
++
++function maybeGetObject(req, res, next) {
++    // Only incur the added latency to get the object if the request is
++    // conditional
++    if (isConditional(req)) {
++        getObject(req, res, next);
++    } else {
++        next();
++    }
++}
++
++module.exports = {
++    Bucket: Bucket,
++    BucketObject: BucketObject,
++    getBucketIfExists: getBucketIfExists,
++    createObjectMetadata: createObjectMetadata,
++    loadRequest: loadRequest,
++    notFoundHandler: notFoundHandler,
++    successHandler: successHandler,
++    isConditional: isConditional,
++    getObject: getObject,
++    maybeGetObject: maybeGetObject
++};
+diff --git a/lib/buckets/common.js b/lib/buckets/common.js
+new file mode 100644
+index 0000000..019e87c
+--- /dev/null
++++ b/lib/buckets/common.js
+@@ -0,0 +1,153 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var EventEmitter = require('events').EventEmitter;
++
++var assert = require('assert-plus');
++var jsprim = require('jsprim');
++var sprintf = require('util').format;
++
++require('../errors');
++
++/*
++ * A valid bucket name is composed of one or more "labels," separated by
++ * periods.
++ *
++ * A label is defined as a string that meets the following criteria:
++ * - Contains only lowercase letters, numbers, and hyphens
++ * - Does not start or end with a hyphen.
++ *
++ * Bucket names must also be between 3 and 63 characters long, and must not
++ * "resemble an IP address," as defined immediately below.
++ */
++var bucketLabelRegexStr = '([a-z0-9]([a-z0-9-]*[a-z0-9])?)';
++var bucketRegexStr =
++    sprintf('^(%s\\.)*%s$', bucketLabelRegexStr, bucketLabelRegexStr);
++var bucketRegex = new RegExp(bucketRegexStr);
++
++/*
++ * S3 considers "resembling an IP address" to mean four groups of between one
++ * and three digits each, separated by periods. This includes strings that are
++ * not actually valid IP addresses. For example:
++ *
++ * - 1.1.1.1 resembles an IP address
++ * - 999.999.999.999 also resembles an IP address
++ * - 172.25.1234.1 does not, because there is a section with more than three
++ *   digits. This is thus a valid bucket name.
++ */
++var threeDigitRegexStr = '[0-9]{1,3}';
++var resemblesIpRegexStr = sprintf('^%s\.%s\.%s\.%s$', threeDigitRegexStr,
++    threeDigitRegexStr, threeDigitRegexStr, threeDigitRegexStr);
++var resemblesIpRegex = new RegExp(resemblesIpRegexStr);
++
++function isValidBucketName(name) {
++    return bucketRegex.test(name) && !resemblesIpRegex.test(name) &&
++        name.length >= 3 && name.length <= 63;
++}
++
++function listBuckets(req) {
++    return (_list('buckets', req));
++}
++
++function listObjects(req, bucket) {
++    return (_list('objects', req, bucket));
++}
++
++function _list(type, req, bucket) {
++    assert.string(type, 'type');
++    assert.object(req, 'req');
++    assert.object(req.log, 'req.log');
++    assert.object(req.boray, 'req.boray');
++    assert.object(req.params, 'req.params');
++    assert.optionalString(bucket, 'bucket');
++
++    var client = req.boray.client;
++    var ee = new EventEmitter();
++    var log = req.log;
++    var requestId = req.getId();
++
++    var owner = req.owner.account.uuid;
++    var prefix = req.params.prefix;
++    var marker = req.params.marker;
++    var delimiter = req.params.delimiter;
++
++    assert.uuid(owner, 'owner');
++
++    var limit;
++    if (req.params.limit) {
++        limit = parseInt(req.params.limit, 10);
++        if (isNaN(limit) || limit <= 0 || limit > 1024) {
++            process.nextTick(function () {
++                ee.emit('error', new InvalidLimitError(req.params.limit));
++            });
++            return (ee);
++        }
++    } else {
++        limit = 1024;
++    }
++
++    assert.number(limit, 'limit');
++    assert.ok(limit > 0, 'limit > 0');
++    assert.ok(limit <= 1024, 'limit <= 1024');
++
++    log.debug('buckets common _list (%s): entered', type);
++
++    var mreq;
++    switch (type) {
++    case 'buckets':
++        mreq = client.listBucketsNoVnode(owner, prefix, limit, marker,
++            delimiter, requestId);
++        break;
++    case 'objects':
++        mreq = client.listObjectsNoVnode(owner, bucket, prefix, limit, marker,
++            delimiter, requestId);
++        break;
++    default:
++        assert.fail('unknown type: ' + type);
++        break;
++    }
++
++    mreq.on('record', function (r) {
++        assert.object(r, 'r');
++        assert.string(r.type, 'r.type');
++
++        if (r.type === 'message') {
++            mreq.emit('message', r);
++            return;
++        }
++
++        assert.string(r.name, 'r.name');
++
++        var entry = {
++            name: r.name,
++            type: r.type,
++            etag: r.etag,
++            size: r.contentLength,
++            contentType: r.contentType,
++            contentMD5: r.contentMD5
++        };
++
++        if (r.mtime) {
++            entry.mtime = new Date(r.mtime).toISOString();
++        }
++
++        mreq.emit('entry', entry, r);
++    });
++
++    return (mreq);
++}
++
++///--- Exports
++
++module.exports = {
++    isValidBucketName: isValidBucketName,
++    listBuckets: listBuckets,
++    listObjects: listObjects
++};
+diff --git a/lib/buckets/create.js b/lib/buckets/create.js
+new file mode 100644
+index 0000000..2563a13
+--- /dev/null
++++ b/lib/buckets/create.js
+@@ -0,0 +1,81 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var auth = require('../auth');
++var buckets = require('./buckets');
++var common = require('./common');
++var errors = require('../errors');
++
++function createBucket(req, res, next) {
++
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var log = req.log;
++    var requestId = req.getId();
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name
++    }, 'createBucket: entered');
++
++    if (!common.isValidBucketName(bucket.name)) {
++        next(new errors.InvalidBucketNameError(bucket.name));
++        return;
++    }
++
++    var onCreateBucket = function onCreate(err, bucket_data) {
++        if (bucket_data !== undefined && bucket_data._node) {
++            // Record the name of the shard and vnode contacted.
++            req.entryShard = bucket_data._node.pnode;
++            req.entryVnode = bucket_data._node.vnode;
++        }
++
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name
++            }, 'createBucket: error creating bucket');
++            next(err);
++        } else {
++            // There is only one error type returned by this RPC
++            if (bucket_data.error && bucket_data.error.name ===
++                'BucketAlreadyExists') {
++                var already_exists_error =
++                    new errors.BucketExistsError(bucket.name);
++                next(already_exists_error);
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name,
++                    data: bucket_data
++                }, 'createBucket: done');
++                res.send(204, bucket_data);
++                next(null, bucket_data);
++            }
++        }
++    };
++
++    req.boray.client.createBucketNoVnode(owner, bucket.name, requestId,
++        onCreateBucket);
++}
++
++module.exports = {
++
++    createBucketHandler: function createBucketHandler() {
++        var chain = [
++            buckets.loadRequest,
++            auth.authorizationHandler(),
++            createBucket
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/buckets/delete.js b/lib/buckets/delete.js
+new file mode 100644
+index 0000000..e77ff5f
+--- /dev/null
++++ b/lib/buckets/delete.js
+@@ -0,0 +1,124 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var auth = require('../auth');
++var buckets = require('./buckets');
++var common = require('./common');
++var errors = require('../errors');
++
++function deleteBucket(req, res, next) {
++
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var log = req.log;
++    var requestId = req.getId();
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name
++    }, 'deleteBucket: entered');
++
++    var onDeleteBucket = function onDelete(err, bucket_data) {
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name
++            }, 'deleteBucket: failed');
++
++            next(err);
++        } else {
++            log.debug({
++                owner: owner,
++                bucket: bucket.name
++            }, 'deleteBucket: done');
++
++            res.send(204, null);
++            next(null, bucket_data);
++        }
++    };
++
++    var onGetBucket = function onGet(err1, bucket_data) {
++        if (err1) {
++            log.debug({
++                err: err1,
++                owner: owner,
++                bucket: bucket.name
++            }, 'getBucket: failed');
++
++            next(err1);
++            return;
++        } else {
++            // There is only one error type returned by this RPC
++            if (bucket_data.error && bucket_data.error.name ===
++                'BucketNotFound') {
++                req.resource_exists = false;
++                var not_found_error =
++                    new errors.BucketNotFoundError(bucket.name);
++                next(not_found_error);
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name
++                }, 'getBucket: done');
++
++                // The bucket exists, now check if it is empty
++                var mreq = common.listObjects(req, bucket_data.id);
++                var bucketEmpty = true;
++
++                mreq.once('error', function onError(err2) {
++                    mreq.removeAllListeners('end');
++                    mreq.removeAllListeners('entry');
++
++                    log.debug(err2, 'deleteBucket: empty bucket check failed');
++                    next(err2);
++                });
++
++                mreq.once('entry', function onEntry(bucketObject) {
++                    // Bucket is not empty so notify client immediately
++                    mreq.removeAllListeners('end');
++                    mreq.removeAllListeners('entry');
++                    var notFoundErr =
++                        new errors.BucketNotEmptyError(bucket.name);
++                    bucketEmpty = false;
++                    res.send(409, notFoundErr);
++                    return (next(notFoundErr));
++                });
++
++                mreq.once('end', function onEnd() {
++                    log.debug({}, 'deleteBucket: empty bucket check done');
++                    if (bucketEmpty === true) {
++                        req.boray.client.deleteBucketNoVnode(owner, bucket.name,
++                            requestId, onDeleteBucket);
++                    } else {
++                        next();
++                    }
++                });
++            }
++        }
++    };
++
++    req.boray.client.getBucketNoVnode(owner, bucket.name, requestId,
++        onGetBucket);
++}
++
++
++module.exports = {
++
++    deleteBucketHandler: function deleteBucketHandler() {
++        var chain = [
++            buckets.loadRequest,
++            auth.authorizationHandler(),
++            deleteBucket
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/buckets/head.js b/lib/buckets/head.js
+new file mode 100644
+index 0000000..ac9c1be
+--- /dev/null
++++ b/lib/buckets/head.js
+@@ -0,0 +1,72 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var auth = require('../auth');
++var buckets = require('./buckets');
++var common = require('../common');
++var errors = require('../errors');
++
++function headBucket(req, res, next) {
++
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var log = req.log;
++    var requestId = req.getId();
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name
++    }, 'headBucket: requested');
++
++    var onGetBucket = function onGet(err, bucket_data) {
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name
++            }, 'headBucket: failed');
++
++            next(err);
++            return;
++        } else {
++            // There is only one error type returned by this RPC
++            if (bucket_data.error && bucket_data.error.name ===
++                'BucketNotFound') {
++                req.resource_exists = false;
++                var not_found_error =
++                    new errors.BucketNotFoundError(bucket.name);
++                next(not_found_error);
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name
++                }, 'headBucket: done');
++                next();
++            }
++        }
++    };
++
++    req.boray.client.getBucketNoVnode(owner, bucket.name, requestId,
++        onGetBucket);
++}
++
++module.exports = {
++
++    headBucketHandler: function headBucketHandler() {
++        var chain = [
++            buckets.loadRequest,
++            headBucket,
++            auth.authorizationHandler(),
++            buckets.successHandler
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/buckets/index.js b/lib/buckets/index.js
+new file mode 100644
+index 0000000..d3c85f4
+--- /dev/null
++++ b/lib/buckets/index.js
+@@ -0,0 +1,29 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++function reExport(obj) {
++    Object.keys(obj || {}).forEach(function (k) {
++        module.exports[k] = obj[k];
++    });
++}
++
++module.exports = {};
++reExport(require('./create'));
++reExport(require('./delete'));
++reExport(require('./head'));
++reExport(require('./list'));
++reExport(require('./options'));
++reExport(require('./objects/create'));
++reExport(require('./objects/delete'));
++reExport(require('./objects/get'));
++reExport(require('./objects/head'));
++reExport(require('./objects/list'));
++reExport(require('./objects/metadata/get'));
++reExport(require('./objects/metadata/update'));
+diff --git a/lib/buckets/list.js b/lib/buckets/list.js
+new file mode 100644
+index 0000000..9c6e39a
+--- /dev/null
++++ b/lib/buckets/list.js
+@@ -0,0 +1,102 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++var auth = require('../auth');
++var buckets = require('./buckets');
++var common = require('./common');
++
++function listBuckets(req, res, next) {
++
++    var log = req.log;
++    log.debug({
++        key: req.key,
++        params: req.params
++    }, 'listBuckets: requested');
++
++    var mreq = common.listBuckets(req);
++
++    var entries = [];
++    var message;
++
++    mreq.once('error', function onError(err) {
++        mreq.removeAllListeners('end');
++        mreq.removeAllListeners('entry');
++
++        log.debug(err, 'listBuckets: failed');
++        next(err);
++    });
++
++    mreq.on('message', function onMessage(_message) {
++        message = _message;
++        assert.object(message, 'message');
++        assert.bool(message.finished, message.finished);
++    });
++
++    mreq.on('entry', function onEntry(entry, raw) {
++        entries.push({
++            entry: entry,
++            raw: raw
++        });
++    });
++
++    mreq.once('end', function onEnd() {
++        // ensure that we received a messaged
++        assert.ok(message, 'message');
++
++        log.debug({}, 'listBuckets: done');
++
++        if (!message.finished) {
++            // If we are not finished then we are certain there is at least 1
++            // record received
++            assert.ok(entries.length > 0, 'entries.length > 0');
++
++            var lastObject = entries[entries.length - 1];
++            var lastEntry = lastObject.entry;
++            var lastRaw = lastObject.raw;
++
++            assert.object(lastEntry, 'lastEntry');
++            assert.string(lastEntry.name, 'lastEntry.name');
++
++            assert.object(lastRaw, 'lastRaw');
++            assert.optionalString(lastRaw.nextMarker, 'lastRaw.nextMarker');
++
++            res.header('Next-Marker', lastRaw.nextMarker || lastEntry.name);
++        }
++
++        entries.forEach(function (obj) {
++            var entry = obj.entry;
++            res.write(JSON.stringify(entry, null, 0) + '\n');
++        });
++
++        res.end();
++        next();
++    });
++}
++
++function setAuthContext(req, res, next) {
++    req.authContext.action = 'getdirectory';
++    next();
++}
++
++module.exports = {
++
++    listBucketsHandler: function listBucketsHandler() {
++        var chain = [
++            buckets.loadRequest,
++            setAuthContext,
++            auth.authorizationHandler(),
++            listBuckets
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/buckets/objects/create.js b/lib/buckets/objects/create.js
+new file mode 100644
+index 0000000..74b3b8c
+--- /dev/null
++++ b/lib/buckets/objects/create.js
+@@ -0,0 +1,154 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var auth = require('../../auth');
++var buckets = require('../buckets');
++var common = require('../../common');
++var conditional = require('../../conditional_request');
++var libuuid = require('libuuid');
++var obj = require('../../obj');
++
++
++function createObject(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var bucketObject = req.bucketObject;
++    var objectId = req.objectId;
++    var type = bucket.type;
++    var props = {};
++    var log = req.log;
++    var requestId = req.getId();
++
++    log.debug({
++        owner: owner,
++        bucket_name: bucket.name,
++        bucket_id: bucket.id,
++        object: bucketObject.name
++    }, 'createObject: requested');
++
++    buckets.createObjectMetadata(req, type,
++        function onCreateMetadata(createErr, object_data) {
++
++        if (createErr) {
++            next(createErr);
++            return;
++        }
++
++        log.debug({
++            owner: owner,
++            bucket_name: bucket.name,
++            bucket_id: bucket.id,
++            object: bucketObject.name,
++            metadata: object_data
++        }, 'onCreateMetadata: entered');
++
++        var onCreateObject = function onCreate(createErr2, response_data) {
++            if (object_data !== undefined && object_data._node) {
++                // Record the name of the shard and vnode contacted.
++                req.entryShard = response_data._node.pnode;
++                req.entryVnode = response_data._node.vnode;
++            }
++
++            if (createErr2) {
++                log.debug(createErr2, 'createObject: failed');
++                next(createErr2);
++            } else {
++                log.debug({
++                    bucket: bucketObject.bucket_name,
++                    object: bucketObject.name
++                }, 'createObject: done');
++                if (req.headers['origin']) {
++                    res.header('Access-Control-Allow-Origin',
++                               req.headers['origin']);
++                }
++                res.header('Etag', response_data.id);
++                res.header('Last-Modified', new Date(response_data.modified));
++                res.header('Computed-MD5', req._contentMD5);
++                res.send(204);
++                next(null, response_data);
++            }
++        };
++
++        req.boray.client.createObjectNoVnode(owner, bucket.id,
++            bucketObject.name, objectId, object_data.contentLength,
++            object_data.contentMD5, object_data.contentType,
++            object_data.headers, object_data.sharks, props, requestId,
++            onCreateObject);
++    });
++}
++
++
++function parseArguments(req, res, next)  {
++    var copies;
++    var len;
++    var maxObjectCopies = req.config.maxObjectCopies || obj.DEF_MAX_COPIES;
++
++    // First determine object size
++    if (req.isChunked()) {
++        var maxSize = req.msk_defaults.maxStreamingSize;
++        assert.number(maxSize, 'maxSize');
++        len = parseInt(req.header('max-content-length', maxSize), 10);
++        if (len < 0) {
++            next(new MaxContentLengthError(len));
++            return;
++        }
++        req.log.debug('streaming upload: using max_size=%d', len);
++    } else if ((len = req.getContentLength()) < 0) {
++        // allow zero-byte objects
++        next(new ContentLengthError());
++        return;
++    } else if ((req.getContentLength() || 0) === 0) {
++        req._contentMD5 = obj.ZERO_BYTE_MD5;
++        req.sharks = [];
++        req._zero = true;
++        len = 0;
++    }
++
++    // Next determine the number of copies
++    copies = parseInt((req.header('durability-level') ||
++                       obj.DEF_NUM_COPIES), 10);
++    if (copies < obj.DEF_MIN_COPIES || copies > maxObjectCopies) {
++        next(new InvalidDurabilityLevelError(obj.DEF_MIN_COPIES,
++                                             maxObjectCopies));
++        return;
++    }
++
++    req._copies = copies;
++    req._size = len;
++    req.objectId = libuuid.create();
++    assert.ok(len >= 0);
++    assert.ok(copies >= 0);
++    assert.ok(req.objectId);
++
++    req.log.debug({
++        copies: req._copies,
++        length: req._size
++    }, 'putBucketObject:parseArguments: done');
++    next();
++}
++
++module.exports = {
++    createBucketObjectHandler: function createBucketObjectHandler() {
++        var chain = [
++            buckets.loadRequest,
++            buckets.getBucketIfExists,
++            auth.authorizationHandler(),
++            buckets.maybeGetObject,
++            conditional.conditionalRequest(),
++            parseArguments,  // not blocking
++            common.findSharks, // blocking
++            common.startSharkStreams,
++            common.sharkStreams, // blocking
++            createObject // blocking
++        ];
++        return (chain);
++    }
++};
+diff --git a/lib/buckets/objects/delete.js b/lib/buckets/objects/delete.js
+new file mode 100644
+index 0000000..1465849
+--- /dev/null
++++ b/lib/buckets/objects/delete.js
+@@ -0,0 +1,84 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var auth = require('../../auth');
++var buckets = require('../buckets');
++var conditional = require('../../conditional_request');
++var errors = require('../../errors');
++
++function deleteObject(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var bucketObject = req.bucketObject;
++    var log = req.log;
++    var requestId = req.getId();
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name,
++        bucket_id: bucket.id,
++        object: bucketObject.name
++    }, 'deleteBucketObject: requested');
++
++    var onObjectDelete = function onDelete(err, object_data) {
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name,
++                bucket_id: bucket.id,
++                object: bucketObject.name
++            }, 'deleteObject: error deleting object');
++
++            next(err);
++            return;
++        } else {
++            // There is only one error type returned by this RPC
++            if (object_data.error && object_data.error.name ===
++                'ObjectNotFound') {
++                    req.resource_exists = false;
++                    req.not_found_error =
++                        new errors.ObjectNotFoundError(bucketObject.name);
++                    next();
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name,
++                    bucket_id: bucket.id,
++                    object: bucketObject.name
++                }, 'deleteObject: done');
++
++                req.resource_exists = true;
++                next(null, object_data);
++            }
++        }
++    };
++
++    req.boray.client.deleteObjectNoVnode(owner, bucket.id, bucketObject.name,
++        requestId, onObjectDelete);
++}
++
++module.exports = {
++
++    deleteBucketObjectHandler: function deleteBucketObjectHandler() {
++        var chain = [
++            buckets.loadRequest,
++            buckets.getBucketIfExists,
++            auth.authorizationHandler(),
++            buckets.maybeGetObject,
++            conditional.conditionalRequest(),
++            deleteObject,
++            buckets.notFoundHandler,
++            buckets.successHandler
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/buckets/objects/get.js b/lib/buckets/objects/get.js
+new file mode 100644
+index 0000000..3016e3c
+--- /dev/null
++++ b/lib/buckets/objects/get.js
+@@ -0,0 +1,33 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var auth = require('../../auth');
++var buckets = require('../buckets');
++var common = require('../../common');
++var conditional = require('../../conditional_request');
++var errors = require('../../errors');
++var obj = require('../../obj');
++
++
++module.exports = {
++
++    getBucketObjectHandler: function getBucketObjectHandler() {
++        var chain = [
++            buckets.loadRequest,
++            buckets.getBucketIfExists,
++            buckets.getObject,
++            auth.authorizationHandler(),
++            conditional.conditionalRequest(),
++            buckets.notFoundHandler,
++            common.streamFromSharks
++        ];
++        return (chain);
++    }
++};
+diff --git a/lib/buckets/objects/head.js b/lib/buckets/objects/head.js
+new file mode 100644
+index 0000000..cd84c54
+--- /dev/null
++++ b/lib/buckets/objects/head.js
+@@ -0,0 +1,105 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var buckets = require('../buckets');
++var common = require('../../common');
++var conditional = require('../../conditional_request');
++var errors = require('../../errors');
++var obj = require('../../obj');
++
++function headObject(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var bucketObject = req.bucketObject;
++    var requestId = req.getId();
++    var log = req.log;
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name,
++        bucket_id: bucket.id,
++        object: bucketObject.name,
++        requestId: requestId
++    }, 'headBucketObject: requested');
++
++
++    var onGetObject = function onGet(err, object_data) {
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name,
++                bucket_id: bucket.id,
++                object: bucketObject.name
++            }, 'headObject: error reading object metadata');
++
++            next(err);
++            return;
++        } else {
++            // There is only one error type returned by this RPC
++            if (object_data.error && object_data.error.name ===
++               'ObjectNotFound') {
++                    req.resource_exists = false;
++                    req.not_found_error =
++                        new errors.ObjectNotFoundError(bucketObject.name);
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name,
++                    bucket_id: bucket.id,
++                    object: bucketObject.name
++                }, 'headObject: done');
++
++                req.resource_exists = true;
++                req.metadata = req.metadta || {};
++                req.metadata.type = 'bucketobject';
++                req.metadata.objectId = object_data.id;
++                req.metadata.contentMD5 = object_data.content_md5;
++                req.metadata.contentLength = object_data.content_length;
++                req.metadata.contentType = object_data.content_type;
++
++                // Add other needed response headers
++                res.set('Etag', object_data.id);
++                res.set('Last-Modified', new Date(object_data.modified));
++                res.set('Durability-Level', object_data.sharks.length);
++                res.set('Content-Length', object_data.content_length);
++                res.set('Content-MD5', object_data.content_md5);
++                res.set('Content-Type', object_data.content_type);
++
++                Object.keys(object_data.headers).forEach(function (k) {
++                    if (/^m-\w+/.test(k)) {
++                        res.set(k, object_data.headers[k]);
++                    }
++                });
++            }
++
++            next();
++        }
++    };
++
++    req.boray.client.getObjectNoVnode(owner, bucket.id, bucketObject.name,
++        requestId, onGetObject);
++}
++
++module.exports = {
++
++    headBucketObjectHandler: function headBucketObjectHandler() {
++        var chain = [
++            buckets.loadRequest,
++            buckets.getBucketIfExists,
++            headObject,
++            conditional.conditionalRequest(),
++            buckets.notFoundHandler,
++            buckets.successHandler
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/buckets/objects/list.js b/lib/buckets/objects/list.js
+new file mode 100644
+index 0000000..ded9b98
+--- /dev/null
++++ b/lib/buckets/objects/list.js
+@@ -0,0 +1,101 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++var auth = require('../../auth');
++var buckets = require('../buckets');
++var common = require('../common');
++
++function listBucketObjects(req, res, next) {
++    var bucket = req.bucket;
++    var log = req.log;
++
++    assert.uuid(bucket.id, 'bucket.id');
++
++    log.debug({
++        bucket: req.name,
++        params: req.params
++    }, 'listBucketObjects: requested');
++
++    var mreq = common.listObjects(req, bucket.id);
++
++    var entries = [];
++    var message;
++
++    mreq.once('error', function onError(err) {
++        mreq.removeAllListeners('end');
++        mreq.removeAllListeners('entry');
++
++        log.debug(err, 'listBucketObjects: failed');
++        next(err);
++    });
++
++    mreq.on('message', function onMessage(_message) {
++        message = _message;
++        assert.object(message, 'message');
++        assert.bool(message.finished, message.finished);
++    });
++
++    mreq.on('entry', function onEntry(entry, raw) {
++        entries.push({
++            entry: entry,
++            raw: raw
++        });
++    });
++
++    mreq.once('end', function onEnd() {
++        // ensure that we received a messaged
++        assert.ok(message, 'message');
++
++        log.debug({}, 'listBucketObjects: done');
++
++        if (!message.finished) {
++            // If we are not finished then we are certain there is at least 1
++            // record received
++            assert.ok(entries.length > 0, 'entries.length > 0');
++
++            var lastObject = entries[entries.length - 1];
++            var lastEntry = lastObject.entry;
++            var lastRaw = lastObject.raw;
++
++            assert.object(lastEntry, 'lastEntry');
++            assert.string(lastEntry.name, 'lastEntry.name');
++
++            assert.object(lastRaw, 'lastRaw');
++            assert.optionalString(lastRaw.nextMarker, 'lastRaw.nextMarker');
++
++            res.header('Next-Marker', lastRaw.nextMarker || lastEntry.name);
++        }
++
++        entries.forEach(function (obj) {
++            var entry = obj.entry;
++            res.write(JSON.stringify(entry, null, 0) + '\n');
++        });
++
++        res.end();
++        next();
++    });
++}
++
++
++module.exports = {
++
++    listBucketObjectsHandler: function listBucketObjectsHandler() {
++        var chain = [
++            buckets.loadRequest,
++            auth.authorizationHandler(),
++            buckets.getBucketIfExists,
++            listBucketObjects
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/buckets/objects/metadata/get.js b/lib/buckets/objects/metadata/get.js
+new file mode 100644
+index 0000000..c0fa407
+--- /dev/null
++++ b/lib/buckets/objects/metadata/get.js
+@@ -0,0 +1,112 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var auth = require('../../../auth');
++var buckets = require('../../buckets');
++var common = require('../../../common');
++var conditional = require('../../../conditional_request');
++var errors = require('../../../errors');
++var obj = require('../../../obj');
++
++function getObjectMetadata(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var bucketObject = req.bucketObject;
++    var requestId = req.getId();
++    var log = req.log;
++
++    log.debug({
++        owner: owner,
++        bucket: bucket.name,
++        bucket_id: bucket.id,
++        object: bucketObject.name,
++        requestId: requestId
++    }, 'getBucketObjectMetadata: requested');
++
++
++    var onGetObject = function onGet(err, object_data) {
++        if (err) {
++            log.debug({
++                err: err,
++                owner: owner,
++                bucket: bucket.name,
++                bucket_id: bucket.id,
++                object: bucketObject.name
++            }, 'getObject: error reading object metadata');
++
++            next(err);
++            return;
++        } else {
++            // There is only one error type returned by this RPC
++            if (object_data.error && object_data.error.name ===
++               'ObjectNotFound') {
++                    req.resource_exists = false;
++                    req.not_found_error =
++                        new errors.ObjectNotFoundError(bucketObject.name);
++                    next();
++            } else {
++                log.debug({
++                    owner: owner,
++                    bucket: bucket.name,
++                    bucket_id: bucket.id,
++                    object: bucketObject.name
++                }, 'getObject: done');
++
++                req.resource_exists = true;
++                req.metadata = object_data;
++                req.metadata.type = 'bucketobject';
++                req.metadata.objectId = object_data.id;
++                req.metadata.contentMD5 = object_data.content_md5;
++                req.metadata.contentLength = object_data.content_length;
++                req.metadata.contentType = object_data.content_type;
++
++                // Add other needed response headers
++                res.set('Etag', object_data.id);
++                res.set('Last-Modified', new Date(object_data.modified));
++                res.set('Content-Type', object_data.content_type);
++                res.set('Durability-Level', object_data.sharks.length);
++                res.set('Content-Length', object_data.content_length);
++                res.set('Content-MD5', object_data.content_md5);
++                res.set('Content-Type', object_data.content_type);
++
++                Object.keys(object_data.headers).forEach(function (k) {
++                    if (/^m-\w+/.test(k)) {
++                        res.set(k, object_data.headers[k]);
++                    }
++                });
++
++                next(null, object_data);
++            }
++        }
++    };
++
++    req.boray.client.getObjectNoVnode(owner, bucket.id, bucketObject.name,
++        requestId, onGetObject);
++}
++
++
++module.exports = {
++
++    getBucketObjectMetadataHandler: function getBucketObjectMetadataHandler() {
++        var chain = [
++            buckets.loadRequest,
++            buckets.getBucketIfExists,
++            getObjectMetadata,
++            auth.authorizationHandler(),
++            conditional.conditionalRequest(),
++            buckets.notFoundHandler,
++            buckets.successHandler
++        ];
++        return (chain);
++    },
++
++    getObjectMetadata: getObjectMetadata
++
++};
+diff --git a/lib/buckets/objects/metadata/update.js b/lib/buckets/objects/metadata/update.js
+new file mode 100644
+index 0000000..6cf4e33
+--- /dev/null
++++ b/lib/buckets/objects/metadata/update.js
+@@ -0,0 +1,129 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var auth = require('../../../auth');
++var buckets = require('../../buckets');
++var common = require('../../../common');
++var conditional = require('../../../conditional_request');
++var libuuid = require('libuuid');
++var obj = require('../../../obj');
++
++
++function updateObjectMetadata(req, res, next) {
++    var owner = req.owner.account.uuid;
++    var bucket = req.bucket;
++    var bucketObject = req.bucketObject;
++    var objectId = libuuid.create();
++    var type = bucket.type;
++    var props = {};
++    var log = req.log;
++    var requestId = req.getId();
++
++    log.debug({
++        owner: owner,
++        bucket_name: bucket.name,
++        bucket_id: bucket.id,
++        object: bucketObject.name
++    }, 'createObject: requested');
++
++    buckets.createObjectMetadata(req, type,
++        function onCreateMetadata(createErr, object_data) {
++
++        if (createErr) {
++            next(createErr);
++            return;
++        }
++
++        log.debug({
++            owner: owner,
++            bucket_name: bucket.name,
++            bucket_id: bucket.id,
++            object: bucketObject.name,
++            metadata: object_data
++        }, 'onCreateMetadata: entered');
++
++        var onUpdateObject = function onUpdate(createErr2, response_data) {
++            if (response_data !== undefined && response_data._node) {
++                // Record the name of the shard and vnode contacted.
++                req.entryShard = response_data._node.pnode;
++                req.entryVnode = response_data._node.vnode;
++            }
++
++            if (createErr2) {
++                log.debug(createErr2, 'createObject: failed');
++                next(createErr2);
++            } else {
++                log.debug({
++                    bucket: bucketObject.bucket_name,
++                    object: bucketObject.name
++                }, 'createObject: done');
++                if (req.headers['origin']) {
++                    res.header('Access-Control-Allow-Origin',
++                               req.headers['origin']);
++                }
++                res.header('Etag', response_data.id);
++                res.header('Last-Modified', new Date(response_data.modified));
++
++                Object.keys(response_data.headers).forEach(function (k) {
++                    if (/^m-\w+/.test(k)) {
++                        res.set(k, response_data.headers[k]);
++                    }
++                });
++
++                res.send(204);
++                next(null, response_data);
++            }
++        };
++
++        req.boray.client.updateObjectNoVnode(owner, bucket.id,
++            bucketObject.name, objectId, object_data.contentType,
++            object_data.headers, props, requestId, onUpdateObject);
++    });
++}
++
++
++function parseArguments(req, res, next)  {
++    if ([
++        'content-length',
++        'content-md5',
++        'durability-level'
++    ].some(function (k) {
++        var bad = req.headers[k];
++        if (bad) {
++            setImmediate(function killRequest() {
++                next(new InvalidUpdateError(k));
++            });
++        }
++        return (bad);
++    })) {
++        return;
++    }
++
++    req.log.debug('updateObjectMetadata:parseArguments: done');
++    next();
++}
++
++
++module.exports = {
++    updateBucketObjectMetadataHandler:
++        function updateBucketObjectMetadataHandler() {
++        var chain = [
++            buckets.loadRequest,
++            buckets.getBucketIfExists,
++            auth.authorizationHandler(),
++            buckets.maybeGetObject,
++            conditional.conditionalRequest(),
++            parseArguments,  // not blocking
++            updateObjectMetadata // blocking
++        ];
++        return (chain);
++    }
++};
+diff --git a/lib/buckets/options.js b/lib/buckets/options.js
+new file mode 100644
+index 0000000..b2334c6
+--- /dev/null
++++ b/lib/buckets/options.js
+@@ -0,0 +1,39 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var auth = require('../auth');
++var buckets = require('./buckets');
++var common = require('./common');
++
++function options(req, res, next) {
++
++    var log = req.log;
++    log.debug('options: requested');
++
++    res.setHeader('Allow', 'OPTIONS, GET');
++    res.send(204);
++
++    log.debug('options: done');
++
++    next();
++}
++
++module.exports = {
++
++    optionsBucketsHandler: function optionsBucketsHandler() {
++        var chain = [
++            buckets.loadRequest,
++            auth.authorizationHandler(),
++            options
++        ];
++        return (chain);
++    }
++
++};
+diff --git a/lib/check_stream.js b/lib/check_stream.js
+index 8e9edae..a125f2e 100644
+--- a/lib/check_stream.js
++++ b/lib/check_stream.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+diff --git a/lib/common.js b/lib/common.js
+index 532f0f4..b18f3f1 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -5,11 +5,12 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var EventEmitter = require('events').EventEmitter;
+ var http = require('http');
++var once = require('once');
+ var os = require('os');
+ var path = require('path');
+ var util = require('util');
+@@ -22,14 +23,15 @@ var vasync = require('vasync');
+ var restify = require('restify');
+ var VError = require('verror');
+ 
+-var muskieUtils = require('./utils');
+-
++var CheckStream = require('./check_stream');
+ require('./errors');
+-
+-
++var muskieUtils = require('./utils');
++var sharkClient = require('./shark_client');
++var utils = require('./utils');
+ 
+ ///--- Globals
+ 
++var clone = utils.shallowCopy;
+ var sprintf = util.format;
+ 
+ var ANONYMOUS_USER = libmanta.ANONYMOUS_USER;
+@@ -42,6 +44,10 @@ var CORS_RES_HDRS = [
+     'access-control-allow-methods'
+ ];
+ 
++/* JSSTYLED */
++var BUCKETS_ROOT_PATH = /^\/([a-zA-Z][a-zA-Z0-9_\.@%]+)\/buckets\/?.*/;
++/* JSSTYLED */
++var BUCKETS_OBJECTS_PATH = /^\/([a-zA-Z][a-zA-Z0-9_\.@%]+)\/buckets\/([a-zA-Z][a-zA-Z0-9_\.@%]+)\/objects\/.*/;
+ /* JSSTYLED */
+ var JOBS_PATH = /^\/([a-zA-Z][a-zA-Z0-9_\.@%]+)\/jobs\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/;
+ /* JSSTYLED */
+@@ -63,6 +69,7 @@ var ROOT_REGEXPS = [
+     new RegExp('^\\/[a-zA-Z0-9_\\-\\.@%]+\\/stor\\/?$'), // storage
+     new RegExp('^\\/[a-zA-Z0-9_\\-\\.@%]+\\/jobs\\/?$'), // jobs (list)
+     new RegExp('^\\/[a-zA-Z0-9_\\-\\.@%]+\\/uploads\\/?$'), // uploads (list)
++    new RegExp('^\\/[a-zA-Z0-9_\\-\\.@%]+\\/buckets\\/?$'), // buckets (list)
+ 
+     // jobs storage
+     new RegExp('^\\/[a-zA-Z0-9_\\-\\.@%]+\\/jobs\\/[\\w-]+\\/stor\\/?$'),
+@@ -84,6 +91,8 @@ var METRIC_DELETED_DATA_COUNTER = 'muskie_deleted_bytes';
+ // The max number of headers we store on an object in Moray: 4 KB.
+ var MAX_HDRSIZE = 4 * 1024;
+ 
++var DATA_TIMEOUT = parseInt(process.env.MUSKIE_DATA_TIMEOUT || 45000, 10);
++
+ ///--- Internals
+ 
+ 
+@@ -101,6 +110,22 @@ HttpRequest.abandonSharks = function abandonSharks() {
+ };
+ 
+ 
++HttpRequest.encodeBucketObject = function encodeBucketObject() {
++    var self = this;
++
++    var splitPath = self.path().split('/');
++    /* This slice is :account/buckets/:bucketname/objects/ */
++    var baseBucketObjectPath = splitPath.slice(0, 5).join('/');
++
++    var bucketObject = self.path().split('/objects/').pop();
++    var encodedBucketObject = encodeURIComponent(bucketObject);
++    var pathParts = [baseBucketObjectPath, encodedBucketObject];
++
++    self._path = pathParts.join('/');
++    return (self._path);
++};
++
++
+ HttpRequest.isConditional = function isConditional() {
+     return (this.headers['if-match'] !== undefined ||
+             this.headers['if-none-match'] !== undefined);
+@@ -141,6 +166,22 @@ HttpRequest.isReadOnly = function isReadOnly() {
+ };
+ 
+ 
++HttpRequest.isBucketRoot = function isBucketRoot() {
++    function _test(p) {
++        return (BUCKETS_ROOT_PATH.test(p));
++    }
++
++    return (_test(this.path()));
++};
++
++HttpRequest.isBucketObject = function isBucketObject() {
++    function _test(p) {
++        return (BUCKETS_OBJECTS_PATH.test(p));
++    }
++
++    return (_test(this.path()));
++};
++
+ HttpRequest.isRootDirectory = function isRootDirectory(d) {
+     function _test(dir) {
+         var matches = ROOT_REGEXPS.some(function (re) {
+@@ -182,9 +223,23 @@ function createMetadata(req, type, cb) {
+     if (prev.type === 'directory')
+         type = 'directory';
+ 
++    /*
++     * This allows bucket objects to be created with slashes in their names that
++     * are interpreted as part of the object name, rather than denoting a parent
++     * directory the object resides in.
++     */
++    var mdDirname;
++    if (type !== 'bucketobject') {
++        mdDirname = path.dirname(req.key);
++    } else {
++        /* This cuts the path down to /:account/buckets/:bucketname/objects. */
++        mdDirname = req.key.split('/').slice(0, 5).join('/');
++    }
++    assert.string(mdDirname, 'mdDirname');
++
+     var names;
+     var md = {
+-        dirname: path.dirname(req.key),
++        dirname: mdDirname,
+         key: req.key,
+         headers: {},
+         mtime: Date.now(),
+@@ -223,6 +278,7 @@ function createMetadata(req, type, cb) {
+     });
+ 
+     switch (type) {
++    case 'bucket':
+     case 'directory':
+         break;
+ 
+@@ -230,6 +286,7 @@ function createMetadata(req, type, cb) {
+         md.link = req.link.metadata;
+         break;
+ 
++    case 'bucketobject':
+     case 'object':
+         muskieUtils.validateContentDisposition(
+             req.headers, function cdcb(err, _h) {
+@@ -413,6 +470,34 @@ function ensureNotRoot(req, res, next) {
+ }
+ 
+ 
++function ensureBucket(req, res, next) {
++    req.log.debug({
++        path: req.path
++    }, 'ensureBucket: entered');
++
++    if (req.isBucketRoot()) {
++        req.log.debug('ensureBucket: done');
++        next();
++    } else {
++        next(new ParentNotBucketRootError(req));
++    }
++}
++
++
++function ensureBucketObject(req, res, next) {
++    req.log.debug({
++        path: req.path
++    }, 'ensureBucketObject: entered');
++
++    if (req.isBucketObject()) {
++        req.log.debug('ensureBucketObject: done');
++        next();
++    } else {
++        next(new ParentNotBucketError(req));
++    }
++}
++
++
+ function ensureParent(req, res, next) {
+     req.log.debug({
+         parentKey: req.parentKey,
+@@ -438,6 +523,10 @@ function ensureParent(req, res, next) {
+  * metadata, if necessary.
+  */
+ function getMetadata(req, res, next) {
++    if (req.isBucketRoot()) {
++        return (next());
++    }
++
+     assert.ok(req.key);
+ 
+     var log = req.log;
+@@ -879,12 +968,608 @@ function readdir(dir, req, opts) {
+ 
+ 
+ 
++function findSharks(req, res, next) {
++    if (req._zero || req.query.metadata) {
++        next();
++        return;
++    }
++
++    var log = req.log;
++    var opts = {
++        replicas: req._copies,
++        requestId: req.getId(),
++        size: req._size,
++        isOperator: req.caller.account.isOperator
++    };
++
++    log.debug(opts, 'findSharks: entered');
++
++    opts.log = req.log;
++    req.picker.choose(opts, function (err, sharks) {
++        if (err) {
++            next(err);
++        } else {
++            req._sharks = sharks;
++            log.debug({
++                sharks: req._sharks
++            }, 'findSharks: done');
++            next();
++        }
++    });
++}
++
++
++/*
++ * This handler attempts to connect to one of the pre-selected, cross-DC sharks.
++ * If a connection to any shark in the set fails, we try a different set of
++ * sharks.
++ */
++function startSharkStreams(req, res, next) {
++    if (req._zero || req.query.metadata) {
++        next();
++        return;
++    }
++
++    assert.ok(req._sharks);
++
++    var log = req.log;
++    log.debug({
++        objectId: req.objectId,
++        sharks: req._sharks
++    }, 'startSharkStreams: entered');
++
++    var ndx = 0;
++    var opts = {
++        contentType: req.getContentType(),
++        contentLength: req.isChunked() ? undefined : req._size,
++        contentMd5: req.headers['content-md5'],
++        objectId: req.objectId,
++        owner: req.owner.account.uuid,
++        requestId: req.getId(),
++        sharkConfig: req.sharkConfig,
++        sharkAgent: req.sharkAgent
++    };
++
++    req.sharksContacted = [];
++
++    (function attempt(inputs) {
++        vasync.forEachParallel({
++            func: function shark_connect(shark, cb) {
++                var _opts = clone(opts);
++                _opts.log = req.log;
++                _opts.shark = shark;
++
++                var sharkInfo = createSharkInfo(req, shark.manta_storage_id);
++                sharkConnect(_opts, sharkInfo, cb);
++            },
++            inputs: inputs
++        }, function (err, results) {
++            req.sharks = results.successes || [];
++            if (err || req.sharks.length < req._copies) {
++                log.debug({
++                    err: err,
++                    sharks: inputs
++                }, 'startSharkStreams: failed');
++
++                req.abandonSharks();
++                if (ndx < req._sharks.length) {
++                    attempt(req._sharks[ndx++]);
++                } else {
++                    next(new SharksExhaustedError(res));
++                }
++                return;
++            }
++            if (log.debug()) {
++                req.sharks.forEach(function (s) {
++                    s.headers = s._headers;
++                    log.debug({
++                        client_req: s
++                    }, 'mako: stream started');
++                });
++
++                log.debug({
++                    objectId: req.objectId,
++                    sharks: inputs
++                }, 'startSharkStreams: done');
++            }
++            next();
++        });
++    })(req._sharks[ndx++]);
++}
++
++
++/*
++ * Here we stream the data from the object to each connected shark, using a
++ * check stream to compute the md5 sum of the data as it passes through muskie
++ * to mako.
++ *
++ * This handler is blocking.
++ */
++function sharkStreams(req, res, next) {
++    if (req._zero || req.query.metadata) {
++        next();
++        return;
++    }
++
++    /*
++     * While in the process of streaming the object out to multiple sharks, if a
++     * failure is experienced on one stream, we will essentially treat it as an
++     * overall failure and abandon the process of streaming this object to all
++     * sharks involved.  Note that `next_err()' is wrapped in the `once()'
++     * method because we need only respond to a failure event once.
++     */
++    var next_err = once(function _next_err(err) {
++        req.log.debug({
++            err: err
++        }, 'abandoning request');
++
++        /* Record the number of bytes that we transferred. */
++        req._size = check.bytes;
++
++        req.removeListener('end', onEnd);
++        req.removeListener('error', next_err);
++
++        req.abandonSharks();
++        req.unpipe(check);
++        check.abandon();
++
++        next(err);
++    });
++
++    var barrier = vasync.barrier();
++    var check = new CheckStream({
++        algorithm: 'md5',
++        maxBytes: req._size,
++        timeout: DATA_TIMEOUT,
++        counter: req.collector.getCollector(METRIC_INBOUND_DATA_COUNTER)
++    });
++    var log = req.log;
++
++    req.domain.add(check);
++
++    barrier.once('drain', function onCompleteStreams() {
++        req._timeToLastByte = Date.now();
++
++        req.connection.removeListener('error', abandonUpload);
++        req.removeListener('error', next_err);
++
++        if (req.sharks.some(function (s) {
++            return (s.md5 !== check.digest('base64'));
++        })) {
++            var _md5s = req.sharks.map(function (s) {
++                return (s.md5);
++            });
++            log.error({
++                clientMd5: req.headers['content-md5'],
++                muskieMd5: check.digest('base64'),
++                makoMd5: _md5s
++            }, 'mako didnt receive what muskie sent');
++            var m = new VError('muskie md5 %s and mako md5 ' +
++                            '%s don\'t match', check.digest('base64'),
++                            _md5s.join());
++            next_err(new InternalError(m));
++        } else {
++            log.debug('sharkStreams: done');
++            next();
++        }
++    });
++
++    log.debug('streamToSharks: streaming data');
++
++    function abandonUpload() {
++        next_err(new UploadAbandonedError());
++    }
++
++    req.connection.once('error', abandonUpload);
++
++    req.once('error', next_err);
++
++    barrier.start('client');
++    req.pipe(check);
++    req.sharks.forEach(function (s) {
++        barrier.start(s._shark.manta_storage_id);
++        req.pipe(s);
++        s.once('response', function onSharkResult(sres) {
++            log.debug({
++                mako: s._shark.manta_storage_id,
++                client_res: sres
++            }, 'mako: response received');
++
++            var sharkInfo = getSharkInfo(req, s._shark.manta_storage_id);
++            sharkInfo.timeTotal = Date.now() - sharkInfo._startTime;
++            sharkInfo.result = 'fail'; // most cases below here are failures
++
++            s.md5 = sres.headers['x-joyent-computed-content-md5'] ||
++                req._contentMD5;
++            if (sres.statusCode === 469) {
++                next_err(new ChecksumError(s.md5, req.headers['content-md5']));
++            } else if (sres.statusCode === 400 && req.headers['content-md5']) {
++                next_err(new restify.BadRequestError('Content-MD5 invalid'));
++            } else if (sres.statusCode > 400) {
++                var body = '';
++                sres.setEncoding('utf8');
++                sres.on('data', function (chunk) {
++                    body += chunk;
++                });
++                sres.once('end', function () {
++                    log.debug({
++                        mako: s._shark.manta_storage_id,
++                        client_res: sres,
++                        body: body
++                    }, 'mako: response error');
++                    var m = new VError('mako response error, storage id (%s)',
++                        s._shark.manta_storage_id);
++                    next_err(new InternalError(m));
++                });
++                sres.once('error', function (err) {
++                    next_err(new InternalError(err));
++                });
++            } else {
++                sharkInfo.result = 'ok';
++                barrier.done(s._shark.manta_storage_id);
++            }
++            /*
++             * Even though PUT requests that are successful normally result
++             * in an empty resonse body from nginx, we still need to make sure
++             * we let the response stream emit 'end'. Otherwise this will jam
++             * up keep-alive agent connections (the node http.js needs that
++             * 'end' even to happen before relinquishing the socket).
++             *
++             * Easiest thing to do is just call resume() which should make the
++             * stream run out and emit 'end'.
++             */
++            sres.resume();
++        });
++    });
++
++    check.once('timeout', function () {
++        res.header('connection', 'close');
++        next_err(new UploadTimeoutError());
++    });
++
++    check.once('length_exceeded', function (sz) {
++        next_err(new MaxSizeExceededError(sz));
++    });
++
++    check.once('error', next_err);
++
++    function onEnd() {
++        // We replace the actual size, in case it was streaming, and
++        // the content-md5 we actually calculated on the wire
++        req._contentMD5 = check.digest('base64');
++        req._size = check.bytes;
++        barrier.done('client');
++    }
++
++    req.once('end', onEnd);
++
++    barrier.start('check_stream');
++    check.once('done', function () {
++        barrier.done('check_stream');
++    });
++
++    if (req.header('expect') === '100-continue') {
++        res.writeContinue();
++        log.info({
++            remoteAddress: req.connection._xff,
++            remotePort: req.connection.remotePort,
++            req_id: req.id,
++            latency: (Date.now() - req._time),
++            'audit_100': true
++        }, '100-continue sent');
++    }
++
++    req._timeAtFirstByte = Date.now();
++}
++
++// Here we pick a shark to talk to, and the first one that responds we
++// just stream from. After that point any error is an internal error.
++function streamFromSharks(req, res, next) {
++    if (req.metadata.type !== 'object' &&
++        req.metadata.type !== 'bucketobject') {
++            next();
++            return;
++    }
++
++    var connected = false;
++    var log = req.log;
++    var md = req.metadata;
++    var opts = {
++        owner: req.owner.account.uuid,
++        creator: md.creator,
++        objectId: md.objectId,
++        requestId: req.getId()
++    };
++    var queue;
++    var savedErr = false;
++
++    if (req.headers.range)
++        opts.range = req.headers.range;
++
++    log.debug('streamFromSharks: entered');
++
++    addCustomHeaders(req, res);
++
++    if (md.contentLength === 0 || req.method === 'HEAD') {
++        log.debug('streamFromSharks: HEAD || zero-byte object');
++        res.header('Durability-Level', req.metadata.sharks.length);
++        res.header('Content-Disposition', req.metadata.contentDisposition);
++        res.header('Content-Length', md.contentLength);
++        res.header('Content-MD5', md.contentMD5);
++        res.header('Content-Type', md.contentType);
++        res.send(200);
++        next();
++        return;
++    }
++
++    req.sharksContacted = [];
++
++    function respond(shark, sharkReq, sharkInfo) {
++        log.debug('streamFromSharks: streaming data');
++        // Response headers
++        var sh = shark.headers;
++        if (req.headers['range'] !== undefined) {
++            res.header('Content-Type', sh['content-type']);
++            res.header('Content-Range', sh['content-range']);
++        } else {
++            res.header('Accept-Ranges', 'bytes');
++            res.header('Content-Type', md.contentType);
++            res.header('Content-MD5', md.contentMD5);
++        }
++
++        res.header('Content-Disposition', req.metadata.contentDisposition);
++        res.header('Content-Length', sh['content-length']);
++        res.header('Durability-Level', req.metadata.sharks.length);
++
++        req._size = sh['content-length'];
++
++        // Response body
++        req._totalBytes = 0;
++        var check = new CheckStream({
++            maxBytes: parseInt(sh['content-length'], 10) + 1024,
++            timeout: DATA_TIMEOUT,
++            counter: req.collector.getCollector(
++                METRIC_OUTBOUND_DATA_COUNTER)
++        });
++        sharkInfo.timeToFirstByte = check.start - sharkInfo._startTime;
++        check.once('done', function onCheckDone() {
++            req.connection.removeListener('error', onConnectionClose);
++
++            if (check.digest('base64') !== md.contentMD5 &&
++                !req.headers.range) {
++                // We can't set error now as the header has already gone out
++                // MANTA-1821, just stop logging this for now XXX
++                log.warn({
++                    expectedMD5: md.contentMD5,
++                    returnedMD5: check.digest('base64'),
++                    expectedBytes: parseInt(sh['content-length'], 10),
++                    computedBytes: check.bytes,
++                    url: req.url
++                }, 'GetObject: partial object returned');
++                res.statusCode = 597;
++            }
++
++            log.debug('streamFromSharks: done');
++            req._timeAtFirstByte = check.start;
++            req._timeToLastByte = Date.now();
++            req._totalBytes = check.bytes;
++
++            sharkInfo.timeTotal = req._timeToLastByte - sharkInfo._startTime;
++
++            next();
++        });
++        shark.once('error', next);
++
++        function onConnectionClose(err) {
++            /*
++             * It's possible to invoke this function through multiple paths, as
++             * when a socket emits 'error' and the request emits 'close' during
++             * this phase.  But we only want to handle this once.
++             */
++            if (req._muskie_handle_close) {
++                return;
++            }
++
++            req._muskie_handle_close = true;
++            req._probes.client_close.fire(function onFire() {
++                var _obj = {
++                    id: req._id,
++                    method: req.method,
++                    headers: req.headers,
++                    url: req.url,
++                    bytes_sent: check.bytes,
++                    bytes_expected: parseInt(sh['content-length'], 10)
++                };
++                return ([_obj]);
++            });
++
++            req.log.warn(err, 'handling closed client connection');
++            check.removeAllListeners('done');
++            shark.unpipe(check);
++            shark.unpipe(res);
++            sharkReq.abort();
++            req._timeAtFirstByte = check.start;
++            req._timeToLastByte = Date.now();
++            req._totalBytes = check.bytes;
++            res.statusCode = 499;
++            next(false);
++        }
++
++        /*
++         * It's possible that the client has already closed its connection at
++         * this point, in which case we need to abort the request here in order
++         * to avoid coming to rest in a broken state.  You might think we'd
++         * notice this problem when we pipe the mako response to the client's
++         * response and attempt to write to a destroyed Socket, but instead Node
++         * drops such writes without emitting an error.  (It appears to assume
++         * that the caller will be listening for 'close'.)
++         */
++        if (req._muskie_client_closed) {
++            setImmediate(onConnectionClose,
++                new Error('connection closed before streamFromSharks'));
++        } else {
++            req.connection.once('error', onConnectionClose);
++            req.once('close', function () {
++                onConnectionClose(new Error(
++                    'connection closed during streamFromSharks'));
++            });
++        }
++
++        res.writeHead(shark.statusCode);
++        shark.pipe(check);
++        shark.pipe(res);
++    }
++
++    queue = libmanta.createQueue({
++        limit: 1,
++        worker: function start(s, cb) {
++            if (connected) {
++                cb();
++            } else {
++                var sharkInfo = createSharkInfo(req, s.hostname);
++
++                s.get(opts, function (err, cReq, cRes) {
++                    if (err) {
++                        sharkInfo.result = 'fail';
++                        sharkInfo.timeTotal = Date.now() - sharkInfo._startTime;
++                        log.warn({
++                            err: err,
++                            shark: s.toString()
++                        }, 'mako: connection failed');
++                        savedErr = err;
++                        cb();
++                    } else {
++                        sharkInfo.result = 'ok';
++                        connected = true;
++                        respond(cRes, cReq, sharkInfo);
++                        cb();
++                    }
++                });
++            }
++        }
++    });
++
++    queue.once('end', function () {
++        if (!connected) {
++            // Honor Nginx handling Range GET requests
++            if (savedErr && savedErr._result) {
++                var rh = savedErr._result.headers;
++                if (req.headers['range'] !== undefined && rh['content-range']) {
++                    res.setHeader('content-range', rh['content-range']);
++                    next(new restify.RequestedRangeNotSatisfiableError());
++                    return;
++                }
++            }
++            next(savedErr || new InternalError());
++        }
++    });
++
++    var shuffledSharks = utils.shuffle(req.metadata.sharks);
++
++    shuffledSharks.forEach(function (s) {
++        queue.push(sharkClient.getClient({
++            connectTimeout: req.sharkConfig.connectTimeout,
++            log: req.log,
++            retry: req.sharkConfig.retry,
++            shark: s,
++            agent: req.sharkAgent
++        }));
++    });
++
++    queue.close();
++}
++
++// Simple wrapper around sharkClient.getClient + put
++//
++// opts:
++//   {
++//      contentType: req.getContentType(),   // content-type from the request
++//      contentLength: req.isChunked() ? undefined : req._size,
++//      log: $bunyan,
++//      shark: $shark,  // a specific shark from $picker.choose()
++//      objectId: req.objectId,    // proposed objectId
++//      owner: req.owner.account.uuid,   // /:login/stor/... (uuid for $login)
++//      sharkConfig: {  // from config.json
++//        connectTimeout: 4000,
++//        retry: {
++//          retries: 2
++//        }
++//      },
++//      requestId: req.getId()   // current request_id
++//   }
++//
++// sharkInfo: object used for logging information about the shark
++//
++function sharkConnect(opts, sharkInfo, cb) {
++    var client = sharkClient.getClient({
++        connectTimeout: opts.sharkConfig.connectTimeout,
++        log: opts.log,
++        retry: opts.sharkConfig.retry,
++        shark: opts.shark,
++        agent: opts.sharkAgent
++    });
++    assert.ok(client, 'sharkClient returned null');
++
++    client.put(opts, function (err, req) {
++        if (err) {
++            cb(err);
++        } else {
++            req._shark = opts.shark;
++            opts.log.debug({
++                client_req: req
++            }, 'SharkClient: put started');
++            sharkInfo.timeToFirstByte = Date.now() - sharkInfo._startTime;
++            cb(null, req);
++        }
++    });
++}
++
++// Creates a 'sharkInfo' object, used for logging purposes,
++// and saves it on the input request object to log later.
++//
++// Input:
++//      req: the request object to save this shark on
++//      hostname: the name of the shark (e.g., '1.stor.emy-13.joyent.us')
++// Output:
++//      a sharkInfo object
++function createSharkInfo(req, hostname) {
++    var sharkInfo = {
++        shark: hostname,
++        result: null, // 'ok' or 'fail'
++        // time until streaming object to or from the shark begins
++        timeToFirstByte: null,
++        timeTotal: null, // total request time
++
++        // private: time request begins (used to calculate other time values)
++        _startTime: Date.now()
++    };
++
++    req.sharksContacted.push(sharkInfo);
++    return (sharkInfo);
++}
++
++// Given a request object and shark name, returns the matching sharkInfo object.
++// This is only meant to be used if we are certain the shark is in this request,
++// and will cause an assertion failure otherwise.
++function getSharkInfo(req, hostname) {
++    var sharks = req.sharksContacted.filter(function (sharkInfo) {
++        return (sharkInfo.shark === hostname);
++    });
++
++    assert.equal(sharks.length, 1, 'There should only be one sharkInfo ' +
++        'with hostname "' + hostname + '"');
++
++    return (sharks[0]);
++}
++
+ ///--- Exports
+ 
+ module.exports = {
+ 
+     ANONYMOUS_USER: ANONYMOUS_USER,
+ 
++    CORS_RES_HDRS: CORS_RES_HDRS,
++
+     JOBS_PATH: JOBS_PATH,
+ 
+     STOR_PATH: STOR_PATH,
+@@ -899,6 +1584,8 @@ module.exports = {
+ 
+     UPLOADS_ROOT_PATH: UPLOADS_ROOT_PATH,
+ 
++    BUCKETS_ROOT_PATH: BUCKETS_ROOT_PATH,
++
+     MAX_HDRSIZE: MAX_HDRSIZE,
+ 
+     METRIC_REQUEST_COUNTER: METRIC_REQUEST_COUNTER,
+@@ -1065,6 +1752,14 @@ module.exports = {
+         return (ensureNotRoot);
+     },
+ 
++    ensureBucketRootHandler: function () {
++        return (ensureBucket);
++    },
++
++    ensureBucketObjectHandler: function () {
++        return (ensureBucketObject);
++    },
++
+     ensureParentHandler: function () {
+         return (ensureParent);
+     },
+@@ -1083,6 +1778,7 @@ module.exports = {
+             // General request setup
+             req.config = options;
+             req.moray = clients.moray;
++            req.boray = clients.boray;
+ 
+             /*
+              * MANTA-331: while a trailing '/' is ok in HTTP, this messes with
+@@ -1130,6 +1826,7 @@ module.exports = {
+                 account: req.owner.account,
+                 path: req.path()
+             };
++
+             libmanta.normalizeMantaPath(_opts, function (err, p) {
+                 if (err) {
+                     req.log.debug({
+@@ -1154,5 +1851,10 @@ module.exports = {
+         }
+ 
+         return (setup);
+-    }
++    },
++
++    findSharks: findSharks,
++    startSharkStreams: startSharkStreams,
++    sharkStreams: sharkStreams,
++    streamFromSharks: streamFromSharks
+ };
+diff --git a/lib/conditional_request.js b/lib/conditional_request.js
+new file mode 100644
+index 0000000..f251fb1
+--- /dev/null
++++ b/lib/conditional_request.js
+@@ -0,0 +1,225 @@
++// Copyright 2012 Mark Cavage, Inc.  All rights reserved.
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var restify = require('restify');
++
++///--- Globals
++
++var BadRequestError = restify.BadRequestError;
++var PreconditionFailedError = restify.PreconditionFailedError;
++
++var IF_MATCH_FAIL = 'if-match \'%s\' didn\'t match etag \'%s\'';
++var IF_NO_MATCH_FAIL = 'if-none-match \'%s\' matched etag \'%s\'';
++var IF_MOD_FAIL = 'object was modified at \'%s\'; if-modified-since \'%s\'';
++var IF_UNMOD_FAIL = 'object was modified at \'%s\'; if-unmodified-since \'%s\'';
++
++
++///--- API
++// Reference RFC2616 section 14 for an explanation of what this all does.
++
++function checkIfMatch(req, res, next) {
++    assert.bool(req.resource_exists, 'resource_exists');
++
++    var clientETags;
++    var cur;
++    var etag = res.etag || res.getHeader('etag') || '';
++    var ifMatch;
++    var matched = false;
++
++    if ((ifMatch = req.headers['if-match'])) {
++        /* JSSTYLED */
++        clientETags = ifMatch.split(/\s*,\s*/);
++
++        for (var i = 0; i < clientETags.length; i++) {
++            cur = clientETags[i];
++            // only strong comparison
++            /* JSSTYLED */
++            cur = cur.replace(/^W\//, '');
++            /* JSSTYLED */
++            cur = cur.replace(/^"(\w*)"$/, '$1');
++
++            if (cur === '*') {
++                matched = req.resource_exists;
++                break;
++            } else if (req.resource_exists && cur === etag) {
++                matched = true;
++                break;
++            }
++        }
++
++        if (!matched) {
++            var err = new PreconditionFailedError(IF_MATCH_FAIL,
++                ifMatch,
++                etag);
++            return (next(err));
++        }
++    }
++
++    return (next());
++}
++
++
++function checkIfNoneMatch(req, res, next) {
++    assert.bool(req.resource_exists, 'resource_exists');
++
++    var clientETags;
++    var cur;
++    var etag = res.etag || res.getHeader('etag') || '';
++    var ifNoneMatch;
++    var matched = false;
++
++    if ((ifNoneMatch = req.headers['if-none-match'])) {
++        /* JSSTYLED */
++        clientETags = ifNoneMatch.split(/\s*,\s*/);
++
++        for (var i = 0; i < clientETags.length; i++) {
++            cur = clientETags[i];
++            // ignore weak validation
++            /* JSSTYLED */
++            cur = cur.replace(/^W\//, '');
++            /* JSSTYLED */
++            cur = cur.replace(/^"(\w*)"$/, '$1');
++
++            if (cur === '*') {
++                matched = req.resource_exists;
++            } else if (req.resource_exists && cur === etag) {
++                matched = true;
++                break;
++            }
++        }
++
++        if (matched) {
++            // If request method is not GET or HEAD then return 412
++            if (req.method !== 'GET' && req.method !== 'HEAD') {
++                var err = new PreconditionFailedError(IF_NO_MATCH_FAIL,
++                                                      ifNoneMatch,
++                                                      etag);
++                next(err);
++            } else {
++                // For GET or HEAD return 304 Not Modified
++                res.send(304);
++                next(false);
++            }
++            return;
++        }
++    }
++
++    next();
++}
++
++
++function checkIfModified(req, res, next) {
++    var code;
++    var err;
++    var ctime = req.header('if-modified-since');
++    var mtime = res.mtime || res.header('Last-Modified') || '';
++
++    if (!mtime || !ctime) {
++        next();
++        return;
++    }
++
++    try {
++        //
++        // TODO handle Range header modifications
++        //
++        // Note: this is not technically correct as per 2616 -
++        // 2616 only specifies semantics for GET requests, not
++        // any other method - but using if-modified-since with a
++        // PUT or DELETE seems like returning 412 is sane
++        //
++        if (Date.parse(mtime) <= Date.parse(ctime)) {
++            switch (req.method) {
++                case 'GET':
++                case 'HEAD':
++                    code = 304;
++                    break;
++
++                default:
++                    err = new PreconditionFailedError(IF_MOD_FAIL,
++                        mtime,
++                        ctime);
++                    break;
++            }
++        }
++    } catch (e) {
++        next(new BadRequestError(e.message));
++        return;
++    }
++
++    if (code !== undefined) {
++        res.send(code);
++        next(false);
++        return;
++    }
++
++    next(err);
++}
++
++
++function checkIfUnmodified(req, res, next) {
++    var err;
++    var ctime = req.headers['if-unmodified-since'];
++    var mtime = res.mtime || res.header('Last-Modified') || '';
++
++    if (!mtime || !ctime) {
++        next();
++        return;
++    }
++
++    try {
++        if (Date.parse(mtime) > Date.parse(ctime)) {
++            err = new PreconditionFailedError(IF_UNMOD_FAIL,
++                mtime,
++                ctime);
++        }
++    } catch (e) {
++        next(new BadRequestError(e.message));
++        return;
++    }
++
++    next(err);
++}
++
++
++///--- Exports
++
++/**
++ * Returns a set of plugins that will compare an already set ETag header with
++ * the client's If-Match and If-None-Match header, and an already set
++ * Last-Modified header with the client's If-Modified-Since and
++ * If-Unmodified-Since header.
++ */
++
++module.exports = {
++    conditionalRequest: function _conditionalRequest() {
++        var chain = [
++            checkIfMatch,
++            checkIfUnmodified,
++            checkIfNoneMatch,
++            checkIfModified
++        ];
++        return (chain);
++    },
++
++    matchConditionalRequest: function _matchConditionalRequest() {
++        var chain = [
++            checkIfMatch,
++            checkIfNoneMatch
++        ];
++        return (chain);
++    },
++
++    modifiedConditionalRequest: function _modifiedConditionalRequest() {
++        var chain = [
++            checkIfUnmodified,
++            checkIfModified
++
++        ];
++        return (chain);
++    }
++};
+diff --git a/lib/configure.js b/lib/configure.js
+index 5948c44..91a1327 100644
+--- a/lib/configure.js
++++ b/lib/configure.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2019, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var fs = require('fs');
+@@ -59,7 +59,7 @@ function configure(appName, opts, dtProbes) {
+     cfg.log = configureLogging(appName, cfg.bunyan, opts.verbose);
+ 
+     [ cfg.auth, cfg.marlin, cfg.moray, cfg.medusa,
+-      cfg.cueballHttpAgent, cfg.sharkConfig
++      cfg.cueballHttpAgent, cfg.sharkConfig, cfg.boray
+     ].forEach(function (x) {
+         x.log = cfg.log;
+     });
+diff --git a/lib/dir.js b/lib/dir.js
+index 43458ef..d99da4f 100644
+--- a/lib/dir.js
++++ b/lib/dir.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var util = require('util');
+diff --git a/lib/errors.js b/lib/errors.js
+index ac42afb..71d4448 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+@@ -91,6 +91,33 @@ function AuthorizationRequiredError(reason) {
+ util.inherits(AuthorizationRequiredError, MuskieError);
+ 
+ 
++function BucketExistsError(bucket) {
++    MuskieError.call(this, {
++        restCode: 'BucketAlreadyExists',
++        statusCode: 409,
++        message: sprintf('%s already exists', bucket)
++    });
++}
++util.inherits(BucketExistsError, MuskieError);
++
++function BucketNotEmptyError(bucket) {
++    MuskieError.call(this, {
++        restCode: 'BucketNotEmpty',
++        statusCode: 409,
++        message: sprintf('%s is not empty', bucket)
++    });
++}
++util.inherits(BucketExistsError, MuskieError);
++
++function BucketNotFoundError(p) {
++    MuskieError.call(this, {
++        restCode: 'BucketNotFound',
++        statusCode: 404,
++        message: p + ' was not found'
++    });
++}
++util.inherits(BucketNotFoundError, MuskieError);
++
+ function ChecksumError(expected, actual) {
+     MuskieError.call(this, {
+         restCode: 'ContentMD5Mismatch',
+@@ -220,6 +247,16 @@ function InvalidAuthTokenError(reason) {
+ util.inherits(InvalidAuthTokenError, MuskieError);
+ 
+ 
++function InvalidBucketNameError(name) {
++    MuskieError.call(this, {
++        restCode: 'InvalidBucketName',
++        statusCode: 422,
++        message: name + ' is not a valid bucket name'
++    });
++}
++util.inherits(InvalidBucketNameError, MuskieError);
++
++
+ function InvalidHttpAuthTokenError(reason) {
+     MuskieError.call(this, {
+         restCode: 'InvalidHttpAuthenticationToken',
+@@ -520,6 +557,30 @@ function NotImplementedError(message) {
+ util.inherits(NotImplementedError, MuskieError);
+ 
+ 
++/*
++ * A "bucket object" path is in the form:
++ * /buckets/:bucketname/objects/:objectname
++ */
++function ParentNotBucketError(req) {
++    MuskieError.call(this, {
++        restCode: 'ParentNotBucket',
++        statusCode: 400,
++        message: sprintf('bucket objects must be created in a bucket')
++    });
++}
++util.inherits(ParentNotBucketError, MuskieError);
++
++
++function ParentNotBucketRootError(req) {
++    MuskieError.call(this, {
++        restCode: 'ParentNotBucketRoot',
++        statusCode: 400,
++        message: sprintf('buckets must be created in the buckets directory')
++    });
++}
++util.inherits(ParentNotBucketRootError, MuskieError);
++
++
+ function ParentNotDirectoryError(req) {
+     MuskieError.call(this, {
+         restCode: 'ParentNotDirectory',
+@@ -530,6 +591,14 @@ function ParentNotDirectoryError(req) {
+ }
+ util.inherits(ParentNotDirectoryError, MuskieError);
+ 
++function ObjectNotFoundError(p) {
++    MuskieError.call(this, {
++        restCode: 'ObjectNotFound',
++        statusCode: 404,
++        message: p + ' was not found'
++    });
++}
++util.inherits(ObjectNotFoundError, MuskieError);
+ 
+ function PreSignedRequestError(msg) {
+     MuskieError.call(this, {
+diff --git a/lib/index.js b/lib/index.js
+index 6cfd4e9..be4b0d2 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2019, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var server = require('./server');
+diff --git a/lib/jobs/common.js b/lib/jobs/common.js
+index 53aa0c5..c8a6b9f 100644
+--- a/lib/jobs/common.js
++++ b/lib/jobs/common.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/jobs/create.js b/lib/jobs/create.js
+index 42ac15b..402bdbd 100644
+--- a/lib/jobs/create.js
++++ b/lib/jobs/create.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var util = require('util');
+diff --git a/lib/jobs/error.js b/lib/jobs/error.js
+index 486d809..a77c262 100644
+--- a/lib/jobs/error.js
++++ b/lib/jobs/error.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var auth = require('../auth');
+diff --git a/lib/jobs/fail.js b/lib/jobs/fail.js
+index 12353ab..77a91a9 100644
+--- a/lib/jobs/fail.js
++++ b/lib/jobs/fail.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var auth = require('../auth');
+diff --git a/lib/jobs/get.js b/lib/jobs/get.js
+index 2c01971..c8bb932 100644
+--- a/lib/jobs/get.js
++++ b/lib/jobs/get.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var libmanta = require('libmanta');
+diff --git a/lib/jobs/index.js b/lib/jobs/index.js
+index a7d4eb3..a024800 100644
+--- a/lib/jobs/index.js
++++ b/lib/jobs/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ ///--- Helpers
+diff --git a/lib/jobs/input.js b/lib/jobs/input.js
+index 678efb8..28e7a9d 100644
+--- a/lib/jobs/input.js
++++ b/lib/jobs/input.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var stream = require('stream');
+diff --git a/lib/jobs/list.js b/lib/jobs/list.js
+index cf4a991..3046923 100644
+--- a/lib/jobs/list.js
++++ b/lib/jobs/list.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/jobs/output.js b/lib/jobs/output.js
+index 7415a4f..f4d24c5 100644
+--- a/lib/jobs/output.js
++++ b/lib/jobs/output.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var auth = require('../auth');
+diff --git a/lib/jobs/post.js b/lib/jobs/post.js
+index a61f996..e13050f 100644
+--- a/lib/jobs/post.js
++++ b/lib/jobs/post.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var auth = require('../auth');
+diff --git a/lib/link.js b/lib/link.js
+index 537577c..5640a2f 100644
+--- a/lib/link.js
++++ b/lib/link.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var url = require('url');
+diff --git a/lib/medusa/connector.js b/lib/medusa/connector.js
+index 5fa5f9e..38a7516 100644
+--- a/lib/medusa/connector.js
++++ b/lib/medusa/connector.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/medusa/index.js b/lib/medusa/index.js
+index c4873e7..65cb5f3 100644
+--- a/lib/medusa/index.js
++++ b/lib/medusa/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ ///--- Helpers
+diff --git a/lib/medusa/routes.js b/lib/medusa/routes.js
+index e972865..4c74d32 100644
+--- a/lib/medusa/routes.js
++++ b/lib/medusa/routes.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ // vim: set ts=8 sts=8 sw=8 et:
+diff --git a/lib/obj.js b/lib/obj.js
+index b1e48ee..596832b 100644
+--- a/lib/obj.js
++++ b/lib/obj.js
+@@ -5,12 +5,12 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ //
+ // PUT object is probably the most complicated code that happens
+-// synchronously in muskie, and can get a bit uniwiedly to trace through, so
++// synchronously in muskie, and can get a bit unwieldy to trace through, so
+ // below is some context on what we need to do.
+ //
+ // Recall that the contract of PUT object is that by default muskie will stream
+@@ -63,20 +63,15 @@ var vasync = require('vasync');
+ var VError = require('verror');
+ 
+ var common = require('./common');
+-var CheckStream = require('./check_stream');
+ var sharkClient = require('./shark_client');
+ var utils = require('./utils');
+ require('./errors');
+ 
+-
+-
+ ///--- Globals
+ 
+ var clone = utils.shallowCopy;
+ var httpDate = restify.httpDate;
+ 
+-var DATA_TIMEOUT = parseInt(process.env.MUSKIE_DATA_TIMEOUT || 45000, 10);
+-
+ // Upper bound of 1 million entries in a directory.
+ var MAX_DIRENTS = 1000000;
+ 
+@@ -98,91 +93,6 @@ var ZERO_BYTE_MD5 = '1B2M2Y8AsgTpgAmY7PhCfg==';
+ 
+ ///--- Helpers
+ 
+-// Simple wrapper around sharkClient.getClient + put
+-//
+-// opts:
+-//   {
+-//      contentType: req.getContentType(),   // content-type from the request
+-//      contentLength: req.isChunked() ? undefined : req._size,
+-//      log: $bunyan,
+-//      shark: $shark,  // a specific shark from $picker.choose()
+-//      objectId: req.objectId,    // proposed objectId
+-//      owner: req.owner.account.uuid,   // /:login/stor/... (uuid for $login)
+-//      sharkConfig: {  // from config.json
+-//        connectTimeout: 4000,
+-//        retry: {
+-//          retries: 2
+-//        }
+-//      },
+-//      requestId: req.getId()   // current request_id
+-//   }
+-//
+-// sharkInfo: object used for logging information about the shark
+-//
+-function sharkConnect(opts, sharkInfo, cb) {
+-    var client = sharkClient.getClient({
+-        connectTimeout: opts.sharkConfig.connectTimeout,
+-        log: opts.log,
+-        retry: opts.sharkConfig.retry,
+-        shark: opts.shark,
+-        agent: opts.sharkAgent
+-    });
+-    assert.ok(client, 'sharkClient returned null');
+-
+-    client.put(opts, function (err, req) {
+-        if (err) {
+-            cb(err);
+-        } else {
+-            req._shark = opts.shark;
+-            opts.log.debug({
+-                client_req: req
+-            }, 'SharkClient: put started');
+-            sharkInfo.timeToFirstByte = Date.now() - sharkInfo._startTime;
+-            cb(null, req);
+-        }
+-    });
+-}
+-
+-// Creates a 'sharkInfo' object, used for logging purposes,
+-// and saves it on the input request object to log later.
+-//
+-// Input:
+-//      req: the request object to save this shark on
+-//      hostname: the name of the shark (e.g., '1.stor.emy-13.joyent.us')
+-// Output:
+-//      a sharkInfo object
+-function createSharkInfo(req, hostname) {
+-    var sharkInfo = {
+-        shark: hostname,
+-        result: null, // 'ok' or 'fail'
+-        // time until streaming object to or from the shark begins
+-        timeToFirstByte: null,
+-        timeTotal: null, // total request time
+-
+-        // private: time request begins (used to calculate other time values)
+-        _startTime: Date.now()
+-    };
+-
+-    req.sharksContacted.push(sharkInfo);
+-    return (sharkInfo);
+-}
+-
+-// Given a request object and shark name, returns the matching sharkInfo object.
+-// This is only meant to be used if we are certain the shark is in this request,
+-// and will cause an assertion failure otherwise.
+-function getSharkInfo(req, hostname) {
+-    var sharks = req.sharksContacted.filter(function (sharkInfo) {
+-        return (sharkInfo.shark === hostname);
+-    });
+-
+-    assert.equal(sharks.length, 1, 'There should only be one sharkInfo ' +
+-        'with hostname "' + hostname + '"');
+-
+-    return (sharks[0]);
+-}
+-
+-
+-
+ ///-- Routes
+ 
+ //--- PUT Handlers ---//
+@@ -295,37 +205,6 @@ function parseArguments(req, res, next) {
+ }
+ 
+ 
+-function findSharks(req, res, next) {
+-    if (req._zero || req.query.metadata) {
+-        next();
+-        return;
+-    }
+-
+-    var log = req.log;
+-    var opts = {
+-        replicas: req._copies,
+-        requestId: req.getId(),
+-        size: req._size,
+-        isOperator: req.caller.account.isOperator
+-    };
+-
+-    log.debug(opts, 'findSharks: entered');
+-
+-    opts.log = req.log;
+-    req.picker.choose(opts, function (err, sharks) {
+-        if (err) {
+-            next(err);
+-        } else {
+-            req._sharks = sharks;
+-            log.debug({
+-                sharks: req._sharks
+-            }, 'findSharks: done');
+-            next();
+-        }
+-    });
+-}
+-
+-
+ // Ensures that directories do not exceed a set number of entries.
+ function enforceDirectoryCount(req, res, next) {
+     if (req.query.metadata) {
+@@ -357,275 +236,11 @@ function enforceDirectoryCount(req, res, next) {
+ 
+ 
+ /*
+- * This handler attempts to connect to one of the pre-selected, cross-DC sharks.
+- * If a connection to any shark in the set fails, we try a different set of
+- * sharks.
++ * Here we add a new object record to Moray.
+  */
+-function startSharkStreams(req, res, next) {
+-    if (req._zero || req.query.metadata) {
+-        next();
+-        return;
+-    }
+-
+-    assert.ok(req._sharks);
+-
++function addMetadata(req, res, type, next) {
+     var log = req.log;
+-    log.debug({
+-        objectId: req.objectId,
+-        sharks: req._sharks
+-    }, 'startSharkStreams: entered');
+-
+-    var ndx = 0;
+-    var opts = {
+-        contentType: req.getContentType(),
+-        contentLength: req.isChunked() ? undefined : req._size,
+-        contentMd5: req.headers['content-md5'],
+-        objectId: req.objectId,
+-        owner: req.owner.account.uuid,
+-        requestId: req.getId(),
+-        sharkConfig: req.sharkConfig,
+-        sharkAgent: req.sharkAgent
+-    };
+-
+-    req.sharksContacted = [];
+-
+-    (function attempt(inputs) {
+-        vasync.forEachParallel({
+-            func: function shark_connect(shark, cb) {
+-                var _opts = clone(opts);
+-                _opts.log = req.log;
+-                _opts.shark = shark;
+-
+-                var sharkInfo = createSharkInfo(req, shark.manta_storage_id);
+-                sharkConnect(_opts, sharkInfo, cb);
+-            },
+-            inputs: inputs
+-        }, function (err, results) {
+-            req.sharks = results.successes || [];
+-            if (err || req.sharks.length < req._copies) {
+-                log.debug({
+-                    err: err,
+-                    sharks: inputs
+-                }, 'startSharkStreams: failed');
+-
+-                req.abandonSharks();
+-                if (ndx < req._sharks.length) {
+-                    attempt(req._sharks[ndx++]);
+-                } else {
+-                    next(new SharksExhaustedError(res));
+-                }
+-                return;
+-            }
+-            if (log.debug()) {
+-                req.sharks.forEach(function (s) {
+-                    s.headers = s._headers;
+-                    log.debug({
+-                        client_req: s
+-                    }, 'mako: stream started');
+-                });
+-
+-                log.debug({
+-                    objectId: req.objectId,
+-                    sharks: inputs
+-                }, 'startSharkStreams: done');
+-            }
+-            next();
+-        });
+-    })(req._sharks[ndx++]);
+-}
+-
+-
+-/*
+- * Here we stream the data from the object to each connected shark, using a
+- * check stream to compute the md5 sum of the data as it passes through muskie
+- * to mako.
+- *
+- * This handler is blocking.
+- */
+-function sharkStreams(req, res, next) {
+-    if (req._zero || req.query.metadata) {
+-        next();
+-        return;
+-    }
+-
+-    /*
+-     * While in the process of streaming the object out to multiple sharks, if a
+-     * failure is experienced on one stream, we will essentially treat it as an
+-     * overall failure and abandon the process of streaming this object to all
+-     * sharks involved.  Note that `next_err()' is wrapped in the `once()'
+-     * method because we need only respond to a failure event once.
+-     */
+-    var next_err = once(function _next_err(err) {
+-        req.log.debug({
+-            err: err
+-        }, 'abandoning request');
+-
+-        /* Record the number of bytes that we transferred. */
+-        req._size = check.bytes;
+-
+-        req.removeListener('end', onEnd);
+-        req.removeListener('error', next_err);
+-
+-        req.abandonSharks();
+-        req.unpipe(check);
+-        check.abandon();
+-
+-        next(err);
+-    });
+-
+-    var barrier = vasync.barrier();
+-    var check = new CheckStream({
+-        algorithm: 'md5',
+-        maxBytes: req._size,
+-        timeout: DATA_TIMEOUT,
+-        counter: req.collector.getCollector(common.METRIC_INBOUND_DATA_COUNTER)
+-    });
+-    var log = req.log;
+-
+-    req.domain.add(check);
+-
+-    barrier.once('drain', function onCompleteStreams() {
+-        req._timeToLastByte = Date.now();
+-
+-        req.connection.removeListener('error', abandonUpload);
+-        req.removeListener('error', next_err);
+-
+-        if (req.sharks.some(function (s) {
+-            return (s.md5 !== check.digest('base64'));
+-        })) {
+-            var _md5s = req.sharks.map(function (s) {
+-                return (s.md5);
+-            });
+-            log.error({
+-                clientMd5: req.headers['content-md5'],
+-                muskieMd5: check.digest('base64'),
+-                makoMd5: _md5s
+-            }, 'mako didnt recieve what muskie sent');
+-            var m = new VError('muskie md5 %s and mako md5 ' +
+-                            '%s don\'t match', check.digest('base64'),
+-                            _md5s.join());
+-            next_err(new InternalError(m));
+-        } else {
+-            log.debug('sharkStreams: done');
+-            next();
+-        }
+-    });
+-
+-    log.debug('streamToSharks: streaming data');
+-
+-    function abandonUpload() {
+-        next_err(new UploadAbandonedError());
+-    }
+-
+-    req.connection.once('error', abandonUpload);
+-
+-    req.once('error', next_err);
+-
+-    barrier.start('client');
+-    req.pipe(check);
+-    req.sharks.forEach(function (s) {
+-        barrier.start(s._shark.manta_storage_id);
+-        req.pipe(s);
+-        s.once('response', function onSharkResult(sres) {
+-            log.debug({
+-                mako: s._shark.manta_storage_id,
+-                client_res: sres
+-            }, 'mako: response received');
+-
+-            var sharkInfo = getSharkInfo(req, s._shark.manta_storage_id);
+-            sharkInfo.timeTotal = Date.now() - sharkInfo._startTime;
+-            sharkInfo.result = 'fail'; // most cases below here are failures
+-
+-            s.md5 = sres.headers['x-joyent-computed-content-md5'] ||
+-                req._contentMD5;
+-            if (sres.statusCode === 469) {
+-                next_err(new ChecksumError(s.md5, req.headers['content-md5']));
+-            } else if (sres.statusCode === 400 && req.headers['content-md5']) {
+-                next_err(new restify.BadRequestError('Content-MD5 invalid'));
+-            } else if (sres.statusCode > 400) {
+-                var body = '';
+-                sres.setEncoding('utf8');
+-                sres.on('data', function (chunk) {
+-                    body += chunk;
+-                });
+-                sres.once('end', function () {
+-                    log.debug({
+-                        mako: s._shark.manta_storage_id,
+-                        client_res: sres,
+-                        body: body
+-                    }, 'mako: response error');
+-                    var m = new VError('mako response error, storage id (%s)',
+-                        s._shark.manta_storage_id);
+-                    next_err(new InternalError(m));
+-                });
+-                sres.once('error', function (err) {
+-                    next_err(new InternalError(err));
+-                });
+-            } else {
+-                sharkInfo.result = 'ok';
+-                barrier.done(s._shark.manta_storage_id);
+-            }
+-            /*
+-             * Even though PUT requests that are successful normally result
+-             * in an empty resonse body from nginx, we still need to make sure
+-             * we let the response stream emit 'end'. Otherwise this will jam
+-             * up keep-alive agent connections (the node http.js needs that
+-             * 'end' even to happen before relinquishing the socket).
+-             *
+-             * Easiest thing to do is just call resume() which should make the
+-             * stream run out and emit 'end'.
+-             */
+-            sres.resume();
+-        });
+-    });
+-
+-    check.once('timeout', function () {
+-        res.header('connection', 'close');
+-        next_err(new UploadTimeoutError());
+-    });
+-
+-    check.once('length_exceeded', function (sz) {
+-        next_err(new MaxSizeExceededError(sz));
+-    });
+-
+-    check.once('error', next_err);
+-
+-    function onEnd() {
+-        // We replace the actual size, in case it was streaming, and
+-        // the content-md5 we actually calculated on the wire
+-        req._contentMD5 = check.digest('base64');
+-        req._size = check.bytes;
+-        barrier.done('client');
+-    }
+-
+-    req.once('end', onEnd);
+-
+-    barrier.start('check_stream');
+-    check.once('done', function () {
+-        barrier.done('check_stream');
+-    });
+-
+-    if (req.header('expect') === '100-continue') {
+-        res.writeContinue();
+-        log.info({
+-            remoteAddress: req.connection._xff,
+-            remotePort: req.connection.remotePort,
+-            req_id: req.id,
+-            latency: (Date.now() - req._time),
+-            'audit_100': true
+-        }, '100-continue sent');
+-    }
+-
+-    req._timeAtFirstByte = Date.now();
+-}
+-
+-
+-/*
+- * Here we save a new object record to Moray.
+- */
+-function saveMetadata(req, res, next) {
+-    var log = req.log;
+-    common.createMetadata(req, 'object', function (err, opts) {
++    common.createMetadata(req, type, function (err, opts) {
+         if (err) {
+             next(err);
+             return;
+@@ -664,6 +279,25 @@ function saveMetadata(req, res, next) {
+             }
+         });
+     });
++
++}
++
++
++/*
++ * Here we save a new object record to Moray.
++ */
++function saveMetadata(req, res, next) {
++    var type = 'object';
++    addMetadata(req, res, type, next);
++}
++
++
++/*
++ * Here we save a new bucket object record to Moray.
++ */
++function saveBucketObjectMetadata(req, res, next) {
++    var type = 'bucketobject';
++    addMetadata(req, res, type, next);
+ }
+ 
+ 
+@@ -696,225 +330,6 @@ function verifyRange(req, res, next) {
+     return (next());
+ }
+ 
+-
+-// Here we pick a shark to talk to, and the first one that responds we
+-// just stream from. After that point any error is an internal error.
+-function streamFromSharks(req, res, next) {
+-    if (req.metadata.type !== 'object') {
+-        next();
+-        return;
+-    }
+-
+-    var connected = false;
+-    var log = req.log;
+-    var md = req.metadata;
+-    var opts = {
+-        owner: req.owner.account.uuid,
+-        creator: md.creator,
+-        objectId: md.objectId,
+-        requestId: req.getId()
+-    };
+-    var queue;
+-    var savedErr = false;
+-
+-    if (req.headers.range)
+-        opts.range = req.headers.range;
+-
+-    log.debug('streamFromSharks: entered');
+-
+-    common.addCustomHeaders(req, res);
+-
+-    if (md.contentLength === 0 || req.method === 'HEAD') {
+-        log.debug('streamFromSharks: HEAD || zero-byte object');
+-        res.header('Durability-Level', req.metadata.sharks.length);
+-        res.header('Content-Disposition', req.metadata.contentDisposition);
+-        res.header('Content-Length', md.contentLength);
+-        res.header('Content-MD5', md.contentMD5);
+-        res.header('Content-Type', md.contentType);
+-        res.send(200);
+-        next();
+-        return;
+-    }
+-
+-    req.sharksContacted = [];
+-
+-    function respond(shark, sharkReq, sharkInfo) {
+-        log.debug('streamFromSharks: streaming data');
+-        // Response headers
+-        var sh = shark.headers;
+-        if (req.headers['range'] !== undefined) {
+-            res.header('Content-Type', sh['content-type']);
+-            res.header('Content-Range', sh['content-range']);
+-        } else {
+-            res.header('Accept-Ranges', 'bytes');
+-            res.header('Content-Type', md.contentType);
+-            res.header('Content-MD5', md.contentMD5);
+-        }
+-
+-        res.header('Content-Disposition', req.metadata.contentDisposition);
+-        res.header('Content-Length', sh['content-length']);
+-        res.header('Durability-Level', req.metadata.sharks.length);
+-
+-        req._size = sh['content-length'];
+-
+-        // Response body
+-        req._totalBytes = 0;
+-        var check = new CheckStream({
+-            maxBytes: parseInt(sh['content-length'], 10) + 1024,
+-            timeout: DATA_TIMEOUT,
+-            counter: req.collector.getCollector(
+-                common.METRIC_OUTBOUND_DATA_COUNTER)
+-        });
+-        sharkInfo.timeToFirstByte = check.start - sharkInfo._startTime;
+-        check.once('done', function onCheckDone() {
+-            req.connection.removeListener('error', onConnectionClose);
+-
+-            if (check.digest('base64') !== md.contentMD5 &&
+-                !req.headers.range) {
+-                // We can't set error now as the header has already gone out
+-                // MANTA-1821, just stop logging this for now XXX
+-                log.warn({
+-                    expectedMD5: md.contentMD5,
+-                    returnedMD5: check.digest('base64'),
+-                    expectedBytes: parseInt(sh['content-length'], 10),
+-                    computedBytes: check.bytes,
+-                    url: req.url
+-                }, 'GetObject: partial object returned');
+-                res.statusCode = 597;
+-            }
+-
+-            log.debug('streamFromSharks: done');
+-            req._timeAtFirstByte = check.start;
+-            req._timeToLastByte = Date.now();
+-            req._totalBytes = check.bytes;
+-
+-            sharkInfo.timeTotal = req._timeToLastByte - sharkInfo._startTime;
+-
+-            next();
+-        });
+-        shark.once('error', next);
+-
+-        function onConnectionClose(err) {
+-            /*
+-             * It's possible to invoke this function through multiple paths, as
+-             * when a socket emits 'error' and the request emits 'close' during
+-             * this phase.  But we only want to handle this once.
+-             */
+-            if (req._muskie_handle_close) {
+-                return;
+-            }
+-
+-            req._muskie_handle_close = true;
+-            req._probes.client_close.fire(function onFire() {
+-                var _obj = {
+-                    id: req._id,
+-                    method: req.method,
+-                    headers: req.headers,
+-                    url: req.url,
+-                    bytes_sent: check.bytes,
+-                    bytes_expected: parseInt(sh['content-length'], 10)
+-                };
+-                return ([_obj]);
+-            });
+-
+-            req.log.warn(err, 'handling closed client connection');
+-            check.removeAllListeners('done');
+-            shark.unpipe(check);
+-            shark.unpipe(res);
+-            sharkReq.abort();
+-            req._timeAtFirstByte = check.start;
+-            req._timeToLastByte = Date.now();
+-            req._totalBytes = check.bytes;
+-            res.statusCode = 499;
+-            next(false);
+-        }
+-
+-        /*
+-         * It's possible that the client has already closed its connection at
+-         * this point, in which case we need to abort the request here in order
+-         * to avoid coming to rest in a broken state.  You might think we'd
+-         * notice this problem when we pipe the mako response to the client's
+-         * response and attempt to write to a destroyed Socket, but instead Node
+-         * drops such writes without emitting an error.  (It appears to assume
+-         * that the caller will be listening for 'close'.)
+-         */
+-        if (req._muskie_client_closed) {
+-            setImmediate(onConnectionClose,
+-                new Error('connection closed before streamFromSharks'));
+-        } else {
+-            req.connection.once('error', onConnectionClose);
+-            req.once('close', function () {
+-                onConnectionClose(new Error(
+-                    'connection closed during streamFromSharks'));
+-            });
+-        }
+-
+-        res.writeHead(shark.statusCode);
+-        shark.pipe(check);
+-        shark.pipe(res);
+-    }
+-
+-    queue = libmanta.createQueue({
+-        limit: 1,
+-        worker: function start(s, cb) {
+-            if (connected) {
+-                cb();
+-            } else {
+-                var sharkInfo = createSharkInfo(req, s.hostname);
+-
+-                s.get(opts, function (err, cReq, cRes) {
+-                    if (err) {
+-                        sharkInfo.result = 'fail';
+-                        sharkInfo.timeTotal = Date.now() - sharkInfo._startTime;
+-                        log.warn({
+-                            err: err,
+-                            shark: s.toString()
+-                        }, 'mako: connection failed');
+-                        savedErr = err;
+-                        cb();
+-                    } else {
+-                        sharkInfo.result = 'ok';
+-                        connected = true;
+-                        respond(cRes, cReq, sharkInfo);
+-                        cb();
+-                    }
+-                });
+-            }
+-        }
+-    });
+-
+-    queue.once('end', function () {
+-        if (!connected) {
+-            // Honor Nginx handling Range GET requests
+-            if (savedErr && savedErr._result) {
+-                var rh = savedErr._result.headers;
+-                if (req.headers['range'] !== undefined && rh['content-range']) {
+-                    res.setHeader('content-range', rh['content-range']);
+-                    next(new restify.RequestedRangeNotSatisfiableError());
+-                    return;
+-                }
+-            }
+-            next(savedErr || new InternalError());
+-        }
+-    });
+-
+-    var shuffledSharks = utils.shuffle(req.metadata.sharks);
+-
+-    shuffledSharks.forEach(function (s) {
+-        queue.push(sharkClient.getClient({
+-            connectTimeout: req.sharkConfig.connectTimeout,
+-            log: req.log,
+-            retry: req.sharkConfig.retry,
+-            shark: s,
+-            agent: req.sharkAgent
+-        }));
+-    });
+-
+-    queue.close();
+-}
+-
+-
+-
+ //-- DELETE handlers --//
+ 
+ function deletePointer(req, res, next) {
+@@ -968,6 +383,22 @@ module.exports = {
+     DEF_NUM_COPIES: DEF_NUM_COPIES,
+     ZERO_BYTE_MD5: ZERO_BYTE_MD5,
+ 
++    /*
++     * This handler is called by the bucket object creation handler. This file
++     * provides access to unexposed functions not available to the buckets
++     * handler directly which are necessary for writing object data to shards.
++     */
++    putBucketObjectHandler: function _putBucketObject() {
++        var chain = [
++            parseArguments,
++            common.findSharks,
++            common.startSharkStreams,
++            common.sharkStreams,
++            saveBucketObjectMetadata
++        ];
++        return (chain);
++    },
++
+     putObjectHandler: function _putObject() {
+         var chain = [
+             restify.conditionalRequest(),
+@@ -976,9 +407,9 @@ module.exports = {
+             common.ensureNotDirectoryHandler(), // not blocking
+             common.ensureParentHandler(), // not blocking
+             enforceDirectoryCount,
+-            findSharks, // blocking
+-            startSharkStreams,
+-            sharkStreams, // blocking
++            common.findSharks, // blocking
++            common.startSharkStreams,
++            common.sharkStreams, // blocking
+             saveMetadata // blocking
+         ];
+         return (chain);
+@@ -989,7 +420,7 @@ module.exports = {
+             negotiateContent, // not blocking
+             restify.conditionalRequest(),
+             verifyRange,
+-            streamFromSharks // blocking
++            common.streamFromSharks // blocking
+         ];
+ 
+         return (chain);
+@@ -1009,8 +440,8 @@ module.exports = {
+         var chain = [
+             parseArguments,
+             enforceDirectoryCount,
+-            startSharkStreams,
+-            sharkStreams,
++            common.startSharkStreams,
++            common.sharkStreams,
+             saveMetadata
+         ];
+         return (chain);
+diff --git a/lib/other.js b/lib/other.js
+index 84f75a7..3f50868 100644
+--- a/lib/other.js
++++ b/lib/other.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var os = require('os');
+diff --git a/lib/server.js b/lib/server.js
+index be938a0..ae1593f 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2019, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var crypto = require('crypto');
+@@ -21,6 +21,7 @@ var restify = require('restify');
+ 
+ var audit = require('./audit');
+ var auth = require('./auth');
++var buckets = require('./buckets');
+ var common = require('./common');
+ var dir = require('./dir');
+ var jobs = require('./jobs');
+@@ -268,6 +269,13 @@ function createServer(options, clients, name) {
+             ok = false;
+         }
+ 
++        if (options.enableBuckets && !clients.boray && req.isBucketRoot()) {
++            error = 'boray unavailable';
++            errors.push(new Error(error));
++            req.log.error(error);
++            ok = false;
++        }
++
+         if (!ok) {
+             next(new ServiceUnavailableError(req,
+                         new verror.MultiError(errors)));
+@@ -365,6 +373,11 @@ function createServer(options, clients, name) {
+         addMultipartUploadRoutes(server);
+     }
+ 
++    // Buckets API
++    if (options.enableBuckets) {
++        addBucketsRoutes(server);
++    }
++
+     server.use(common.getMetadataHandler());
+     server.use(auth.storageContext);
+     server.use(auth.authorizationHandler());
+@@ -432,6 +445,15 @@ function createServer(options, clients, name) {
+         var _p = storagePaths[k].regex;
+         var _n = storagePaths[k].name;
+ 
++        /*
++         * The semantics of the buckets routes are different from those which
++         * are convenient to auto-generate for storage directory trees.
++         * Therefore it makes sense to skip creation of unnecessary routes if
++         * the path concerned is buckets-related.
++         */
++        if (_n === 'Buckets')
++            return;
++
+         // Otherwise in audit/dtrace we'll see GetStorageStorage
+         if (_n === 'Storage')
+             _n = '';
+@@ -518,12 +540,134 @@ function createServer(options, clients, name) {
+ }
+ 
+ 
+-function forbiddenHandler(req, res, next) {
++function methodNotAllowHandler(req, res, next) {
+     req.log.debug('Method ' + req.method + ' disallowed for ' + req.url);
+     res.send(405);
+     next(false);
+ }
+ 
++/*
++ * This function adds the following routes:
++ *  - listing buckets
++ *  - creating a bucket
++ *  - getting a bucket
++ *  - deleting a bucket
++ *  - listing objects in a bucket
++ *  - creating an object inside a bucket
++ *  - getting an object from a bucket
++ *  - deleting an object from a bucket
++ */
++function addBucketsRoutes(server) {
++
++    server.get({
++        path: '/:account/buckets',
++        name: 'ListBuckets'
++    }, buckets.listBucketsHandler());
++
++    server.opts({
++        path: '/:account/buckets',
++        name: 'OptionsBuckets'
++    }, buckets.optionsBucketsHandler());
++
++    server.put({
++        path: '/:account/buckets/:bucket_name',
++        name: 'CreateBucket',
++        contentType: '*/*'
++    }, buckets.createBucketHandler());
++
++    server.head({
++        path: '/:account/buckets/:bucket_name',
++        name: 'HeadBucket'
++    }, buckets.headBucketHandler());
++
++    server.del({
++        path: '/:account/buckets/:bucket_name',
++        name: 'DeleteBucket'
++    }, buckets.deleteBucketHandler());
++
++    server.get({
++        path: '/:account/buckets/:bucket_name/objects',
++        name: 'ListBucketObjects'
++    }, buckets.listBucketObjectsHandler());
++
++    server.put({
++        path: '/:account/buckets/:bucket_name/objects/:object_name',
++        name: 'CreateBucketObject',
++        contentType: '*/*'
++    }, buckets.createBucketObjectHandler());
++
++    server.get({
++        path: '/:account/buckets/:bucket_name/objects/:object_name',
++        name: 'GetBucketObject'
++    }, buckets.getBucketObjectHandler());
++
++    server.head({
++        path: '/:account/buckets/:bucket_name/objects/:object_name',
++        name: 'HeadBucketObject'
++    }, buckets.headBucketObjectHandler());
++
++    server.del({
++        path: '/:account/buckets/:bucket_name/objects/:object_name',
++        name: 'DeleteBucketObject'
++    }, buckets.deleteBucketObjectHandler());
++
++    server.get({
++        path: '/:account/buckets/:bucket_name/objects/:object_name/metadata',
++        name: 'GetBucketObjectMetadata',
++        contentType: '*/*'
++    }, buckets.getBucketObjectMetadataHandler());
++
++    server.put({
++        path: '/:account/buckets/:bucket_name/objects/:object_name/metadata',
++        name: 'UpdateBucketObjectMetadata',
++        contentType: '*/*'
++    }, buckets.updateBucketObjectMetadataHandler());
++
++    server.post({
++        path: '/:account/buckets'
++    }, methodNotAllowHandler);
++
++    server.put({
++        path: '/:account/buckets'
++    }, methodNotAllowHandler);
++
++    server.head({
++        path: '/:account/buckets'
++    }, methodNotAllowHandler);
++
++    server.del({
++        path: '/:account/buckets'
++    }, methodNotAllowHandler);
++
++    server.post({
++        path: '/:account/buckets/:bucket_name/objects'
++    }, methodNotAllowHandler);
++
++    server.put({
++        path: '/:account/buckets/:bucket_name/objects'
++    }, methodNotAllowHandler);
++
++    server.head({
++        path: '/:account/buckets/:bucket_name/objects'
++    }, methodNotAllowHandler);
++
++    server.del({
++        path: '/:account/buckets/:bucket_name/objects'
++    }, methodNotAllowHandler);
++
++    server.head({
++        path: '/:account/buckets/:bucket_name/objects/:object_name/metadata'
++    }, methodNotAllowHandler);
++
++    server.post({
++        path: '/:account/buckets/:bucket_name/objects/:object_name/metadata'
++    }, methodNotAllowHandler);
++
++    server.del({
++        path: '/:account/buckets/:bucket_name/objects/:object_name/metadata'
++    }, methodNotAllowHandler);
++
++}
+ 
+ /*
+  * This adds the routes for the majority of multipart upload API endpoints,
+@@ -558,7 +702,7 @@ function addMultipartUploadRoutes(server) {
+ 
+     server.put({
+         path: '/:account/uploads'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     // Redirects
+     /* JSSTYLED */
+@@ -628,19 +772,19 @@ function addMultipartUploadRoutes(server) {
+ 
+     server.head({
+         path: '/:account/uploads/[0-f]+/:id/state'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.put({
+         path: '/:account/uploads/[0-f]+/:id/state'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.post({
+         path: '/:account/uploads/[0-f]+/:id/state'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.del({
+         path: '/:account/uploads/[0-f]+/:id/state'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     /*
+      * Path: /:account/uploads/[0-f]/:id/abort
+@@ -655,19 +799,19 @@ function addMultipartUploadRoutes(server) {
+ 
+     server.get({
+         path: '/:account/uploads/[0-f]+/:id/abort'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.put({
+         path: '/:account/uploads/[0-f]+/:id/abort'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.head({
+         path: '/:account/uploads/[0-f]+/:id/abort'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.del({
+         path: '/:account/uploads/[0-f]+/:id/abort'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     /*
+      * Path: /:account/uploads/[0-f]/:id/commit
+@@ -683,19 +827,19 @@ function addMultipartUploadRoutes(server) {
+ 
+     server.get({
+         path: '/:account/uploads/[0-f]+/:id/commit'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.put({
+         path: '/:account/uploads/[0-f]+/:id/commit'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.head({
+         path: '/:account/uploads/[0-f]+/:id/commit'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.del({
+         path: '/:account/uploads/[0-f]+/:id/commit'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ }
+ 
+ 
+@@ -717,11 +861,11 @@ function addMultipartUploadDataPlaneRoutes(server) {
+ 
+     server.put({
+         path: '/:account/uploads/[0-f]+/:id'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.post({
+         path: '/:account/uploads/[0-f]+/:id'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     /*
+      * Path: /:account/uploads/[0-f]/:id/:partNum
+@@ -742,11 +886,11 @@ function addMultipartUploadDataPlaneRoutes(server) {
+ 
+     server.get({
+         path: '/:account/uploads/[0-f]+/:id/:partNum'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ 
+     server.post({
+         path: '/:account/uploads/[0-f]+/:id/:partNum'
+-    }, forbiddenHandler);
++    }, methodNotAllowHandler);
+ }
+ 
+ 
+diff --git a/lib/throttle.js b/lib/throttle.js
+index 82cd5b4..a552df2 100644
+--- a/lib/throttle.js
++++ b/lib/throttle.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/uploads/abort.js b/lib/uploads/abort.js
+index a41de3d..ca48413 100644
+--- a/lib/uploads/abort.js
++++ b/lib/uploads/abort.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/uploads/commit.js b/lib/uploads/commit.js
+index a5c56a8..2233c92 100644
+--- a/lib/uploads/commit.js
++++ b/lib/uploads/commit.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/uploads/common.js b/lib/uploads/common.js
+index a4d9d46..141f59f 100644
+--- a/lib/uploads/common.js
++++ b/lib/uploads/common.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var util = require('util');
+diff --git a/lib/uploads/create.js b/lib/uploads/create.js
+index b1b1cc5..197a3d7 100644
+--- a/lib/uploads/create.js
++++ b/lib/uploads/create.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2019, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/lib/uploads/del.js b/lib/uploads/del.js
+index 4ca4f68..c2b8cc5 100644
+--- a/lib/uploads/del.js
++++ b/lib/uploads/del.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var dir = require('../dir');
+diff --git a/lib/uploads/get.js b/lib/uploads/get.js
+index 89d43a2..89912f4 100644
+--- a/lib/uploads/get.js
++++ b/lib/uploads/get.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var auth = require('../auth');
+diff --git a/lib/uploads/index.js b/lib/uploads/index.js
+index ff61c30..9711c15 100644
+--- a/lib/uploads/index.js
++++ b/lib/uploads/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ ///--- Helpers
+diff --git a/lib/uploads/redirect.js b/lib/uploads/redirect.js
+index f4c3606..050d212 100644
+--- a/lib/uploads/redirect.js
++++ b/lib/uploads/redirect.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var uploadsCommon = require('./common');
+diff --git a/lib/uploads/upload.js b/lib/uploads/upload.js
+index 32e5a28..f0c32bd 100644
+--- a/lib/uploads/upload.js
++++ b/lib/uploads/upload.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var jsprim = require('jsprim');
+diff --git a/lib/utils.js b/lib/utils.js
+index 2ef67a1..f5b07e5 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2019, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+diff --git a/main.js b/main.js
+index 76d64b6..fc9d2ac 100644
+--- a/main.js
++++ b/main.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2019, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ var net = require('net');
+@@ -31,7 +31,8 @@ var restify = require('restify');
+ var vasync = require('vasync');
+ 
+ var app = require('./lib');
+-
++var boray = require('./lib/buckets/boray');
++var uploadsCommon = require('./lib/uploads/common');
+ 
+ ///--- Internal Functions
+ 
+@@ -304,6 +305,40 @@ function createMorayClient(opts, onConnect) {
+ }
+ 
+ 
++function onBorayConnect(clients, barrier, borayClient) {
++    clients.boray = borayClient;
++    barrier.done('createBorayClient');
++}
++
++
++function createBorayClient(opts, onConnect) {
++    assert.object(opts, 'options');
++    assert.object(opts.log, 'options.log');
++
++    var log = opts.log.child({component: 'boray'}, true);
++    opts.log = log;
++
++    var client = new boray.createClient(opts);
++
++    client.once('error', function (err) {
++        client.removeAllListeners('connect');
++
++        log.error(err, 'boray: failed to connect');
++    });
++
++    client.once('connect', function _onConnect() {
++        client.removeAllListeners('error');
++
++        log.info({
++            host: opts.host,
++            port: opts.port
++        }, 'boray: connected');
++
++        onConnect(client);
++    });
++}
++
++
+ function onMedusaConnect(clients, medusaClient) {
+     clients.medusa = medusaClient;
+ }
+@@ -401,6 +436,12 @@ function clientsConnected(appName, cfg, clients) {
+     barrier.start('createMorayClient');
+     createMorayClient(cfg.moray, onMorayConnect.bind(null, clients, barrier));
+ 
++    if (cfg.enableBuckets && cfg.boray) {
++        barrier.start('createBorayClient');
++        createBorayClient(cfg.boray,
++            onBorayConnect.bind(null, clients, barrier));
++    }
++
+     // Establish other client connections needed for writes and jobs requests.
+     createPickerClient(cfg.storage, cfg.log,
+         onPickerConnect.bind(null, clients));
+diff --git a/package.json b/package.json
+index 2b90ea0..feffbdf 100644
+--- a/package.json
++++ b/package.json
+@@ -15,6 +15,7 @@
+         "artedi": "1.1.1",
+         "assert-plus": "0.1.5",
+         "backoff": "2.3.0",
++        "boray": "git+https://github.com/joyent/node-boray.git#master",
+         "bunyan": "0.22.1",
+         "bunyan-syslog": "0.2.2",
+         "cmdln": "4.3.0",
+diff --git a/sapi_manifests/muskie/template b/sapi_manifests/muskie/template
+index 03beef2..597839e 100644
+--- a/sapi_manifests/muskie/template
++++ b/sapi_manifests/muskie/template
+@@ -237,6 +237,16 @@
+   "datacenter": "{{DATACENTER}}",
+   "region": "{{REGION}}",
+   "server_uuid": "{{auto.SERVER_UUID}}",
+-  "zone_uuid": "{{auto.ZONENAME}}"
++  "zone_uuid": "{{auto.ZONENAME}}",
+ 
++  {{! Buckets configuration options }}
++  "enableBuckets": {{#BUCKETS_ENABLE}}{{{BUCKETS_ENABLE}}}{{/BUCKETS_ENABLE}}{{^BUCKETS_ENABLE}}false{{/BUCKETS_ENABLE}},
++  "boray": {
++    "borayOptions": {
++        "srvDomain": "{{ELECTRIC_BORAY}}",
++        "cueballOptions": {
++            "resolvers": ["nameservice.{{DOMAIN_NAME}}"]
++        }
++    }
++  }
+ }
+diff --git a/test/bucket-name.test.js b/test/bucket-name.test.js
+new file mode 100644
+index 0000000..45bed9c
+--- /dev/null
++++ b/test/bucket-name.test.js
+@@ -0,0 +1,96 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++var bunyan = require('bunyan');
++var isValidBucketName = require('../lib/buckets/common.js').isValidBucketName;
++
++exports.bucketName = function bucketName(t) {
++    var validBucketNames = [
++        // Simple names that start and end with a letter and/or number
++        'abc',
++        '123',
++        'a12',
++        '1ab',
++        // Hyphens are allowed in the middle
++        'a-b',
++        '1-2',
++        'a-1',
++        '1-a',
++        // Test multiple hyphens and more complex patterns
++        'a--b',
++        '1-2-3',
++        'qw-90ert-y78-56uiop',
++        // Names with periods
++        'a.b',
++        '1.a.2',
++        'a-1.b-2.c-3',
++        'qw-90.ert-y.78-56u.iop',
++        // Names that sort of look like IP addresses but are valid
++        '1.2',
++        '1.2.3',
++        '1.2.3.4.5',
++        '1.2.a.4',
++        '1234.5.6.7',
++        '111.222.34.5555',
++        // A name that is the maximum allowed length (63 chars)
++        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
++    ];
++
++    var invalidBucketNames = [
++        // Too short
++        'a',
++        'aa',
++        // Too long (64 and 65 chars)
++        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
++        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
++        // Too long, even if broken up with dots -- total length is what counts
++        'aaaaaaaaaaaa.aaaaaaaaaaa.aaaaaaaaaaaaa.aaaaaaaaaaaa.aaaaaaaaa.aa',
++        // No capital letters
++        'Hello',
++        'HeLlO',
++        'HELLO',
++        // No punctuation other than dots or hyphens
++        '!h!ello!',
++        '*smile:.%)',
++        'foo/bar',
++        // No hyphens at the beginning or end (or both)
++        '-aa',
++        'aa-',
++        '-a-',
++        // Hyphen rules also apply to sections between dots
++        'a.-bb.c',
++        'a.bb-.c',
++        'a.-b-.c',
++        // No starting or ending with dots, or more than one dot in a row
++        '.aa',
++        'aa.',
++        'a..a',
++        'a...a',
++        /*
++         * Nothing that resembles an IP address -- that is, no names that are
++         * four groupings of between one and three digits each. Whether or not
++         * the numbers make sense as an IP address doesn't matter.
++         */
++        '1.2.3.4',
++        '1.255.6.77',
++        '127.0.0.1',
++        '999.999.999.999'
++    ];
++
++    validBucketNames.forEach(function testValid(name) {
++        t.ok(isValidBucketName(name));
++    });
++
++    invalidBucketNames.forEach(function testInvalid(name) {
++        t.equal(isValidBucketName(name), false);
++    });
++
++    t.done();
++};
+diff --git a/tools/jsl.node.conf b/tools/jsl.node.conf
+index 6b349fa..56128af 100644
+--- a/tools/jsl.node.conf
++++ b/tools/jsl.node.conf
+@@ -177,6 +177,8 @@
+ +define NotAcceptableError
+ +define NotEnoughSpaceError
+ +define NotImplementedError
+++define ParentNotBucketError
+++define ParentNotBucketRootError
+ +define ParentNotDirectoryError
+ +define PreSignedRequestError
+ +define QueryParameterForbiddenError

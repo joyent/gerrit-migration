@@ -1,0 +1,329 @@
+commit 7d5abf77f4acd35bd9d3da8d019b3ec45ef29022
+Author: rhb2 <robert.bogart@joyent.com>
+Date:   2019-07-19T20:57:24+00:00 (3 months ago)
+    
+    MANTA-4420 Remora Agent: Implement API for obtaining assignment stats
+    MANTA-4421 Remora agent: Implement API to allow clients to request assignments, filtered by TaskStatus
+
+diff --git a/src/agent.rs b/src/agent.rs
+index 6662d90..7d9c4d4 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -1,7 +1,6 @@
+ use std::collections::HashMap;
+ use std::fs;
+ use std::fs::File;
+-//use std::io::Error;
+ use std::net::*;
+ use std::path::Path;
+ use std::sync::{mpsc, Arc, Mutex, RwLock};
+@@ -10,7 +9,6 @@ use futures::future;
+ use futures::future::*;
+ use futures::stream::*;
+ 
+-//use gotham::extractor::QueryStringExtractor;
+ use gotham::handler::{Handler, HandlerFuture, IntoHandlerError, NewHandler};
+ use gotham::helpers::http::response::{create_empty_response, create_response};
+ use gotham::router::{builder::*, Router};
+@@ -23,7 +21,7 @@ use libmanta::moray::MantaObjectShark;
+ use md5::{Digest, Md5};
+ 
+ use crate::job::Task;
+-use crate::job::TaskStatus;
++use crate::job::{AgentAssignmentState, AgentAssignmentStats, TaskStatus};
+ 
+ use reqwest::StatusCode;
+ use rusqlite;
+@@ -53,10 +51,12 @@ pub struct Agent {
+ impl Agent {
+     pub fn new(tx: Arc<Mutex<mpsc::Sender<String>>>) -> Agent {
+         let assignments = Arc::new(Mutex::new(Assignments::new()));
+-        Agent {
+-            assignments,
+-            tx,
+-        }
++        Agent { assignments, tx }
++    }
++
++    pub fn run(addr: &'static str) {
++        println!("Listening for requests at {}", addr);
++        gotham::start(addr, router());
+     }
+ }
+ 
+@@ -95,7 +95,7 @@ fn load_saved_assignments(agent: &Agent) {
+ fn assignment_save(uuid: &str, path: &str, tasks: Arc<RwLock<Vec<Task>>>) {
+     let conn = match rusqlite::Connection::open(format!("{}/{}", path, uuid)) {
+         Ok(conn) => conn,
+-        Err(e) => panic!("DB error {}", e),
++        Err(e) => panic!("DB error opening {}/{}: {}", path, uuid, e),
+     };
+ 
+     let tasklist = tasks.read().unwrap();
+@@ -253,11 +253,19 @@ fn post(agent: Agent, mut state: State) -> Box<HandlerFuture> {
+                 let uuid = Uuid::new_v4().to_hyphenated().to_string();
+                 assignment_save(&uuid, REMORA_SCHEDULED_DIR, v.clone());
+ 
++                let status: AgentAssignmentStats = AgentAssignmentStats {
++                    uuid: uuid.clone(),
++                    state: AgentAssignmentState::Scheduled,
++                    complete: 0,
++                    failed: 0,
++                    total: v.read().unwrap().len(),
++                };
++
+                 let res = create_response(
+                     &state,
+                     StatusCode::OK,
+                     mime::APPLICATION_JSON,
+-                    serde_json::to_vec(&uuid)
++                    serde_json::to_vec(&status)
+                         .expect("serialized assignment id"),
+                 );
+ 
+@@ -332,6 +340,115 @@ fn get_specific(agent: Agent, mut state: State) -> Box<HandlerFuture> {
+     Box::new(future::ok((state, res)))
+ }
+ 
++fn get_stats(agent: &Agent, uuid: &str) -> Option<AgentAssignmentStats> {
++    let assignment = match get_specific_impl(&agent, &uuid) {
++        Some(a) => a,
++        None => return None,
++    };
++
++    let tasks = assignment.read().unwrap();
++    let len = tasks.len();
++
++    let mut stats: AgentAssignmentStats = AgentAssignmentStats {
++        uuid: uuid.to_string(),
++        state: AgentAssignmentState::Scheduled,
++        failed: 0,
++        complete: 0,
++        total: len,
++    };
++
++    for t in tasks.iter().take(len) {
++        match t.status {
++            TaskStatus::Pending => (),
++            TaskStatus::Running => (),
++            TaskStatus::Complete => stats.complete += 1,
++            TaskStatus::Failed(_) => {
++                stats.complete += 1;
++                stats.failed += 1;
++            }
++        }
++    }
++
++    if stats.complete == stats.total {
++        let failures = get_by_taskstatus_impl(
++            agent,
++            uuid,
++            TaskStatus::Failed(String::new()),
++        );
++        stats.state = AgentAssignmentState::Complete(failures);
++    } else if stats.complete > 0 {
++        stats.state = AgentAssignmentState::Running;
++    }
++
++    Some(stats)
++}
++
++fn get_status(agent: Agent, mut state: State) -> Box<HandlerFuture> {
++    let query_param = QueryStringExtractor::take_from(&mut state);
++    let uuid = query_param.uuid;
++
++    let res = match get_stats(&agent, &uuid) {
++        Some(status) => create_response(
++            &state,
++            StatusCode::OK,
++            mime::APPLICATION_JSON,
++            serde_json::to_vec(&status).expect("serialized status"),
++        ),
++        None => create_empty_response(&state, StatusCode::NOT_FOUND),
++    };
++
++    Box::new(future::ok((state, res)))
++}
++
++fn get_by_taskstatus_impl(
++    agent: &Agent,
++    uuid: &str,
++    status: TaskStatus,
++) -> Option<Vec<Task>> {
++    let assignment = match get_specific_impl(&agent, &uuid) {
++        Some(a) => a,
++        None => return None,
++    };
++
++    let tasks = assignment.read().unwrap();
++    let mut filtered = Vec::new();
++
++    for t in &*tasks {
++        if t.status.as_u32() == status.as_u32() {
++            let f = t.clone();
++            filtered.push(f);
++        }
++    }
++
++    Some(filtered)
++}
++
++fn get_by_taskstatus(
++    agent: Agent,
++    mut state: State,
++    status: TaskStatus,
++) -> Box<HandlerFuture> {
++    let query_param = QueryStringExtractor::take_from(&mut state);
++    let uuid = query_param.uuid;
++
++    let assignment = match get_by_taskstatus_impl(&agent, &uuid, status) {
++        Some(a) => a,
++        None => {
++            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
++            return Box::new(future::ok((state, res)));
++        }
++    };
++
++    let res = create_response(
++        &state,
++        StatusCode::OK,
++        mime::APPLICATION_JSON,
++        serde_json::to_vec(&assignment).expect("serialized assignment"),
++    );
++
++    Box::new(future::ok((state, res)))
++}
++
+ fn validate_assignment(body: &Chunk) -> Result<Vec<Task>, String> {
+     let data = String::from_utf8(body.to_vec()).unwrap();
+ 
+@@ -354,9 +471,21 @@ impl Handler for Agent {
+         match method.as_str() {
+             "POST" => post(self, state),
+             _ => {
++                // Obtain an entire assignment and the tasks within it
+                 if path == "/assignment" {
+                     get_specific(self, state)
++                // Executive summary of an assignment
++                } else if path == "/status" {
++                    get_status(self, state)
++                // Obtain a list of failed tasks within an assignment
++                } else if path == "/failures" {
++                    get_by_taskstatus(
++                        self,
++                        state,
++                        TaskStatus::Failed(String::new()),
++                    )
+                 } else {
++                    // Get all assignments which have not complete yet
+                     get(self, state)
+                 }
+             }
+@@ -567,11 +696,20 @@ fn router() -> Router {
+         let agent = Agent::new(tx.clone());
+         let pool = ThreadPool::new(1);
+ 
++        create_dir(REMORA_SCHEDULED_DIR);
++        create_dir(REMORA_FINISHED_DIR);
++
+         for _ in 0..1 {
+             let rx = rx.clone();
+             let assignments = agent.assignments.clone();
+             pool.execute(move || loop {
+-                let uuid = rx.lock().unwrap().recv().unwrap();
++                let uuid = match rx.lock().unwrap().recv() {
++                    Ok(r) => r,
++                    Err(e) => {
++                        println!("Channel read error: {}", e);
++                        return;
++                    }
++                };
+                 process_assignment(assignments.clone(), uuid);
+             });
+         }
+@@ -585,6 +723,16 @@ fn router() -> Router {
+ 
+         route.get("assignments").to_new_handler(agent.clone());
+ 
++        route
++            .get("status")
++            .with_query_string_extractor::<QueryStringExtractor>()
++            .to_new_handler(agent.clone());
++
++        route
++            .get("failures")
++            .with_query_string_extractor::<QueryStringExtractor>()
++            .to_new_handler(agent.clone());
++
+         route.post("assignments").to_new_handler(agent.clone());
+     })
+ }
+@@ -594,13 +742,3 @@ fn create_dir(dirname: &str) {
+         panic!("Error creating directory {}", e);
+     }
+ }
+-
+-impl Agent {
+-    pub fn run(addr: &'static str) {
+-        create_dir(REMORA_SCHEDULED_DIR);
+-        create_dir(REMORA_FINISHED_DIR);
+-
+-        println!("Listening for requests at {}", addr);
+-        gotham::start(addr, router());
+-    }
+-}
+diff --git a/src/config.rs b/src/config.rs
+index b432482..b7bc7ac 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -64,7 +64,6 @@ impl Command {
+     pub fn parse_config() -> Result<Config, Error> {
+         let file = File::open("./target/debug/config.json")?;
+         let reader = BufReader::new(file);
+-        println!("parsing config");
+         let config: Config = serde_json::from_reader(reader)?;
+ 
+         Ok(config)
+diff --git a/src/job.rs b/src/job.rs
+index 1f2e1e3..2f605b1 100644
+--- a/src/job.rs
++++ b/src/job.rs
+@@ -121,6 +121,22 @@ pub struct Assignment {
+     state: AssignmentState,
+ }
+ 
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub enum AgentAssignmentState {
++    Scheduled,                   // Haven't even started it yet
++    Running,                     // Currently processing it
++    Complete(Option<Vec<Task>>), // Done.  Include any failed tasks
++}
++
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct AgentAssignmentStats {
++    pub uuid: String,
++    pub state: AgentAssignmentState,
++    pub failed: usize,
++    pub complete: usize,
++    pub total: usize,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct Task {
+     pub object_id: String, // or Uuid
+@@ -150,6 +166,15 @@ impl TaskStatus {
+     pub fn default() -> Self {
+         TaskStatus::Pending
+     }
++
++    pub fn as_u32(&self) -> u32 {
++        match self {
++            TaskStatus::Pending => 0,
++            TaskStatus::Running => 1,
++            TaskStatus::Complete => 2,
++            TaskStatus::Failed(_) => 3,
++        }
++    }
+ }
+ 
+ impl Default for Job {

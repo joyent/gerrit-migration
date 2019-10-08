@@ -1,0 +1,349 @@
+commit 2fbbef559c5c2b76467e067e0a0f81a7b35c4a6a
+Author: Mohamed Khalfella <mohamed.khalfella@joyent.com>
+Date:   2018-10-07T16:03:36-07:00 (1 year ago)
+    
+    MANTA-3678 storage metering could use some more memory
+
+diff --git a/assets/lib/storage-reduce1.js b/assets/lib/storage-reduce1.js
+index 3a521e3..944309c 100755
+--- a/assets/lib/storage-reduce1.js
++++ b/assets/lib/storage-reduce1.js
+@@ -6,7 +6,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /* BEGIN JSSTYLED */
+@@ -65,18 +65,31 @@
+  *                      namespace: 0,
+  *                      ...
+  *              },
+- *              "objects": {
+- *                      objectId: {
+- *                              namespace: 0, // count of # keys in this
+- *                                            // namespace for this objectId
+- *                              ...
+- *                              _size: 0
+- *                      },
++ *              "objs": {
++ *                      namespace: 0,
++ *                      ...
++ *              },
++ *              "keys": {
++ *                      namespace: 0,
+  *                      ...
+- *              }
++ *              },
++ *              "bytes": {
++ *                      namespace: 0,
++ *                      ...
++ *              },
+  *      },
+  *      ...
+  * }
++ *
++ * SQLite table structure
++ *
++ * ------------------------
++ * |  OWNER   |    uuid   |
++ * ------------------------
++ * |          |           |
++ * ------------------------
++ * |          |           |
++ * ------------------------
+  */
+ 
+ /*
+@@ -93,11 +106,19 @@
+ 
+ /* END JSSTYLED */
+ 
+-var mod_carrier = require('carrier');
++var es = require('event-stream');
++var fs = require('fs');
++var sqlite3 = require('sqlite3').verbose();
+ var Big = require('big.js');
++
++
++var sstmt = null;
++var istmt = null;
++
+ var ERROR = false;
+ var MIN_SIZE = +process.env['MIN_SIZE'] || 131072;
+ 
++
+ var LOG = require('bunyan').createLogger({
+         name: 'storage-reduce1.js',
+         stream: process.stderr,
+@@ -105,11 +126,15 @@ var LOG = require('bunyan').createLogger({
+ });
+ 
+ var NAMESPACES = (process.env.NAMESPACES).split(' ');
++var DBFILE = +process.env['DBFILE'] || '/var/tmp/objects.db';
+ 
+-function count(record, aggr) {
++function processLine(record, aggr, db, cb) {
+         var owner = record.owner;
+         var type = record.type;
+         var namespace;
++        var n;
++
++
+         try {
+                 namespace = record.key.split('/')[2]; // /:uuid/:namespace/...
+         } catch (e) {
+@@ -118,36 +143,76 @@ function count(record, aggr) {
+                 return;
+         }
+ 
+-        aggr[owner] = aggr[owner] || {
+-                dirs: {},
+-                objects: {}
+-        };
+ 
+-        aggr[owner].dirs[namespace] = aggr[owner].dirs[namespace] || 0;
++        if (!aggr[owner]) {
++                aggr[owner] = { dirs: {},
++                    objs: {},
++                    keys: {},
++                    bytes: {}
++                };
++                for (n in NAMESPACES) {
++                        aggr[owner].dirs[NAMESPACES[n]] = 0;
++                        aggr[owner].objs[NAMESPACES[n]] = 0;
++                        aggr[owner].keys[NAMESPACES[n]] = 0;
++                        aggr[owner].bytes[NAMESPACES[n]] = new Big(0);
++                }
++        }
++
++         /* Ignore objects and directories in other namespaces */
++        if (!(aggr[owner].bytes[namespace])) {
++                cb();
++                return;
++        }
+ 
+         if (type === 'directory') {
+                 aggr[owner].dirs[namespace]++;
++                cb();
++                return;
+         } else if (type === 'object') {
+-                var index = aggr[owner].objects;
+-                var n;
+                 try {
+                         var objectId = record.objectId;
+                         var size = Math.max(record.contentLength, MIN_SIZE) *
+                             record.sharks.length;
+                 } catch (e) {
+                         console.warn(e);
++                        ERROR = true;
+                         return;
+                 }
+ 
+-                if (!index[objectId]) {
+-                        index[objectId] = {};
+-                        for (n in NAMESPACES) {
+-                                index[objectId][NAMESPACES[n]] = 0;
++                sstmt.get([owner, objectId], function (err, row) {
++                        if (err) {
++                                LOG.error(err, 'sqlite3: Error');
++                                ERROR = true;
++                                return;
+                         }
+-                }
+ 
+-                index[objectId][namespace]++;
+-                index[objectId]._size = size;
++                        /*
++                         * We saw this object for this owner.
++                         * keys++ and return.
++                         */
++                        aggr[owner].keys[namespace]++;
++                        if (row) {
++                                cb();
++                                return;
++                        }
++
++                        /* Add the owner, objectId to sqlite table */
++                        istmt.run([owner, objectId], function (er) {
++                                if (er) {
++                                        LOG.error(er, 'sqlite3: Error');
++                                        ERROR = true;
++                                        return;
++                                }
++
++                                aggr[owner].objs[namespace]++;
++                                aggr[owner].bytes[namespace] =
++                                    aggr[owner].bytes[namespace].plus(size);
++                                cb();
++                        });
++
++                });
++
++
+         } else {
+                 LOG.error(record, 'unrecognized object type: ' + type);
+                 ERROR = true;
+@@ -155,42 +220,18 @@ function count(record, aggr) {
+ }
+ 
+ function printResults(aggr) {
+-        var n, dirs;
++        var n, bytes;
+         Object.keys(aggr).forEach(function (owner) {
+-                var keys = {};
+-                var bytes = {};
+-                var objects = {};
+-
+                 for (n in NAMESPACES) {
+-                        keys[NAMESPACES[n]] = 0;
+-                        bytes[NAMESPACES[n]] = new Big(0);
+-                        objects[NAMESPACES[n]] = 0;
+-                }
+-
+-                Object.keys(aggr[owner].objects).forEach(function (object) {
+-                        var counted = false;
+-                        var objCounts = aggr[owner].objects[object];
+-                        for (n in NAMESPACES) {
+-                                if (!counted && objCounts[NAMESPACES[n]] > 0) {
+-                                        counted = true;
+-                                        var size = objCounts._size;
+-                                        bytes[NAMESPACES[n]] =
+-                                                bytes[NAMESPACES[n]].plus(size);
+-                                        objects[NAMESPACES[n]]++;
+-                                }
+-                                keys[NAMESPACES[n]] += objCounts[NAMESPACES[n]];
+-                        }
+-                });
+-
+-                for (n in NAMESPACES) {
+-                        dirs = aggr[owner].dirs[NAMESPACES[n]] || 0;
++                        //dirs = aggr[owner].dirs[NAMESPACES[n]] || 0;
++                        bytes = aggr[owner].bytes[NAMESPACES[n]].toString();
+                         console.log(JSON.stringify({
+                                 owner: owner,
+                                 namespace: NAMESPACES[n],
+-                                directories: dirs,
+-                                keys: keys[NAMESPACES[n]],
+-                                objects: objects[NAMESPACES[n]],
+-                                bytes: bytes[NAMESPACES[n]].toString()
++                                directories: aggr[owner].dirs[NAMESPACES[n]],
++                                keys: aggr[owner].keys[NAMESPACES[n]],
++                                objects: aggr[owner].objs[NAMESPACES[n]],
++                                bytes: bytes
+                         }));
+                 }
+         });
+@@ -198,11 +239,56 @@ function printResults(aggr) {
+ 
+ 
+ function main() {
+-        var carry = mod_carrier.carry(process.openStdin());
+ 
+         var aggr = {};
+         var lineCount = 0;
+-        carry.on('line', function onLine(line) {
++
++        try {
++                fs.unlinkSync(DBFILE);
++        } catch (e) {
++        }
++
++        function sqlite3_execute(sqdb, cmd, args) {
++                sqdb.run(cmd, args, function (error) {
++                        if (error) {
++                                LOG.error(error, 'sqlite3: Error ' + cmd);
++                                ERROR = true;
++                        }
++                });
++        }
++
++        function sqlite3_prepare_stmt(sqdb, stmt, args) {
++                return (sqdb.prepare(stmt, args, function (error) {
++                        if (error) {
++                                LOG.error(error, 'sqlite3: Error ' + stmt);
++                                ERROR = true;
++                        }
++                }));
++        }
++
++        var db = new sqlite3.cached.Database(DBFILE);
++        db.serialize(function () {
++                sqlite3_execute(db, 'PRAGMA synchronous = OFF', []);
++                sqlite3_execute(db, 'PRAGMA journal_mode = OFF', []);
++                sqlite3_execute(db, 'PRAGMA locking_mode = EXCLUSIVE', []);
++                // 1.5 GB of cache.
++                sqlite3_execute(db, 'PRAGMA cache_size = 393216', []);
++                // This will create an index covering (owner, uuid)
++                sqlite3_execute(db, 'CREATE TABLE objects ' +
++                    '(owner TEXT, uuid TEXT, ' +
++                    'PRIMARY KEY (owner, uuid))', []);
++
++                sstmt = sqlite3_prepare_stmt(db,
++                    'SELECT * FROM objects WHERE owner = ? and uuid = ?', []);
++                istmt = sqlite3_prepare_stmt(db,
++                    'INSERT INTO objects VALUES (?, ?)', []);
++
++                sqlite3_execute(db, 'BEGIN TRANSACTION', []);
++        });
++
++        process.stdin.pipe(es.split())
++            .pipe(es.through(function write(line) {
++
+                 lineCount++;
+                 try {
+                         var record = JSON.parse(line);
+@@ -216,15 +302,17 @@ function main() {
+                         LOG.error(line, 'Missing owner or type field on line ' +
+                                 lineCount);
+                         ERROR = true;
+-                        return;
+                 }
+-
+-                count(record, aggr);
+-        });
+-
+-        carry.on('end', function onEnd() {
++                this.pause();
++                var self = this;
++                processLine(record, aggr, db, function () {
++                        self.resume();
++                });
++            },
++            function end() {
+                 printResults(aggr);
+-        });
++            }));
++
+ }
+ 
+ if (require.main === module) {
+diff --git a/package.json b/package.json
+index efe580b..a0d6aa6 100644
+--- a/package.json
++++ b/package.json
+@@ -11,16 +11,18 @@
+                 "backoff": "1.2.0",
+                 "bunyan": "0.21.1",
+                 "carrier": "0.1.10",
++                "event-stream": "4.0.0",
+                 "ipaddr.js": "0.1.1",
+                 "jsprim": "0.5.0",
+-                "libmanta": "git+ssh://git@github.com:joyent/node-libmanta.git#master",
+-                "marlin": "git+ssh://git@github.com:joyent/manta-marlin.git#master",
+-                "manta": "git+ssh://git@github.com:joyent/node-manta.git#master",
+-                "manta-compute-bin": "git+ssh://git@github.com:joyent/manta-compute-bin.git#master",
++                "libmanta": "git+https://github.com/joyent/node-libmanta.git#master",
++                "marlin": "git+https://github.com/joyent/manta-marlin.git#master",
++                "manta": "git+https://github.com/joyent/node-manta.git#master",
++                "manta-compute-bin": "git+https://github.com/joyent/manta-compute-bin.git#master",
+                 "once": "1.1.1",
+                 "readable-stream": "0.3.1",
+                 "posix-getopt": "1.0.0",
+                 "screener": "0.0.5",
++                "sqlite3": "3.1.9",
+                 "vasync": "1.3.3"
+         },
+         "devDependencies": {

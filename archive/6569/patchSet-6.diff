@@ -1,0 +1,831 @@
+commit d0ffb367e57259893b835039328d88dd2aa8295a
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2019-07-22T16:24:25-04:00 (3 months ago)
+    
+    MANTA-4355 Expose pagination for bucket and object listing
+
+diff --git a/lib/server.js b/lib/server.js
+index 004b074..5b2f6d4 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -31,6 +31,7 @@ var InvocationError = errors.InvocationError;
+ 
+ var KANG_VERSION = '1.2.0';
+ var BORAY_LIMIT = 1000;
++var BORAY_MULTIPLIER = 2;
+ 
+ var CB_ARGS_SCHEMA = [
+     { name: 'owner', type: 'string' },
+@@ -46,10 +47,10 @@ var DB_ARGS_SCHEMA = [
+ 
+ var LB_ARGS_SCHEMA = [
+     { name: 'owner', type: 'string' },
+-    { name: 'sorted', type: 'boolean' },
+-    { name: 'order_by', type: 'string' },
+-    { name: 'prefix', type: 'string' },
++    { name: 'prefix', type: 'optionalString' },
+     { name: 'limit', type: 'number' },
++    { name: 'marker', type: 'optionalString' },
++    { name: 'delimiter', type: 'optionalString' },
+     { name: 'request_id', type: 'string' }
+ ];
+ 
+@@ -94,47 +95,103 @@ var UO_ARGS_SCHEMA = [
+ var LO_ARGS_SCHEMA = [
+     { name: 'owner', type: 'string' },
+     { name: 'bucket_id', type: 'string' },
+-    { name: 'sorted', type: 'boolean' },
+-    { name: 'order_by', type: 'string' },
+-    { name: 'prefix', type: 'string' },
++    { name: 'prefix', type: 'optionalString' },
+     { name: 'limit', type: 'number' },
++    { name: 'marker', type: 'optionalString' },
++    { name: 'delimiter', type: 'optionalString' },
+     { name: 'request_id', type: 'string' }
+ ];
+ 
+-util.inherits(LimitOffsetStream, events.EventEmitter);
+-function LimitOffsetStream(opts) {
++util.inherits(LimitMarkerStream, events.EventEmitter);
++function LimitMarkerStream(opts) {
+     var self = this;
+ 
+     assert.object(opts, 'opts');
+     assert.object(opts.log, 'opts.log');
+-    assert.number(opts.limit, 'opts.limit');
++    assert.string(opts.markerKey, 'opts.markerKey');
+     assert.func(opts.getStream, 'opts.getStream');
++    assert.optionalString(opts.marker, 'opts.marker');
++    assert.number(opts.limit, 'opts.limit');
+ 
+-    self.offset = 0;
+-    self.limit = opts.limit;
+-    self.done = false;
+     self.log = opts.log;
+-
++    self.marker = opts.marker || '';
++    self.markerKey = opts.markerKey;
+     self.getStream = opts.getStream;
++    self.limit = opts.limit;
++    self.pendingRecord = null;
++    self.done = false;
+ }
+ 
+-LimitOffsetStream.prototype._getNewStream = function _getNewStream(cb) {
++LimitMarkerStream.prototype.setNewMarker = function setNewMarker(marker, cb) {
+     var self = this;
+ 
++    assert.string(marker, 'marker');
+     assert.func(cb, 'cb');
+ 
++    assert.ok(!self.done, 'stream already finished');
++
++    var done = false;
++
++    vasync.whilst(
++        function testFunc() {
++            return !done;
++        },
++        function iterateFunc(cb2) {
++            var opts = {
++                autoPaginate: false
++            };
++
++            self.getNextRecord(opts, function (record, isDone) {
++                if (isDone) {
++                    self.log.debug('setNewMarker exhausted existing page');
++                    done = true;
++                    self.marker = marker;
++                    self.res = null;
++                    self.pendingRecord = null;
++                    cb2();
++                    return;
++                }
++
++                assert.object(record, 'record');
++                if (record[self.markerKey] >= marker) {
++                    // we are done fast forwarding
++                    self.pendingRecord = record;
++                    done = true;
++                    self.marker = record[self.markerKey];
++                    self.log.debug({pendingRecord: record, marker: self.marker},
++                        'setNewMarker found record above marker');
++                    cb2();
++                    return;
++                }
++
++                // discard this record and keep going
++                cb2();
++            });
++        },
++        function whilstDone(err, arg) {
++            // no error should be seen here
++            assert.ifError(err, 'setNewMarker whilst error');
++            cb(err);
++        });
++};
++
++LimitMarkerStream.prototype._getNewStream = function _getNewStream() {
++    var self = this;
++
++    assert.ok(!self.done, 'stream already finished');
++
+     self.log.debug({
+-        offset: self.offset,
++        marker: self.marker,
+         limit: self.limit
+-    }, 'calling getStream(offset=%d, limit=%d)',
+-        self.offset,
++    }, 'calling getStream(marker=%j, limit=%d)',
++        self.marker,
+         self.limit);
+ 
+     if (self.res) {
+         self.res.removeAllListeners();
+     }
+ 
+-    self.res = self.getStream(self.offset, self.limit);
++    self.res = self.getStream(self.marker, self.limit);
+     self.numRecords = 0;
+     self.resEnded = false;
+     self.recordPending = false;
+@@ -150,55 +207,81 @@ LimitOffsetStream.prototype._getNewStream = function _getNewStream(cb) {
+     });
+ };
+ 
+-LimitOffsetStream.prototype.getNextRecord =
+-    function getNextRecord(cb, skipCheck) {
++LimitMarkerStream.prototype.getNextRecord =
++    function getNextRecord(opts, cb) {
+ 
+     var self = this;
+ 
++    if (typeof (opts) === 'function') {
++        cb = opts;
++        opts = {};
++    }
++
++    assert.object(opts, 'opts');
++    assert.optionalBool(opts.skipCheck, 'opts.skipCheck');
++    assert.optionalBool(opts.autoPaginate, 'opts.autoPaginate');
+     assert.func(cb, 'cb');
+-    assert.optionalBool(skipCheck, skipCheck);
+ 
+-    if (!skipCheck) {
+-        assert(!self.recordingPending, 'self.recordPending');
+-        self.recordPending = true;
++    assert.ok(!self.done, 'stream already finished');
++
++    var autoPaginate = (opts.autoPaginate === false) ? false : true;
++
++    if (self.pendingRecord) {
++        // a record was left over from setNewMarker, send it out
++        var r = self.pendingRecord;
++        self.pendingRecord = null;
++        self.log.warn({record: r}, 'returning pendingRecord');
++        sendRecord(r);
++        return;
+     }
+ 
+     if (!self.res) {
+-        // hasn't opened initial stream yet
+-        self.log.debug('requesting initial stream');
+-        self._getNewStream(cb);
++        self.log.debug('requesting new stream');
++        self._getNewStream();
+         setImmediate(function () {
+-            self.getNextRecord(cb, true);
++            self.getNextRecord({skipCheck: true}, cb);
+         });
+         return;
+     }
+ 
++    if (!opts.skipCheck) {
++        assert(!self.recordingPending, 'self.recordPending');
++    }
++
++    self.recordPending = true;
++
+     var record = self.res.read();
+ 
+     if (record) {
+-        self.log.trace({record: record}, 'record available - sending');
++        self.log.trace({record: record}, 'record available - returning');
+         sendRecord(record);
+         return;
+     }
+ 
+     if (self.resEnded) {
+         self.log.debug('self.resEnded is true');
++        self.res = null;
++
+         if (self.numRecords === self.limit) {
+-            self.log.debug('requesting new stream');
+-            self.offset += self.numRecords;
+-            self._getNewStream(cb);
++
++            // callback with the isDone boolean set, but without setting
++            // self.done
++            if (!autoPaginate) {
++                self.log.debug('autoPagination disabled, sending isDone');
++                cb(null, true);
++                return;
++            }
++
++            self.log.debug('autoPagination enabled, requesting next page');
++            self._getNewStream();
+             setImmediate(function () {
+-                self.getNextRecord(cb, true);
++                self.getNextRecord({skipCheck: true}, cb);
+             });
+             return;
+         }
+ 
+-        self.log.debug('no more pagination required');
++        self.log.debug('stream is finished and all records exhausted, done');
+         self.done = true;
+-    }
+-
+-    if (self.done) {
+-        self.log.debug('self.done is true, sending final event');
+         cb(null, true);
+         return;
+     }
+@@ -221,7 +304,7 @@ LimitOffsetStream.prototype.getNextRecord =
+         self.removeListener('end', tryRead);
+ 
+         setImmediate(function () {
+-            self.getNextRecord(cb, true);
++            self.getNextRecord({skipCheck: true}, cb);
+         });
+     }
+ 
+@@ -231,6 +314,7 @@ LimitOffsetStream.prototype.getNextRecord =
+         setImmediate(function () {
+             self.numRecords++;
+             self.recordPending = false;
++            self.marker = _record[self.markerKey];
+             cb(_record, false);
+         });
+     }
+@@ -395,6 +479,7 @@ function createServer(options, callback) {
+ function invalidArgs(rpc, argv, types) {
+     var route = rpc.methodName();
+     var len = types.length;
++    var optionalRe = /^optional(.*)$/;
+ 
+     if (argv.length !== len) {
+         rpc.fail(new InvocationError(
+@@ -407,6 +492,20 @@ function invalidArgs(rpc, argv, types) {
+         var name = types[i].name;
+         var type = types[i].type;
+         var val = argv[i];
++        var m;
++
++        /*
++         * If the argument is an "optional" type, figure out what type it is
++         * supposed to be, and loop here early if it is set to `null` or
++         * `undefined`.
++         */
++        if ((m = type.match(optionalRe))) {
++            type = m[1].toLowerCase();
++
++            if (val === null || val === undefined) {
++                continue;
++            }
++        }
+ 
+         // 'array' is not a primitive type in javascript, but certain
+         // rpcs expect them. Since typeof ([]) === 'object', we need to
+@@ -428,7 +527,8 @@ function invalidArgs(rpc, argv, types) {
+             return true;
+         }
+ 
+-        if (typeof (argv[i]) !== types[i].type) {
++
++        if (typeof (argv[i]) !== type) {
+             rpc.fail(new InvocationError('%s expects "%s" (args[%d]) to be ' +
+                 'of type %s but received type %s instead (%j)', route, name, i,
+                 type, typeof (val), val));
+@@ -669,19 +769,21 @@ function listBuckets(options) {
+         }
+ 
+         var owner = argv[0];
+-        var sorted = argv[1];
+-        var order_by = argv[2];
+-        var prefix = argv[3];
+-        var limit = argv[4];
++        var prefix = argv[1];
++        var limit = argv[2];
++        var marker = argv[3];
++        var delimiter = argv[4];
++        var id = argv[5];
+ 
+-        if (limit === 0) {
+-            limit = Infinity;
++        if (delimiter && delimiter.length > 1) {
++            rpc.fail(new InvocationError(
++                'listBuckets delimeter larger than 1 character: %j',
++                delimiter));
++            return;
+         }
+ 
+-        var id = argv[5];
+-
+         dtrace['listbuckets-start'].fire(function () {
+-            return ([msgid, id, owner, sorted, order_by, prefix, limit]);
++            return ([msgid, id, owner, prefix, limit, marker, delimiter]);
+         });
+ 
+         var log = options.log.child({
+@@ -690,10 +792,10 @@ function listBuckets(options) {
+ 
+         log.debug({
+             owner: owner,
+-            sorted: sorted,
+-            order_by: order_by,
+             prefix: prefix,
+-            limit: limit
++            limit: limit,
++            marker: marker,
++            delimiter: delimiter
+         }, 'listBuckets: entered');
+ 
+         var nodes = options.dataDirector.getAllNodes();
+@@ -701,8 +803,7 @@ function listBuckets(options) {
+         var totalVnodes = nodes.length;
+ 
+         // Find an appropriate limit to use with boray
+-        var borayLimit = Math.ceil(limit / totalVnodes);
+-        borayLimit = Math.min(borayLimit, BORAY_LIMIT);
++        var borayLimit = Math.ceil(limit / totalVnodes * BORAY_MULTIPLIER);
+ 
+         log.debug('%d vnodes found total, want %d records, using limit of %d',
+             totalVnodes, limit, borayLimit);
+@@ -713,12 +814,14 @@ function listBuckets(options) {
+             assert.object(client, 'client for pnode: ' + node.pnode);
+ 
+             vnodes[node.vnode] = {
+-                lostream: new LimitOffsetStream({
++                lmstream: new LimitMarkerStream({
++                    marker: marker,
++                    markerKey: 'name',
+                     limit: borayLimit,
+                     log: log.child({vnode: node.vnode}),
+-                    getStream: function (offset, _limit) {
+-                        return client.listBuckets(owner, order_by,
+-                            prefix, _limit, offset, node.vnode, id);
++                    getStream: function (_marker, _limit) {
++                        return client.listBuckets(owner, prefix, _limit,
++                            _marker, node.vnode, id);
+                     }
+                 }),
+                 record: null
+@@ -728,16 +831,17 @@ function listBuckets(options) {
+         var opts = {
+             limit: limit,
+             prefix: prefix,
+-            order_by: order_by,
++            delimiter: delimiter,
++            order_by: 'name',
+             log: log,
+-            vnodes: vnodes,
+-            sorted: sorted
++            vnodes: vnodes
+         };
+         paginationStream(opts,
+             function onRecord(record) {
+                 dtrace['listbuckets-record'].fire(function () {
+                     return ([msgid]);
+                 });
++                log.warn({record: record}, 'writing record');
+                 rpc.write(formatRecord(record));
+             },
+             function done(err) {
+@@ -758,25 +862,38 @@ function listBuckets(options) {
+ 
+         function formatRecord(record) {
+             assert.object(record, 'record');
++
++            var obj;
++
++            if (record.type === 'message') {
++                assert.bool(record.finished, 'record.finished');
++                obj = {
++                    type: 'message',
++                    finished: record.finished
++                };
++
++                return obj;
++            }
++
+             assert.string(record.name, 'record.name');
++
++            if (record.type === 'group') {
++                obj = {
++                    name: record.name,
++                    type: 'group'
++                };
++
++                return obj;
++            }
++
+             assert.date(record.created, 'record.created');
+ 
+-            /*
+-             * name: r.key.split('/').pop(),
+-             * etag: r.value.etag,
+-             * size: r.value.contentLength,
+-             * type: r.value.type,
+-             * contentType: r.value.contentType,
+-             * contentMD5: r.value.contentMD5,
+-             * mtime: new Date(r.value.mtime).toISOString()
+-             */
+-            var obj = {
+-                key: record.name,
+-                value: {
+-                    type: 'bucket',
+-                    mtime: record.created
+-                }
++            obj = {
++                name: record.name,
++                type: 'bucket',
++                mtime: record.created
+             };
++
+             return obj;
+         }
+     }
+@@ -1126,19 +1243,21 @@ function listObjects(options) {
+ 
+         var owner = argv[0];
+         var bucket_id = argv[1];
+-        var sorted = argv[2];
+-        var order_by = argv[3];
+-        var prefix = argv[4];
+-        var limit = argv[5];
++        var prefix = argv[2];
++        var limit = argv[3];
++        var marker = argv[4];
++        var delimiter = argv[5];
++        var id = argv[6];
+ 
+-        if (limit === 0) {
+-            limit = Infinity;
++        if (delimiter && delimiter.length > 1) {
++            rpc.fail(new InvocationError(
++                'listObjects delimeter larger than 1 character: %j',
++                delimiter));
++            return;
+         }
+ 
+-        var id = argv[6];
+-
+         dtrace['listobjects-start'].fire(function () {
+-            return ([msgid, id, owner, sorted, order_by, prefix, limit]);
++            return ([msgid, id, owner, prefix, limit, marker, delimiter]);
+         });
+ 
+         var log = options.log.child({
+@@ -1147,7 +1266,11 @@ function listObjects(options) {
+ 
+         log.debug({
+             owner: owner,
+-            bucket_id: bucket_id
++            bucket_id: bucket_id,
++            prefix: prefix,
++            limit: limit,
++            marker: marker,
++            delimiter: delimiter
+         }, 'listObjects: entered');
+ 
+         var vnodes = {};
+@@ -1155,8 +1278,7 @@ function listObjects(options) {
+         var totalVnodes = nodes.length;
+ 
+         // Find an appropriate limit to use with boray
+-        var borayLimit = Math.ceil(limit / totalVnodes);
+-        borayLimit = Math.min(borayLimit, BORAY_LIMIT);
++        var borayLimit = Math.ceil(limit / totalVnodes * BORAY_MULTIPLIER);
+ 
+         log.debug('%d vnodes found total, want %d records, using limit of %d',
+             totalVnodes, limit, borayLimit);
+@@ -1167,12 +1289,14 @@ function listObjects(options) {
+             assert.object(client, 'client for pnode: ' + node.pnode);
+ 
+             vnodes[node.vnode] = {
+-                lostream: new LimitOffsetStream({
++                lmstream: new LimitMarkerStream({
++                    marker: marker,
++                    markerKey: 'name',
+                     limit: borayLimit,
+                     log: log.child({vnode: node.vnode}),
+-                    getStream: function (offset, _limit) {
++                    getStream: function (_marker, _limit) {
+                         return client.listObjects(owner, bucket_id,
+-                            order_by, prefix, _limit, offset, node.vnode, id);
++                            prefix, _limit, _marker, node.vnode, id);
+                     }
+                 }),
+                 record: null
+@@ -1182,10 +1306,10 @@ function listObjects(options) {
+         var opts = {
+             limit: limit,
+             prefix: prefix,
+-            order_by: order_by,
++            order_by: 'name',
++            delimiter: delimiter,
+             log: log,
+-            vnodes: vnodes,
+-            sorted: sorted
++            vnodes: vnodes
+         };
+         paginationStream(opts,
+             function onRecord(record) {
+@@ -1212,32 +1336,44 @@ function listObjects(options) {
+ 
+         function formatRecord(record) {
+             assert.object(record, 'record');
+-            assert.uuid(record.id, 'record.id');
++
++            var obj;
++
++            if (record.type === 'message') {
++                assert.bool(record.finished, 'record.finished');
++                obj = {
++                    type: 'message',
++                    finished: record.finished
++                };
++
++                return obj;
++            }
++
+             assert.string(record.name, 'record.name');
++
++            if (record.type === 'group') {
++                obj = {
++                    name: record.name,
++                    type: 'group'
++                };
++
++                return obj;
++            }
++
++            assert.uuid(record.id, 'record.id');
+             assert.date(record.created, 'record.created');
+             assert.string(record.content_type, 'record.content_type');
+             assert.string(record.content_md5, 'record.content_md5');
+             assert.number(record.content_length, 'record.content_length');
+ 
+-            /*
+-             * name: r.key.split('/').pop(),
+-             * etag: r.value.etag,
+-             * size: r.value.contentLength,
+-             * type: r.value.type,
+-             * contentType: r.value.contentType,
+-             * contentMD5: r.value.contentMD5,
+-             * mtime: new Date(r.value.mtime).toISOString()
+-             */
+-            var obj = {
+-                key: record.name,
+-                value: {
+-                    type: 'bucketobject',
+-                    etag: record.id,
+-                    mtime: record.created,
+-                    contentType: record.content_type,
+-                    contentMD5: record.content_md5,
+-                    contentLength: record.content_length
+-                }
++            obj = {
++                name: record.name,
++                type: 'bucketobject',
++                etag: record.id,
++                mtime: record.created,
++                contentType: record.content_type,
++                contentMD5: record.content_md5,
++                contentLength: record.content_length
+             };
+ 
+             return obj;
+@@ -1249,62 +1385,28 @@ function listObjects(options) {
+ 
+ function paginationStream(opts, onRecord, done) {
+     assert.object(opts, 'opts');
+-    assert.bool(opts.sorted, 'opts.sorted');
+     assert.object(opts.vnodes, 'opts.vnodes');
+     assert.object(opts.log, 'opts.log');
+     assert.number(opts.limit, 'opts.limit');
+     assert.string(opts.order_by, 'opts.order_by');
++    assert.optionalString(opts.delimiter, 'opts.delimiter');
+     assert.func(onRecord, 'onRecord');
+     assert.func(done, 'done');
+ 
+     var log = opts.log;
+     var vnodes = opts.vnodes;
+     var limit = opts.limit;
++    var delimiter = opts.delimiter;
+ 
+-    var totalRecordsSent = 0;
+-
+-    if (!opts.sorted) {
+-        log.debug('paginationStream unsorted');
+-        vasync.forEachParallel({
+-            inputs: Object.keys(vnodes),
+-            func: function (vnode, cb2) {
+-                var o = vnodes[vnode];
+-
+-                function next() {
+-                    o.lostream.getNextRecord(function (record, isDone) {
+-                        if (isDone) {
+-                            cb2();
+-                            return;
+-                        }
+-
+-                        if (totalRecordsSent >= limit) {
+-                            log.debug('limit hit (%d) - ending early',
+-                                limit);
+-                            cb2();
+-                            return;
+-                        }
+-
+-                        assert.object(record, 'record');
+-                        assert.string(record.created, 'record.created');
+-                        record.created = new Date(record.created);
+-
+-                        onRecord(record);
+-                        totalRecordsSent++;
++    var nextMarker;
+ 
+-                        setImmediate(next);
+-                    });
+-                }
+-
+-                next();
+-            }
+-        }, done);
+-        return;
+-    }
++    var totalRecordsSent = 0;
++    var doneEarly = false;
+ 
+-    log.debug('paginationStream sorted');
++    log.debug('paginationStream starting');
+     vasync.whilst(
+         function () {
+-            return Object.keys(vnodes).length > 0;
++            return Object.keys(vnodes).length > 0 && !doneEarly;
+         },
+         function (cb) {
+             vasync.forEachParallel({
+@@ -1312,12 +1414,22 @@ function paginationStream(opts, onRecord, done) {
+                 func: function (vnode, cb2) {
+                     var o = vnodes[vnode];
+ 
++                    assert.object(o, util.format('vnodes[%d]', vnode));
++
+                     if (o.record) {
+                         cb2();
+                         return;
+                     }
+ 
+-                    o.lostream.getNextRecord(function (record, isDone) {
++                    if (o.lmstream.done) {
++                        log.debug('pagination remove vnode %d from list',
++                            vnode);
++                        delete vnodes[vnode];
++                        cb2();
++                        return;
++                    }
++
++                    o.lmstream.getNextRecord(function (record, isDone) {
+                         if (isDone) {
+                             delete vnodes[vnode];
+                             cb2();
+@@ -1332,23 +1444,48 @@ function paginationStream(opts, onRecord, done) {
+                     });
+                 }
+             }, function (err) {
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
+                 if (totalRecordsSent >= limit) {
+                     log.debug('limit hit (%d) - ending early', limit);
+-                    vnodes = {};
+-                    cb(err);
++                    doneEarly = true;
++                    cb();
+                     return;
+                 }
+ 
+-                processRecords();
+-                cb(err);
++                processRecords(cb);
++            });
++        }, function (err) {
++            if (err) {
++                done(err);
++                return;
++            }
++
++            /*
++             * If we have exhausted all vnodes of their records, then we know
++             * *for sure* that there are no more pending records for the user
++             * to request.
++             */
++            var finished = (Object.keys(vnodes).length === 0);
++            vnodes = {};
++
++            onRecord({
++                type: 'message',
++                finished: finished
+             });
+-        }, done);
+ 
+-    function processRecords() {
++            done();
++        });
++
++    function processRecords(cb) {
+         var keys = Object.keys(vnodes);
+ 
+         if (keys.length === 0) {
+             log.debug('no more records to process, we are done');
++            cb();
+             return;
+         }
+ 
+@@ -1364,10 +1501,69 @@ function paginationStream(opts, onRecord, done) {
+         var o = vnodes[vnode];
+         assert.object(o, 'o');
+ 
+-        onRecord(o.record);
+-        totalRecordsSent++;
+-
++        var rec = o.record;
+         o.record = null;
++
++        // just send the plain record if no delimiter was specified
++        if (!delimiter) {
++            sendRecord(rec);
++            cb();
++            return;
++        }
++
++        // try to split the string by the delimiter
++        var name = rec[opts.order_by];
++        var idx = name.indexOf(delimiter);
++
++        // no delimiter found, just send the plain record
++        if (idx < 0) {
++            sendRecord(rec);
++            cb();
++            return;
++        }
++
++        // delimiter found
++        var base = name.substr(0, idx);
++        nextMarker = base + String.fromCharCode(delimiter.charCodeAt(0) + 1);
++
++        // send the group record
++        sendRecord({
++            name: base + delimiter,
++            type: 'group'
++        });
++
++        // Fast forward each vnode stream to the next marker
++        vasync.forEachParallel({
++            inputs: Object.keys(vnodes),
++            func: function (_vnode, cb2) {
++                var ob = vnodes[_vnode];
++
++                assert.object(ob, util.format('vnodes[%d]', _vnode));
++
++                if (ob.lmstream.done) {
++                    log.debug('fast-forward remove vnode %d from list',
++                        _vnode);
++                    delete vnodes[_vnode];
++                    cb2();
++                    return;
++                }
++
++                if (ob.record && ob.record[opts.order_by] &&
++                    ob.record[opts.order_by] < nextMarker) {
++
++                    ob.record = null;
++                }
++
++                ob.lmstream.setNewMarker(nextMarker, cb2);
++            }
++        }, function (err) {
++            cb(err);
++        });
++
++        function sendRecord(_rec) {
++            totalRecordsSent++;
++            onRecord(_rec);
++        }
+     }
+ }
+ 

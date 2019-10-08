@@ -1,0 +1,1039 @@
+commit 664d5d0b8c901b4326488d3985d6a47cf923f031
+Author: Jordan Paige Hendricks <jordan.hendricks@joyent.com>
+Date:   2019-08-09T19:39:21+00:00 (8 weeks ago)
+    
+    OS-5553 Want NVMe Hotplug Support
+    OS-7691 ldi_handle dcmd segfaults occasionally
+
+diff --git a/usr/src/cmd/fm/modules/common/fabric-xlate/fabric-xlate.h b/usr/src/cmd/fm/modules/common/fabric-xlate/fabric-xlate.h
+index f33ea9ecd6..9a7aa46c08 100644
+--- a/usr/src/cmd/fm/modules/common/fabric-xlate/fabric-xlate.h
++++ b/usr/src/cmd/fm/modules/common/fabric-xlate/fabric-xlate.h
+@@ -20,6 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #ifndef _FABRIC_XLATE_H
+@@ -31,6 +32,7 @@
+ #include <sys/types.h>
+ #include <sys/pcie.h>
+ #include <sys/fm/io/pci.h>
++#include <limits.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -45,6 +47,17 @@ extern "C" {
+ #define	PF_ADDR_PIO		(1 << 1)
+ #define	PF_ADDR_CFG		(1 << 2)
+ 
++
++/*
++ * The fabric ereport preparation functions (fab_prep_*) in fab_erpt_tbl_t
++ * structures may return an error if the ereport could not be set up properly.
++ * Typically, these errors * are errnos. It is possible that based on incoming
++ * ereport payload data, we might not want to generate an ereport at all: In
++ * this case, the preparation functions may instead return PF_EREPORT_IGNORE,
++ * which is set at a high value so as not to collide with the errnos.
++ */
++#define	PF_EREPORT_IGNORE	INT_MAX
++
+ extern fmd_xprt_t *fab_fmd_xprt;	/* FMD transport layer handle */
+ extern char fab_buf[];
+ 
+@@ -121,8 +134,12 @@ typedef struct fab_data {
+ 	uint16_t pcie_rp_ctl;		/* root complex control register */
+ 	uint32_t pcie_rp_err_status;	/* pcie root complex error status reg */
+ 	uint32_t pcie_rp_err_cmd;	/* pcie root complex error cmd reg */
+-	uint16_t pcie_rp_ce_src_id;	/* pcie root complex ce sourpe id */
+-	uint16_t pcie_rp_ue_src_id;	/* pcie root complex ue sourpe id */
++	uint16_t pcie_rp_ce_src_id;	/* pcie root complex ce source id */
++	uint16_t pcie_rp_ue_src_id;	/* pcie root complex ue source id */
++
++	uint32_t pcie_slot_cap;		/* pcie slot capabilities */
++	uint16_t pcie_slot_control;	/* pcie slot control */
++	uint16_t pcie_slot_status;	/* pcie slot status */
+ 
+ 	/* Flags */
+ 	boolean_t pcie_rp_send_all;	/* need to send ereports on all rps */
+@@ -131,7 +148,6 @@ typedef struct fab_data {
+ typedef struct fab_erpt_tbl {
+ 	const char	*err_class;	/* Final Ereport Class */
+ 	uint32_t	reg_bit;	/* Error Bit Mask */
+-	/* Pointer to function that prepares the ereport body */
+ 	const char	*tgt_class;	/* Target Ereport Class */
+ } fab_erpt_tbl_t;
+ 
+diff --git a/usr/src/cmd/fm/modules/common/fabric-xlate/fx_fabric.c b/usr/src/cmd/fm/modules/common/fabric-xlate/fx_fabric.c
+index 69ecf1aa8d..481b2fe107 100644
+--- a/usr/src/cmd/fm/modules/common/fabric-xlate/fx_fabric.c
++++ b/usr/src/cmd/fm/modules/common/fabric-xlate/fx_fabric.c
+@@ -22,10 +22,13 @@
+ /*
+  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ *
++ * Copyright 2019 Joyent, Inc.
+  */
+ #include <stddef.h>
+ #include <strings.h>
+ #include <sys/fm/util.h>
++#include <sys/pcie.h>
+ 
+ #include "fabric-xlate.h"
+ 
+@@ -271,6 +274,11 @@ fab_pci_fabric_to_data(fmd_hdl_t *hdl, nvlist_t *nvl, fab_data_t *data)
+ 	FAB_LOOKUP(32,	"pcie_adv_rp_command",	&data->pcie_rp_err_cmd);
+ 	FAB_LOOKUP(16,	"pcie_adv_rp_ce_src_id", &data->pcie_rp_ce_src_id);
+ 	FAB_LOOKUP(16,	"pcie_adv_rp_ue_src_id", &data->pcie_rp_ue_src_id);
++
++	/* PCIe Slot Registers */
++	FAB_LOOKUP(32,	"pcie_slot_cap",	&data->pcie_slot_cap);
++	FAB_LOOKUP(16,	"pcie_slot_control", &data->pcie_slot_control);
++	FAB_LOOKUP(16,	"pcie_slot_status", &data->pcie_slot_status);
+ }
+ 
+ static int
+@@ -358,6 +366,32 @@ fab_prep_pcie_ue_erpt(fmd_hdl_t *hdl, fab_data_t *data, nvlist_t *erpt,
+ 	    PCIE_AER_CTL_FST_ERR_PTR_MASK);
+ 	int err = fab_prep_basic_erpt(hdl, data->nvl, erpt, B_FALSE);
+ 
++	// TODO: does eft fault the slot or the child device?
++	/*
++	 * It is possible to see uncorrectable errors for a slot that are
++	 * related to the slot's child device being physically removed from the
++	 * slot. As such, in the case that the slot reports that it is empty, we
++	 * do not want to generate an ereport for all errors. Generating an
++	 * ereport here will will cause the eft module to fault the device and
++	 * io-retire to subsequently retire the device. Retiring the device
++	 * makes little sense given that the device is physically gone; more
++	 * confusingly, if plugged back into the * slot, it would be marked
++	 * retired already.
++	 *
++	 * The only error ignored for this case is Completion Timeout. It is
++	 * possible more errors should be ignored, and if they are seen
++	 * in the field it might be worth broadening the set of ignored errors.
++	 */
++	(void) nvlist_add_uint32(erpt, "pcie_slot_cap", data->pcie_slot_cap);
++	(void) nvlist_add_uint16(erpt, "pcie_slot_control",
++	    data->pcie_slot_control);
++	(void) nvlist_add_uint16(erpt, "pcie_slot_status",
++	    data->pcie_slot_status);
++	if ((tbl->reg_bit == PCIE_AER_UCE_TO) &&
++	    !(data->pcie_slot_status & PCIE_SLOTSTS_PRESENCE_DETECTED)) {
++		return (PF_EREPORT_IGNORE);
++	}
++
+ 	/* Generate an ereport for this error bit. */
+ 	(void) snprintf(fab_buf, FM_MAX_CLASS, "ereport.io.%s.%s",
+ 	    PCIEX_ERROR_SUBCLASS, class);
+@@ -776,7 +810,7 @@ fab_xlate_pcie_erpts(fmd_hdl_t *hdl, fab_data_t *data)
+ 
+ 	fmd_hdl_debug(hdl, "Sending Ereports Now");
+ 
+-	/* Go through the error logs and send the relavant reports */
++	/* Go through the error logs and send the relevant reports */
+ 	for (tbl = fab_master_err_tbl; tbl->erpt_tbl; tbl++) {
+ 		fab_send_erpt(hdl, data, tbl);
+ 	}
+diff --git a/usr/src/cmd/fm/modules/common/fabric-xlate/fx_subr.c b/usr/src/cmd/fm/modules/common/fabric-xlate/fx_subr.c
+index 8593144b28..a5dc78305d 100644
+--- a/usr/src/cmd/fm/modules/common/fabric-xlate/fx_subr.c
++++ b/usr/src/cmd/fm/modules/common/fabric-xlate/fx_subr.c
+@@ -21,6 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2019 Joyent, Inc.
+  */
+ #include <strings.h>
+ #include <fm/topo_hc.h>
+@@ -185,6 +186,7 @@ fab_send_erpt(fmd_hdl_t *hdl, fab_data_t *data, fab_err_tbl_t *tbl)
+ 	fab_erpt_tbl_t	*erpt_tbl, *entry;
+ 	nvlist_t	*erpt;
+ 	uint32_t	reg;
++	int	err;
+ 
+ 	erpt_tbl = tbl->erpt_tbl;
+ 	if (tbl->reg_size == 16) {
+@@ -200,7 +202,9 @@ fab_send_erpt(fmd_hdl_t *hdl, fab_data_t *data, fab_err_tbl_t *tbl)
+ 
+ 		if (nvlist_alloc(&erpt, NV_UNIQUE_NAME, 0) != 0)
+ 			goto done;
+-		if (tbl->fab_prep(hdl, data, erpt, entry) != 0) {
++
++		err = tbl->fab_prep(hdl, data, erpt, entry);
++		if ((err != 0) && (err != PF_EREPORT_IGNORE)) {
+ 			fmd_hdl_debug(hdl, "Prepping ereport failed: "
+ 			    "class = %s\n", entry->err_class);
+ 			nvlist_free(erpt);
+@@ -394,7 +398,7 @@ fab_find_rppath_by_devbdf(fmd_hdl_t *hdl, nvlist_t *nvl, pcie_req_id_t bdf)
+ 	xmlXPathObjectPtr xpathObj;
+ 	xmlNodeSetPtr nodes;
+ 	xmlNodePtr devNode;
+-	char 	*retval, *temp;
++	char	*retval, *temp;
+ 	char	query[500];
+ 	int	i, size, bus, dev, fn;
+ 	char	*hcpath;
+@@ -577,7 +581,7 @@ fail:
+ char *
+ fab_find_bdf(fmd_hdl_t *hdl, nvlist_t *nvl, pcie_req_id_t bdf)
+ {
+-	char 	*retval;
++	char	*retval;
+ 	char	query[500];
+ 	int	bus, dev, fn;
+ 	char	rcpath[255];
+@@ -705,7 +709,7 @@ found:
+ propgroup:
+ 	/* Retrive the "dev" propval and return */
+ 	for (devNode = devNode->children; devNode; devNode = devNode->next) {
+-		char 	*tprop;
++		char	*tprop;
+ 
+ 		tprop = GET_PROP(devNode, "name");
+ 		if (STRCMP(devNode->name, "propval") &&
+@@ -866,8 +870,8 @@ fab_pr(fmd_hdl_t *hdl, fmd_event_t *ep, nvlist_t *nvl)
+ char *
+ fab_get_rpdev(fmd_hdl_t *hdl)
+ {
+-	char 	*retval;
+-	char 	query[500];
++	char	*retval;
++	char	query[500];
+ 
+ 	(void) snprintf(query, sizeof (query), "//propval["
+ 	    "@name='extended-capabilities' and contains(@value, '%s')]"
+@@ -888,8 +892,8 @@ fab_send_erpt_all_rps(fmd_hdl_t *hdl, nvlist_t *erpt)
+ {
+ 	xmlXPathObjectPtr xpathObj;
+ 	xmlNodeSetPtr nodes;
+-	char 	*rppath, *hbpath;
+-	char 	query[600];
++	char	*rppath, *hbpath;
++	char	query[600];
+ 	nvlist_t *detector, *nvl;
+ 	uint_t	i, size;
+ 	size_t len;
+diff --git a/usr/src/cmd/mdb/common/modules/genunix/ldi.c b/usr/src/cmd/mdb/common/modules/genunix/ldi.c
+index a3ceb64421..3e4f11ba28 100644
+--- a/usr/src/cmd/mdb/common/modules/genunix/ldi.c
++++ b/usr/src/cmd/mdb/common/modules/genunix/ldi.c
+@@ -25,7 +25,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #include <sys/types.h>
+@@ -290,7 +290,8 @@ ldi_ident(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ }
+ 
+ static void
+-ldi_handle_header(int refs, int ident) {
++ldi_handle_header(int refs, int ident)
++{
+ 	mdb_printf("%-?s ", "HANDLE");
+ 
+ 	if (refs)
+@@ -369,7 +370,7 @@ ldi_handle(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 	int			refs = 1;
+ 
+ 	if (mdb_getopts(argc, argv,
+-	    'i', MDB_OPT_SETBITS, TRUE, &ident) != argc)
++	    'i', MDB_OPT_SETBITS, TRUE, &ident, NULL) != argc)
+ 		return (DCMD_USAGE);
+ 
+ 	if (ident)
+diff --git a/usr/src/uts/common/io/nvme/nvme.c b/usr/src/uts/common/io/nvme/nvme.c
+index 5af89e3874..46e71cd14d 100644
+--- a/usr/src/uts/common/io/nvme/nvme.c
++++ b/usr/src/uts/common/io/nvme/nvme.c
+@@ -13,7 +13,7 @@
+  * Copyright 2018 Nexenta Systems, Inc.
+  * Copyright 2016 Tegile Systems, Inc. All rights reserved.
+  * Copyright (c) 2016 The MathWorks, Inc.  All rights reserved.
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  * Copyright 2019 Western Digital Corporation.
+  */
+ 
+@@ -1017,6 +1017,11 @@ nvme_submit_admin_cmd(nvme_qpair_t *qp, nvme_cmd_t *cmd)
+ static int
+ nvme_submit_io_cmd(nvme_qpair_t *qp, nvme_cmd_t *cmd)
+ {
++	if (cmd->nc_nvme->n_dead) {
++		cmn_err(CE_WARN, "failing I/O; nvme controller is dead");
++		return (EIO);
++	}
++
+ 	if (sema_tryp(&qp->nq_sema) == 0)
+ 		return (EAGAIN);
+ 
+@@ -3181,6 +3186,43 @@ nvme_fm_errcb(dev_info_t *dip, ddi_fm_error_t *fm_error, const void *arg)
+ 	return (fm_error->fme_status);
+ }
+ 
++static void
++nvme_remove_callback(dev_info_t *dip, ddi_eventcookie_t cookie, void *a,
++    void *b)
++{
++	nvme_t *nvme;
++	int i;
++
++	nvme = ddi_get_soft_state(nvme_state, ddi_get_instance(dip));
++	nvme->n_dead = B_TRUE;
++
++	/*
++	 * Fail all outstanding commands, excluding those in the admin queue
++	 * (queue 0).
++	 */
++	for (i = 1; i < nvme->n_ioq_count + 1; i++) {
++		nvme_qpair_t *qp = nvme->n_ioq[i];
++		if (qp == NULL) {
++			continue;
++		}
++
++		mutex_enter(&qp->nq_mutex);
++		int j;
++		for (j = 0; j < qp->nq_nentry; j++) {
++			nvme_cmd_t *cmd = qp->nq_cmd[j];
++
++			if (cmd == NULL) {
++				continue;
++			}
++
++			(void) nvme_unqueue_cmd(nvme, qp, cmd->nc_sqe.sqe_cid);
++			taskq_dispatch_ent((taskq_t *)cmd->nc_nvme->n_cmd_taskq,
++			    cmd->nc_callback, cmd, TQ_NOSLEEP, &cmd->nc_tqent);
++		}
++		mutex_exit(&qp->nq_mutex);
++	}
++}
++
+ static int
+ nvme_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ {
+@@ -3203,6 +3245,21 @@ nvme_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	ddi_set_driver_private(dip, nvme);
+ 	nvme->n_dip = dip;
+ 
++	/* Set up event handlers for hot removal. */
++	if (nvme->n_rm_cookie == NULL) {
++		if (ddi_get_eventcookie(nvme->n_dip, DDI_DEVI_REMOVE_EVENT,
++		    &nvme->n_rm_cookie) != DDI_SUCCESS) {
++			goto fail;
++		}
++
++		nvme->n_ev_rm_cb_id = NULL;
++		if (ddi_add_event_handler(nvme->n_dip, nvme->n_rm_cookie,
++		    nvme_remove_callback, NULL, &nvme->n_ev_rm_cb_id) !=
++		    DDI_SUCCESS) {
++			goto fail;
++		}
++	}
++
+ 	mutex_init(&nvme->n_minor.nm_mutex, NULL, MUTEX_DRIVER, NULL);
+ 
+ 	nvme->n_strict_version = ddi_prop_get_int(DDI_DEV_T_ANY, dip,
+@@ -3420,6 +3477,11 @@ nvme_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+ 	if (nvme == NULL)
+ 		return (DDI_FAILURE);
+ 
++	// TODO: error handling?
++	if (nvme->n_ev_rm_cb_id != NULL) {
++		(void) ddi_remove_event_handler(nvme->n_ev_rm_cb_id);
++	}
++
+ 	ddi_remove_minor_node(dip, "devctl");
+ 	mutex_destroy(&nvme->n_minor.nm_mutex);
+ 
+@@ -3712,8 +3774,10 @@ nvme_bd_cmd(nvme_namespace_t *ns, bd_xfer_t *xfer, uint8_t opc)
+ 	boolean_t poll;
+ 	int ret;
+ 
+-	if (nvme->n_dead)
++	if (nvme->n_dead) {
++		cmn_err(CE_WARN, "failing I/O; nvme controller is dead");
+ 		return (EIO);
++	}
+ 
+ 	cmd = nvme_create_nvm_cmd(ns, opc, xfer);
+ 	if (cmd == NULL)
+diff --git a/usr/src/uts/common/io/nvme/nvme_var.h b/usr/src/uts/common/io/nvme/nvme_var.h
+index 6f3b53d3ec..4a6b3965f9 100644
+--- a/usr/src/uts/common/io/nvme/nvme_var.h
++++ b/usr/src/uts/common/io/nvme/nvme_var.h
+@@ -12,7 +12,7 @@
+ /*
+  * Copyright 2018 Nexenta Systems, Inc.
+  * Copyright 2016 The MathWorks, Inc. All rights reserved.
+- * Copyright 2017 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  * Copyright 2019 Western Digital Corporation.
+  */
+ 
+@@ -76,8 +76,8 @@ struct nvme_dma {
+ struct nvme_cmd {
+ 	struct list_node nc_list;
+ 
+-	nvme_sqe_t nc_sqe;
+-	nvme_cqe_t nc_cqe;
++	nvme_sqe_t nc_sqe; /* submission queue entry */
++	nvme_cqe_t nc_cqe; /* completion queue entry */
+ 
+ 	void (*nc_callback)(void *);
+ 	bd_xfer_t *nc_xfer;
+@@ -90,8 +90,8 @@ struct nvme_cmd {
+ 	kmutex_t nc_mutex;
+ 	kcondvar_t nc_cv;
+ 
+-	taskq_ent_t nc_tqent;
+-	nvme_t *nc_nvme;
++	taskq_ent_t nc_tqent; /* task queue entry for command */
++	nvme_t *nc_nvme;	  /* pointer to nvme struct */
+ };
+ 
+ struct nvme_cq {
+@@ -108,15 +108,18 @@ struct nvme_cq {
+ 	kmutex_t ncq_mutex;
+ };
+ 
++// Represents a queue pair of completion and submission queues.
+ struct nvme_qpair {
+ 	size_t nq_nentry;
+ 
++	/* submission fields */
+ 	nvme_dma_t *nq_sqdma;
+ 	nvme_sqe_t *nq_sq;
+ 	uint_t nq_sqhead;
+ 	uint_t nq_sqtail;
+ 	uintptr_t nq_sqtdbl;
+ 
++	/* completion fields */
+ 	nvme_cq_t *nq_cq;
+ 
+ 	nvme_cmd_t **nq_cmd;
+@@ -128,6 +131,9 @@ struct nvme_qpair {
+ };
+ 
+ struct nvme {
++	ddi_eventcookie_t n_rm_cookie;
++	ddi_callback_id_t n_ev_rm_cb_id;
++
+ 	dev_info_t *n_dip;
+ 	int n_progress;
+ 
+@@ -139,7 +145,7 @@ struct nvme {
+ 
+ 	size_t n_inth_sz;
+ 	ddi_intr_handle_t *n_inth;
+-	int n_intr_cnt;
++	int n_intr_cnt; // TODO: explain this
+ 	uint_t n_intr_pri;
+ 	int n_intr_cap;
+ 	int n_intr_type;
+@@ -182,10 +188,10 @@ struct nvme {
+ 	uint_t n_ioq_count;
+ 	uint_t n_cq_count;
+ 
+-	nvme_identify_ctrl_t *n_idctl;
++	nvme_identify_ctrl_t *n_idctl; /* controller data structure */
+ 
+-	nvme_qpair_t *n_adminq;
+-	nvme_qpair_t **n_ioq;
++	nvme_qpair_t *n_adminq; /* pointer to admin queue (always queue 0) */
++	nvme_qpair_t **n_ioq; /* array of queue pair pointers */
+ 	nvme_cq_t **n_cq;
+ 
+ 	nvme_namespace_t *n_ns;
+diff --git a/usr/src/uts/common/io/pciex/hotplug/pciehpc.c b/usr/src/uts/common/io/pciex/hotplug/pciehpc.c
+index 5ce219bd2f..3e4beda495 100644
+--- a/usr/src/uts/common/io/pciex/hotplug/pciehpc.c
++++ b/usr/src/uts/common/io/pciex/hotplug/pciehpc.c
+@@ -395,6 +395,21 @@ pciehpc_intr(dev_info_t *dip)
+ 				    PCIE_SLOTCTL,
+ 				    control & ~PCIE_SLOTCTL_PWR_FAULT_EN);
+ 
++			/*
++			 * If supported, notify the child device driver that the
++			 * device is being removed.
++			 */
++			dev_info_t *cdip = ddi_get_child(dip);
++			if (cdip != NULL) {
++				ddi_eventcookie_t rm_cookie;
++				if (ddi_get_eventcookie(cdip,
++				    DDI_DEVI_REMOVE_EVENT,
++				    &rm_cookie) == DDI_SUCCESS) {
++					ndi_post_event(dip, cdip, rm_cookie,
++					    NULL);
++				}
++			}
++
+ 			/*
+ 			 * Ask DDI Hotplug framework to change state to Empty
+ 			 */
+diff --git a/usr/src/uts/common/io/pciex/pcie.c b/usr/src/uts/common/io/pciex/pcie.c
+index 1922f821f3..d5bf858406 100644
+--- a/usr/src/uts/common/io/pciex/pcie.c
++++ b/usr/src/uts/common/io/pciex/pcie.c
+@@ -786,6 +786,13 @@ pcie_init_pfd(dev_info_t *dip)
+ 				    PCIE_ZALLOC(pf_pcix_ecc_regs_t);
+ 			}
+ 		}
++
++		PCIE_SLOT_REG(pfd_p) = PCIE_ZALLOC(pf_pcie_slot_regs_t);
++		PCIE_SLOT_REG(pfd_p)->pcie_slot_regs_valid = B_FALSE;
++		PCIE_SLOT_REG(pfd_p)->pcie_slot_cap = 0;
++		PCIE_SLOT_REG(pfd_p)->pcie_slot_control = 0;
++		PCIE_SLOT_REG(pfd_p)->pcie_slot_status = 0;
++
+ 	} else if (PCIE_IS_PCIX(bus_p)) {
+ 		if (PCIE_IS_BDG(bus_p)) {
+ 			PCIX_BDG_ERR_REG(pfd_p) =
+diff --git a/usr/src/uts/common/io/pciex/pcie_fault.c b/usr/src/uts/common/io/pciex/pcie_fault.c
+index 6a335db3e2..0255ea9d18 100644
+--- a/usr/src/uts/common/io/pciex/pcie_fault.c
++++ b/usr/src/uts/common/io/pciex/pcie_fault.c
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #include <sys/sysmacros.h>
+@@ -200,7 +200,7 @@ pf_eh_exit(pcie_bus_t *bus_p)
+  * for the root_pfd_p.
+  *
+  * "Root Complexes" such as NPE and PX should call scan_fabric using itself as
+- * the rdip.  PCIe Root ports should call pf_scan_fabric using it's parent as
++ * the rdip.  PCIe Root ports should call pf_scan_fabric using its parent as
+  * the rdip.
+  *
+  * Scan fabric initiated from RCs are likely due to a fabric message, traps or
+@@ -565,8 +565,7 @@ pf_pcix_regs_gather(pf_data_t *pfd_p, pcie_bus_t *bus_p)
+ 	}
+ }
+ 
+-static void
+-pf_pcie_regs_gather(pf_data_t *pfd_p, pcie_bus_t *bus_p)
++static void pf_pcie_regs_gather(pf_data_t *pfd_p, pcie_bus_t *bus_p)
+ {
+ 	pf_pcie_err_regs_t *pcie_regs = PCIE_ERR_REG(pfd_p);
+ 	pf_pcie_adv_err_regs_t *pcie_adv_regs = PCIE_ADV_REG(pfd_p);
+@@ -587,12 +586,28 @@ pf_pcie_regs_gather(pf_data_t *pfd_p, pcie_bus_t *bus_p)
+ 		    PCIE_ROOTCTL);
+ 	}
+ 
++	/*
++	 * For Downstream Ports and Root Ports with a Slot Implemented that are
++	 * hotplug capable, gather Slot Register state. This information is
++	 * useful, for instance, to know whether the Slot's child device is
++	 * phyiscally present (via the Slot Status register).
++	 */
++	if ((PCIE_IS_SWD(bus_p) || PCIE_IS_ROOT(bus_p)) &&
++	    PCIE_IS_HOTPLUG_ENABLED(PCIE_BUS2DIP(bus_p))) {
++		pf_pcie_slot_regs_t *pcie_slot_regs = PCIE_SLOT_REG(pfd_p);
++		pcie_slot_regs->pcie_slot_cap = PCIE_CAP_GET(32, bus_p,
++		    PCIE_SLOTCAP);
++		pcie_slot_regs->pcie_slot_control = PCIE_CAP_GET(16, bus_p,
++		    PCIE_SLOTCTL);
++		pcie_slot_regs->pcie_slot_status = PCIE_CAP_GET(16, bus_p,
++		    PCIE_SLOTSTS);
++		pcie_slot_regs->pcie_slot_regs_valid = B_TRUE;
++	}
++
+ 	if (!PCIE_HAS_AER(bus_p))
+ 		return;
+ 
+ 	/* Gather UE AERs */
+-	pcie_adv_regs->pcie_adv_ctl = PCIE_AER_GET(32, bus_p,
+-	    PCIE_AER_CTL);
+ 	pcie_adv_regs->pcie_ue_status = PCIE_AER_GET(32, bus_p,
+ 	    PCIE_AER_UCE_STS);
+ 	pcie_adv_regs->pcie_ue_mask = PCIE_AER_GET(32, bus_p,
+@@ -838,7 +853,7 @@ pf_pci_find_rp_fault(pf_data_t *pfd_p, pcie_bus_t *bus_p)
+ 	 * Check to see if an error has been received that
+ 	 * requires a scan of the fabric.  Count the number of
+ 	 * faults seen.  If MUL CE/FE_NFE that counts for
+-	 * atleast 2 faults, so just return with full_scan.
++	 * at least 2 faults, so just return with full_scan.
+ 	 */
+ 	if ((root_err & PCIE_AER_RE_STS_MUL_CE_RCVD) ||
+ 	    (root_err & PCIE_AER_RE_STS_MUL_FE_NFE_RCVD)) {
+@@ -1232,7 +1247,7 @@ const pf_fab_err_tbl_t pcie_rp_tbl[] = {
+ 	{PCIE_AER_UCE_FCP,	pf_panic,
+ 	    PF_AFFECTED_SELF | PF_AFFECTED_CHILDREN, 0},
+ 
+-	{PCIE_AER_UCE_TO,	pf_panic,
++	{PCIE_AER_UCE_TO,	pf_analyse_to,
+ 	    PF_AFFECTED_ADDR, PF_AFFECTED_CHILDREN},
+ 
+ 	{PCIE_AER_UCE_CA,	pf_no_panic,
+@@ -1923,9 +1938,30 @@ static int
+ pf_analyse_to(ddi_fm_error_t *derr, uint32_t bit, pf_data_t *dq_head_p,
+     pf_data_t *pfd_p)
+ {
++	dev_info_t	*rpdip = PCIE_PFD2BUS(pfd_p)->bus_rp_dip;
++	pf_data_t	*rppfd = PCIE_DIP2PFD(rpdip);
++	pf_pcie_slot_regs_t *p_pcie_slot_regs;
++
+ 	if (HAS_AER_LOGS(pfd_p, bit) && CE_ADVISORY(pfd_p))
+ 		return (PF_ERR_NO_PANIC);
+ 
++	p_pcie_slot_regs = PCIE_SLOT_REG(rppfd);
++	if (p_pcie_slot_regs->pcie_slot_regs_valid) {
++		cmn_err(CE_WARN, "slot status: 0x%x",
++		    p_pcie_slot_regs->pcie_slot_status);
++
++		/*
++		 * If the device is reported gone from its parent slot, then it
++		 * is expected that any outstanding commands would time out. In
++		 * this case, do not panic.
++		 */
++		if (!(p_pcie_slot_regs->pcie_slot_status &
++		    PCIE_SLOTSTS_PRESENCE_DETECTED)) {
++			cmn_err(CE_WARN, "pf_analyse_to: not panicking");
++			return (PF_ERR_NO_PANIC);
++		}
++	}
++
+ 	return (PF_ERR_PANIC);
+ }
+ 
+@@ -2970,6 +3006,18 @@ pf_send_ereport(ddi_fm_error_t *derr, pf_impl_t *impl)
+ 			    NULL);
+ 		}
+ 
++		/* Slot Status registers */
++		if (PCIE_SLOT_REG(pfd_p)->pcie_slot_regs_valid) {
++			fm_payload_set(ereport,
++			    "pcie_slot_cap", DATA_TYPE_UINT32,
++			    PCIE_SLOT_REG(pfd_p)->pcie_slot_cap,
++			    "pcie_slot_control", DATA_TYPE_UINT16,
++			    PCIE_SLOT_REG(pfd_p)->pcie_slot_control,
++			    "pcie_slot_status", DATA_TYPE_UINT16,
++			    PCIE_SLOT_REG(pfd_p)->pcie_slot_status,
++			    NULL);
++		}
++
+ generic:
+ 		/* IOV related information */
+ 		if (!PCIE_BDG_IS_UNASSIGNED(PCIE_PFD2BUS(impl->pf_dq_head_p))) {
+diff --git a/usr/src/uts/common/os/ddi_hp_impl.c b/usr/src/uts/common/os/ddi_hp_impl.c
+index 79165af9ff..f4ac89cbd3 100644
+--- a/usr/src/uts/common/os/ddi_hp_impl.c
++++ b/usr/src/uts/common/os/ddi_hp_impl.c
+@@ -21,6 +21,8 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ *
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -593,8 +595,7 @@ ddihp_cn_pre_change_state(ddi_hp_cn_handle_t *hdlp,
+ 	dev_info_t		*dip = hdlp->cn_dip;
+ 	int			rv = DDI_SUCCESS;
+ 
+-	if (curr_state > target_state &&
+-	    curr_state == DDI_HP_CN_STATE_ENABLED) {
++	if (target_state < DDI_HP_CN_STATE_ENABLED) {
+ 		/*
+ 		 * If the Connection goes to a lower state from ENABLED,
+ 		 *  then offline all children under it.
+diff --git a/usr/src/uts/common/os/ddi_hp_ndi.c b/usr/src/uts/common/os/ddi_hp_ndi.c
+index a41a12fc74..228475c0a2 100644
+--- a/usr/src/uts/common/os/ddi_hp_ndi.c
++++ b/usr/src/uts/common/os/ddi_hp_ndi.c
+@@ -21,6 +21,8 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ *
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -387,7 +389,14 @@ ddihp_cn_req_handler(ddi_hp_cn_handle_t *hdlp,
+ 
+ 		return (NDI_UNCLAIMED);
+ 	}
+-	if (hdlp->cn_info.cn_state != target_state) {
++
++	/*
++	 * In the case of hot removal of a device, the target state and the
++	 * connection state may both reported as empty. In that case, we still
++	 * want to kick off the cleanup started by the connection ops function.
++	 */
++	if (hdlp->cn_info.cn_state != target_state ||
++	    (target_state == DDI_HP_CN_STATE_EMPTY)) {
+ 		ddi_hp_cn_state_t result_state = 0;
+ 
+ 		DDIHP_CN_OPS(hdlp, DDI_HPOP_CN_CHANGE_STATE,
+diff --git a/usr/src/uts/common/sys/pcie_impl.h b/usr/src/uts/common/sys/pcie_impl.h
+index d1d13625c2..67536fdaa3 100644
+--- a/usr/src/uts/common/sys/pcie_impl.h
++++ b/usr/src/uts/common/sys/pcie_impl.h
+@@ -166,6 +166,7 @@ extern "C" {
+ #define	PCIE_ADV_BDG_HDR(pfd_p, n) PCIE_ADV_BDG_REG(pfd_p)->pcie_sue_hdr[n]
+ #define	PCIE_ADV_RP_REG(pfd_p) \
+ 	PCIE_ADV_REG(pfd_p)->pcie_ext.pcie_adv_rp_regs
++#define	PCIE_SLOT_REG(pfd_p)		pfd_p->pe_pcie_slot_regs
+ #define	PFD_AFFECTED_DEV(pfd_p)	   pfd_p->pe_affected_dev
+ #define	PFD_SET_AFFECTED_FLAG(pfd_p, aff_flag) \
+ 	PFD_AFFECTED_DEV(pfd_p)->pe_affected_flags = aff_flag
+@@ -262,6 +263,13 @@ typedef struct pf_pcie_err_regs {
+ 	pf_pcie_adv_err_regs_t *pcie_adv_regs; /* pcie aer regs */
+ } pf_pcie_err_regs_t;
+ 
++typedef struct pf_pcie_slot_regs {
++	boolean_t pcie_slot_regs_valid; /* true if register values are valid */
++	uint32_t pcie_slot_cap;		/* pcie slot capabilities register */
++	uint16_t pcie_slot_control;	/* pcie slot control register */
++	uint16_t pcie_slot_status;	/* pcie slot status register */
++} pf_pcie_slot_regs_t;
++
+ typedef enum {
+ 	PF_INTR_TYPE_NONE = 0,
+ 	PF_INTR_TYPE_FABRIC = 1,	/* Fabric Message */
+@@ -431,6 +439,7 @@ struct pf_data {
+ 		pf_pcie_err_regs_t	*pe_pcie_regs;	/* PCIe error reg */
+ 	} pe_ext;
+ 	pf_pcix_bdg_err_regs_t *pe_pcix_bdg_regs; /* PCI-X bridge regs */
++	pf_pcie_slot_regs_t *pe_pcie_slot_regs;	  /* PCIe slot regs */
+ 	pf_data_t		*pe_prev;	/* Next error in queue */
+ 	pf_data_t		*pe_next;	/* Next error in queue */
+ 	boolean_t		pe_rber_fatal;
+diff --git a/usr/src/uts/i86pc/io/pci/pci_common.h b/usr/src/uts/i86pc/io/pci/pci_common.h
+index 63fe4bb165..e68150b0e9 100644
+--- a/usr/src/uts/i86pc/io/pci/pci_common.h
++++ b/usr/src/uts/i86pc/io/pci/pci_common.h
+@@ -22,6 +22,8 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ *
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #ifndef	_PCI_PCI_COMMON_H
+@@ -45,6 +47,9 @@ typedef struct pci_state {
+ 	kmutex_t pci_mutex;
+ 	kmutex_t pci_peek_poke_mutex;
+ 	kmutex_t pci_err_mutex;
++
++	/* The following members are only used by npe(7d). */
++	ndi_event_hdl_t pci_ndi_event_hdl;
+ } pci_state_t;
+ 
+ /*
+diff --git a/usr/src/uts/i86pc/io/pciex/npe.c b/usr/src/uts/i86pc/io/pciex/npe.c
+index 4ef393ddb0..f253a04399 100644
+--- a/usr/src/uts/i86pc/io/pciex/npe.c
++++ b/usr/src/uts/i86pc/io/pciex/npe.c
+@@ -26,7 +26,7 @@
+ 
+ /*
+  * Copyright 2012 Garrett D'Amore <garrett@damore.org>.  All rights reserved.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -72,6 +72,15 @@ static int	npe_intr_ops(dev_info_t *, dev_info_t *, ddi_intr_op_t,
+ 		    ddi_intr_handle_impl_t *, void *);
+ static int	npe_fm_init(dev_info_t *, dev_info_t *, int,
+ 		    ddi_iblock_cookie_t *);
++static int	npe_bus_get_eventcookie(dev_info_t *, dev_info_t *, char *,
++		    ddi_eventcookie_t *);
++static int npe_bus_add_eventcall(dev_info_t *dip, dev_info_t *rdip,
++	ddi_eventcookie_t cookie, void (*callback)(dev_info_t *dip,
++		ddi_eventcookie_t cookie, void *arg, void *bus_impldata),
++	void *arg, ddi_callback_id_t *cb_id);
++static int npe_bus_remove_eventcall(dev_info_t *dip, ddi_callback_id_t cb_id);
++static int npe_bus_post_event(dev_info_t *dip, dev_info_t *rdip,
++	ddi_eventcookie_t cookie, void *impl_data);
+ 
+ static int	npe_fm_callback(dev_info_t *, ddi_fm_error_t *, const void *);
+ 
+@@ -102,10 +111,10 @@ struct bus_ops npe_bus_ops = {
+ 	ddi_dma_mctl,
+ 	npe_ctlops,
+ 	ddi_bus_prop_op,
+-	0,			/* (*bus_get_eventcookie)();	*/
+-	0,			/* (*bus_add_eventcall)();	*/
+-	0,			/* (*bus_remove_eventcall)();	*/
+-	0,			/* (*bus_post_event)();		*/
++	npe_bus_get_eventcookie,
++	npe_bus_add_eventcall,
++	npe_bus_remove_eventcall,
++	npe_bus_post_event,
+ 	0,			/* (*bus_intr_ctl)(); */
+ 	0,			/* (*bus_config)(); */
+ 	0,			/* (*bus_unconfig)(); */
+@@ -271,12 +280,26 @@ npe_info(dev_info_t *dip, ddi_info_cmd_t cmd, void *arg, void **result)
+ 	return (ret);
+ }
+ 
++// TODO: move this up?
++// 0 is "removal" for USBA_EVENT_TAG_HOT_REMOVAL and co
++static ndi_event_definition_t npe_ndi_event_defs[] = {
++	{0, DDI_DEVI_REMOVE_EVENT, EPL_KERNEL,
++						NDI_EVENT_POST_TO_ALL}
++};
++
++#define	NPE_N_NDI_EVENTS \
++	(sizeof (npe_ndi_event_defs) / sizeof (ndi_event_definition_t))
++
++static ndi_event_set_t npe_ndi_events = {
++	NDI_EVENTS_REV1, NPE_N_NDI_EVENTS, npe_ndi_event_defs};
++
+ /*ARGSUSED*/
+ static int
+ npe_attach(dev_info_t *devi, ddi_attach_cmd_t cmd)
+ {
+ 	int		instance = ddi_get_instance(devi);
+ 	pci_state_t	*pcip = NULL;
++	int ret;
+ 
+ 	if (cmd == DDI_RESUME) {
+ 		/*
+@@ -316,6 +339,17 @@ npe_attach(dev_info_t *devi, ddi_attach_cmd_t cmd)
+ 	if (pcie_init(devi, NULL) != DDI_SUCCESS)
+ 		goto fail1;
+ 
++	ret = ndi_event_alloc_hdl(pcip->pci_dip, NULL, &pcip->pci_ndi_event_hdl,
++	    NDI_SLEEP);
++	if (ret == 0) {
++		if (ndi_event_bind_set(pcip->pci_ndi_event_hdl, &npe_ndi_events,
++		    NDI_SLEEP) == NDI_FAILURE) {
++			cmn_err(CE_WARN, "npe:  failed to bind NDI event set");
++		}
++	} else {
++		cmn_err(CE_WARN, "npe:  failed to allocate NDI event handle");
++	}
++
+ 	/* Second arg: initialize for pci_express root nexus */
+ 	if (pcitool_init(devi, B_TRUE) != DDI_SUCCESS)
+ 		goto fail2;
+@@ -414,7 +448,7 @@ static int
+ npe_bus_map(dev_info_t *dip, dev_info_t *rdip, ddi_map_req_t *mp,
+     off_t offset, off_t len, caddr_t *vaddrp)
+ {
+-	int 		rnumber;
++	int		rnumber;
+ 	int		space;
+ 	ddi_acc_impl_t	*ap;
+ 	ddi_acc_hdl_t	*hp;
+@@ -1111,6 +1145,55 @@ npe_fm_init(dev_info_t *dip, dev_info_t *tdip, int cap,
+ 	return (pcip->pci_fmcap);
+ }
+ 
++static int
++npe_bus_get_eventcookie(dev_info_t *dip, dev_info_t *rdip, char *eventname,
++    ddi_eventcookie_t *cookiep)
++{
++	pci_state_t *pcip = ddi_get_soft_state(npe_statep,
++	    ddi_get_instance(dip));
++
++	return (ndi_event_retrieve_cookie(pcip->pci_ndi_event_hdl, rdip,
++	    eventname, cookiep, NDI_EVENT_NOPASS));
++}
++
++static int
++npe_bus_add_eventcall(dev_info_t *dip,
++    dev_info_t	*rdip,
++    ddi_eventcookie_t cookie,
++    void		(*callback)(dev_info_t *dip,
++    ddi_eventcookie_t cookie, void *arg,
++    void *bus_impldata),
++    void *arg, ddi_callback_id_t *cb_id)
++{
++	pci_state_t *pcip = ddi_get_soft_state(npe_statep,
++	    ddi_get_instance(dip));
++	// TODO: tag events?
++
++	return (ndi_event_add_callback(pcip->pci_ndi_event_hdl, rdip, cookie,
++	    callback, arg, NDI_SLEEP, cb_id));
++}
++
++static int
++npe_bus_remove_eventcall(dev_info_t *dip, ddi_callback_id_t cb_id)
++{
++	pci_state_t *pcip = ddi_get_soft_state(npe_statep,
++	    ddi_get_instance(dip));
++	return (ndi_event_remove_callback(pcip->pci_ndi_event_hdl, cb_id));
++}
++
++static int
++npe_bus_post_event(dev_info_t *dip,
++    dev_info_t *rdip,
++    ddi_eventcookie_t cookie,
++    void *impl_data)
++{
++	pci_state_t *pcip = ddi_get_soft_state(npe_statep,
++	    ddi_get_instance(dip));
++	return (ndi_event_do_callback(pcip->pci_ndi_event_hdl, rdip, cookie,
++	    impl_data));
++
++}
++
+ /*ARGSUSED*/
+ static int
+ npe_fm_callback(dev_info_t *dip, ddi_fm_error_t *derr, const void *no_used)
+diff --git a/usr/src/uts/intel/io/hotplug/pcicfg/pcicfg.c b/usr/src/uts/intel/io/hotplug/pcicfg/pcicfg.c
+index b482117c7c..7213d2ab9b 100644
+--- a/usr/src/uts/intel/io/hotplug/pcicfg/pcicfg.c
++++ b/usr/src/uts/intel/io/hotplug/pcicfg/pcicfg.c
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1999, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2019, Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -1251,7 +1251,7 @@ pcicfg_ntbridge_unconfigure_child(dev_info_t *new_device, uint_t devno)
+ {
+ 
+ 	dev_info_t	*new_ntbridgechild;
+-	int 		len, bus;
++	int		len, bus;
+ 	uint16_t	vid;
+ 	ddi_acc_handle_t	config_handle;
+ 	pci_bus_range_t pci_bus_range;
+@@ -1368,7 +1368,7 @@ pcicfg_is_ntbridge(dev_info_t *dip)
+ static uint_t
+ pcicfg_ntbridge_child(dev_info_t *dip)
+ {
+-	int 		len, val, rc = DDI_FAILURE;
++	int		len, val, rc = DDI_FAILURE;
+ 	dev_info_t	*anode = dip;
+ 
+ 	/*
+@@ -1398,7 +1398,7 @@ pcicfg_ntbridge_child(dev_info_t *dip)
+ 
+ static uint_t
+ pcicfg_get_ntbridge_child_range(dev_info_t *dip, uint64_t *boundbase,
+-				uint64_t *boundlen, uint_t space_type)
++    uint64_t *boundlen, uint_t space_type)
+ {
+ 	int		length, found = DDI_FAILURE, acount, i, ibridge;
+ 	pci_regspec_t	*assigned;
+@@ -1584,6 +1584,7 @@ static int
+ pcicfg_teardown_device(dev_info_t *dip, pcicfg_flags_t flags, boolean_t is_pcie)
+ {
+ 	ddi_acc_handle_t	handle;
++	int			ret;
+ 
+ 	/*
+ 	 * Free up resources associated with 'dip'
+@@ -1596,10 +1597,14 @@ pcicfg_teardown_device(dev_info_t *dip, pcicfg_flags_t flags, boolean_t is_pcie)
+ 	/*
+ 	 * disable the device
+ 	 */
+-	if (pcicfg_config_setup(dip, &handle) != PCICFG_SUCCESS)
++
++	ret = pcicfg_config_setup(dip, &handle);
++	if (ret == PCICFG_SUCCESS) {
++		pcicfg_device_off(handle);
++		pcicfg_config_teardown(&handle);
++	} else if (ret != PCICFG_NODEVICE) {
+ 		return (PCICFG_FAILURE);
+-	pcicfg_device_off(handle);
+-	pcicfg_config_teardown(&handle);
++	}
+ 
+ 	if (is_pcie) {
+ 		/*
+@@ -2402,7 +2407,7 @@ pcicfg_get_mem(pcicfg_phdl_t *entry, uint32_t length, uint64_t *ans)
+ 
+ static void
+ pcicfg_get_io(pcicfg_phdl_t *entry,
+-	uint32_t length, uint32_t *ans)
++    uint32_t length, uint32_t *ans)
+ {
+ 	uint32_t new_io;
+ 	uint64_t io_last;
+@@ -3189,7 +3194,7 @@ pcicfg_device_off(ddi_acc_handle_t config_handle)
+  */
+ static int
+ pcicfg_set_standard_props(dev_info_t *dip, ddi_acc_handle_t config_handle,
+-	uint8_t pcie_dev)
++    uint8_t pcie_dev)
+ {
+ 	int ret;
+ 	uint16_t cap_id_loc, val;
+@@ -3361,7 +3366,7 @@ pcicfg_set_busnode_props(dev_info_t *dip, uint8_t pcie_device_type)
+ 
+ static int
+ pcicfg_set_childnode_props(dev_info_t *dip, ddi_acc_handle_t config_handle,
+-		uint8_t pcie_dev)
++    uint8_t pcie_dev)
+ {
+ 
+ 	int		ret;
+@@ -3522,7 +3527,7 @@ pcicfg_set_childnode_props(dev_info_t *dip, ddi_acc_handle_t config_handle,
+  */
+ static void
+ pcicfg_set_bus_numbers(ddi_acc_handle_t config_handle,
+-uint_t primary, uint_t secondary, uint_t subordinate)
++    uint_t primary, uint_t secondary, uint_t subordinate)
+ {
+ 	DEBUG3("Setting bridge bus-range %d,%d,%d\n", primary, secondary,
+ 	    subordinate);
+@@ -3548,7 +3553,7 @@ uint_t primary, uint_t secondary, uint_t subordinate)
+  */
+ static void
+ pcicfg_setup_bridge(pcicfg_phdl_t *entry,
+-	ddi_acc_handle_t handle)
++    ddi_acc_handle_t handle)
+ {
+ 	/*
+ 	 * The highest bus seen during probing is the max-subordinate bus
+@@ -3608,7 +3613,7 @@ pcicfg_setup_bridge(pcicfg_phdl_t *entry,
+ 
+ static void
+ pcicfg_update_bridge(pcicfg_phdl_t *entry,
+-	ddi_acc_handle_t handle)
++    ddi_acc_handle_t handle)
+ {
+ 	uint_t length;
+ 
+@@ -3857,7 +3862,7 @@ pcicfg_populate_reg_props(dev_info_t *new_child,
+     ddi_acc_handle_t config_handle)
+ {
+ 	int		i;
+-	uint32_t 	request;
++	uint32_t	request;
+ 
+ 	i = PCI_CONF_BASE0;
+ 
+@@ -5079,7 +5084,7 @@ pcicfg_config_teardown(ddi_acc_handle_t *handle)
+ 
+ static int
+ pcicfg_add_config_reg(dev_info_t *dip,
+-	uint_t bus, uint_t device, uint_t func)
++    uint_t bus, uint_t device, uint_t func)
+ {
+ 	int reg[10] = { PCI_ADDR_CONFIG, 0, 0, 0, 0};
+ 
+@@ -5105,7 +5110,7 @@ pcicfg_ari_configure(dev_info_t *dip)
+ #ifdef DEBUG
+ static void
+ debug(char *fmt, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+-	uintptr_t a4, uintptr_t a5)
++    uintptr_t a4, uintptr_t a5)
+ {
+ 	if (pcicfg_debug > 1) {
+ 		prom_printf("pcicfg: ");

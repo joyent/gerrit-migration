@@ -1,0 +1,729 @@
+commit 7dc31552176b8b159ab88ad78c9b445a789d0748
+Author: rhb2 <robert.bogart@joyent.com>
+Date:   2019-07-24T22:12:28+00:00 (3 months ago)
+    
+    MANTA-4420 Remora Agent: Implement API for obtaining assignment stats
+    MANTA-4421 Remora agent: Implement API to allow clients to request assignments, filtered by TaskStatus
+
+diff --git a/src/agent.rs b/src/agent.rs
+index 6662d90..0c53763 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -1,7 +1,15 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2019, Joyent, Inc.
++ */
+ use std::collections::HashMap;
+ use std::fs;
+ use std::fs::File;
+-//use std::io::Error;
+ use std::net::*;
+ use std::path::Path;
+ use std::sync::{mpsc, Arc, Mutex, RwLock};
+@@ -10,7 +18,6 @@ use futures::future;
+ use futures::future::*;
+ use futures::stream::*;
+ 
+-//use gotham::extractor::QueryStringExtractor;
+ use gotham::handler::{Handler, HandlerFuture, IntoHandlerError, NewHandler};
+ use gotham::helpers::http::response::{create_empty_response, create_response};
+ use gotham::router::{builder::*, Router};
+@@ -23,18 +30,18 @@ use libmanta::moray::MantaObjectShark;
+ use md5::{Digest, Md5};
+ 
+ use crate::job::Task;
+-use crate::job::TaskStatus;
++use crate::job::{AgentAssignmentState, AgentAssignmentStats, TaskStatus};
+ 
+ use reqwest::StatusCode;
+ use rusqlite;
+ use serde::ser::SerializeMap;
+-use serde_derive::Deserialize;
++use serde_derive::{Deserialize, Serialize};
+ use threadpool::ThreadPool;
+ use trust_dns_resolver::Resolver;
+ use uuid::Uuid;
+ use walkdir::WalkDir;
+ 
+-type Assignments = HashMap<String, Arc<RwLock<Vec<Task>>>>;
++type Assignments = HashMap<String, Arc<RwLock<Assignment>>>;
+ 
+ static REMORA_SCHEDULED_DIR: &str = "/manta/remora";
+ static REMORA_FINISHED_DIR: &str = "/var/tmp/remora";
+@@ -53,10 +60,12 @@ pub struct Agent {
+ impl Agent {
+     pub fn new(tx: Arc<Mutex<mpsc::Sender<String>>>) -> Agent {
+         let assignments = Arc::new(Mutex::new(Assignments::new()));
+-        Agent {
+-            assignments,
+-            tx,
+-        }
++        Agent { assignments, tx }
++    }
++
++    pub fn run(addr: &'static str) {
++        println!("Listening for requests at {}", addr);
++        gotham::start(addr, router());
+     }
+ }
+ 
+@@ -65,17 +74,32 @@ impl serde::ser::Serialize for Agent {
+     where
+         S: serde::ser::Serializer,
+     {
+-        let work = self.assignments.lock().unwrap();
+-        let mut map = serializer.serialize_map(Some(work.len()))?;
++        let assignments = self.assignments.lock().unwrap();
++        let mut map = serializer.serialize_map(Some(assignments.len()))?;
+ 
+-        for (k, v) in &*work {
+-            let _tasks = v.read().unwrap();
+-            map.serialize_entry(&k.to_string(), &**v)?;
++        for (k, v) in &*assignments {
++            let tasks = &v.read().unwrap().stats;
++            map.serialize_entry(&k.to_string(), &tasks)?;
+         }
+         map.end()
+     }
+ }
+ 
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct Assignment {
++    pub stats: AgentAssignmentStats,
++    pub tasks: Vec<Task>,
++}
++
++impl Assignment {
++    fn new(v: Vec<Task>, uuid: &str) -> Assignment {
++        Assignment {
++            stats: AgentAssignmentStats::new(uuid, v.len()),
++            tasks: v,
++        }
++    }
++}
++
+ fn load_saved_assignments(agent: &Agent) {
+     for entry in WalkDir::new(REMORA_SCHEDULED_DIR)
+         .min_depth(1)
+@@ -92,37 +116,51 @@ fn load_saved_assignments(agent: &Agent) {
+     }
+ }
+ 
+-fn assignment_save(uuid: &str, path: &str, tasks: Arc<RwLock<Vec<Task>>>) {
++fn assignment_save(
++    uuid: &str,
++    path: &str,
++    assignment: Arc<RwLock<Assignment>>,
++) {
+     let conn = match rusqlite::Connection::open(format!("{}/{}", path, uuid)) {
+         Ok(conn) => conn,
+-        Err(e) => panic!("DB error {}", e),
++        Err(e) => panic!("DB error opening {}/{}: {}", path, uuid, e),
+     };
+ 
+-    let tasklist = tasks.read().unwrap();
++    let assn = assignment.read().unwrap();
++    let tasklist = &assn.tasks;
++    let stats = &assn.stats;
+ 
+-    let result = conn.execute(
++    // Create the table for our tasks.
++    match conn.execute(
+         "create table if not exists tasks (
+-		object_id text primary key not null unique,
+-		owner text not null,
+-		md5sum text not null,
+-		datacenter text not null,
+-		manta_storage_id text not null,
+-		status text not null
+-	    )",
++        object_id text primary key not null unique,
++        owner text not null,
++        md5sum text not null,
++        datacenter text not null,
++        manta_storage_id text not null,
++        status text not null
++	)",
+         rusqlite::params![],
+-    );
++    ) {
++        Ok(_) => (),
++        Err(e) => panic!("Database creation error: {}", e),
++    }
+ 
+-    match result {
++    // Create the table for our stats.
++    match conn.execute(
++        "create table if not exists stats (stats text not null)",
++        rusqlite::params![],
++    ) {
+         Ok(_) => (),
+         Err(e) => panic!("Database creation error: {}", e),
+-    };
++    }
+ 
++    // Populate the task table with the tasks in this assignment.
+     for task in &*tasklist {
+         match conn.execute(
+             "INSERT INTO tasks
+-			(object_id, owner, md5sum, datacenter, manta_storage_id,
+-			status)
+-			values (?1, ?2, ?3, ?4, ?5, ?6)",
++            (object_id, owner, md5sum, datacenter, manta_storage_id, status)
++            values (?1, ?2, ?3, ?4, ?5, ?6)",
+             rusqlite::params![
+                 task.object_id,
+                 task.owner,
+@@ -136,6 +174,15 @@ fn assignment_save(uuid: &str, path: &str, tasks: Arc<RwLock<Vec<Task>>>) {
+             Err(e) => panic!("Task insertion error: {}", e),
+         };
+     }
++
++    // Populate the stats table with our stats
++    match conn.execute(
++        "INSERT INTO stats values (?1)",
++        rusqlite::params![serde_json::to_vec(&stats).unwrap()],
++    ) {
++        Ok(_) => (),
++        Err(e) => panic!("Task insertion error: {}", e),
++    };
+ }
+ 
+ // Given a uuid of a particular assignment, extract its contents from
+@@ -143,7 +190,7 @@ fn assignment_save(uuid: &str, path: &str, tasks: Arc<RwLock<Vec<Task>>>) {
+ // files named after their uuid.  The format is an sqlite database.  We
+ // construct a vector of tasks based on the contents of the only table
+ // in the file called `tasks'.
+-fn assignment_recall(path: String) -> Result<Arc<RwLock<Vec<Task>>>, String> {
++fn assignment_recall(path: String) -> Result<Arc<RwLock<Assignment>>, String> {
+     if !Path::new(&path).exists() {
+         return Err(format!("File does not exist: {}", path));
+     }
+@@ -195,7 +242,31 @@ fn assignment_recall(path: String) -> Result<Arc<RwLock<Vec<Task>>>, String> {
+         tasks.push(i.unwrap());
+     }
+ 
+-    Ok(Arc::new(RwLock::new(tasks)))
++    stmt = match conn.prepare("SELECT stats FROM stats") {
++        Ok(s) => s,
++        Err(e) => return Err(format!("Query creation error: {}", e)),
++    };
++
++    let stats_iter = match stmt.query_map(rusqlite::params![], |row| {
++        let data: Vec<u8> = row.get(0)?;
++        let s = String::from_utf8(data).unwrap();
++        let stats: AgentAssignmentStats = serde_json::from_str(&s).unwrap();
++        Ok(stats)
++    }) {
++        Ok(iter) => iter,
++        Err(e) => return Err(format!("Query execution error: {}", e)),
++    };
++
++    let mut stats = Vec::new();
++
++    for i in stats_iter {
++        stats.push(i.unwrap());
++    }
++
++    let mut assignment = Assignment::new(tasks, &stats[0].uuid);
++    assignment.stats = stats[0].clone();
++
++    Ok(Arc::new(RwLock::new(assignment)))
+ }
+ 
+ // Take our current assignment that we have just finished processing and flush
+@@ -204,9 +275,9 @@ fn assignment_recall(path: String) -> Result<Arc<RwLock<Vec<Task>>>, String> {
+ // so that we do not process it again on restart of the agent.  Finally, remove
+ // the assignment from our HashMap.
+ fn assignment_complete(assignments: Arc<Mutex<Assignments>>, uuid: String) {
+-    let tasks = assignment_get(&assignments, &uuid).unwrap();
++    let assn = assignment_get(&assignments, &uuid).unwrap();
+ 
+-    assignment_save(&uuid, REMORA_FINISHED_DIR, tasks);
++    assignment_save(&uuid, REMORA_FINISHED_DIR, assn);
+     let src = format!("{}/{}", REMORA_SCHEDULED_DIR, uuid);
+ 
+     match fs::remove_file(&src) {
+@@ -230,7 +301,7 @@ fn assignment_complete(assignments: Arc<Mutex<Assignments>>, uuid: String) {
+ // 2. When we receive an assignment over the network from the remora zone.
+ fn assignment_add(
+     agent: &Agent,
+-    assignment: Arc<RwLock<Vec<Task>>>,
++    assignment: Arc<RwLock<Assignment>>,
+     uuidstr: &str,
+ ) {
+     let mut work = agent.assignments.lock().unwrap();
+@@ -246,22 +317,38 @@ fn post(agent: Agent, mut state: State) -> Box<HandlerFuture> {
+         .concat2()
+         .then(move |full_body| match full_body {
+             Ok(valid_body) => {
+-                let v = Arc::new(RwLock::new(
+-                    validate_assignment(&valid_body).unwrap(),
+-                ));
+-
++                // Ceremony for parsing the information needed to create an
++                // an assignent out of the message body.
++                let v = validate_assignment(&valid_body).unwrap();
+                 let uuid = Uuid::new_v4().to_hyphenated().to_string();
+-                assignment_save(&uuid, REMORA_SCHEDULED_DIR, v.clone());
++                let assignment =
++                    Arc::new(RwLock::new(Assignment::new(v, &uuid)));
++
++                // Before we even process the assignment, save it to persistent
++                // storage.
++                assignment_save(
++                    &uuid,
++                    REMORA_SCHEDULED_DIR,
++                    assignment.clone(),
++                );
++
++                // Declare and initialize a stats object which is a fundamental
++                // part of an assignment.
++                let stats = &assignment.read().unwrap().stats;
+ 
++                // Create a response containing our newly initialized stats.
++                // This serves as confirmation to the client that we recieved
++                // their request correctly and are working on it.
+                 let res = create_response(
+                     &state,
+                     StatusCode::OK,
+                     mime::APPLICATION_JSON,
+-                    serde_json::to_vec(&uuid)
++                    serde_json::to_vec(&stats)
+                         .expect("serialized assignment id"),
+                 );
+ 
+-                assignment_add(&agent, v, &uuid);
++                // Add the assignment to the queue for processing.
++                assignment_add(&agent, assignment.clone(), &uuid);
+                 future::ok((state, res))
+             }
+             Err(e) => future::err((state, e.into_handler_error())),
+@@ -291,7 +378,7 @@ fn get(agent: Agent, state: State) -> Box<HandlerFuture> {
+ fn get_specific_impl(
+     agent: &Agent,
+     uuid: &str,
+-) -> Option<Arc<RwLock<Vec<Task>>>> {
++) -> Option<Arc<RwLock<Assignment>>> {
+     match assignment_get(&agent.assignments, &uuid) {
+         Some(assignment) => Some(assignment),
+         None => {
+@@ -323,7 +410,7 @@ fn get_specific(agent: Agent, mut state: State) -> Box<HandlerFuture> {
+                 &state,
+                 StatusCode::OK,
+                 mime::APPLICATION_JSON,
+-                serde_json::to_vec(&**tasks).expect("serialized assignments"),
++                serde_json::to_vec(&tasks.tasks).expect("serialized task"),
+             )
+         }
+         None => create_empty_response(&state, StatusCode::NOT_FOUND),
+@@ -332,6 +419,76 @@ fn get_specific(agent: Agent, mut state: State) -> Box<HandlerFuture> {
+     Box::new(future::ok((state, res)))
+ }
+ 
++fn get_status(agent: Agent, mut state: State) -> Box<HandlerFuture> {
++    let query_param = QueryStringExtractor::take_from(&mut state);
++    let uuid = query_param.uuid;
++
++    let res = match get_specific_impl(&agent, &uuid) {
++        Some(assignment) => {
++            let status = &assignment.read().unwrap().stats;
++            create_response(
++                &state,
++                StatusCode::OK,
++                mime::APPLICATION_JSON,
++                serde_json::to_vec(status).expect("serialized status"),
++            )
++        }
++        None => create_empty_response(&state, StatusCode::NOT_FOUND),
++    };
++
++    Box::new(future::ok((state, res)))
++}
++
++fn get_by_taskstatus_impl(
++    agent: &Agent,
++    uuid: &str,
++    status: TaskStatus,
++) -> Option<Vec<Task>> {
++    let assignment = match get_specific_impl(&agent, &uuid) {
++        Some(a) => a,
++        None => return None,
++    };
++
++    let tasks = &assignment.read().unwrap().tasks;
++    let mut filtered = Vec::new();
++
++    for t in &*tasks {
++        if std::mem::discriminant(&status) == std::mem::discriminant(&t.status)
++        {
++            let f = t.clone();
++            filtered.push(f);
++        }
++    }
++
++    Some(filtered)
++}
++
++fn get_by_taskstatus(
++    agent: Agent,
++    mut state: State,
++    status: TaskStatus,
++) -> Box<HandlerFuture> {
++    let query_param = QueryStringExtractor::take_from(&mut state);
++    let uuid = query_param.uuid;
++
++    let assignment = match get_by_taskstatus_impl(&agent, &uuid, status) {
++        Some(a) => a,
++        None => {
++            let res = create_empty_response(&state, StatusCode::NOT_FOUND);
++            return Box::new(future::ok((state, res)));
++        }
++    };
++
++    let res = create_response(
++        &state,
++        StatusCode::OK,
++        mime::APPLICATION_JSON,
++        serde_json::to_vec(&assignment).expect("serialized assignment"),
++    );
++
++    Box::new(future::ok((state, res)))
++}
++
+ fn validate_assignment(body: &Chunk) -> Result<Vec<Task>, String> {
+     let data = String::from_utf8(body.to_vec()).unwrap();
+ 
+@@ -341,7 +498,7 @@ fn validate_assignment(body: &Chunk) -> Result<Vec<Task>, String> {
+     };
+ 
+     let assignment: Vec<Task> = serde_json::from_value(v).unwrap();
+-    Ok(assignment.clone())
++    Ok(assignment)
+ }
+ 
+ impl Handler for Agent {
+@@ -354,9 +511,21 @@ impl Handler for Agent {
+         match method.as_str() {
+             "POST" => post(self, state),
+             _ => {
++                // Obtain an entire assignment and the tasks within it
+                 if path == "/assignment" {
+                     get_specific(self, state)
++                // Executive summary of an assignment
++                } else if path == "/status" {
++                    get_status(self, state)
++                // Obtain a list of failed tasks within an assignment
++                } else if path == "/failures" {
++                    get_by_taskstatus(
++                        self,
++                        state,
++                        TaskStatus::Failed(String::new()),
++                    )
+                 } else {
++                    // Get all assignments which have not complete yet
+                     get(self, state)
+                 }
+             }
+@@ -519,19 +688,24 @@ fn process_task(task: &mut Task) {
+ fn assignment_get(
+     assignments: &Arc<Mutex<Assignments>>,
+     uuid: &str,
+-) -> Option<Arc<RwLock<Vec<Task>>>> {
++) -> Option<Arc<RwLock<Assignment>>> {
+     let work = assignments.lock().unwrap();
+     match work.get(uuid) {
+-        Some(assignment) => Some(assignment.clone()),
++        Some(assignment) => Some(Arc::clone(&assignment)),
+         None => None,
+     }
+ }
+ 
+ fn process_assignment(assn: Arc<Mutex<Assignments>>, uuid: String) {
+-    let tasks = assignment_get(&assn, &uuid).unwrap();
+-    let len = tasks.read().unwrap().len();
++    let assignment = assignment_get(&assn, &uuid).unwrap();
++    let len = assignment.read().unwrap().tasks.len();
++    let mut failures = Vec::new();
++
++    assignment.write().unwrap().stats.state = AgentAssignmentState::Running;
+ 
+     for i in 0..len {
++        let assn = assignment.clone();
++
+         // Obtain a copy of the current task from our task list.  We
+         // will update the state information of the task and write it
+         // back in to the vector.  We want to retain ownership of the
+@@ -541,7 +715,7 @@ fn process_assignment(assn: Arc<Mutex<Assignments>>, uuid: String) {
+         // to the task list which is why we obtain a copy of the task
+         // as opposed to a reference to it.
+         let mut t = {
+-            let mut tmp = tasks.write().unwrap();
++            let tmp = &mut assn.write().unwrap().tasks;
+             tmp[i].set_status(TaskStatus::Running);
+             tmp[i].clone()
+         };
+@@ -549,11 +723,28 @@ fn process_assignment(assn: Arc<Mutex<Assignments>>, uuid: String) {
+         // Process it.
+         process_task(&mut t);
+ 
++        // Grab the write lock on the assignment.  It will only be held until
++        // the end of the loop (which is not for very long).
++        let tmp = &mut assn.write().unwrap();
++
++        // Update our stats.
++        match t.status {
++            TaskStatus::Pending => (),
++            TaskStatus::Running => (),
++            TaskStatus::Complete => tmp.stats.complete += 1,
++            TaskStatus::Failed(_) => {
++                tmp.stats.complete += 1;
++                tmp.stats.failed += 1;
++                failures.push(t.clone());
++            }
++        }
++
+         // Update the task in the vector.
+-        let mut tmp = tasks.write().unwrap();
+-        tmp[i] = t;
++        tmp.tasks[i] = t;
+     }
+ 
++    assignment.write().unwrap().stats.state =
++        AgentAssignmentState::Complete(Some(failures));
+     assignment_complete(assn, uuid);
+ }
+ 
+@@ -567,12 +758,21 @@ fn router() -> Router {
+         let agent = Agent::new(tx.clone());
+         let pool = ThreadPool::new(1);
+ 
++        create_dir(REMORA_SCHEDULED_DIR);
++        create_dir(REMORA_FINISHED_DIR);
++
+         for _ in 0..1 {
+-            let rx = rx.clone();
+-            let assignments = agent.assignments.clone();
++            let rx = Arc::clone(&rx);
++            let assignments = Arc::clone(&agent.assignments);
+             pool.execute(move || loop {
+-                let uuid = rx.lock().unwrap().recv().unwrap();
+-                process_assignment(assignments.clone(), uuid);
++                let uuid = match rx.lock().unwrap().recv() {
++                    Ok(r) => r,
++                    Err(e) => {
++                        println!("Channel read error: {}", e);
++                        return;
++                    }
++                };
++                process_assignment(Arc::clone(&assignments), uuid);
+             });
+         }
+ 
+@@ -585,6 +785,16 @@ fn router() -> Router {
+ 
+         route.get("assignments").to_new_handler(agent.clone());
+ 
++        route
++            .get("status")
++            .with_query_string_extractor::<QueryStringExtractor>()
++            .to_new_handler(agent.clone());
++
++        route
++            .get("failures")
++            .with_query_string_extractor::<QueryStringExtractor>()
++            .to_new_handler(agent.clone());
++
+         route.post("assignments").to_new_handler(agent.clone());
+     })
+ }
+@@ -594,13 +804,3 @@ fn create_dir(dirname: &str) {
+         panic!("Error creating directory {}", e);
+     }
+ }
+-
+-impl Agent {
+-    pub fn run(addr: &'static str) {
+-        create_dir(REMORA_SCHEDULED_DIR);
+-        create_dir(REMORA_FINISHED_DIR);
+-
+-        println!("Listening for requests at {}", addr);
+-        gotham::start(addr, router());
+-    }
+-}
+diff --git a/src/config.rs b/src/config.rs
+index b432482..b7bc7ac 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -64,7 +64,6 @@ impl Command {
+     pub fn parse_config() -> Result<Config, Error> {
+         let file = File::open("./target/debug/config.json")?;
+         let reader = BufReader::new(file);
+-        println!("parsing config");
+         let config: Config = serde_json::from_reader(reader)?;
+ 
+         Ok(config)
+diff --git a/src/job.rs b/src/job.rs
+index 1f2e1e3..96a988c 100644
+--- a/src/job.rs
++++ b/src/job.rs
+@@ -1,6 +1,12 @@
+-// Copyright 2019 Joyent, Inc.
+-
+-
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2019, Joyent, Inc.
++ */
+ use crate::config::Config;
+ use crate::error::{CrossbeamError, Error, InternalError, InternalErrorCode};
+ use crate::picker as mod_picker;
+@@ -43,12 +49,12 @@ pub enum JobAction {
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ enum EvacuateObjectStatus {
+-    Unprocessed,    // Default state
+-    Processing,     // Object has been included in an assignment and that
+-                    // assignment has been submitted to a remora agent.
+-    Skipped,        // Could not find a shark to put this object in. TODO: Why?
+-     // TODO: Failed,   // Failed to Evacuate Object ???
+-     // TODO: Retrying, // Retrying a failed evacuate attempt
++    Unprocessed, // Default state
++    Processing,  // Object has been included in an assignment and that
++    // assignment has been submitted to a remora agent.
++    Skipped, // Could not find a shark to put this object in. TODO: Why?
++             // TODO: Failed,   // Failed to Evacuate Object ???
++             // TODO: Retrying, // Retrying a failed evacuate attempt
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -121,6 +127,34 @@ pub struct Assignment {
+     state: AssignmentState,
+ }
+ 
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub enum AgentAssignmentState {
++    Scheduled,                   // Haven't even started it yet
++    Running,                     // Currently processing it
++    Complete(Option<Vec<Task>>), // Done.  Include any failed tasks
++}
++
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct AgentAssignmentStats {
++    pub uuid: String,
++    pub state: AgentAssignmentState,
++    pub failed: usize,
++    pub complete: usize,
++    pub total: usize,
++}
++
++impl AgentAssignmentStats {
++    pub fn new(uuid: &str, total: usize) -> AgentAssignmentStats {
++        AgentAssignmentStats {
++            uuid: uuid.to_string(),
++            state: AgentAssignmentState::Scheduled,
++            failed: 0,
++            complete: 0,
++            total,
++        }
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct Task {
+     pub object_id: String, // or Uuid
+@@ -384,12 +418,9 @@ fn run_evacuate_job(job: Job) -> Result<(), Error> {
+ 
+     picker.fini();
+ 
+-    sharkspotter_handle
+-        .join()
+-        .unwrap()
+-        .unwrap_or_else(|e| {
+-            error!("Error joining sharkspotter handle: {}\n", e);
+-            std::process::exit(1);
++    sharkspotter_handle.join().unwrap().unwrap_or_else(|e| {
++        error!("Error joining sharkspotter handle: {}\n", e);
++        std::process::exit(1);
+     });
+ 
+     assignment_generator
+@@ -425,25 +456,26 @@ fn start_sharkspotter(
+     thread::Builder::new()
+         .name(String::from("sharkspotter"))
+         .spawn(move || {
+-        let mut count = 0;
+-        sharkspotter::run(&config, move |obj, _shard| {
+-            // while testing limit the number of objects processed for now
+-            count += 1;
+-            if count > 2000 {
+-                return Err(std::io::Error::new(
+-                    ErrorKind::Other,
+-                    "Just stop already",
+-                ));
+-            }
++            let mut count = 0;
++            sharkspotter::run(&config, move |obj, _shard| {
++                // while testing limit the number of objects processed for now
++                count += 1;
++                if count > 2000 {
++                    return Err(std::io::Error::new(
++                        ErrorKind::Other,
++                        "Just stop already",
++                    ));
++                }
+ 
+-            // TODO:
+-            // - add shard number
+-            sender.send(obj).map_err(CrossbeamError::from).map_err(|e| {
+-                std::io::Error::new(ErrorKind::Other, e.description())
++                // TODO:
++                // - add shard number
++                sender.send(obj).map_err(CrossbeamError::from).map_err(|e| {
++                    std::io::Error::new(ErrorKind::Other, e.description())
++                })
+             })
++            .map_err(Error::from)
+         })
+         .map_err(Error::from)
+-    }).map_err(Error::from)
+ }
+ 
+ /// The assignment manager manages the destination sharks and
+@@ -741,18 +773,14 @@ fn start_assignment_generator(
+                     &assignment
+                 );
+ 
+-                full_assignment_tx
+-                    .send(assignment)
+-                    .map_err(|e| {
+-                        error!(
+-                            "Error sending assignment back to manager: {}", e
+-                        );
++                full_assignment_tx.send(assignment).map_err(|e| {
++                    error!("Error sending assignment back to manager: {}", e);
+ 
+-                        InternalError::new(
+-                            Some(InternalErrorCode::Crossbeam),
+-                            CrossbeamError::from(e).description(),
+-                        )
+-                    })?;
++                    InternalError::new(
++                        Some(InternalErrorCode::Crossbeam),
++                        CrossbeamError::from(e).description(),
++                    )
++                })?;
+             }
+ 
+             Ok(())

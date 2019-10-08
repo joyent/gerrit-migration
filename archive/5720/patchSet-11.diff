@@ -1,0 +1,1116 @@
+commit 676b271eb86b05d5c83cde231fccbe23e0c6cbd8
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2019-05-03T22:19:44+00:00 (5 months ago)
+    
+    OS-7622 bhyve vioapic writes can deadlock instance
+
+diff --git a/usr/src/compat/freebsd/sys/cpuset.h b/usr/src/compat/freebsd/sys/cpuset.h
+index dadadf15b2..626b323d7d 100644
+--- a/usr/src/compat/freebsd/sys/cpuset.h
++++ b/usr/src/compat/freebsd/sys/cpuset.h
+@@ -11,7 +11,7 @@
+ 
+ /*
+  * Copyright 2014 Pluribus Networks Inc.
+- * Copyright 2017 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #ifndef _COMPAT_FREEBSD_SYS_CPUSET_H_
+@@ -27,11 +27,15 @@
+ #define	CPU_SETOF(cpu, set)		cpuset_only((set), (cpu))
+ #define	CPU_ZERO(set)			cpuset_zero((cpuset_t *)(set))
+ #define	CPU_CLR(cpu, set)		cpuset_del((set), (cpu))
++#define	CPU_EMPTY(set)			cpuset_isnull((set))
+ #define	CPU_FFS(set)			cpusetobj_ffs(set)
+ #define	CPU_ISSET(cpu, set)		cpu_in_set((cpuset_t *)(set), (cpu))
+ #define	CPU_AND(dst, src)		cpuset_and(			\
+ 						(cpuset_t *)(dst),	\
+ 						(cpuset_t *)(src))
++#define	CPU_OR(dst, src)		cpuset_or(			\
++						(cpuset_t *)(dst),	\
++						(cpuset_t *)(src))
+ #define	CPU_CMP(set1, set2)		(cpuset_isequal(		\
+ 						(cpuset_t *)(set1),	\
+ 						(cpuset_t *)(set2)) == 0)
+@@ -42,7 +46,6 @@
+ 						(cpuset_t *)(set),	\
+ 						(cpu))
+ 
+-/* XXXJOY: The _ACQ variants appear to imply a membar too. Is that an issue? */
+ #define	CPU_SET_ATOMIC_ACQ(cpu, set)	cpuset_atomic_add((set), (cpu))
+ 
+ 
+diff --git a/usr/src/uts/i86pc/io/vmm/amd/svm.c b/usr/src/uts/i86pc/io/vmm/amd/svm.c
+index ca9ed9e4e1..c10de533c1 100644
+--- a/usr/src/uts/i86pc/io/vmm/amd/svm.c
++++ b/usr/src/uts/i86pc/io/vmm/amd/svm.c
+@@ -1627,6 +1627,8 @@ svm_inj_interrupts(struct svm_softc *sc, int vcpu, struct vlapic *vlapic)
+ 
+ 	need_intr_window = 0;
+ 
++	vlapic_tmr_update(vlapic);
++
+ 	if (vcpustate->nextrip != state->rip) {
+ 		ctrl->intr_shadow = 0;
+ 		VCPU_CTR2(sc->vm, vcpu, "Guest interrupt blocking "
+@@ -2058,8 +2060,8 @@ svm_vmrun(void *arg, int vcpu, register_t rip, pmap_t pmap,
+ 		 * XXX
+ 		 * Setting 'vcpustate->lastcpu' here is bit premature because
+ 		 * we may return from this function without actually executing
+-		 * the VMRUN  instruction. This could happen if a rendezvous
+-		 * or an AST is pending on the first time through the loop.
++		 * the VMRUN  instruction. This could happen if an AST or yield
++		 * condition is pending on the first time through the loop.
+ 		 *
+ 		 * This works for now but any new side-effects of vcpu
+ 		 * migration should take this case into account.
+@@ -2104,9 +2106,9 @@ svm_vmrun(void *arg, int vcpu, register_t rip, pmap_t pmap,
+ 			break;
+ 		}
+ 
+-		if (vcpu_rendezvous_pending(evinfo)) {
++		if (vcpu_runblocked(evinfo)) {
+ 			enable_gintr();
+-			vm_exit_rendezvous(vm, vcpu, state->rip);
++			vm_exit_runblock(vm, vcpu, state->rip);
+ 			break;
+ 		}
+ 
+diff --git a/usr/src/uts/i86pc/io/vmm/intel/vmx.c b/usr/src/uts/i86pc/io/vmm/intel/vmx.c
+index a039455be7..31fc764f93 100644
+--- a/usr/src/uts/i86pc/io/vmm/intel/vmx.c
++++ b/usr/src/uts/i86pc/io/vmm/intel/vmx.c
+@@ -1522,6 +1522,8 @@ vmx_inject_interrupts(struct vmx *vmx, int vcpu, struct vlapic *vlapic,
+ 	int vector;
+ 	boolean_t extint_pending = B_FALSE;
+ 
++	vlapic_tmr_update(vlapic);
++
+ 	gi = vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
+ 	info = vmcs_read(VMCS_ENTRY_INTR_INFO);
+ 
+@@ -1698,6 +1700,8 @@ vmx_inject_interrupts(struct vmx *vmx, int vcpu, struct vlapic *vlapic,
+ 	uint64_t rflags, entryinfo;
+ 	uint32_t gi, info;
+ 
++	vlapic_tmr_update(vlapic);
++
+ 	if (vmx->state[vcpu].nextrip != guestrip) {
+ 		gi = vmcs_read(VMCS_GUEST_INTERRUPTIBILITY);
+ 		if (gi & HWINTR_BLOCKING) {
+@@ -3318,9 +3322,9 @@ vmx_run(void *arg, int vcpu, register_t rip, pmap_t pmap,
+ 			break;
+ 		}
+ 
+-		if (vcpu_rendezvous_pending(evinfo)) {
++		if (vcpu_runblocked(evinfo)) {
+ 			enable_intr();
+-			vm_exit_rendezvous(vmx->vm, vcpu, rip);
++			vm_exit_runblock(vmx->vm, vcpu, rip);
+ 			break;
+ 		}
+ 
+@@ -4040,30 +4044,12 @@ vmx_intr_accepted(struct vlapic *vlapic, int vector)
+ }
+ 
+ static void
+-vmx_set_tmr(struct vlapic *vlapic, int vector, bool level)
++vmx_set_tmr(struct vlapic *vlapic, const uint32_t *masks)
+ {
+-	struct vlapic_vtx *vlapic_vtx;
+-	struct vmx *vmx;
+-	struct vmcs *vmcs;
+-	uint64_t mask, val;
+-
+-	KASSERT(vector >= 0 && vector <= 255, ("invalid vector %d", vector));
+-	KASSERT(!vcpu_is_running(vlapic->vm, vlapic->vcpuid, NULL),
+-	    ("vmx_set_tmr: vcpu cannot be running"));
+-
+-	vlapic_vtx = (struct vlapic_vtx *)vlapic;
+-	vmx = vlapic_vtx->vmx;
+-	vmcs = &vmx->vmcs[vlapic->vcpuid];
+-	mask = 1UL << (vector % 64);
+-
+-	VMPTRLD(vmcs);
+-	val = vmcs_read(VMCS_EOI_EXIT(vector));
+-	if (level)
+-		val |= mask;
+-	else
+-		val &= ~mask;
+-	vmcs_write(VMCS_EOI_EXIT(vector), val);
+-	VMCLEAR(vmcs);
++	vmcs_write(VMCS_EOI_EXIT0, ((uint64_t)masks[1] << 32) | masks[0]);
++	vmcs_write(VMCS_EOI_EXIT1, ((uint64_t)masks[3] << 32) | masks[2]);
++	vmcs_write(VMCS_EOI_EXIT2, ((uint64_t)masks[5] << 32) | masks[4]);
++	vmcs_write(VMCS_EOI_EXIT3, ((uint64_t)masks[7] << 32) | masks[6]);
+ }
+ 
+ static void
+diff --git a/usr/src/uts/i86pc/io/vmm/io/vioapic.c b/usr/src/uts/i86pc/io/vmm/io/vioapic.c
+index c001ffd933..dbd3420420 100644
+--- a/usr/src/uts/i86pc/io/vmm/io/vioapic.c
++++ b/usr/src/uts/i86pc/io/vmm/io/vioapic.c
+@@ -52,6 +52,7 @@ __FBSDID("$FreeBSD$");
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+ #include <sys/malloc.h>
++#include <sys/cpuset.h>
+ 
+ #include <x86/apicreg.h>
+ #include <machine/vmm.h>
+@@ -236,48 +237,139 @@ vioapic_pulse_irq(struct vm *vm, int irq)
+ 	return (vioapic_set_irqstate(vm, irq, IRQSTATE_PULSE));
+ }
+ 
++#define	REDIR_IS_PHYS(reg)	(((reg) & IOART_DESTMOD) == IOART_DESTPHY)
++#define	REDIR_IS_LOWPRIO(reg)	(((reg) & IOART_DELMOD) == IOART_DELLOPRI)
++/* Level-triggered interrupts only valid in fixed and low-priority modes */
++#define	REDIR_IS_LVLTRIG(reg)						\
++    (((reg) & IOART_TRGRLVL) != 0 &&					\
++    (((reg) & IOART_DELMOD) == IOART_DELFIXED || REDIR_IS_LOWPRIO(reg)))
++#define	REDIR_DEST(reg)		((reg) >> (32 + APIC_ID_SHIFT))
++#define	REDIR_VECTOR(reg)	((reg) & IOART_INTVEC)
++
+ /*
+- * Reset the vlapic's trigger-mode register to reflect the ioapic pin
+- * configuration.
++ * Given a redirection entry, determine which vCPUs would be targeted.
+  */
+ static void
+-vioapic_update_tmr(struct vm *vm, int vcpuid, void *arg)
++vioapic_calcdest(struct vioapic *vioapic, uint64_t redir_ent, cpuset_t *dmask)
+ {
+-	struct vioapic *vioapic;
+-	struct vlapic *vlapic;
+-	uint32_t low, high, dest;
+-	int delmode, pin, vector;
+-	bool level, phys;
+ 
+-	vlapic = vm_lapic(vm, vcpuid);
+-	vioapic = vm_ioapic(vm);
++	/*
++	 * When calculating interrupt destinations with vlapic_calcdest(), the
++	 * legacy xAPIC format is assumed, since the system lacks interrupt
++	 * redirection hardware.
++	 * See vlapic_deliver_intr() for more details.
++	 */
++	vlapic_calcdest(vioapic->vm, dmask, REDIR_DEST(redir_ent),
++	    REDIR_IS_PHYS(redir_ent), REDIR_IS_LOWPRIO(redir_ent), false);
++}
++
++/*
++ * Across all redirection entries utilizing a specified vector, determine the
++ * set of vCPUs which would be targeted by a level-triggered interrupt.
++ */
++static void
++vioapic_tmr_active(struct vioapic *vioapic, uint8_t vec, cpuset_t *result)
++{
++	u_int i;
++
++	CPU_ZERO(result);
++	if (vec == 0) {
++		return;
++	}
++
++	for (i = 0; i < REDIR_ENTRIES; i++) {
++		cpuset_t dest;
++		const uint64_t val = vioapic->rtbl[i].reg;
++
++		if (!REDIR_IS_LVLTRIG(val) || REDIR_VECTOR(val) != vec) {
++			continue;
++		}
++
++		CPU_ZERO(&dest);
++		vioapic_calcdest(vioapic, val, &dest);
++		CPU_OR(result, &dest);
++	}
++}
++
++/*
++ * Update TMR state in vLAPICs after changes to vIOAPIC pin configuration
++ */
++static void
++vioapic_update_tmrs(struct vioapic *vioapic, int vcpuid, uint64_t oldval,
++    uint64_t newval)
++{
++	cpuset_t active, allset, newset, oldset;
++	struct vm *vm;
++	uint8_t newvec, oldvec;
++
++	vm = vioapic->vm;
++	CPU_ZERO(&allset);
++	CPU_ZERO(&newset);
++	CPU_ZERO(&oldset);
++	newvec = oldvec = 0;
++
++	if (REDIR_IS_LVLTRIG(oldval)) {
++		vioapic_calcdest(vioapic, oldval, &oldset);
++		CPU_OR(&allset, &oldset);
++		oldvec = REDIR_VECTOR(oldval);
++	}
++
++	if (REDIR_IS_LVLTRIG(newval)) {
++		vioapic_calcdest(vioapic, newval, &newset);
++		CPU_OR(&allset, &newset);
++		newvec = REDIR_VECTOR(newval);
++	}
++
++	if (CPU_EMPTY(&allset) ||
++	    (CPU_CMP(&oldset, &newset) == 0 && oldvec == newvec)) {
++		return;
++	}
+ 
+-	VIOAPIC_LOCK(vioapic);
+ 	/*
+-	 * Reset all vectors to be edge-triggered.
++	 * Since the write to the redirection table has already occurred, a
++	 * scan of level-triggered entries referencing the old vector will find
++	 * only entries which are now currently valid.
+ 	 */
+-	vlapic_reset_tmr(vlapic);
+-	for (pin = 0; pin < REDIR_ENTRIES; pin++) {
+-		low = vioapic->rtbl[pin].reg;
+-		high = vioapic->rtbl[pin].reg >> 32;
++	vioapic_tmr_active(vioapic, oldvec, &active);
+ 
+-		level = low & IOART_TRGRLVL ? true : false;
+-		if (!level)
++	while (!CPU_EMPTY(&allset)) {
++		struct vlapic *vlapic;
++		u_int i;
++
++		i = CPU_FFS(&allset) - 1;
++		CPU_CLR(i, &allset);
++
++		if (oldvec == newvec &&
++		    CPU_ISSET(i, &oldset) && CPU_ISSET(i, &newset)) {
+ 			continue;
++		}
+ 
+-		/*
+-		 * For a level-triggered 'pin' let the vlapic figure out if
+-		 * an assertion on this 'pin' would result in an interrupt
+-		 * being delivered to it. If yes, then it will modify the
+-		 * TMR bit associated with this vector to level-triggered.
+-		 */
+-		phys = ((low & IOART_DESTMOD) == IOART_DESTPHY);
+-		delmode = low & IOART_DELMOD;
+-		vector = low & IOART_INTVEC;
+-		dest = high >> APIC_ID_SHIFT;
+-		vlapic_set_tmr_level(vlapic, dest, phys, delmode, vector);
++		if (i != vcpuid) {
++			vcpu_block_run(vm, i);
++		}
++
++		vlapic = vm_lapic(vm, i);
++		if (CPU_ISSET(i, &oldset)) {
++			/*
++			 * Perform the deassertion if no other level-triggered
++			 * IOAPIC entries target this vCPU with the old vector
++			 *
++			 * Note: Sharing of vectors like that should be
++			 * extremely rare in modern operating systems and was
++			 * previously unsupported by the bhyve vIOAPIC.
++			 */
++			if (!CPU_ISSET(i, &active)) {
++				vlapic_tmr_set(vlapic, oldvec, false);
++			}
++		}
++		if (CPU_ISSET(i, &newset)) {
++			vlapic_tmr_set(vlapic, newvec, true);
++		}
++
++		if (i != vcpuid) {
++			vcpu_unblock_run(vm, i);
++		}
+ 	}
+-	VIOAPIC_UNLOCK(vioapic);
+ }
+ 
+ static uint32_t
+@@ -321,7 +413,6 @@ vioapic_write(struct vioapic *vioapic, int vcpuid, uint32_t addr, uint32_t data)
+ 	uint64_t data64, mask64;
+ 	uint64_t last, changed;
+ 	int regnum, pin, lshift;
+-	cpuset_t allvcpus;
+ 
+ 	regnum = addr & 0xff;
+ 	switch (regnum) {
+@@ -357,18 +448,15 @@ vioapic_write(struct vioapic *vioapic, int vcpuid, uint32_t addr, uint32_t data)
+ 
+ 		/*
+ 		 * If any fields in the redirection table entry (except mask
+-		 * or polarity) have changed then rendezvous all the vcpus
+-		 * to update their vlapic trigger-mode registers.
++		 * or polarity) have changed then update the trigger-mode
++		 * registers on all the vlapics.
+ 		 */
+ 		changed = last ^ vioapic->rtbl[pin].reg;
+ 		if (changed & ~(IOART_INTMASK | IOART_INTPOL)) {
+ 			VIOAPIC_CTR1(vioapic, "ioapic pin%d: recalculate "
+ 			    "vlapic trigger-mode register", pin);
+-			VIOAPIC_UNLOCK(vioapic);
+-			allvcpus = vm_active_cpus(vioapic->vm);
+-			vm_smp_rendezvous(vioapic->vm, vcpuid, allvcpus,
+-			    vioapic_update_tmr, NULL);
+-			VIOAPIC_LOCK(vioapic);
++			vioapic_update_tmrs(vioapic, vcpuid, last,
++			    vioapic->rtbl[pin].reg);
+ 		}
+ 
+ 		/*
+diff --git a/usr/src/uts/i86pc/io/vmm/io/vlapic.c b/usr/src/uts/i86pc/io/vmm/io/vlapic.c
+index 64e34b7532..0d4afd607d 100644
+--- a/usr/src/uts/i86pc/io/vmm/io/vlapic.c
++++ b/usr/src/uts/i86pc/io/vmm/io/vlapic.c
+@@ -91,6 +91,8 @@ __FBSDID("$FreeBSD$");
+  */
+ #define VLAPIC_BUS_FREQ		(128 * 1024 * 1024)
+ 
++static void vlapic_tmr_reset(struct vlapic *);
++
+ static __inline uint32_t
+ vlapic_get_id(struct vlapic *vlapic)
+ {
+@@ -839,11 +841,11 @@ vlapic_icrtmr_write_handler(struct vlapic *vlapic)
+ /*
+  * This function populates 'dmask' with the set of vcpus that match the
+  * addressing specified by the (dest, phys, lowprio) tuple.
+- * 
++ *
+  * 'x2apic_dest' specifies whether 'dest' is interpreted as x2APIC (32-bit)
+  * or xAPIC (8-bit) destination field.
+  */
+-static void
++void
+ vlapic_calcdest(struct vm *vm, cpuset_t *dmask, uint32_t dest, bool phys,
+     bool lowprio, bool x2apic_dest)
+ {
+@@ -1465,7 +1467,7 @@ vlapic_reset(struct vlapic *vlapic)
+ 	lapic->dfr = 0xffffffff;
+ 	lapic->svr = APIC_SVR_VECTOR;
+ 	vlapic_mask_lvts(vlapic);
+-	vlapic_reset_tmr(vlapic);
++	vlapic_tmr_reset(vlapic);
+ 
+ 	lapic->dcr_timer = 0;
+ 	vlapic_dcr_write_handler(vlapic);
+@@ -1632,62 +1634,79 @@ vlapic_enabled(struct vlapic *vlapic)
+ }
+ 
+ static void
+-vlapic_set_tmr(struct vlapic *vlapic, int vector, bool level)
++vlapic_tmr_reset(struct vlapic *vlapic)
+ {
+ 	struct LAPIC *lapic;
+-	uint32_t *tmrptr, mask;
+-	int idx;
+ 
+ 	lapic = vlapic->apic_page;
+-	tmrptr = &lapic->tmr0;
+-	idx = (vector / 32) * 4;
+-	mask = 1 << (vector % 32);
+-	if (level)
+-		tmrptr[idx] |= mask;
+-	else
+-		tmrptr[idx] &= ~mask;
+-
+-	if (vlapic->ops.set_tmr != NULL)
+-		(*vlapic->ops.set_tmr)(vlapic, vector, level);
++	lapic->tmr0 = lapic->tmr1 = lapic->tmr2 = lapic->tmr3 = 0;
++	lapic->tmr4 = lapic->tmr5 = lapic->tmr6 = lapic->tmr7 = 0;
++	vlapic->tmr_pending = 1;
+ }
+ 
++/*
++ * Synchronize TMR designations into the LAPIC state.
++ * The vCPU must be in the VCPU_RUNNING state.
++ */
+ void
+-vlapic_reset_tmr(struct vlapic *vlapic)
++vlapic_tmr_update(struct vlapic *vlapic)
+ {
+-	int vector;
++	struct LAPIC *lapic;
++	uint32_t *tmrptr;
++	uint32_t result[VLAPIC_TMR_CNT];
++	u_int i, tmr_idx;
+ 
+-	VLAPIC_CTR0(vlapic, "vlapic resetting all vectors to edge-triggered");
++	if (vlapic->tmr_pending == 0) {
++		return;
++	}
++
++	lapic = vlapic->apic_page;
++	tmrptr = &lapic->tmr0;
+ 
+-	for (vector = 0; vector <= 255; vector++)
+-		vlapic_set_tmr(vlapic, vector, false);
++	VLAPIC_CTR0(vlapic, "synchronizing TMR");
++	for (i = 0; i < VLAPIC_TMR_CNT; i++) {
++		tmr_idx = i * 4;
++
++		tmrptr[tmr_idx] &= ~vlapic->tmr_vec_deassert[i];
++		tmrptr[tmr_idx] |= vlapic->tmr_vec_assert[i];
++		vlapic->tmr_vec_deassert[i] = 0;
++		vlapic->tmr_vec_assert[i] = 0;
++		result[i] = tmrptr[tmr_idx];
++	}
++	vlapic->tmr_pending = 0;
++
++	if (vlapic->ops.set_tmr != NULL) {
++		(*vlapic->ops.set_tmr)(vlapic, result);
++	}
+ }
+ 
++/*
++ * Designate the TMR state for a given interrupt vector.
++ * The caller must hold the vIOAPIC lock and prevent the vCPU corresponding to
++ * this vLAPIC instance from being-in or entering the VCPU_RUNNING state.
++ */
+ void
+-vlapic_set_tmr_level(struct vlapic *vlapic, uint32_t dest, bool phys,
+-    int delmode, int vector)
++vlapic_tmr_set(struct vlapic *vlapic, uint8_t vector, bool active)
+ {
+-	cpuset_t dmask;
+-	bool lowprio;
+-
+-	KASSERT(vector >= 0 && vector <= 255, ("invalid vector %d", vector));
++	const uint32_t idx = vector / 32;
++	const uint32_t mask = 1 << (vector % 32);
++
++	VLAPIC_CTR2(vlapic, "TMR for vector %u %sasserted", vector,
++	    active ? "" : "de");
++	if (active) {
++		vlapic->tmr_vec_assert[idx] |= mask;
++		vlapic->tmr_vec_deassert[idx] &= ~mask;
++	} else {
++		vlapic->tmr_vec_deassert[idx] |= mask;
++		vlapic->tmr_vec_assert[idx] &= ~mask;
++	}
+ 
+ 	/*
+-	 * A level trigger is valid only for fixed and lowprio delivery modes.
++	 * Track the number of TMR changes between calls to vlapic_tmr_update.
++	 * While a simple boolean would suffice, this count may be useful when
++	 * tracing or debugging, and is cheap to calculate.
+ 	 */
+-	if (delmode != APIC_DELMODE_FIXED && delmode != APIC_DELMODE_LOWPRIO) {
+-		VLAPIC_CTR1(vlapic, "Ignoring level trigger-mode for "
+-		    "delivery-mode %d", delmode);
+-		return;
+-	}
+-
+-	lowprio = (delmode == APIC_DELMODE_LOWPRIO);
+-	vlapic_calcdest(vlapic->vm, &dmask, dest, phys, lowprio, false);
+-
+-	if (!CPU_ISSET(vlapic->vcpuid, &dmask))
+-		return;
+-
+-	VLAPIC_CTR1(vlapic, "vector %d set to level-triggered", vector);
+-	vlapic_set_tmr(vlapic, vector, true);
++	vlapic->tmr_pending = MIN(UINT32_MAX - 1, vlapic->tmr_pending) + 1;
+ }
+ 
+ #ifndef __FreeBSD__
+diff --git a/usr/src/uts/i86pc/io/vmm/io/vlapic.h b/usr/src/uts/i86pc/io/vmm/io/vlapic.h
+index a177b984ce..ac1fc9d43f 100644
+--- a/usr/src/uts/i86pc/io/vmm/io/vlapic.h
++++ b/usr/src/uts/i86pc/io/vmm/io/vlapic.h
+@@ -87,16 +87,11 @@ bool vlapic_enabled(struct vlapic *vlapic);
+ void vlapic_deliver_intr(struct vm *vm, bool level, uint32_t dest, bool phys,
+     int delmode, int vec);
+ 
+-/* Reset the trigger-mode bits for all vectors to be edge-triggered */
+-void vlapic_reset_tmr(struct vlapic *vlapic);
++void vlapic_calcdest(struct vm *vm, cpuset_t *dmask, uint32_t dest, bool phys,
++    bool lowprio, bool x2apic_dest);
+ 
+-/*
+- * Set the trigger-mode bit associated with 'vector' to level-triggered if
+- * the (dest,phys,delmode) tuple resolves to an interrupt being delivered to
+- * this 'vlapic'.
+- */
+-void vlapic_set_tmr_level(struct vlapic *vlapic, uint32_t dest, bool phys,
+-    int delmode, int vector);
++void vlapic_tmr_update(struct vlapic *vlapic);
++void vlapic_tmr_set(struct vlapic *vlapic, uint8_t vector, bool active);
+ 
+ void vlapic_set_cr8(struct vlapic *vlapic, uint64_t val);
+ uint64_t vlapic_get_cr8(struct vlapic *vlapic);
+diff --git a/usr/src/uts/i86pc/io/vmm/io/vlapic_priv.h b/usr/src/uts/i86pc/io/vmm/io/vlapic_priv.h
+index 43abd20a0a..d101f01d24 100644
+--- a/usr/src/uts/i86pc/io/vmm/io/vlapic_priv.h
++++ b/usr/src/uts/i86pc/io/vmm/io/vlapic_priv.h
+@@ -138,6 +138,8 @@ enum boot_state {
+ 
+ #define VLAPIC_MAXLVT_INDEX	APIC_LVT_CMCI
+ 
++#define VLAPIC_TMR_CNT		8
++
+ struct vlapic;
+ 
+ struct vlapic_ops {
+@@ -145,7 +147,7 @@ struct vlapic_ops {
+ 	int (*pending_intr)(struct vlapic *vlapic, int *vecptr);
+ 	void (*intr_accepted)(struct vlapic *vlapic, int vector);
+ 	void (*post_intr)(struct vlapic *vlapic, int hostcpu);
+-	void (*set_tmr)(struct vlapic *vlapic, int vector, bool level);
++	void (*set_tmr)(struct vlapic *vlapic, const uint32_t *result);
+ 	void (*enable_x2apic_mode)(struct vlapic *vlapic);
+ };
+ 
+@@ -157,6 +159,7 @@ struct vlapic {
+ 
+ 	uint32_t		esr_pending;
+ 	int			esr_firing;
++	uint32_t		tmr_pending;
+ 
+ 	struct callout	callout;	/* vlapic timer */
+ 	struct bintime	timer_fire_bt;	/* callout expiry time */
+@@ -184,6 +187,19 @@ struct vlapic {
+ 	 */
+ 	uint32_t	svr_last;
+ 	uint32_t	lvt_last[VLAPIC_MAXLVT_INDEX + 1];
++
++	/*
++	 * Store intended modifications to the trigger-mode register state.
++	 * Along with the tmr_pending counter above, these are protected by the
++	 * vIOAPIC lock and can only be modified under specific conditions:
++	 *
++	 * 1. When holding the vIOAPIC lock, and the vCPU to which the vLAPIC
++	 *    belongs is prevented from entering the VCPU_RUNNING state.
++	 * 2. When the owning vCPU is in the VCPU_RUNNING state, and is
++	 *    applying the TMR modifications prior to interrupt injection.
++	 */
++	uint32_t	tmr_vec_deassert[VLAPIC_TMR_CNT];
++	uint32_t	tmr_vec_assert[VLAPIC_TMR_CNT];
+ };
+ 
+ void vlapic_init(struct vlapic *vlapic);
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm.c b/usr/src/uts/i86pc/io/vmm/vmm.c
+index 14e2fc4e60..68d1c3e0b3 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm.c
+@@ -118,6 +118,7 @@ struct vcpu {
+ #ifndef __FreeBSD__
+ 	int		lastloccpu;	/* (o) last host cpu localized to */
+ #endif
++	u_int		runblock;	/* (i) block vcpu from run state */
+ 	int		reqidle;	/* (i) request vcpu to idle */
+ 	struct vlapic	*vlapic;	/* (i) APIC device model */
+ 	enum x2apic_state x2apic_state;	/* (i) APIC mode */
+@@ -185,14 +186,6 @@ struct vm {
+ 	int		suspend;		/* (i) stop VM execution */
+ 	volatile cpuset_t suspended_cpus; 	/* (i) suspended vcpus */
+ 	volatile cpuset_t halted_cpus;		/* (x) cpus in a hard halt */
+-	cpuset_t	rendezvous_req_cpus;	/* (x) rendezvous requested */
+-	cpuset_t	rendezvous_done_cpus;	/* (x) rendezvous finished */
+-	void		*rendezvous_arg;	/* (x) rendezvous func/arg */
+-	vm_rendezvous_func_t rendezvous_func;
+-	struct mtx	rendezvous_mtx;		/* (o) rendezvous lock */
+-#ifndef __FreeBSD__
+-	kcondvar_t	rendezvous_cv;		/* (0) rendezvous condvar */
+-#endif
+ 	struct mem_map	mem_maps[VM_MAX_MEMMAPS]; /* (i) guest address space */
+ 	struct mem_seg	mem_segs[VM_MAX_MEMSEGS]; /* (o) guest memory regions */
+ 	struct vmspace	*vmspace;		/* (o) guest's address space */
+@@ -356,6 +349,7 @@ vcpu_init(struct vm *vm, int vcpu_id, bool create)
+ 
+ 	vcpu->vlapic = VLAPIC_INIT(vm->cookie, vcpu_id);
+ 	vm_set_x2apic_state(vm, vcpu_id, X2APIC_DISABLED);
++	vcpu->runblock = 0;
+ 	vcpu->reqidle = 0;
+ 	vcpu->exitintinfo = 0;
+ 	vcpu->nmi_pending = 0;
+@@ -586,7 +580,6 @@ vm_create(const char *name, struct vm **retvm)
+ 	vm = malloc(sizeof(struct vm), M_VM, M_WAITOK | M_ZERO);
+ 	strcpy(vm->name, name);
+ 	vm->vmspace = vmspace;
+-	mtx_init(&vm->rendezvous_mtx, "vm rendezvous lock", 0, MTX_DEF);
+ 
+ 	vm->sockets = 1;
+ 	vm->cores = cores_per_package;	/* XXX backwards compatibility */
+@@ -1405,6 +1398,16 @@ vcpu_set_state_locked(struct vm *vm, int vcpuid, enum vcpu_state newstate,
+ 		break;
+ 	}
+ 
++	if (newstate == VCPU_RUNNING) {
++		while (vcpu->runblock != 0) {
++#ifdef __FreeBSD__
++			msleep_spin(&vcpu->state, &vcpu->mtx, "vcpublk", 0);
++#else
++			cv_wait(&vcpu->state_cv, &vcpu->mtx.m);
++#endif
++		}
++	}
++
+ 	if (error)
+ 		return (EBUSY);
+ 
+@@ -1417,7 +1420,8 @@ vcpu_set_state_locked(struct vm *vm, int vcpuid, enum vcpu_state newstate,
+ 	else
+ 		vcpu->hostcpu = NOCPU;
+ 
+-	if (newstate == VCPU_IDLE) {
++	if (newstate == VCPU_IDLE ||
++	    (newstate == VCPU_FROZEN && vcpu->runblock != 0)) {
+ #ifdef __FreeBSD__
+ 		wakeup(&vcpu->state);
+ #else
+@@ -1446,88 +1450,6 @@ vcpu_require_state_locked(struct vm *vm, int vcpuid, enum vcpu_state newstate)
+ 		panic("Error %d setting state to %d", error, newstate);
+ }
+ 
+-static void
+-vm_set_rendezvous_func(struct vm *vm, vm_rendezvous_func_t func)
+-{
+-
+-	KASSERT(mtx_owned(&vm->rendezvous_mtx), ("rendezvous_mtx not locked"));
+-
+-	/*
+-	 * Update 'rendezvous_func' and execute a write memory barrier to
+-	 * ensure that it is visible across all host cpus. This is not needed
+-	 * for correctness but it does ensure that all the vcpus will notice
+-	 * that the rendezvous is requested immediately.
+-	 */
+-	vm->rendezvous_func = func;
+-#ifdef __FreeBSD__
+-	wmb();
+-#else
+-	membar_producer();
+-#endif
+-}
+-
+-#define	RENDEZVOUS_CTR0(vm, vcpuid, fmt)				\
+-	do {								\
+-		if (vcpuid >= 0)					\
+-			VCPU_CTR0(vm, vcpuid, fmt);			\
+-		else							\
+-			VM_CTR0(vm, fmt);				\
+-	} while (0)
+-
+-static void
+-vm_handle_rendezvous(struct vm *vm, int vcpuid)
+-{
+-
+-	KASSERT(vcpuid == -1 || (vcpuid >= 0 && vcpuid < VM_MAXCPU),
+-	    ("vm_handle_rendezvous: invalid vcpuid %d", vcpuid));
+-
+-	mtx_lock(&vm->rendezvous_mtx);
+-	while (vm->rendezvous_func != NULL) {
+-		/* 'rendezvous_req_cpus' must be a subset of 'active_cpus' */
+-		CPU_AND(&vm->rendezvous_req_cpus, &vm->active_cpus);
+-
+-		if (vcpuid != -1 &&
+-		    CPU_ISSET(vcpuid, &vm->rendezvous_req_cpus) &&
+-		    !CPU_ISSET(vcpuid, &vm->rendezvous_done_cpus)) {
+-			VCPU_CTR0(vm, vcpuid, "Calling rendezvous func");
+-			(*vm->rendezvous_func)(vm, vcpuid, vm->rendezvous_arg);
+-			CPU_SET(vcpuid, &vm->rendezvous_done_cpus);
+-		}
+-		if (CPU_CMP(&vm->rendezvous_req_cpus,
+-		    &vm->rendezvous_done_cpus) == 0) {
+-			VCPU_CTR0(vm, vcpuid, "Rendezvous completed");
+-			vm_set_rendezvous_func(vm, NULL);
+-#ifdef __FreeBSD__
+-			wakeup(&vm->rendezvous_func);
+-#else
+-			cv_broadcast(&vm->rendezvous_cv);
+-#endif
+-			break;
+-		}
+-		RENDEZVOUS_CTR0(vm, vcpuid, "Wait for rendezvous completion");
+-#ifdef __FreeBSD__
+-		mtx_sleep(&vm->rendezvous_func, &vm->rendezvous_mtx, 0,
+-		    "vmrndv", 0);
+-#else
+-		/*
+-		 * A cv_wait() call should be adequate for this, but since the
+-		 * bhyve process could be killed in the middle of an unfinished
+-		 * vm_smp_rendezvous, rendering its completion impossible, a
+-		 * timed wait is necessary.  When bailing out early from a
+-		 * rendezvous, the instance may be left in a bizarre state, but
+-		 * that is preferable to a thread stuck waiting in the kernel.
+-		 */
+-		if (cv_reltimedwait_sig(&vm->rendezvous_cv,
+-		    &vm->rendezvous_mtx.m, hz, TR_CLOCK_TICK) <= 0) {
+-			if ((curproc->p_flag & SEXITING) != 0) {
+-				break;
+-			}
+-		}
+-#endif
+-	}
+-	mtx_unlock(&vm->rendezvous_mtx);
+-}
+-
+ /*
+  * Emulate a guest 'hlt' by sleeping until the vcpu is ready to run.
+  */
+@@ -1559,7 +1481,7 @@ vm_handle_hlt(struct vm *vm, int vcpuid, bool intr_disabled, bool *retu)
+ 		 * vcpu returned from VMRUN() and before it acquired the
+ 		 * vcpu lock above.
+ 		 */
+-		if (vm->rendezvous_func != NULL || vm->suspend || vcpu->reqidle)
++		if (vm->suspend || vcpu->reqidle)
+ 			break;
+ 		if (vm_nmi_pending(vm, vcpuid))
+ 			break;
+@@ -1766,10 +1688,6 @@ vm_handle_suspend(struct vm *vm, int vcpuid, bool *retu)
+ 
+ 	/*
+ 	 * Wait until all 'active_cpus' have suspended themselves.
+-	 *
+-	 * Since a VM may be suspended at any time including when one or
+-	 * more vcpus are doing a rendezvous we need to call the rendezvous
+-	 * handler while we are waiting to prevent a deadlock.
+ 	 */
+ 	vcpu_lock(vcpu);
+ 	while (1) {
+@@ -1778,35 +1696,27 @@ vm_handle_suspend(struct vm *vm, int vcpuid, bool *retu)
+ 			break;
+ 		}
+ 
+-		if (vm->rendezvous_func == NULL) {
+-			VCPU_CTR0(vm, vcpuid, "Sleeping during suspend");
+-			vcpu_require_state_locked(vm, vcpuid, VCPU_SLEEPING);
++		VCPU_CTR0(vm, vcpuid, "Sleeping during suspend");
++		vcpu_require_state_locked(vm, vcpuid, VCPU_SLEEPING);
+ #ifdef __FreeBSD__
+-			msleep_spin(vcpu, &vcpu->mtx, "vmsusp", hz);
++		msleep_spin(vcpu, &vcpu->mtx, "vmsusp", hz);
+ #else
+-			/*
+-			 * Like vm_handle_rendezvous, vm_handle_suspend could
+-			 * become stuck in the kernel if the bhyve process
+-			 * driving its vCPUs is killed.  Offer a bail-out in
+-			 * that case, even though not all the vCPUs have
+-			 * reached the suspended state.
+-			 */
+-			if (cv_reltimedwait_sig(&vcpu->vcpu_cv, &vcpu->mtx.m,
+-			    hz, TR_CLOCK_TICK) <= 0) {
+-				if ((curproc->p_flag & SEXITING) != 0) {
+-					vcpu_require_state_locked(vm, vcpuid,
+-					    VCPU_FROZEN);
+-					break;
+-				}
++		/*
++		 * To prevent vm_handle_suspend from becoming stuck in the
++		 * kernel if the bhyve process driving its vCPUs is killed,
++		 * offer a bail-out, even though not all the vCPUs have reached
++		 * the suspended state.
++		 */
++		if (cv_reltimedwait_sig(&vcpu->vcpu_cv, &vcpu->mtx.m,
++		    hz, TR_CLOCK_TICK) <= 0) {
++			if ((curproc->p_flag & SEXITING) != 0) {
++				vcpu_require_state_locked(vm, vcpuid,
++				    VCPU_FROZEN);
++				break;
+ 			}
+-#endif
+-			vcpu_require_state_locked(vm, vcpuid, VCPU_FROZEN);
+-		} else {
+-			VCPU_CTR0(vm, vcpuid, "Rendezvous during suspend");
+-			vcpu_unlock(vcpu);
+-			vm_handle_rendezvous(vm, vcpuid);
+-			vcpu_lock(vcpu);
+ 		}
++#endif
++		vcpu_require_state_locked(vm, vcpuid, VCPU_FROZEN);
+ 	}
+ 	vcpu_unlock(vcpu);
+ 
+@@ -1908,17 +1818,15 @@ vm_exit_debug(struct vm *vm, int vcpuid, uint64_t rip)
+ }
+ 
+ void
+-vm_exit_rendezvous(struct vm *vm, int vcpuid, uint64_t rip)
++vm_exit_runblock(struct vm *vm, int vcpuid, uint64_t rip)
+ {
+ 	struct vm_exit *vmexit;
+ 
+-	KASSERT(vm->rendezvous_func != NULL, ("rendezvous not in progress"));
+-
+ 	vmexit = vm_exitinfo(vm, vcpuid);
+ 	vmexit->rip = rip;
+ 	vmexit->inst_length = 0;
+-	vmexit->exitcode = VM_EXITCODE_RENDEZVOUS;
+-	vmm_stat_incr(vm, vcpuid, VMEXIT_RENDEZVOUS, 1);
++	vmexit->exitcode = VM_EXITCODE_RUNBLOCK;
++	vmm_stat_incr(vm, vcpuid, VMEXIT_RUNBLOCK, 1);
+ }
+ 
+ void
+@@ -2080,7 +1988,7 @@ vm_run(struct vm *vm, struct vm_run *vmrun)
+ 	pmap = vmspace_pmap(vm->vmspace);
+ 	vcpu = &vm->vcpu[vcpuid];
+ 	vme = &vcpu->exitinfo;
+-	evinfo.rptr = &vm->rendezvous_func;
++	evinfo.rptr = &vcpu->runblock;
+ 	evinfo.sptr = &vm->suspend;
+ 	evinfo.iptr = &vcpu->reqidle;
+ 
+@@ -2170,9 +2078,7 @@ restart:
+ 			vioapic_process_eoi(vm, vcpuid,
+ 			    vme->u.ioapic_eoi.vector);
+ 			break;
+-		case VM_EXITCODE_RENDEZVOUS:
+-			vm_handle_rendezvous(vm, vcpuid);
+-			error = 0;
++		case VM_EXITCODE_RUNBLOCK:
+ 			break;
+ 		case VM_EXITCODE_HLT:
+ 			intr_disabled = ((vme->u.hlt.rflags & PSL_I) == 0);
+@@ -2799,6 +2705,54 @@ vcpu_get_state(struct vm *vm, int vcpuid, int *hostcpu)
+ 	return (state);
+ }
+ 
++void
++vcpu_block_run(struct vm *vm, int vcpuid)
++{
++	struct vcpu *vcpu;
++
++	if (vcpuid < 0 || vcpuid >= VM_MAXCPU)
++		panic("vcpu_block_run: invalid vcpuid %d", vcpuid);
++
++	vcpu = &vm->vcpu[vcpuid];
++
++	vcpu_lock(vcpu);
++	vcpu->runblock++;
++	if (vcpu->runblock == 1 && vcpu->state == VCPU_RUNNING) {
++		vcpu_notify_event_locked(vcpu, false);
++	}
++	while (vcpu->state == VCPU_RUNNING) {
++#ifdef __FreeBSD__
++		msleep_spin(&vcpu->state, &vcpu->mtx, "vcpublk", 0);
++#else
++		cv_wait(&vcpu->state_cv, &vcpu->mtx.m);
++#endif
++	}
++	vcpu_unlock(vcpu);
++}
++
++void
++vcpu_unblock_run(struct vm *vm, int vcpuid)
++{
++	struct vcpu *vcpu;
++
++	if (vcpuid < 0 || vcpuid >= VM_MAXCPU)
++		panic("vcpu_block_run: invalid vcpuid %d", vcpuid);
++
++	vcpu = &vm->vcpu[vcpuid];
++
++	vcpu_lock(vcpu);
++	KASSERT(vcpu->runblock != 0, ("expected non-zero runblock"));
++	vcpu->runblock--;
++	if (vcpu->runblock == 0) {
++#ifdef __FreeBSD__
++		wakeup(&vcpu->state);
++#else
++		cv_broadcast(&vcpu->state_cv);
++#endif
++	}
++	vcpu_unlock(vcpu);
++}
++
+ #ifndef	__FreeBSD__
+ uint64_t
+ vcpu_tsc_offset(struct vm *vm, int vcpuid)
+@@ -2995,54 +2949,6 @@ vm_apicid2vcpuid(struct vm *vm, int apicid)
+ 	return (apicid);
+ }
+ 
+-void
+-vm_smp_rendezvous(struct vm *vm, int vcpuid, cpuset_t dest,
+-    vm_rendezvous_func_t func, void *arg)
+-{
+-	int i;
+-
+-	/*
+-	 * Enforce that this function is called without any locks
+-	 */
+-	WITNESS_WARN(WARN_PANIC, NULL, "vm_smp_rendezvous");
+-	KASSERT(vcpuid == -1 || (vcpuid >= 0 && vcpuid < VM_MAXCPU),
+-	    ("vm_smp_rendezvous: invalid vcpuid %d", vcpuid));
+-
+-restart:
+-	mtx_lock(&vm->rendezvous_mtx);
+-	if (vm->rendezvous_func != NULL) {
+-		/*
+-		 * If a rendezvous is already in progress then we need to
+-		 * call the rendezvous handler in case this 'vcpuid' is one
+-		 * of the targets of the rendezvous.
+-		 */
+-		RENDEZVOUS_CTR0(vm, vcpuid, "Rendezvous already in progress");
+-		mtx_unlock(&vm->rendezvous_mtx);
+-		vm_handle_rendezvous(vm, vcpuid);
+-		goto restart;
+-	}
+-	KASSERT(vm->rendezvous_func == NULL, ("vm_smp_rendezvous: previous "
+-	    "rendezvous is still in progress"));
+-
+-	RENDEZVOUS_CTR0(vm, vcpuid, "Initiating rendezvous");
+-	vm->rendezvous_req_cpus = dest;
+-	CPU_ZERO(&vm->rendezvous_done_cpus);
+-	vm->rendezvous_arg = arg;
+-	vm_set_rendezvous_func(vm, func);
+-	mtx_unlock(&vm->rendezvous_mtx);
+-
+-	/*
+-	 * Wake up any sleeping vcpus and trigger a VM-exit in any running
+-	 * vcpus so they handle the rendezvous as soon as possible.
+-	 */
+-	for (i = 0; i < VM_MAXCPU; i++) {
+-		if (CPU_ISSET(i, &dest))
+-			vcpu_notify_event(vm, i, false);
+-	}
+-
+-	vm_handle_rendezvous(vm, vcpuid);
+-}
+-
+ struct vatpic *
+ vm_atpic(struct vm *vm)
+ {
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm_sol_glue.c b/usr/src/uts/i86pc/io/vmm/vmm_sol_glue.c
+index d03955ec06..8dc7118ee1 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm_sol_glue.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm_sol_glue.c
+@@ -125,21 +125,24 @@ pmap_kextract(vm_offset_t va)
+ int
+ cpusetobj_ffs(const cpuset_t *set)
+ {
+-#if	CPUSET_WORDS > 1
+-	int	i, cbit;
+-
+-	cbit = 0;
+-	for (i = 0; i < CPUSET_WORDS; i++) {
+-		if (set->cpub[i] != 0) {
+-			cbit = ffsl(set->cpub[i]);
+-			cbit += i * sizeof (set->cpub[0]);
+-			break;
+-		}
++	uint_t large, small;
++
++	/*
++	 * Rather than reaching into the cpuset_t ourselves, leave that task to
++	 * cpuset_bounds().  The simplicity is worth the extra wasted work to
++	 * find the upper bound.
++	 */
++	cpuset_bounds(set, &small, &large);
++
++	if (small == CPUSET_NOTINSET) {
++		/* The FreeBSD version returns 0 if it find nothing */
++		return (0);
+ 	}
+-	return (cbit);
+-#else
+-	return (ffsl(*set));
+-#endif
++
++	ASSERT3U(small, <=, INT_MAX);
++
++	/* Least significant bit index starts at 1 for valid results */
++	return (small + 1);
+ }
+ 
+ struct kmem_item {
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm_stat.c b/usr/src/uts/i86pc/io/vmm/vmm_stat.c
+index c2c2cfe77c..9b11733952 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm_stat.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm_stat.c
+@@ -168,5 +168,5 @@ VMM_STAT(VMEXIT_UNKNOWN, "number of vm exits for unknown reason");
+ VMM_STAT(VMEXIT_ASTPENDING, "number of times astpending at exit");
+ VMM_STAT(VMEXIT_REQIDLE, "number of times idle requested at exit");
+ VMM_STAT(VMEXIT_USERSPACE, "number of vm exits handled in userspace");
+-VMM_STAT(VMEXIT_RENDEZVOUS, "number of times rendezvous pending at exit");
++VMM_STAT(VMEXIT_RUNBLOCK, "number of times runblock at exit");
+ VMM_STAT(VMEXIT_EXCEPTION, "number of vm exits due to exceptions");
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm_stat.h b/usr/src/uts/i86pc/io/vmm/vmm_stat.h
+index 1193cea368..3232e23888 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm_stat.h
++++ b/usr/src/uts/i86pc/io/vmm/vmm_stat.h
+@@ -166,7 +166,7 @@ VMM_STAT_DECLARE(VMEXIT_INST_EMUL);
+ VMM_STAT_DECLARE(VMEXIT_UNKNOWN);
+ VMM_STAT_DECLARE(VMEXIT_ASTPENDING);
+ VMM_STAT_DECLARE(VMEXIT_USERSPACE);
+-VMM_STAT_DECLARE(VMEXIT_RENDEZVOUS);
++VMM_STAT_DECLARE(VMEXIT_RUNBLOCK);
+ VMM_STAT_DECLARE(VMEXIT_EXCEPTION);
+ VMM_STAT_DECLARE(VMEXIT_REQIDLE);
+ #endif
+diff --git a/usr/src/uts/i86pc/sys/vmm.h b/usr/src/uts/i86pc/sys/vmm.h
+index e5e5460211..c0db3a0f29 100644
+--- a/usr/src/uts/i86pc/sys/vmm.h
++++ b/usr/src/uts/i86pc/sys/vmm.h
+@@ -146,7 +146,7 @@ struct vm_guest_paging;
+ struct pmap;
+ 
+ struct vm_eventinfo {
+-	void	*rptr;		/* rendezvous cookie */
++	u_int	*rptr;		/* runblock cookie */
+ 	int	*sptr;		/* suspend cookie */
+ 	int	*iptr;		/* reqidle cookie */
+ };
+@@ -274,38 +274,21 @@ int vm_resume_cpu(struct vm *vm, int vcpu);
+ struct vm_exit *vm_exitinfo(struct vm *vm, int vcpuid);
+ void vm_exit_suspended(struct vm *vm, int vcpuid, uint64_t rip);
+ void vm_exit_debug(struct vm *vm, int vcpuid, uint64_t rip);
+-void vm_exit_rendezvous(struct vm *vm, int vcpuid, uint64_t rip);
++void vm_exit_runblock(struct vm *vm, int vcpuid, uint64_t rip);
+ void vm_exit_astpending(struct vm *vm, int vcpuid, uint64_t rip);
+ void vm_exit_reqidle(struct vm *vm, int vcpuid, uint64_t rip);
+ 
+ #ifdef _SYS__CPUSET_H_
+-/*
+- * Rendezvous all vcpus specified in 'dest' and execute 'func(arg)'.
+- * The rendezvous 'func(arg)' is not allowed to do anything that will
+- * cause the thread to be put to sleep.
+- *
+- * If the rendezvous is being initiated from a vcpu context then the
+- * 'vcpuid' must refer to that vcpu, otherwise it should be set to -1.
+- *
+- * The caller cannot hold any locks when initiating the rendezvous.
+- *
+- * The implementation of this API may cause vcpus other than those specified
+- * by 'dest' to be stalled. The caller should not rely on any vcpus making
+- * forward progress when the rendezvous is in progress.
+- */
+-typedef void (*vm_rendezvous_func_t)(struct vm *vm, int vcpuid, void *arg);
+-void vm_smp_rendezvous(struct vm *vm, int vcpuid, cpuset_t dest,
+-    vm_rendezvous_func_t func, void *arg);
+ cpuset_t vm_active_cpus(struct vm *vm);
+ cpuset_t vm_debug_cpus(struct vm *vm);
+ cpuset_t vm_suspended_cpus(struct vm *vm);
+ #endif	/* _SYS__CPUSET_H_ */
+ 
+ static __inline int
+-vcpu_rendezvous_pending(struct vm_eventinfo *info)
++vcpu_runblocked(struct vm_eventinfo *info)
+ {
+ 
+-	return (*((uintptr_t *)(info->rptr)) != 0);
++	return (*info->rptr != 0);
+ }
+ 
+ static __inline int
+@@ -344,6 +327,9 @@ enum vcpu_state {
+ int vcpu_set_state(struct vm *vm, int vcpu, enum vcpu_state state,
+     bool from_idle);
+ enum vcpu_state vcpu_get_state(struct vm *vm, int vcpu, int *hostcpu);
++void vcpu_block_run(struct vm *, int);
++void vcpu_unblock_run(struct vm *, int);
++
+ #ifndef __FreeBSD__
+ uint64_t vcpu_tsc_offset(struct vm *vm, int vcpuid);
+ #endif
+@@ -578,7 +564,7 @@ enum vm_exitcode {
+ 	VM_EXITCODE_INST_EMUL,
+ 	VM_EXITCODE_SPINUP_AP,
+ 	VM_EXITCODE_DEPRECATED1,	/* used to be SPINDOWN_CPU */
+-	VM_EXITCODE_RENDEZVOUS,
++	VM_EXITCODE_RUNBLOCK,
+ 	VM_EXITCODE_IOAPIC_EOI,
+ 	VM_EXITCODE_SUSPENDED,
+ 	VM_EXITCODE_INOUT_STR,

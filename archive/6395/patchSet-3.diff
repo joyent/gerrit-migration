@@ -1,0 +1,2678 @@
+commit e5cf9a8a114c674e23818bbeeebd96b3f849a87c
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2019-06-10T15:53:57-07:00 (4 months ago)
+    
+    joyent/gerritbot#9 Move server logic into its own FSM class
+    joyent/gerritbot#11 Want updated worker zone configuration
+
+diff --git a/Makefile b/Makefile
+index f9a9f9f..f44df63 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ NPM		:= npm
+ ESLINT		= ./node_modules/.bin/eslint
+-JS_FILES	:= $(wildcard *.js)
++JS_FILES	:= $(wildcard *.js) $(wildcard lib/*.js)
+ 
+ $(ESLINT): | $(NPM_EXEC)
+ 	$(NPM) install \
+diff --git a/README.adoc b/README.adoc
+new file mode 100644
+index 0000000..89d48c6
+--- /dev/null
++++ b/README.adoc
+@@ -0,0 +1,52 @@
++:toc: left
++:source-highlighter: pygments
++:doctype: book
++:idprefix:
++:docinfo:
++
++# gerritbot
++
++## About
++
++This is the bot that takes care of running `make check` on new code reviews and
++patchsets pushed to https://cr.joyent.us/[cr.joyent.us].
++
++## Configuration
++
++The configuration file contains the following values:
++
++- `"my_name"`, the host name workers should use to connect back to the
++  supervisor server
++- `"port"`, the port that the supervisor server should listen on
++- `"spares"`, the number of spare worker zones to maintain
++- `"max"`, the maximum number of worker zones that should be allowed to run
++- `"dryrun"`, a boolean indicating whether the `"make check"` results should be
++  posted to Gerrit
++- `"gerrit"`, an object describing how to connect to Gerrit:
++    -- `"host"`, the Gerrit instance's hostname
++    -- `"port"`, the SSH port that Gerrit is listening on
++    -- `"user"`, the user to listen and post as to Gerrit
++    -- `"keyFile"`, a path to an SSH key for the `"user"`
++- `"docker"`, an object describing how to connect to Docker:
++    -- `"host"`, a Triton Docker hostname
++    -- `"network"`, the name of the network that the workers should be placed on
++    -- `"user"`, the user to authenticate as
++    -- `"keyFile"`, a path to an SSH key for the `"user"`
++- `"repos"`, an object describing configurations for repository processing
++    -- `"check"`, a map of project names to booleans indicating whether to force
++      disable or enable `"make check"` for a repo
++- `"workers"`, an object describing the configuration for the worker zones:
++    -- `"image"`, the image UUID to provision
++    -- `"pkgsrc"`, a list of pkgsrc packages to install (or remove if they begin
++      with `-`)
++    -- `"memory"`, the amount of memory (in megabytes) each worker zone should
++      have
++    -- `"npm"`, npm packages that should be installed globally
++
++## License
++
++MPL-v2
++
++## Contributing
++
++Contributions should be made via https://cr.joyent.us[Joyent Gerrit].
+diff --git a/etc/config.json b/etc/config.json
+index 3275370..b375775 100644
+--- a/etc/config.json
++++ b/etc/config.json
+@@ -3,6 +3,7 @@
+ 	"my_name": "buildbot.inst.awilson.staging-1.cns.joyent.us",
+ 	"spares": 3,
+ 	"max": 6,
++	"dryrun": false,
+ 	"gerrit": {
+ 		"host": "cr.joyent.us",
+ 		"port": 22,
+@@ -15,9 +16,37 @@
+ 		"keyFile": "./sdc.id_rsa",
+ 		"network": "external"
+ 	},
+-	"slaves": {
+-		"image": "96bcddda-beb7-11e5-af20-a3fb54c8ae29",
+-		"pkgsrc": ["-nodejs", "nodejs-0.10", "build-essential"],
++	"repos": {
++		"check": {
++			"joyent/haproxy-1.8": false,
++			"joyent/illumos-extra": false,
++			"joyent/illumos-joyent": false,
++			"joyent/illumos-kvm": false,
++			"joyent/illumos-kvm-cmd": false,
++			"joyent/mako-gc-feeder": false,
++			"joyent/manta-muskie": false,
++			"joyent/manta-scripts": false,
++			"joyent/mdata-client": false,
++			"joyent/mname-balancer": false,
++			"joyent/mountain-gorilla": false,
++			"joyent/pg_prefaulter": false,
++			"joyent/postgres": false,
++			"joyent/sdc-scripts": false,
++			"joyent/zfs_snapshot_tar": false,
++			"joyent/zoneinit": false
++		}
++	},
++	"workers": {
++		"image": "c193a558-1d63-11e9-97cf-97bb3ee5c14f",
++		"pkgsrc": [
++			"-nodejs",
++			"nodejs-6.14",
++			"npm",
++			"build-essential",
++			"gcc49",
++			"rust"
++		],
++		"memory": 2048,
+ 		"npm": []
+ 	}
+ }
+diff --git a/agent.js b/lib/agent.js
+similarity index 100%
+rename from agent.js
+rename to lib/agent.js
+diff --git a/lib/supervisor.js b/lib/supervisor.js
+new file mode 100644
+index 0000000..6dac259
+--- /dev/null
++++ b/lib/supervisor.js
+@@ -0,0 +1,467 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++'use strict';
++
++const mod_assert = require('assert-plus');
++const mod_crypto = require('crypto');
++const mod_fs = require('fs');
++const mod_fsm = require('mooremachine');
++const mod_http = require('http');
++const mod_jade = require('jade');
++const mod_jsprim = require('jsprim');
++const mod_path = require('path');
++const mod_qs = require('querystring');
++const mod_util = require('util');
++const mod_worker = require('./worker');
++const mod_ws = require('ws');
++
++const AGENT_JS = mod_path.join(__dirname, 'agent.js');
++
++function workerIsReady(w) {
++	return (w.isInState('ready'));
++}
++
++function workerIsSettingUp(w) {
++	return (w.isInState('setup'));
++}
++
++function assertSupervisorOptions(opts) {
++	mod_assert.object(opts, 'opts');
++	mod_assert.object(opts.config, 'opts.config');
++	mod_assert.object(opts.docker, 'opts.docker');
++	mod_assert.object(opts.gerrit, 'opts.gerrit');
++	mod_assert.string(opts.cookie, 'opts.cookie');
++	mod_assert.object(opts.log, 'opts.log');
++}
++
++/*
++ * The SupervisorServer is responsible for managing zone creation and deletion,
++ * and delegating checking patchsets to running zones.
++ */
++function SupervisorServer(opts) {
++	assertSupervisorOptions(opts);
++
++	var self = this;
++
++	self.ss_cookie = opts.cookie;
++
++	self.ss_docker = opts.docker;
++	self.ss_gerrit = opts.gerrit;
++
++	self.ss_config = opts.config;
++	self.ss_log = opts.log;
++
++	self.ss_checkrepos = mod_jsprim.deepCopy(self.ss_config.repos.check);
++
++	self.ss_spawning = {};
++	self.ss_queue = [];
++	self.ss_workers = [];
++
++	self.ss_tplCache = {};
++
++	self.ss_http = mod_http.createServer();
++	self.ss_server = new mod_ws.Server({
++		server: self.ss_http
++	});
++
++	self.ss_server.on('connection', self.handleNewConnection.bind(self));
++
++	self.ss_http.on('request', self.handleHttpRequest.bind(self));
++	self.ss_http.listen(self.ss_config.port);
++
++	self.ss_evs = self.ss_gerrit.eventStream();
++	self.ss_evs.on('bootstrap', self.bootstrap.bind(self));
++	self.ss_evs.stream.on('readable', self.handleNewPatchsets.bind(self));
++
++	mod_fsm.FSM.call(self, 'stopped');
++}
++mod_util.inherits(SupervisorServer, mod_fsm.FSM);
++
++SupervisorServer.prototype.spawnWorker = function spawnWorker() {
++	var self = this;
++
++	var spawnCookie = mod_crypto.randomBytes(8).toString('base64');
++	var agentUrl = mod_util.format('http://%s:%d/agent.js',
++	    self.ss_config.my_name, self.ss_config.port);
++	var payload = {
++		Hostname: '',
++		Domainname: '',
++		User: '',
++		AttachStdin: false,
++		AttachStdout: false,
++		AttachStderr: false,
++		Tty: false,
++		OpenStdin: false,
++		StdinOnce: false,
++		Env: [],
++		Cmd: [
++			'/usr/bin/bash', '-c',
++			'export PATH=/opt/local/bin:/opt/local/sbin:$PATH; ' +
++			'useradd -P "Primary Administrator" -s /usr/bin/bash ' +
++				'-m build && ' +
++			'pkgin -y up && ' +
++			'pkgin -y in nodejs && ' +
++			'curl -O ' + agentUrl + ' && ' +
++			'npm install ws@6.2.1 mooremachine && ' +
++			'/usr/lib/pfexecd && ' +
++			'exec su - build -c "' +
++				'exec node /tmp/agent.js ' + self.ss_config.my_name +
++				' ' + self.ss_config.port + ' ' + self.ss_cookie +
++			'"'
++		],
++		Entrypoint: [],
++		Image: self.ss_config.workers.image,
++		Labels: { 'buildbot.worker': 'true' },
++		Volumes: {},
++		WorkingDir: '/tmp',
++		NetworkDisabled: false,
++		NetworkMode: self.ss_config.docker.network,
++		ExposedPorts: {},
++		StopSignal: 'SIGTERM',
++		HostConfig: {
++			Binds: [],
++			Links: [],
++			LxcConf: {'lxc.utsname': 'docker'},
++			Memory: self.ss_config.workers.memory * 1024 * 1024,
++			Dns: ['8.8.8.8', '8.8.4.4']
++		}
++	};
++
++	function postCreate(err, req, res, obj) {
++		if (err) {
++			self.delSpawnStatus(spawnCookie);
++			self.ss_log.error(err, 'spawning docker container');
++			return;
++		}
++
++		var cid = obj.Id.slice(0, 12);
++		self.ss_log.info('created docker container %s', cid);
++		self.setSpawnStatus(spawnCookie, 'booting');
++
++		self.ss_docker.post('/containers/' + cid + '/start', {},
++		    function (err2) {
++			if (err2) {
++				self.delSpawnStatus(spawnCookie);
++				self.ss_log.error(err2,
++				    'starting docker container %s', cid);
++				return;
++			}
++
++			self.delSpawnStatus(spawnCookie);
++			self.setSpawnStatus(cid, 'booting');
++			self.ss_log.info('started docker container %s', cid);
++		});
++	}
++
++	self.setSpawnStatus(spawnCookie, 'provisioning');
++	self.ss_docker.post('/containers/create', payload, postCreate);
++};
++
++/*
++ * Run a given Gerrit query and process all changes that it returns.
++ */
++SupervisorServer.prototype.runQuery = function runQuery(q) {
++	var self = this;
++
++	var incl = ['patch-sets'];
++	var qstream = self.ss_gerrit.queryStream(q, incl);
++	qstream.on('readable', function () {
++		var change;
++		while ((change = qstream.read()) !== null) {
++			if (change.project === undefined ||
++			    change.id === undefined) {
++				continue;
++			}
++			var ps = change.patchSets[change.patchSets.length - 1];
++			if (ps.isDraft === false)
++				self.handleNewPatchset(change, ps);
++		}
++	});
++};
++
++/*
++ * Query Gerrit for all of the changes that the bot needs to review.
++ */
++SupervisorServer.prototype.bootstrap = function bootstrap() {
++	this.runQuery('status:open AND NOT label:CI-Testing>=-1');
++};
++
++SupervisorServer.prototype.handleNewPatchsets = function handleNewPatchsets() {
++	var event;
++
++	while ((event = this.ss_evs.stream.read()) !== null) {
++		if (event.type === 'patchset-created' &&
++		    event.patchSet.kind !== 'NO_CHANGE' &&
++		    event.patchSet.kind !== 'NO_CODE_CHANGE' &&
++		    event.patchSet.isDraft === false) {
++			this.handleNewPatchset(event.change, event.patchSet);
++		}
++	}
++};
++
++SupervisorServer.prototype.handleNewPatchset =
++    function handleNewPatchset(change, ps) {
++	if (this.isDisabledRepo(change.project)) {
++		return;
++	}
++
++	this.ss_log.info('queued %s %d (#%d)',
++	    change.project, change.number, ps.number);
++	this.ss_queue.push([change, ps]);
++	this.runQueue();
++};
++
++SupervisorServer.prototype.runQueue = function runQueue() {
++	var workers = this.ss_workers;
++	var spares = workers.filter(workerIsReady);
++	var settingUp = workers.filter(workerIsSettingUp);
++
++	var countSpawning = Object.keys(this.ss_spawning).length;
++	var countNotBusy = spares.length + settingUp.length + countSpawning;
++	var toMake = this.ss_config.spares - countNotBusy;
++
++	if (workers.length + countSpawning + toMake > this.ss_config.max) {
++		toMake = this.ss_config.max - (workers.length + countSpawning);
++        }
++
++	if (toMake > 0) {
++		this.ss_log.info('to make: %d - spares: %d, settingUp: %d, ' +
++		    'spawning: %d (total %d)',
++		    toMake, spares.length, settingUp.length, countSpawning,
++		    workers.length + countSpawning);
++	}
++
++	for (var j = 0; j < toMake; ++j) {
++		this.spawnWorker();
++	}
++
++	while (spares.length > 0 && this.ss_queue.length > 0) {
++		var item = this.ss_queue.shift();
++		if (this.isDisabledRepo(item[0].project)) {
++			continue;
++		}
++
++		var worker = spares.shift();
++		worker.build.apply(worker, item);
++	}
++};
++
++SupervisorServer.prototype.handleNewConnection = function (ws) {
++	var self = this;
++
++	var conn = new mod_worker.Connection({
++		docker: self.ss_docker,
++		gerrit: self.ss_gerrit,
++		supervisor: self,
++		config: self.ss_config,
++		cookie: self.ss_cookie,
++		log: self.ss_log
++	});
++
++	self.ss_workers.push(conn);
++
++	conn.on('ready', function () {
++		self.runQueue();
++	});
++
++	conn.on('closed', function () {
++		var idx = self.ss_workers.indexOf(conn);
++		mod_assert.notStrictEqual(idx, -1);
++		self.ss_workers.splice(idx, 1);
++	});
++
++	conn.accept(ws);
++};
++
++/*
++ * Set the informational status for a booting container.
++ */
++SupervisorServer.prototype.setSpawnStatus = function (cid, s) {
++	mod_assert.string(cid, 'cid');
++	mod_assert.string(s, 's');
++
++	this.ss_spawning[cid] = s;
++};
++
++/*
++ * Remove the information status for a container.
++ */
++SupervisorServer.prototype.delSpawnStatus = function (cid) {
++	mod_assert.string(cid, 'cid');
++
++	delete (this.ss_spawning[cid]);
++};
++
++/*
++ * If a repository's "make check" status has not yet been determined,
++ * set a new one.
++ */
++SupervisorServer.prototype.setInitialRepoStatus = function (repo, s) {
++	if (this.ss_checkrepos[repo] !== undefined) {
++		return;
++	}
++
++	this.ss_checkrepos[repo] = s;
++};
++
++/*
++ * Force a new "make check" status for a given repo.
++ */
++SupervisorServer.prototype.setRepoStatus = function (repo, s) {
++	this.ss_checkrepos[repo] = s;
++};
++
++/*
++ * Check whether this repo has been disabled due to either having failed to run
++ * "make check" previously or having been manually disabled.
++ */
++SupervisorServer.prototype.isDisabledRepo = function (repo) {
++	return (this.ss_checkrepos[repo] === false);
++};
++
++SupervisorServer.prototype.handleHttpRequest = function (req, res) {
++	var self = this;
++	var formdata = '';
++
++	if (req.url === '/agent.js') {
++		res.writeHead(200);
++		mod_fs.createReadStream(AGENT_JS).pipe(res);
++	} else if (req.url === '/status') {
++		var tpl = self._getTpl('./status.html.tpl');
++		var vars = {
++			workers: self.ss_workers,
++			overrides: self.ss_checkrepos,
++			queue: self.ss_queue,
++			spawning: self.ss_spawning
++		};
++		var html;
++		try {
++			html = tpl(vars);
++		} catch (e) {
++			html = e.stack;
++		}
++		res.writeHead(200, {
++			'content-type': 'text/html'
++		});
++		res.write(html);
++		res.end();
++	} else if (req.url === '/override' && req.method === 'POST') {
++		req.on('readable', function () {
++			var chunk;
++			while ((chunk = req.read()) !== null) {
++				formdata += chunk.toString('utf-8');
++			}
++		});
++		req.on('end', function () {
++			var args = mod_qs.parse(formdata);
++			if (args && args.repo) {
++				if (args.clear) {
++					self.setRepoStatus(args.repo,
++					    undefined);
++				} else if (args.value) {
++					self.setRepoStatus(args.repo,
++					    (args.value === 'true'));
++				}
++				res.writeHead(303, { 'location': '/status' });
++				res.end();
++			} else {
++				res.writeHead(500);
++				res.end();
++			}
++		});
++	} else if (req.url === '/bootstrap' && req.method === 'POST') {
++		self.bootstrap();
++		res.writeHead(303, { 'location': '/status' });
++		res.end();
++	} else if (req.url === '/runquery' && req.method === 'POST') {
++		req.on('readable', function () {
++			var chunk;
++			while ((chunk = req.read()) !== null) {
++				formdata += chunk.toString('utf-8');
++			}
++		});
++		req.on('end', function () {
++			var args = mod_qs.parse(formdata);
++			if (args && args.query) {
++				self.runQuery(args.query);
++				res.writeHead(303, { 'location': '/status' });
++				res.end();
++			} else {
++				res.writeHead(500);
++				res.end();
++			}
++		});
++	} else {
++		res.writeHead(404);
++		res.end();
++	}
++};
++
++/*
++ * Do an initial queue run so that we spawn our spare instances, and then
++ * wait for work.
++ */
++SupervisorServer.prototype.state_running = function (S) {
++	var self = this;
++
++	S.gotoStateOn(self, 'stopAsserted', 'stopping');
++
++	S.interval(5000, function () {
++		self.runQueue();
++	});
++
++	self.runQueue();
++};
++
++SupervisorServer.prototype.state_stopping = function (S) {
++	this.ss_workers.forEach(function (w) {
++		w.release();
++	});
++
++	S.gotoState('stopped');
++};
++
++SupervisorServer.prototype.state_stopped = function (S) {
++	S.gotoStateOn(this, 'startAsserted', 'running');
++};
++
++SupervisorServer.prototype.start = function () {
++	this.emit('startAsserted');
++};
++
++SupervisorServer.prototype.stop = function () {
++	this.emit('stopAsserted');
++};
++
++SupervisorServer.prototype._getTpl = function getTpl(fn) {
++	var stat = mod_fs.statSync(fn);
++	var cache = this.ss_tplCache[fn];
++	if (cache && stat.mtime.getTime() <= cache.mtime.getTime())
++		return (cache.func);
++
++	var tpl = mod_fs.readFileSync(fn, 'utf-8');
++	var func;
++	try {
++		func = mod_jade.compile(tpl, {
++			filename: fn,
++			pretty: true
++		});
++	} catch (e) {
++		this.ss_log.error(e, 'failed to compile template');
++		func = function () { return ('Error'); };
++	}
++	this.ss_tplCache[fn] = { mtime: stat.mtime, func: func };
++	return (func);
++};
++
++module.exports = {
++	Server: SupervisorServer
++};
+diff --git a/lib/worker.js b/lib/worker.js
+new file mode 100644
+index 0000000..8a17933
+--- /dev/null
++++ b/lib/worker.js
+@@ -0,0 +1,868 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++'use strict';
++
++const Buffer = require('safer-buffer').Buffer;
++const mod_assert = require('assert-plus');
++const mod_bunyan = require('bunyan');
++const mod_crypto = require('crypto');
++const mod_events = require('events');
++const mod_fsm = require('mooremachine');
++const mod_stream = require('stream');
++const mod_util = require('util');
++const mod_vasync = require('vasync');
++
++function assertWorkerOptions(opts) {
++	mod_assert.object(opts, 'options');
++	mod_assert.object(opts.config, 'options.config');
++	mod_assert.object(opts.docker, 'options.docker');
++	mod_assert.object(opts.gerrit, 'options.gerrit');
++	mod_assert.object(opts.supervisor, 'options.supervisor');
++	mod_assert.string(opts.cookie, 'options.cookie');
++	mod_assert.optionalObject(opts.log, 'options.log');
++}
++
++function WorkerConnection(opts) {
++	assertWorkerOptions(opts);
++
++	this.wc_gerrit = opts.gerrit;
++	this.wc_docker = opts.docker;
++	this.wc_sup = opts.supervisor;
++
++	this.wc_cookie = opts.cookie;
++
++	this.wc_log = opts.log;
++
++	this.wc_ws = undefined;
++	if (this.wc_log === undefined)
++		this.wc_log = mod_bunyan.createLogger({ name: 'connection '});
++	this.wc_config = opts.config;
++	this.wc_uuid = undefined;
++	this.wc_kids = {};
++	this.wc_lastMsg = [];
++
++	mod_fsm.FSM.call(this, 'idle');
++}
++mod_util.inherits(WorkerConnection, mod_fsm.FSM);
++
++WorkerConnection.prototype.accept = function (ws) {
++	mod_assert.strictEqual(this.getState(), 'idle');
++	this.wc_ws = ws;
++	var req = this.wc_ws.upgradeReq;
++	var sock = req.socket;
++	this.wc_log = this.wc_log.child({
++		client: sock.remoteAddress + ':' + sock.remotePort
++	});
++	this.emit('acceptAsserted');
++};
++
++WorkerConnection.prototype.state_idle = function (S) {
++	S.on(this, 'acceptAsserted', function () {
++		S.gotoState('auth');
++	});
++};
++
++WorkerConnection.prototype.state_auth = function (S) {
++	var self = this;
++	var others = self.wc_sup.ss_workers.filter(function (wc) {
++		return (!(wc.isInState('closed') || wc.isInState('closing')) &&
++		    wc.wc_uuid === self.wc_uuid && wc !== self);
++	});
++	if (others.length > 0) {
++		self.wc_log.error('duplicate client');
++		S.gotoState('closing');
++		return;
++	}
++
++	S.on(this.wc_ws, 'message', function onMessage(msg) {
++		try {
++			msg = JSON.parse(msg);
++		} catch (e) {
++			self.wc_log.error(e,
++			    'failed to parse incoming message');
++			S.gotoState('closing');
++			return;
++		}
++		var keys = Object.keys(msg).sort();
++		if (msg.cookie === self.wc_cookie && keys.length === 2 &&
++		    keys[0] === 'cookie' && keys[1] === 'uuid') {
++			self.wc_uuid = msg.uuid.replace(/-/g, '');
++			var cid = self.wc_uuid.slice(0, 12);
++			self.wc_sup.delSpawnStatus(cid);
++			self.wc_log = self.wc_log.child({ cid: cid });
++			self.wc_log.info('authenticated agent on %s', cid);
++			S.gotoState('setup');
++		} else {
++			self.wc_log.warn('failed to auth worker, disconnecting');
++			S.gotoState('closing');
++		}
++	});
++
++	S.gotoStateTimeout(5000, 'closing');
++	S.gotoStateOn(self.wc_ws, 'close', 'closing');
++};
++
++WorkerConnection.prototype.state_setup = function (S) {
++	var self = this;
++	S.on(this.wc_ws, 'message', function onMessage(msg) {
++		try {
++			msg = JSON.parse(msg);
++		} catch (e) {
++			self.wc_log.error(e,
++			    'failed to parse incoming message');
++			S.gotoState('closing');
++			return;
++		}
++		self.handleMessage(msg);
++	});
++	S.on(this.wc_ws, 'close', function () {
++		S.gotoState('closing');
++	});
++	S.gotoState('setup.pkgsrc');
++};
++
++WorkerConnection.prototype.state_setup.pkgsrc = function (S) {
++	var self = this;
++	mod_vasync.forEachPipeline({
++		func: processPkgsrc,
++		inputs: this.wc_config.workers.pkgsrc || []
++	}, function (err) {
++		if (err) {
++			self.wc_log.error(err, 'failed to setup zone');
++			S.gotoState('closing');
++			return;
++		}
++		S.gotoState('setup.npm');
++	});
++	function processPkgsrc(instr, cb) {
++		var cmd = 'pfexec';
++		var args = ['/opt/local/bin/pkgin', '-y'];
++		var m = instr.match(/^-(.+)$/);
++		if (m) {
++			args.push('rm');
++			args.push(m[1]);
++		} else {
++			args.push('in');
++			args.push(instr);
++		}
++		var kid = self.spawn(cmd, args);
++		var errOut = '';
++		S.on(kid.stderr, 'data', function (data) {
++			errOut = errOut + data.toString('utf-8');
++		});
++		S.on(kid, 'close', function (exitStatus) {
++			if (exitStatus === 0) {
++				cb();
++				return;
++			}
++			self.wc_log.error('failed to run pkgin cmd in zone',
++			    {args: args, stderr: errOut});
++			cb(new Error('pkgin command failed'));
++		});
++	}
++};
++
++WorkerConnection.prototype.state_setup.npm = function (S) {
++	var self = this;
++	mod_vasync.forEachPipeline({
++		func: processPkgsrc,
++		inputs: this.wc_config.workers.npm || []
++	}, function (err) {
++		if (err) {
++			self.wc_log.error(err, 'failed to setup zone');
++			S.gotoState('closing');
++			return;
++		}
++		S.gotoState('setup.clean_old');
++	});
++	function processPkgsrc(instr, cb) {
++		var cmd = 'pfexec';
++		var args = ['/opt/local/bin/npm', 'install', '-g', instr];
++		var kid = self.spawn(cmd, args);
++		var errOut = '';
++		S.on(kid.stderr, 'data', function (data) {
++			errOut = errOut + data.toString('utf-8');
++		});
++		S.on(kid, 'close', function (exitStatus) {
++			if (exitStatus === 0) {
++				cb();
++				return;
++			}
++			self.wc_log.error('failed to run npm cmd in zone',
++			    {args: args, stderr: errOut});
++			cb(new Error('npm command failed'));
++		});
++	}
++};
++
++WorkerConnection.prototype.state_setup.clean_old = function (S) {
++	var self = this;
++	var kid = this.spawn('rm',
++	    ['-rf',
++	    '/home/build/jsstyle',
++	    '/home/build/javascriptlint',
++	    '/tmp/repo']);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0) {
++			S.gotoState('setup.jsl_clone');
++			return;
++		}
++		self.wc_log.error('failed to run command in zone',
++		    {stderr: errOut});
++		S.gotoState('closing');
++		return;
++	});
++};
++
++WorkerConnection.prototype.state_setup.jsl_clone = function (S) {
++	var self = this;
++	var kid = this.spawn('git',
++	    ['clone',
++	    'https://github.com/joyent/javascriptlint.git',
++	    '/home/build/javascriptlint']);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0) {
++			S.gotoState('setup.jsl_chdir');
++			return;
++		}
++		self.wc_log.error('failed to run command in zone',
++		    {stderr: errOut});
++		S.gotoState('closing');
++		return;
++	});
++};
++
++WorkerConnection.prototype.state_setup.jsl_chdir = function (S) {
++	var self = this;
++	var emitter = this.chdir('/home/build/javascriptlint');
++	S.on(emitter, 'done', function () {
++		S.gotoState('setup.jsl_build');
++	});
++	S.on(emitter, 'error', function (err) {
++		self.wc_log.error(err, 'failed to chdir');
++		S.gotoState('closing');
++	});
++};
++
++WorkerConnection.prototype.state_setup.jsl_build = function (S) {
++	var self = this;
++	var kid = this.spawn('gmake', ['install']);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0) {
++			S.gotoState('setup.jsstyle_clone');
++			return;
++		}
++		self.wc_log.error('failed to run command in zone',
++		    {stderr: errOut});
++		S.gotoState('closing');
++		return;
++	});
++};
++
++WorkerConnection.prototype.state_setup.jsstyle_clone = function (S) {
++	var self = this;
++	var kid = this.spawn('git',
++	    ['clone',
++	    'https://github.com/joyent/jsstyle.git',
++	    '/home/build/jsstyle']);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0) {
++			S.gotoState('setup.lintpaths');
++			return;
++		}
++		self.wc_log.error('failed to run command in zone',
++		    {stderr: errOut});
++		S.gotoState('closing');
++		return;
++	});
++};
++
++WorkerConnection.prototype.state_setup.lintpaths = function (S) {
++	var self = this;
++	var emitter = this.addPath([
++	    '/home/build/javascriptlint/build/install',
++	    '/home/build/jsstyle'
++	]);
++	S.on(emitter, 'done', function () {
++		S.gotoState('ready');
++	});
++	S.on(emitter, 'error', function (err) {
++		self.wc_log.error(err, 'failed to add paths');
++		S.gotoState('closing');
++	});
++};
++
++WorkerConnection.prototype.state_ready = function (S) {
++	var self = this;
++
++	S.on(this.wc_ws, 'message', function onMessage(msg) {
++		try {
++			msg = JSON.parse(msg);
++		} catch (e) {
++			self.wc_log.error(e,
++			    'failed to parse incoming message');
++			S.gotoState('closing');
++			return;
++		}
++		self.handleMessage(msg);
++	});
++	S.on(this, 'claimAsserted', function () {
++		S.gotoState('running');
++	});
++	S.on(this, 'releaseAsserted', function () {
++		S.gotoState('closing');
++	});
++	S.on(this.wc_ws, 'close', function () {
++		S.gotoState('closing');
++	});
++
++	self.wc_log.info('ready to rock');
++	self.emit('ready');
++};
++
++WorkerConnection.prototype.build = function (change, patchset) {
++	mod_assert.strictEqual(this.getState(), 'ready');
++	this.wc_change = change;
++	this.wc_patchset = patchset;
++	this.emit('claimAsserted');
++};
++
++WorkerConnection.prototype.release = function () {
++	mod_assert.strictEqual(this.getState(), 'running');
++	this.emit('releaseAsserted');
++};
++
++WorkerConnection.prototype.state_running = function (S) {
++	var self = this;
++	this.wc_log.info('building %s #%d (ps %d)', this.wc_change.project,
++	    this.wc_change.number, this.wc_patchset.number);
++	S.on(this.wc_ws, 'message', function onMessage(msg) {
++		try {
++			msg = JSON.parse(msg);
++		} catch (e) {
++			self.wc_log.error(e,
++			    'failed to parse incoming message');
++			S.gotoState('closing');
++			return;
++		}
++		self.handleMessage(msg);
++	});
++	S.on(this, 'releaseAsserted', function () {
++		S.gotoState('closing');
++	});
++	S.on(this.wc_ws, 'close', function () {
++		S.gotoState('closing');
++	});
++	S.gotoState('running.clone');
++};
++
++WorkerConnection.prototype.state_running.clone = function (S) {
++	var self = this;
++	var host = self.wc_config.gerrit.host;
++	var url = 'https://' + host + '/' + self.wc_change.project;
++	var kid = self.spawn('git', ['clone', url, '/tmp/repo']);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0) {
++			S.gotoState('running.chdir');
++			return;
++		}
++		self.wc_log.error({ stderr: errOut },
++		    'failed to run command in zone');
++		S.gotoState('closing');
++		return;
++	});
++};
++
++WorkerConnection.prototype.state_running.chdir = function (S) {
++	var self = this;
++	var emitter = this.chdir('/tmp/repo');
++	S.on(emitter, 'done', function () {
++		S.gotoState('running.fetch');
++	});
++	S.on(emitter, 'error', function (err) {
++		self.wc_log.error(err, 'failed to chdir');
++		S.gotoState('closing');
++	});
++};
++
++WorkerConnection.prototype.state_running.fetch = function (S) {
++	var self = this;
++	var kid = this.spawn('git',
++	    ['fetch', 'origin', this.wc_patchset.ref]);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0) {
++			S.gotoState('running.checkout');
++			return;
++		}
++		self.wc_log.error('failed to run command in zone',
++		    {stderr: errOut});
++		S.gotoState('closing');
++		return;
++	});
++};
++
++WorkerConnection.prototype.state_running.checkout = function (S) {
++	var self = this;
++	var kid = this.spawn('git',
++	    ['checkout', '-f', 'FETCH_HEAD']);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0) {
++			S.gotoState('running.findmake');
++			return;
++		}
++		self.wc_log.error('failed to run command in zone',
++		    {stderr: errOut});
++		S.gotoState('closing');
++		return;
++	});
++};
++
++WorkerConnection.prototype.state_running.findmake = function (S) {
++	var self = this;
++	var kid = this.spawn('gmake', ['-q', 'check']);
++	var errOut = '';
++	S.on(kid.stderr, 'data', function (data) {
++		errOut = errOut + data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		if (exitStatus === 0 || exitStatus === 1) {
++			S.gotoState('running.makecheck');
++			return;
++		}
++		self.wc_sup.setInitialRepoStatus(self.wc_change.project, false);
++		self.wc_log.warn({status: exitStatus, stderr: errOut},
++		    'make check first run failed, skipping');
++		S.gotoState('closing');
++	});
++};
++
++WorkerConnection.prototype.state_running.makecheck = function (S) {
++	var self = this;
++	var kid = this.spawn('gmake', ['check']);
++	S.on(kid, 'close', function (exitStatus) {
++		self.wc_status = exitStatus;
++		if (exitStatus === 0) {
++			self.wc_sup.setInitialRepoStatus(self.wc_change.project, true);
++		}
++		self.wc_log.info({status: exitStatus},
++		    'make check first run done');
++		S.gotoState('running.makecheck2');
++	});
++};
++
++WorkerConnection.prototype.state_running.makecheck2 = function (S) {
++	var self = this;
++	var kid = this.spawn('gmake', ['check']);
++	var out = '';
++	S.on(kid.stderr, 'data', function (data) {
++		out += data.toString('utf-8');
++	});
++	S.on(kid.stdout, 'data', function (data) {
++		out += data.toString('utf-8');
++	});
++	S.on(kid, 'close', function (exitStatus) {
++		self.wc_out = out.split('\n');
++		self.wc_status = exitStatus;
++		self.wc_log.info({status: exitStatus, output: self.wc_out},
++		    'make check done');
++		S.gotoState('running.report');
++	});
++};
++
++var JSL_RE = /^\/tmp\/repo\/([^(:]+)\(([0-9]+)\): (.+)$/;
++var JSL_NULL_RE = /^\/tmp\/repo\/([^(:]+)$/;
++var JSSTYLE_RE = /^([^:]+): ([0-9]+): (.+)$/;
++var ESLINT_FILE_RE = /^\/tmp\/repo\/(.+)$/;
++var ESLINT_RE = /^\s*([0-9]+):[0-9]+\s+([^ ]+)\s\s+(.+)\s\s+(.+)$/;
++var BASHSTY_RE = /^([^:]+): ([0-9]+): (.+)$/;
++
++WorkerConnection.prototype.state_running.report = function (S) {
++	var self = this;
++	var review = {};
++	review.labels = {};
++	if (this.wc_status === 0) {
++		review.message = '"make check" passed ok';
++		review.labels['CI-Testing'] = '+1';
++	} else {
++		review.message = '"make check" exited with status ' +
++		    this.wc_status;
++		review.labels['CI-Testing'] = '-1';
++
++		var comments = [];
++		var ls = this.wc_out;
++		var mode = 'none';
++		var esfile;
++		var c, m;
++
++		for (var i = 0; i < ls.length; ++i) {
++			if (ls[i].match(/^\s*$/))
++				continue;
++			if (mode === 'jsl') {
++				m = ls[i].match(JSL_RE);
++				if (m) {
++					c = {};
++					c.path = m[1];
++					c.line = parseInt(m[2], 10);
++					c.message = m[3];
++					comments.push(c);
++					continue;
++				} else if (ls[i].match(JSL_NULL_RE)) {
++					continue;
++				} else {
++					mode = 'none';
++				}
++			}
++			if (mode === 'jsstyle') {
++				m = ls[i].match(JSSTYLE_RE);
++				if (m) {
++					c = {};
++					c.path = m[1];
++					c.line = parseInt(m[2], 10);
++					c.message = m[3];
++					comments.push(c);
++					continue;
++				} else if (ls[i].match(/^Unescaped left br/)) {
++					continue;
++				} else {
++					mode = 'none';
++				}
++			}
++			if (mode === 'eslint') {
++				m = ls[i].match(ESLINT_FILE_RE);
++				if (m) {
++					esfile = m[1];
++					continue;
++				}
++				m = ls[i].match(ESLINT_RE);
++				if (m && esfile !== undefined) {
++					c = {};
++					c.path = esfile;
++					c.line = parseInt(m[1], 10);
++					c.message = m[3].trim();
++					comments.push(c);
++					continue;
++				} else {
++					mode = 'none';
++				}
++			}
++			if (mode === 'bashsty') {
++				m = ls[i].match(BASHSTY_RE);
++				if (m) {
++					c = {};
++					c.path = m[1];
++					c.line = parseInt(m[2], 10);
++					c.message = m[3];
++					comments.push(c);
++					continue;
++				} else {
++					mode = 'none';
++				}
++			}
++			if (ls[i].match(/^([^ ]+\/)?jsl /)) {
++				mode = 'jsl';
++			} else if (ls[i].match(/^([^ ]+\/)?jsstyle /)) {
++				mode = 'jsstyle';
++			} else if (ls[i].match(/^([^ ]+\/)?eslint /)) {
++				mode = 'eslint';
++			} else if (ls[i].match(/^([^ ]+\/)?bashstyle /)) {
++				mode = 'bashsty';
++			}
++		}
++
++		review.comments = {};
++		comments.forEach(function (comment) {
++			if (review.comments[comment.path] === undefined)
++				review.comments[comment.path] = [];
++			review.comments[comment.path].push(comment);
++		});
++
++		if (comments.length < 1) {
++			var start = this.wc_out.length - 50;
++			if (start < 0)
++				start = 0;
++			var lines = this.wc_out.slice(start,
++			    this.wc_out.length);
++			lines = lines.map(function (v) { return (' ' + v); });
++			review.message += '\n\n' + lines.join('\n');
++		}
++	}
++	review.project = this.wc_change.project;
++	var spec = this.wc_change.number + ',' + this.wc_patchset.number;
++
++	if (this.wc_config.dryrun) {
++		this.wc_log.info({ review: review },
++		    'skipping posting review for %s; dryrun enabled', spec);
++		S.gotoState('closing');
++		return;
++	}
++
++	this.wc_gerrit.review(spec, review, S.callback(function (err) {
++		if (err) {
++			self.wc_log.error({ err: err },
++			    'failed to post review (report)');
++			/*
++			 * If we hit
++			 * <https://bugs.chromium.org/p/gerrit/issues/detail?id=3475>
++			 * then fallback to a dumber report that doesn't try
++			 * to match 'make check' output to patchset files.
++			 * See arekinath/gerritbot#1.
++			 */
++			var marker = 'not found in revision';
++			if (err.message.search(marker) !== -1) {
++				S.gotoState('running.reportfallback');
++				return;
++			}
++		}
++		S.gotoState('closing');
++	}));
++};
++
++WorkerConnection.prototype.state_running.reportfallback = function (S) {
++	mod_assert.ok(this.wc_status !== 0,
++	    'this impl assumes the "make check" failed');
++
++	var self = this;
++	var review = {};
++	review.labels = {};
++	review.message = '"make check" exited with status ' + this.wc_status;
++	review.labels['CI-Testing'] = '-1';
++
++	var start = this.wc_out.length - 50;
++	if (start < 0)
++		start = 0;
++	var lines = this.wc_out.slice(start,
++	    this.wc_out.length);
++	lines = lines.map(function (v) { return (' ' + v); });
++	review.message += '\n\n' + lines.join('\n');
++
++	review.project = this.wc_change.project;
++	var spec = this.wc_change.number + ',' + this.wc_patchset.number;
++	this.wc_gerrit.review(spec, review, S.callback(function (err) {
++		if (err) {
++			self.wc_log.error({ err: err },
++			    'failed to post review (reportfallback)');
++		}
++		S.gotoState('closing');
++	}));
++};
++
++WorkerConnection.prototype.state_closing = function (S) {
++	var self = this;
++	try {
++		this.wc_ws.send(JSON.stringify({ op: 'exit' }));
++	} catch (e) {
++		this.wc_log.warn({ err: e }, 'failed to send exit message');
++	}
++	this.wc_ws.close();
++	if (this.wc_uuid !== undefined) {
++		this.wc_docker.del('/containers/' + this.wc_uuid + '?force=1',
++		    function (err) {
++			if (err) {
++				self.wc_log.error(err, 'failed to destroy');
++			}
++		});
++	}
++	S.gotoState('closed');
++};
++
++WorkerConnection.prototype.state_closed = function () {
++	this.emit('closed');
++};
++
++function RemoteReadable() {
++	mod_stream.Readable.call(this, {});
++}
++mod_util.inherits(RemoteReadable, mod_stream.Readable);
++RemoteReadable.prototype._read = function (_size) {
++};
++
++WorkerConnection.prototype.handleMessage = function (msg) {
++	mod_assert.string(msg.cookie, 'msg.cookie');
++	var emitter = this.wc_kids[msg.cookie];
++	mod_assert.object(emitter, 'emitter for ' + msg.cookie);
++	var stream;
++
++	if (msg.event === 'data') {
++		stream = emitter[msg.stream];
++		msg.data.forEach(function (d) {
++			stream.push(Buffer.from(d, 'base64'));
++		});
++	} else if (msg.event === 'end') {
++		stream = emitter[msg.stream];
++		stream.push(null);
++	} else if (msg.event === 'spawn') {
++		emitter.emit('spawn', msg.pid);
++		emitter.pid = msg.pid;
++	} else if (msg.event === 'close') {
++		emitter.emit('close', msg.exitStatus);
++	} else if (msg.event === 'done') {
++		emitter.emit('done');
++	} else if (msg.event === 'error') {
++		var err = new Error(msg.error);
++		err.stack = msg.stack;
++		err.code = msg.code;
++		if (msg.stream)
++			emitter[msg.stream].emit('error', err);
++		else
++			emitter.emit('error', err);
++	} else {
++		throw (new Error('Unknown event type ' + msg.event));
++	}
++	this.wc_lastMsg.push(msg);
++	if (this.wc_lastMsg.length > 8)
++		this.wc_lastMsg.shift();
++};
++
++WorkerConnection.prototype.spawn = function (cmd, args, opts) {
++	var self = this;
++	mod_assert.string(cmd, 'command');
++	mod_assert.arrayOfString(args, 'arguments');
++	mod_assert.optionalObject(opts, 'options');
++
++	var cookie = mod_crypto.randomBytes(9).toString('base64');
++	var req = {};
++	req.cookie = cookie;
++	req.op = 'spawn';
++	req.cmd = cmd;
++	req.args = args;
++	req.opts = opts || {};
++
++	var emitter = new mod_events.EventEmitter();
++	emitter.stdout = new RemoteReadable();
++	emitter.stderr = new RemoteReadable();
++
++	this.wc_kids[cookie] = emitter;
++
++	var ended = 0;
++	function onEnd() {
++		if (++ended >= 3)
++			delete (self.wc_kids[cookie]);
++	}
++	emitter.on('close', onEnd);
++	emitter.stdout.on('end', onEnd);
++	emitter.stderr.on('end', onEnd);
++
++	this.wc_ws.send(JSON.stringify(req));
++
++	return (emitter);
++};
++
++WorkerConnection.prototype.streamFile = function (path) {
++	var self = this;
++	mod_assert.string(path, 'path');
++
++	var cookie = mod_crypto.randomBytes(9).toString('base64');
++	var req = {};
++	req.cookie = cookie;
++	req.op = 'streamfile';
++	req.path = path;
++
++	var emitter = new mod_events.EventEmitter();
++	emitter.stream = new RemoteReadable();
++
++	this.wc_kids[cookie] = emitter;
++
++	emitter.on('error', function () {
++		delete (self.wc_kids[cookie]);
++	});
++	emitter.stream.on('end', function () {
++		delete (self.wc_kids[cookie]);
++	});
++
++	this.wc_ws.send(JSON.stringify(req));
++
++	return (emitter);
++};
++
++WorkerConnection.prototype.chdir = function (dir) {
++	var self = this;
++	mod_assert.string(dir, 'dir');
++
++	var cookie = mod_crypto.randomBytes(9).toString('base64');
++	var req = {};
++	req.cookie = cookie;
++	req.op = 'chdir';
++	req.dir = dir;
++
++	var emitter = new mod_events.EventEmitter();
++	this.wc_kids[cookie] = emitter;
++
++	emitter.on('done', function () {
++		delete (self.wc_kids[cookie]);
++	});
++	emitter.on('error', function () {
++		delete (self.wc_kids[cookie]);
++	});
++
++	this.wc_ws.send(JSON.stringify(req));
++
++	return (emitter);
++};
++
++WorkerConnection.prototype.addPath = function (post, pre) {
++	var self = this;
++	mod_assert.arrayOfString(post, 'post');
++	mod_assert.optionalArrayOfString(pre, 'pre');
++
++	var cookie = mod_crypto.randomBytes(9).toString('base64');
++	var req = {};
++	req.cookie = cookie;
++	req.op = 'addpath';
++	req.pre = pre;
++	req.post = post;
++
++	var emitter = new mod_events.EventEmitter();
++	this.wc_kids[cookie] = emitter;
++
++	emitter.on('done', function () {
++		delete (self.wc_kids[cookie]);
++	});
++	emitter.on('error', function () {
++		delete (self.wc_kids[cookie]);
++	});
++
++	this.wc_ws.send(JSON.stringify(req));
++
++	return (emitter);
++};
++
++
++module.exports = {
++	Connection: WorkerConnection
++};
+diff --git a/package.json b/package.json
+index 0415470..9e4f5c2 100644
+--- a/package.json
++++ b/package.json
+@@ -13,9 +13,11 @@
+     "bunyan": "^1.8.1",
+     "gerritbot": "^1.0.0",
+     "jade": "^1.11.0",
++    "jsprim": "^2.0.0",
+     "lstream": "0.0.4",
+-    "mooremachine": "^2.0.0",
++    "mooremachine": "^2.3.0",
+     "restify-clients": "^1.3.0",
++    "safer-buffer": "~2.1.0",
+     "sshpk": "^1.10.0",
+     "vasync": "^1.6.4",
+     "verror": "^1.6.1",
+diff --git a/server.js b/server.js
+index 344af93..41eea67 100644
+--- a/server.js
++++ b/server.js
+@@ -2,26 +2,24 @@
+  * This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- *
+- * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+-const mod_ws = require('ws');
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++'use strict';
++
+ const mod_assert = require('assert-plus');
+-const mod_fs = require('fs');
+-const mod_fsm = require('mooremachine');
+-const mod_util = require('util');
+ const mod_bunyan = require('bunyan');
+ const mod_crypto = require('crypto');
+-const mod_stream = require('stream');
++const mod_fs = require('fs');
++const mod_gbot = require('gerritbot');
+ const mod_restify = require('restify-clients');
+ const mod_sshpk = require('sshpk');
+-const mod_events = require('events');
+-const mod_http = require('http');
+-const mod_vasync = require('vasync');
+-const mod_gbot = require('gerritbot');
+-const mod_jade = require('jade');
+-const mod_qs = require('querystring');
++const mod_supervisor = require('./lib/supervisor');
++
++const COOKIE = mod_crypto.randomBytes(8).toString('base64');
+ 
+ var config = JSON.parse(
+     mod_fs.readFileSync('etc/config.json').toString('utf-8'));
+@@ -33,13 +31,6 @@ if (config.port === undefined)
+ 
+ var log = mod_bunyan.createLogger({ name: 'makecheckbot' });
+ 
+-var repoHasMakeCheck = {};
+-repoHasMakeCheck['joyent/illumos-extra'] = false;
+-repoHasMakeCheck['joyent/illumos-joyent'] = false;
+-repoHasMakeCheck['joyent/zfs_snapshot_tar'] = false;
+-repoHasMakeCheck['joyent/illumos-kvm'] = false;
+-repoHasMakeCheck['joyent/postgres'] = false;
+-
+ var dockerKeyPem = mod_fs.readFileSync(config.docker.keyFile);
+ var dockerKey = mod_sshpk.parsePrivateKey(dockerKeyPem);
+ var id = mod_sshpk.identityFromDN('CN=' + config.docker.user);
+@@ -64,1094 +55,12 @@ var docker = mod_restify.createJsonClient({
+ 	cert: cert.toBuffer('pem')
+ });
+ 
+-const COOKIE = mod_crypto.randomBytes(8).toString('base64');
+-
+-var spawning = {};
+-var queue = [];
+-
+-function spawnWorker() {
+-	var spawnCookie = mod_crypto.randomBytes(8).toString('base64');
+-	spawning[spawnCookie] = 'provisioning';
+-	var agentUrl =
+-	    'http://' + config.my_name + ':' + config.port + '/agent.js';
+-	var payload = {
+-		Hostname: '',
+-		Domainname: '',
+-		User: '',
+-		AttachStdin: false,
+-		AttachStdout: false,
+-		AttachStderr: false,
+-		Tty: false,
+-		OpenStdin: false,
+-		StdinOnce: false,
+-		Env: [],
+-		Cmd: [
+-			'/usr/bin/bash', '-c',
+-			'export PATH=/opt/local/bin:/opt/local/sbin:$PATH; ' +
+-			'useradd -P "Primary Administrator" -s /usr/bin/bash ' +
+-				'-m build && ' +
+-			'pkgin -y up && ' +
+-			'pkgin -y in nodejs && ' +
+-			'curl -O ' + agentUrl + ' && ' +
+-			'npm install ws mooremachine && ' +
+-			'/usr/lib/pfexecd && ' +
+-			'exec su - build -c "' +
+-				'exec node /tmp/agent.js ' + config.my_name +
+-				' ' + config.port + ' ' + COOKIE +
+-			'"'
+-		],
+-		Entrypoint: [],
+-		Image: config.slaves.image,
+-		Labels: { 'buildbot.worker': 'true' },
+-		Volumes: {},
+-		WorkingDir: '/tmp',
+-		NetworkDisabled: false,
+-		NetworkMode: config.docker.network,
+-		ExposedPorts: {},
+-		StopSignal: 'SIGTERM',
+-		HostConfig: {
+-			Binds: [],
+-			Links: [],
+-			LxcConf: {'lxc.utsname': 'docker'},
+-			Memory: 2048 * 1024 * 1024,
+-			Dns: ['8.8.8.8', '8.8.4.4']
+-		}
+-	};
+-	docker.post('/containers/create', payload,
+-	    function (err, req, res, obj) {
+-		if (err) {
+-			delete (spawning[spawnCookie]);
+-			log.error(err, 'spawning docker container');
+-		} else {
+-			var cid = obj.Id.slice(0, 12);
+-			log.info('created docker container %s', cid);
+-			spawning[spawnCookie] = 'booting';
+-			docker.post('/containers/' + cid + '/start', {},
+-			    function (err2) {
+-				if (err2) {
+-					delete (spawning[spawnCookie]);
+-					log.error(err2,
+-					    'starting docker container %s',
+-					    cid);
+-				} else {
+-					delete (spawning[spawnCookie]);
+-					spawning[cid] = 'booting';
+-					log.info('started docker container %s',
+-					    cid);
+-				}
+-			});
+-		}
+-	});
+-}
+-
+-var slaves = [];
+-var evs;
+-var httpServer = mod_http.createServer();
+-var server = new mod_ws.Server({ server: httpServer });
+-
+-var tplCache = {};
+-function getTpl(fn) {
+-	var stat = mod_fs.statSync(fn);
+-	var cache = tplCache[fn];
+-	if (cache && stat.mtime.getTime() <= cache.mtime.getTime())
+-		return (cache.func);
+-
+-	var tpl = mod_fs.readFileSync(fn, 'utf-8');
+-	var func;
+-	try {
+-		func = mod_jade.compile(tpl, {
+-			filename: fn,
+-			pretty: true
+-		});
+-	} catch (e) {
+-		log.error(e, 'failed to compile template');
+-		func = function () { return ('Error'); };
+-	}
+-	tplCache[fn] = { mtime: stat.mtime, func: func };
+-	return (func);
+-}
+-
+-server.on('connection', function onConnection(ws) {
+-	var conn = new SlaveConnection({
+-		config: config,
+-		log: log
+-	});
+-	conn.accept(ws);
+-	runQueue();
+-});
+-
+-httpServer.on('request', function (req, res) {
+-	if (req.url === '/agent.js') {
+-		res.writeHead(200);
+-		mod_fs.createReadStream('./agent.js').pipe(res);
+-	} else if (req.url === '/status') {
+-		var tpl = getTpl('./status.html.tpl');
+-		var vars = {
+-			slaves: slaves,
+-			overrides: repoHasMakeCheck,
+-			queue: queue,
+-			spawning: spawning
+-		};
+-		var html;
+-		try {
+-			html = tpl(vars);
+-		} catch (e) {
+-			html = e.stack;
+-		}
+-		res.writeHead(200, {
+-			'content-type': 'text/html'
+-		});
+-		res.write(html);
+-		res.end();
+-	} else if (req.url === '/override' && req.method === 'POST') {
+-		var formdata = '';
+-		req.on('readable', function () {
+-			var chunk;
+-			while ((chunk = req.read()) !== null) {
+-				formdata += chunk.toString('utf-8');
+-			}
+-		});
+-		req.on('end', function () {
+-			var args = mod_qs.parse(formdata);
+-			if (args && args.repo) {
+-				if (args.clear) {
+-					delete (repoHasMakeCheck[args.repo]);
+-				} else if (args.value) {
+-					repoHasMakeCheck[args.repo] =
+-					    (args.value === 'true');
+-				}
+-				res.writeHead(303, { 'location': '/status' });
+-				res.end();
+-			} else {
+-				res.writeHead(500);
+-				res.end();
+-			}
+-		});
+-	} else if (req.url === '/bootstrap' && req.method === 'POST') {
+-		evs.emit('bootstrap');
+-		res.writeHead(303, { 'location': '/status' });
+-		res.end();
+-	} else if (req.url === '/runquery' && req.method === 'POST') {
+-		var formdata = '';
+-		req.on('readable', function () {
+-			var chunk;
+-			while ((chunk = req.read()) !== null) {
+-				formdata += chunk.toString('utf-8');
+-			}
+-		});
+-		req.on('end', function () {
+-			var args = mod_qs.parse(formdata);
+-			if (args && args.query) {
+-				runQuery(args.query);
+-				res.writeHead(303, { 'location': '/status' });
+-				res.end();
+-			} else {
+-				res.writeHead(500);
+-				res.end();
+-			}
+-		});
+-	} else {
+-		res.writeHead(404);
+-		res.end();
+-	}
++var server = new mod_supervisor.Server({
++	docker: docker,
++	gerrit: gerrit,
++	config: config,
++	cookie: COOKIE,
++	log: log
+ });
+ 
+-httpServer.listen(config.port);
+-
+-function SlaveConnection(opts) {
+-	mod_assert.object(opts, 'options');
+-	mod_assert.object(opts.config, 'options.config');
+-	mod_assert.optionalObject(opts.log, 'options.log');
+-	this.sc_log = opts.log;
+-	this.sc_ws = undefined;
+-	if (this.sc_log === undefined)
+-		this.sc_log = mod_bunyan.createLogger({ name: 'connection '});
+-	this.sc_config = opts.config;
+-	this.sc_uuid = undefined;
+-	this.sc_kids = {};
+-	this.sc_lastMsg = [];
+-	slaves.push(this);
+-	mod_fsm.FSM.call(this, 'idle');
+-}
+-mod_util.inherits(SlaveConnection, mod_fsm.FSM);
+-
+-SlaveConnection.prototype.accept = function (ws) {
+-	mod_assert.strictEqual(this.getState(), 'idle');
+-	this.sc_ws = ws;
+-	var req = this.sc_ws.upgradeReq;
+-	var sock = req.socket;
+-	this.sc_log = this.sc_log.child({
+-		client: sock.remoteAddress + ':' + sock.remotePort
+-	});
+-	this.emit('acceptAsserted');
+-};
+-
+-SlaveConnection.prototype.state_idle = function (S) {
+-	S.on(this, 'acceptAsserted', function () {
+-		S.gotoState('auth');
+-	});
+-};
+-
+-SlaveConnection.prototype.state_auth = function (S) {
+-	var self = this;
+-	var others = slaves.filter(function (sc) {
+-		return (!(sc.isInState('closed') || sc.isInState('closing')) &&
+-		    sc.sc_uuid === self.sc_uuid && sc !== self);
+-	});
+-	if (others.length > 0) {
+-		self.sc_log.error('duplicate client');
+-		S.gotoState('closing');
+-		return;
+-	}
+-	S.timeout(5000, function () {
+-		S.gotoState('closing');
+-	});
+-	S.on(this.sc_ws, 'message', function onMessage(msg) {
+-		try {
+-			msg = JSON.parse(msg);
+-		} catch (e) {
+-			self.sc_log.error(e,
+-			    'failed to parse incoming message');
+-			S.gotoState('closing');
+-			return;
+-		}
+-		var keys = Object.keys(msg).sort();
+-		if (msg.cookie === COOKIE && keys.length === 2 &&
+-		    keys[0] === 'cookie' && keys[1] === 'uuid') {
+-			self.sc_uuid = msg.uuid.replace(/-/g, '');
+-			var cid = self.sc_uuid.slice(0, 12);
+-			delete (spawning[cid]);
+-			self.sc_log.info('authenticated agent on %s', cid);
+-			self.sc_log = self.sc_log.child({ cid: cid });
+-			S.gotoState('setup');
+-		} else {
+-			self.sc_log.warn('failed to auth slave, disconnecting');
+-			S.gotoState('closing');
+-		}
+-	});
+-	S.on(this.sc_ws, 'close', function () {
+-		S.gotoState('closing');
+-	});
+-};
+-
+-SlaveConnection.prototype.state_setup = function (S) {
+-	var self = this;
+-	S.on(this.sc_ws, 'message', function onMessage(msg) {
+-		try {
+-			msg = JSON.parse(msg);
+-		} catch (e) {
+-			self.sc_log.error(e,
+-			    'failed to parse incoming message');
+-			S.gotoState('closing');
+-			return;
+-		}
+-		self.handleMessage(msg);
+-	});
+-	S.on(this.sc_ws, 'close', function () {
+-		S.gotoState('closing');
+-	});
+-	S.gotoState('setup.pkgsrc');
+-};
+-
+-SlaveConnection.prototype.state_setup.pkgsrc = function (S) {
+-	var self = this;
+-	mod_vasync.forEachPipeline({
+-		func: processPkgsrc,
+-		inputs: this.sc_config.slaves.pkgsrc || []
+-	}, function (err) {
+-		if (err) {
+-			self.sc_log.error(err, 'failed to setup zone');
+-			S.gotoState('closing');
+-			return;
+-		}
+-		S.gotoState('setup.npm');
+-	});
+-	function processPkgsrc(instr, cb) {
+-		var cmd = 'pfexec';
+-		var args = ['/opt/local/bin/pkgin', '-y'];
+-		var m = instr.match(/^-(.+)$/);
+-		if (m) {
+-			args.push('rm');
+-			args.push(m[1]);
+-		} else {
+-			args.push('in');
+-			args.push(instr);
+-		}
+-		var kid = self.spawn(cmd, args);
+-		var errOut = '';
+-		S.on(kid.stderr, 'data', function (data) {
+-			errOut = errOut + data.toString('utf-8');
+-		});
+-		S.on(kid, 'close', function (exitStatus) {
+-			if (exitStatus === 0) {
+-				cb();
+-				return;
+-			}
+-			self.sc_log.error('failed to run pkgin cmd in zone',
+-			    {args: args, stderr: errOut});
+-			cb(new Error('pkgin command failed'));
+-		});
+-	}
+-};
+-
+-SlaveConnection.prototype.state_setup.npm = function (S) {
+-	var self = this;
+-	mod_vasync.forEachPipeline({
+-		func: processPkgsrc,
+-		inputs: this.sc_config.slaves.npm || []
+-	}, function (err) {
+-		if (err) {
+-			self.sc_log.error(err, 'failed to setup zone');
+-			S.gotoState('closing');
+-			return;
+-		}
+-		S.gotoState('setup.clean_old');
+-	});
+-	function processPkgsrc(instr, cb) {
+-		var cmd = 'pfexec';
+-		var args = ['/opt/local/bin/npm', 'install', '-g', instr];
+-		var kid = self.spawn(cmd, args);
+-		var errOut = '';
+-		S.on(kid.stderr, 'data', function (data) {
+-			errOut = errOut + data.toString('utf-8');
+-		});
+-		S.on(kid, 'close', function (exitStatus) {
+-			if (exitStatus === 0) {
+-				cb();
+-				return;
+-			}
+-			self.sc_log.error('failed to run npm cmd in zone',
+-			    {args: args, stderr: errOut});
+-			cb(new Error('npm command failed'));
+-		});
+-	}
+-};
+-
+-SlaveConnection.prototype.state_setup.clean_old = function (S) {
+-	var self = this;
+-	var kid = this.spawn('rm',
+-	    ['-rf',
+-	    '/home/build/jsstyle',
+-	    '/home/build/javascriptlint',
+-	    '/tmp/repo']);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0) {
+-			S.gotoState('setup.jsl_clone');
+-			return;
+-		}
+-		self.sc_log.error('failed to run command in zone',
+-		    {stderr: errOut});
+-		S.gotoState('closing');
+-		return;
+-	});
+-};
+-
+-SlaveConnection.prototype.state_setup.jsl_clone = function (S) {
+-	var self = this;
+-	var kid = this.spawn('git',
+-	    ['clone',
+-	    'https://github.com/davepacheco/javascriptlint',
+-	    '/home/build/javascriptlint']);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0) {
+-			S.gotoState('setup.jsl_chdir');
+-			return;
+-		}
+-		self.sc_log.error('failed to run command in zone',
+-		    {stderr: errOut});
+-		S.gotoState('closing');
+-		return;
+-	});
+-};
+-
+-SlaveConnection.prototype.state_setup.jsl_chdir = function (S) {
+-	var self = this;
+-	var emitter = this.chdir('/home/build/javascriptlint');
+-	S.on(emitter, 'done', function () {
+-		S.gotoState('setup.jsl_build');
+-	});
+-	S.on(emitter, 'error', function (err) {
+-		self.sc_log.error(err, 'failed to chdir');
+-		S.gotoState('closing');
+-	});
+-};
+-
+-SlaveConnection.prototype.state_setup.jsl_build = function (S) {
+-	var self = this;
+-	var kid = this.spawn('gmake', ['install']);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0) {
+-			S.gotoState('setup.jsstyle_clone');
+-			return;
+-		}
+-		self.sc_log.error('failed to run command in zone',
+-		    {stderr: errOut});
+-		S.gotoState('closing');
+-		return;
+-	});
+-};
+-
+-SlaveConnection.prototype.state_setup.jsstyle_clone = function (S) {
+-	var self = this;
+-	var kid = this.spawn('git',
+-	    ['clone',
+-	    'https://github.com/davepacheco/jsstyle',
+-	    '/home/build/jsstyle']);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0) {
+-			S.gotoState('setup.lintpaths');
+-			return;
+-		}
+-		self.sc_log.error('failed to run command in zone',
+-		    {stderr: errOut});
+-		S.gotoState('closing');
+-		return;
+-	});
+-};
+-
+-SlaveConnection.prototype.state_setup.lintpaths = function (S) {
+-	var self = this;
+-	var emitter = this.addPath([
+-	    '/home/build/javascriptlint/build/install',
+-	    '/home/build/jsstyle'
+-	]);
+-	S.on(emitter, 'done', function () {
+-		S.gotoState('ready');
+-	});
+-	S.on(emitter, 'error', function (err) {
+-		self.sc_log.error(err, 'failed to add paths');
+-		S.gotoState('closing');
+-	});
+-};
+-
+-SlaveConnection.prototype.state_ready = function (S) {
+-	var self = this;
+-	this.sc_log.info('ready to rock');
+-	S.on(this.sc_ws, 'message', function onMessage(msg) {
+-		try {
+-			msg = JSON.parse(msg);
+-		} catch (e) {
+-			self.sc_log.error(e,
+-			    'failed to parse incoming message');
+-			S.gotoState('closing');
+-			return;
+-		}
+-		self.handleMessage(msg);
+-	});
+-	S.on(this, 'claimAsserted', function () {
+-		S.gotoState('running');
+-	});
+-	S.on(this.sc_ws, 'close', function () {
+-		S.gotoState('closing');
+-	});
+-	runQueue();
+-};
+-
+-SlaveConnection.prototype.build = function (change, patchset) {
+-	mod_assert.strictEqual(this.getState(), 'ready');
+-	this.sc_change = change;
+-	this.sc_patchset = patchset;
+-	this.emit('claimAsserted');
+-};
+-
+-SlaveConnection.prototype.release = function () {
+-	mod_assert.strictEqual(this.getState(), 'running');
+-	this.emit('releaseAsserted');
+-};
+-
+-SlaveConnection.prototype.state_running = function (S) {
+-	var self = this;
+-	this.sc_log.info('building %s #%d (ps %d)', this.sc_change.project,
+-	    this.sc_change.number, this.sc_patchset.number);
+-	S.on(this.sc_ws, 'message', function onMessage(msg) {
+-		try {
+-			msg = JSON.parse(msg);
+-		} catch (e) {
+-			self.sc_log.error(e,
+-			    'failed to parse incoming message');
+-			S.gotoState('closing');
+-			return;
+-		}
+-		self.handleMessage(msg);
+-	});
+-	S.on(this, 'releaseAsserted', function () {
+-		S.gotoState('closing');
+-	});
+-	S.on(this.sc_ws, 'close', function () {
+-		S.gotoState('closing');
+-	});
+-	S.gotoState('running.clone');
+-};
+-
+-SlaveConnection.prototype.state_running.clone = function (S) {
+-	var self = this;
+-	var kid = this.spawn('git',
+-	    ['clone',
+-	    'https://' + config.gerrit.host + '/' + this.sc_change.project,
+-	    '/tmp/repo']);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0) {
+-			S.gotoState('running.chdir');
+-			return;
+-		}
+-		self.sc_log.error('failed to run command in zone',
+-		    {stderr: errOut});
+-		S.gotoState('closing');
+-		return;
+-	});
+-};
+-
+-SlaveConnection.prototype.state_running.chdir = function (S) {
+-	var self = this;
+-	var emitter = this.chdir('/tmp/repo');
+-	S.on(emitter, 'done', function () {
+-		S.gotoState('running.fetch');
+-	});
+-	S.on(emitter, 'error', function (err) {
+-		self.sc_log.error(err, 'failed to chdir');
+-		S.gotoState('closing');
+-	});
+-};
+-
+-SlaveConnection.prototype.state_running.fetch = function (S) {
+-	var self = this;
+-	var kid = this.spawn('git',
+-	    ['fetch', 'origin', this.sc_patchset.ref]);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0) {
+-			S.gotoState('running.checkout');
+-			return;
+-		}
+-		self.sc_log.error('failed to run command in zone',
+-		    {stderr: errOut});
+-		S.gotoState('closing');
+-		return;
+-	});
+-};
+-
+-SlaveConnection.prototype.state_running.checkout = function (S) {
+-	var self = this;
+-	var kid = this.spawn('git',
+-	    ['checkout', '-f', 'FETCH_HEAD']);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0) {
+-			S.gotoState('running.findmake');
+-			return;
+-		}
+-		self.sc_log.error('failed to run command in zone',
+-		    {stderr: errOut});
+-		S.gotoState('closing');
+-		return;
+-	});
+-};
+-
+-SlaveConnection.prototype.state_running.findmake = function (S) {
+-	var self = this;
+-	var kid = this.spawn('gmake', ['-q', 'check']);
+-	var errOut = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		errOut = errOut + data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		if (exitStatus === 0 || exitStatus === 1) {
+-			S.gotoState('running.makecheck');
+-			return;
+-		}
+-		if (repoHasMakeCheck[self.sc_change.project] === undefined)
+-			repoHasMakeCheck[self.sc_change.project] = false;
+-		self.sc_log.warn({status: exitStatus, stderr: errOut},
+-		    'make check first run failed, skipping');
+-		S.gotoState('closing');
+-	});
+-};
+-
+-SlaveConnection.prototype.state_running.makecheck = function (S) {
+-	var self = this;
+-	var kid = this.spawn('gmake', ['check']);
+-	S.on(kid, 'close', function (exitStatus) {
+-		self.sc_status = exitStatus;
+-		if (exitStatus === 0)
+-			repoHasMakeCheck[self.sc_change.project] = true;
+-		self.sc_log.info({status: exitStatus},
+-		    'make check first run done');
+-		S.gotoState('running.makecheck2');
+-	});
+-};
+-
+-SlaveConnection.prototype.state_running.makecheck2 = function (S) {
+-	var self = this;
+-	var kid = this.spawn('gmake', ['check']);
+-	var out = '';
+-	S.on(kid.stderr, 'data', function (data) {
+-		out += data.toString('utf-8');
+-	});
+-	S.on(kid.stdout, 'data', function (data) {
+-		out += data.toString('utf-8');
+-	});
+-	S.on(kid, 'close', function (exitStatus) {
+-		self.sc_out = out.split('\n');
+-		self.sc_status = exitStatus;
+-		self.sc_log.info({status: exitStatus, output: self.sc_out},
+-		    'make check done');
+-		S.gotoState('running.report');
+-	});
+-};
+-
+-var JSL_RE = /^\/tmp\/repo\/([^(:]+)\(([0-9]+)\): (.+)$/;
+-var JSL_NULL_RE = /^\/tmp\/repo\/([^(:]+)$/;
+-var JSSTYLE_RE = /^([^:]+): ([0-9]+): (.+)$/;
+-var ESLINT_FILE_RE = /^\/tmp\/repo\/(.+)$/;
+-var ESLINT_RE = /^\s*([0-9]+):[0-9]+\s+([^ ]+)\s\s+(.+)\s\s+(.+)$/;
+-var BASHSTY_RE = /^([^:]+): ([0-9]+): (.+)$/;
+-
+-SlaveConnection.prototype.state_running.report = function (S) {
+-	var self = this;
+-	var review = {};
+-	review.labels = {};
+-	if (this.sc_status === 0) {
+-		review.message = '"make check" passed ok';
+-		review.labels['CI-Testing'] = '+1';
+-	} else {
+-		review.message = '"make check" exited with status ' +
+-		    this.sc_status;
+-		review.labels['CI-Testing'] = '-1';
+-
+-		var comments = [];
+-		var ls = this.sc_out;
+-		var mode = 'none';
+-		var esfile;
+-		var c, m;
+-
+-		for (var i = 0; i < ls.length; ++i) {
+-			if (ls[i].match(/^\s*$/))
+-				continue;
+-			if (mode === 'jsl') {
+-				m = ls[i].match(JSL_RE);
+-				if (m) {
+-					c = {};
+-					c.path = m[1];
+-					c.line = parseInt(m[2], 10);
+-					c.message = m[3];
+-					comments.push(c);
+-					continue;
+-				} else if (ls[i].match(JSL_NULL_RE)) {
+-					continue;
+-				} else {
+-					mode = 'none';
+-				}
+-			}
+-			if (mode === 'jsstyle') {
+-				m = ls[i].match(JSSTYLE_RE);
+-				if (m) {
+-					c = {};
+-					c.path = m[1];
+-					c.line = parseInt(m[2], 10);
+-					c.message = m[3];
+-					comments.push(c);
+-					continue;
+-				} else if (ls[i].match(/^Unescaped left br/)) {
+-					continue;
+-				} else {
+-					mode = 'none';
+-				}
+-			}
+-			if (mode === 'eslint') {
+-				m = ls[i].match(ESLINT_FILE_RE);
+-				if (m) {
+-					esfile = m[1];
+-					continue;
+-				}
+-				m = ls[i].match(ESLINT_RE);
+-				if (m && esfile !== undefined) {
+-					c = {};
+-					c.path = esfile;
+-					c.line = parseInt(m[1], 10);
+-					c.message = m[3].trim();
+-					comments.push(c);
+-					continue;
+-				} else {
+-					mode = 'none';
+-				}
+-			}
+-			if (mode === 'bashsty') {
+-				m = ls[i].match(BASHSTY_RE);
+-				if (m) {
+-					c = {};
+-					c.path = m[1];
+-					c.line = parseInt(m[2], 10);
+-					c.message = m[3];
+-					comments.push(c);
+-					continue;
+-				} else {
+-					mode = 'none';
+-				}
+-			}
+-			if (ls[i].match(/^([^ ]+\/)?jsl /)) {
+-				mode = 'jsl';
+-			} else if (ls[i].match(/^([^ ]+\/)?jsstyle /)) {
+-				mode = 'jsstyle';
+-			} else if (ls[i].match(/^([^ ]+\/)?eslint /)) {
+-				mode = 'eslint';
+-			} else if (ls[i].match(/^([^ ]+\/)?bashstyle /)) {
+-				mode = 'bashsty';
+-			}
+-		}
+-
+-		review.comments = {};
+-		comments.forEach(function (comment) {
+-			if (review.comments[comment.path] === undefined)
+-				review.comments[comment.path] = [];
+-			review.comments[comment.path].push(comment);
+-		});
+-
+-		if (comments.length < 1) {
+-			var start = this.sc_out.length - 50;
+-			if (start < 0)
+-				start = 0;
+-			var lines = this.sc_out.slice(start,
+-			    this.sc_out.length);
+-			lines = lines.map(function (v) { return (' ' + v); });
+-			review.message += '\n\n' + lines.join('\n');
+-		}
+-	}
+-	review.project = this.sc_change.project;
+-	var spec = this.sc_change.number + ',' + this.sc_patchset.number;
+-	gerrit.review(spec, review, S.callback(function (err) {
+-		if (err) {
+-			self.sc_log.error({ err: err },
+-			    'failed to post review (report)');
+-			/*
+-			 * If we hit
+-			 * <https://bugs.chromium.org/p/gerrit/issues/detail?id=3475>
+-			 * then fallback to a dumber report that doesn't try
+-			 * to match 'make check' output to patchset files.
+-			 * See arekinath/gerritbot#1.
+-			 */
+-			var marker = 'not found in revision';
+-			if (err.message.search(marker) !== -1) {
+-				S.gotoState('running.reportfallback');
+-				return;
+-			}
+-		}
+-		S.gotoState('closing');
+-	}));
+-};
+-
+-SlaveConnection.prototype.state_running.reportfallback = function (S) {
+-	mod_assert.ok(this.sc_status !== 0,
+-	    'this impl assumes the "make check" failed');
+-
+-	var self = this;
+-	var review = {};
+-	review.labels = {};
+-	review.message = '"make check" exited with status ' + this.sc_status;
+-	review.labels['CI-Testing'] = '-1';
+-
+-	var start = this.sc_out.length - 50;
+-	if (start < 0)
+-		start = 0;
+-	var lines = this.sc_out.slice(start,
+-	    this.sc_out.length);
+-	lines = lines.map(function (v) { return (' ' + v); });
+-	review.message += '\n\n' + lines.join('\n');
+-
+-	review.project = this.sc_change.project;
+-	var spec = this.sc_change.number + ',' + this.sc_patchset.number;
+-	gerrit.review(spec, review, S.callback(function (err) {
+-		if (err) {
+-			self.sc_log.error({ err: err },
+-			    'failed to post review (reportfallback)');
+-		}
+-		S.gotoState('closing');
+-	}));
+-};
+-
+-SlaveConnection.prototype.state_closing = function (S) {
+-	var self = this;
+-	try {
+-		this.sc_ws.send(JSON.stringify({ op: 'exit' }));
+-	} catch (e) {
+-		this.sc_log.warn({ err: e }, 'failed to send exit message');
+-	}
+-	this.sc_ws.close();
+-	var idx = slaves.indexOf(this);
+-	mod_assert.notStrictEqual(idx, -1);
+-	slaves.splice(idx, 1);
+-	if (this.sc_uuid !== undefined) {
+-		docker.del('/containers/' + this.sc_uuid + '?force=1',
+-		    function (err) {
+-			if (err) {
+-				self.sc_log.error(err, 'failed to destroy');
+-			}
+-		});
+-	}
+-	S.gotoState('closed');
+-};
+-
+-SlaveConnection.prototype.state_closed = function () {
+-};
+-
+-function RemoteReadable() {
+-	mod_stream.Readable.call(this, {});
+-}
+-mod_util.inherits(RemoteReadable, mod_stream.Readable);
+-RemoteReadable.prototype._read = function (_size) {
+-};
+-
+-SlaveConnection.prototype.handleMessage = function (msg) {
+-	mod_assert.string(msg.cookie, 'msg.cookie');
+-	var emitter = this.sc_kids[msg.cookie];
+-	mod_assert.object(emitter, 'emitter for ' + msg.cookie);
+-	var stream;
+-
+-	if (msg.event === 'data') {
+-		stream = emitter[msg.stream];
+-		msg.data.forEach(function (d) {
+-			stream.push(new Buffer(d, 'base64'));
+-		});
+-	} else if (msg.event === 'end') {
+-		stream = emitter[msg.stream];
+-		stream.push(null);
+-	} else if (msg.event === 'spawn') {
+-		emitter.emit('spawn', msg.pid);
+-		emitter.pid = msg.pid;
+-	} else if (msg.event === 'close') {
+-		emitter.emit('close', msg.exitStatus);
+-	} else if (msg.event === 'done') {
+-		emitter.emit('done');
+-	} else if (msg.event === 'error') {
+-		var err = new Error(msg.error);
+-		err.stack = msg.stack;
+-		err.code = msg.code;
+-		if (msg.stream)
+-			emitter[msg.stream].emit('error', err);
+-		else
+-			emitter.emit('error', err);
+-	} else {
+-		throw (new Error('Unknown event type ' + msg.event));
+-	}
+-	this.sc_lastMsg.push(msg);
+-	if (this.sc_lastMsg.length > 8)
+-		this.sc_lastMsg.shift();
+-};
+-
+-SlaveConnection.prototype.spawn = function (cmd, args, opts) {
+-	var self = this;
+-	mod_assert.string(cmd, 'command');
+-	mod_assert.arrayOfString(args, 'arguments');
+-	mod_assert.optionalObject(opts, 'options');
+-
+-	var cookie = mod_crypto.randomBytes(9).toString('base64');
+-	var req = {};
+-	req.cookie = cookie;
+-	req.op = 'spawn';
+-	req.cmd = cmd;
+-	req.args = args;
+-	req.opts = opts || {};
+-
+-	var emitter = new mod_events.EventEmitter();
+-	emitter.stdout = new RemoteReadable();
+-	emitter.stderr = new RemoteReadable();
+-
+-	this.sc_kids[cookie] = emitter;
+-
+-	var ended = 0;
+-	function onEnd() {
+-		if (++ended >= 3)
+-			delete (self.sc_kids[cookie]);
+-	}
+-	emitter.on('close', onEnd);
+-	emitter.stdout.on('end', onEnd);
+-	emitter.stderr.on('end', onEnd);
+-
+-	this.sc_ws.send(JSON.stringify(req));
+-
+-	return (emitter);
+-};
+-
+-SlaveConnection.prototype.streamFile = function (path) {
+-	var self = this;
+-	mod_assert.string(path, 'path');
+-
+-	var cookie = mod_crypto.randomBytes(9).toString('base64');
+-	var req = {};
+-	req.cookie = cookie;
+-	req.op = 'streamfile';
+-	req.path = path;
+-
+-	var emitter = new mod_events.EventEmitter();
+-	emitter.stream = new RemoteReadable();
+-
+-	this.sc_kids[cookie] = emitter;
+-
+-	emitter.on('error', function () {
+-		delete (self.sc_kids[cookie]);
+-	});
+-	emitter.stream.on('end', function () {
+-		delete (self.sc_kids[cookie]);
+-	});
+-
+-	this.sc_ws.send(JSON.stringify(req));
+-
+-	return (emitter);
+-};
+-
+-SlaveConnection.prototype.chdir = function (dir) {
+-	var self = this;
+-	mod_assert.string(dir, 'dir');
+-
+-	var cookie = mod_crypto.randomBytes(9).toString('base64');
+-	var req = {};
+-	req.cookie = cookie;
+-	req.op = 'chdir';
+-	req.dir = dir;
+-
+-	var emitter = new mod_events.EventEmitter();
+-	this.sc_kids[cookie] = emitter;
+-
+-	emitter.on('done', function () {
+-		delete (self.sc_kids[cookie]);
+-	});
+-	emitter.on('error', function () {
+-		delete (self.sc_kids[cookie]);
+-	});
+-
+-	this.sc_ws.send(JSON.stringify(req));
+-
+-	return (emitter);
+-};
+-
+-SlaveConnection.prototype.addPath = function (post, pre) {
+-	var self = this;
+-	mod_assert.arrayOfString(post, 'post');
+-	mod_assert.optionalArrayOfString(pre, 'pre');
+-
+-	var cookie = mod_crypto.randomBytes(9).toString('base64');
+-	var req = {};
+-	req.cookie = cookie;
+-	req.op = 'addpath';
+-	req.pre = pre;
+-	req.post = post;
+-
+-	var emitter = new mod_events.EventEmitter();
+-	this.sc_kids[cookie] = emitter;
+-
+-	emitter.on('done', function () {
+-		delete (self.sc_kids[cookie]);
+-	});
+-	emitter.on('error', function () {
+-		delete (self.sc_kids[cookie]);
+-	});
+-
+-	this.sc_ws.send(JSON.stringify(req));
+-
+-	return (emitter);
+-};
+-
+-for (var i = 0; i < config.spares; ++i)
+-	spawnWorker();
+-
+-evs = gerrit.eventStream();
+-evs.on('bootstrap', function () {
+-	runQuery('status:open AND NOT label:CI-Testing>=-1');
+-});
+-function runQuery(q) {
+-	var incl = ['patch-sets'];
+-	var qstream = gerrit.queryStream(q, incl);
+-	qstream.on('readable', function () {
+-		var change;
+-		while ((change = qstream.read()) !== null) {
+-			if (change.project === undefined ||
+-			    change.id === undefined) {
+-				continue;
+-			}
+-			var ps = change.patchSets[change.patchSets.length - 1];
+-			if (ps.isDraft === false)
+-				handleNewPatchset(change, ps);
+-		}
+-	});
+-}
+-evs.stream.on('readable', function () {
+-	var event;
+-	while ((event = evs.stream.read()) !== null) {
+-		if (event.type === 'patchset-created' &&
+-		    event.patchSet.kind !== 'NO_CHANGE' &&
+-		    event.patchSet.kind !== 'NO_CODE_CHANGE' &&
+-		    event.patchSet.isDraft === false) {
+-			handleNewPatchset(event.change, event.patchSet);
+-		}
+-	}
+-});
+-
+-function handleNewPatchset(change, ps) {
+-	if (repoHasMakeCheck[change.project] === false)
+-		return;
+-	log.info('queued %s %d (#%d)',
+-	    change.project, change.number, ps.number);
+-	queue.push([change, ps]);
+-	runQueue();
+-}
+-
+-function runQueue() {
+-	var spares = slaves.filter(function (s) {
+-		return (s.getState() === 'ready');
+-	});
+-	var settingUp = slaves.filter(function (s) {
+-		var st = s.getState();
+-		return (st.indexOf('setup') !== -1 ||
+-		    st === 'auth' || st === 'idle');
+-	});
+-
+-	var countSpawning = Object.keys(spawning).length;
+-	var countNotBusy = spares.length + settingUp.length + countSpawning;
+-	var toMake = config.spares - countNotBusy;
+-	if (slaves.length + countSpawning + toMake > config.max)
+-		toMake = config.max - (slaves.length + countSpawning);
+-	if (toMake > 0) {
+-		log.info('to make: %d - spares: %d, settingUp: %d, ' +
+-		    'spawning: %d (total %d)',
+-		    toMake, spares.length, settingUp.length, countSpawning,
+-		    slaves.length + countSpawning);
+-	}
+-
+-	for (var j = 0; j < toMake; ++j)
+-		spawnWorker();
+-
+-	while (spares.length > 0 && queue.length > 0) {
+-		var slave = spares.shift();
+-		var item = queue.shift();
+-		if (repoHasMakeCheck[item[0].project] === false)
+-			continue;
+-		slave.build.apply(slave, item);
+-	}
+-}
+-
+-setInterval(runQueue, 5000);
++server.start();
+diff --git a/status.html.tpl b/status.html.tpl
+index fd2ae05..db06bde 100644
+--- a/status.html.tpl
++++ b/status.html.tpl
+@@ -67,12 +67,12 @@ html(lang="en")
+             td= uuid
+             td= spawning[uuid]
+             td none
+-        each slave in slaves
++        each worker in workers
+           tr
+-            td= slave.sc_uuid
+-            td= slave.getState()
+-            if slave.sc_change !== undefined
+-              td #{slave.sc_change.project}: #{slave.sc_change.number}/#{slave.sc_patchset.number}
++            td= worker.wc_uuid
++            td= worker.getState()
++            if worker.wc_change !== undefined
++              td #{worker.wc_change.project}: #{worker.wc_change.number}/#{worker.wc_patchset.number}
+             else
+               td none
+     .section

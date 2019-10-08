@@ -1,0 +1,827 @@
+commit ff78e7596746ba8ff6b75784270c71ddaac008c9 (HEAD -> master)
+Author: Richard Bradley <richard.bradley@joyent.com>
+Date:   2019-04-29T15:29:05+01:00 (5 months ago)
+    
+    MANATEE-380 would like `manatee-adm promote`
+    Reviewed by: David Pacheco <dap@joyent.com>
+    Approved by: David Pacheco <dap@joyent.com>
+    Approved by: Isaac Davis <isaac.davis@joyent.com>
+    Approved by: Joshua M. Clulow <jmc@joyent.com>
+
+diff --git a/Makefile b/Makefile
+index 03314c3..0125cba 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2014, Joyent, Inc.
++# Copyright (c) 2019, Joyent, Inc.
+ #
+ 
+ JSL		 = jsl
+@@ -43,6 +43,8 @@ test:
+ 	node test/tst.onwm_newpeer.js
+ 	node test/tst.cluster_setup_onwm.js
+ 	node test/tst.freeze.js
++	node test/tst.promote_primary.js
++	node test/tst.promote_sync.js
+ 	@echo all tests passed
+ 
+ include Makefile.targ
+diff --git a/README.md b/README.md
+index c47f894..d6eb3b6 100644
+--- a/README.md
++++ b/README.md
+@@ -309,6 +309,42 @@ The primary will come up as primary, see that the cluster must be transitioning
+ to normal mode, and declare a new generation with the newly-deployed peer as the
+ sync.  After that, the cluster behaves like a normal cluster.
+ 
++## Planned promotions
++
++A topology change in Manatee takes place when the cluster determines that a peer
++has gone missing and another peer is available to takeover in that role.  This
++is done by watching for changes to the active peers (i.e. the presence of their
++ephemeral nodes in ZooKeeper), but depending on ZooKeeper configuration this
++could be a lengthy period of time before the cluster notices.  For situations
++where a known topology change is going to happen (e.g. when upgrading the
++cluster), Manatee will watch for a special object in ZooKeeper and proactively
++take actions on the request, instead of waiting for a timeout of the applicable
++ephemeral node.
++
++This object is named `promote` in the cluster's state and is described below in
++the "Data structures" section.  When an operator puts this object, each peer in
++the cluster will get a "clusterStateChange" event and, as part of its evaluation
++of this state, validate the promotion request against the current state of the
++cluster.  If this request is invalid, the request is ignored and a message
++logged.  If this request is valid, the primary (or in the event of a deposition
++of the primary, the sync) will put a new state object into ZooKeeper reflecting
++the intended state of the cluster (e.g. new primary required, async chain
++changes).  Each peer will then receive a subsequent "clusterStateChange"
++notification and take the appropriate actions defined in this state.
++
++The original `promote` object will not be re-written to the cluster's state when
++a promotion request is acted upon.  When the promotion request is invalid, the
++primary is responsible for removing the promote object from the cluster state
++after finding it to be invalid.
++
++The cluster will never act on a promotion request where the current time is
++greater than that in the `promote.expireTime`, or in the case where any other of
++the properties do not match the current state of the cluster (e.g. if
++`promote.generation` doesn't match `clusterState.generation`).  This has the
++effect of protecting the cluster from acting on a promotion request where there
++might have been a natural takeover in the time between when the operator was
++building this object and putting it into ZooKeeper.
++
+ # Implementation notes
+ 
+ ## Data structures
+@@ -356,6 +392,21 @@ comparing the identities of two peers, only the `id` field is used.**
+   versions.
+ * `oneNodeWriteMode`: if true, then the cluster is configured for one-node-write
+   mode.  See above for details.
++* `promote`: an optional object containing the intent of an operator-initiated
++  promotion for an individual peer.  See below for details.
++
++#### clusterState.promote
++
++`promote` is an optional object that is validated separately to the clusterState
++object.  Its properties are expected to be as follows:
++
++* `id` (string): id of the peer to be promoted (see "peer identifier")
++* `role` (string): current role of the peer to be promoted
++* `asyncIndex` (integer): position in the async chain (if "role" is "async")
++* `generation` (integer): generation of the cluster that the promotion is taking
++  place in
++* `expireTime` (string): time that a promotion must happen within in the format
++  of an ISO 8601 timestamp
+ 
+ ### pg config
+ 
+diff --git a/lib/manatee-peer.js b/lib/manatee-peer.js
+index f008341..a2e6b6a 100644
+--- a/lib/manatee-peer.js
++++ b/lib/manatee-peer.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -14,11 +14,13 @@
+ 
+ var mod_assertplus = require('assert-plus');
+ var mod_events = require('events');
++var mod_extsprintf = require('extsprintf');
+ var mod_jsprim = require('jsprim');
+ var mod_util = require('util');
+ var mod_vasync = require('vasync');
+ var VError = require('verror');
+ 
++var sprintf = mod_extsprintf.sprintf;
+ var mod_validation = require('./validation');
+ var mod_lsn = require('pg-lsn');
+ var EventEmitter = mod_events.EventEmitter;
+@@ -478,6 +480,15 @@ ManateePeer.prototype.evalClusterState = function (norest)
+ 		return;
+ 	}
+ 
++	/*
++	 * Determine if there is an operator-defined promotion that has been
++	 * requested (by way of a "promote" object on our ZooKeeper state) and
++	 * take action if required.
++	 */
++	if (this.promotion()) {
++		return;
++	}
++
+ 	/*
+ 	 * If the generation has changed, then go back to square one (unless
+ 	 * we think we're the primary but no longer are, in which case it's game
+@@ -707,8 +718,128 @@ ManateePeer.prototype.startTransitionToNormalMode = function ()
+ 	});
+ };
+ 
+-ManateePeer.prototype.startTakeover = function (reason, minwal)
++/*
++ * Validates and acts on a "promote" object in the state object so long as it's
++ * applicable to this peer.
++ *
++ * Returns true if an update to the cluster's state is required (whether that be
++ * in the case of a topology change or the deletion of the promotion request),
++ * or false if no state change is to take place.
++ */
++ManateePeer.prototype.promotion = function ()
++{
++	var promote, isTakeover, newasyncs, newIndex;
++
++	promote = mod_validation.validatePromoteRequest(this.mp_zkstate);
++	if (!promote) {
++		return (false);
++	} else if (promote instanceof Error) {
++		var err = new VError(promote,
++		    'found a promote object but it is invalid');
++		this.mp_log.warn(err);
++		if (this.mp_role == MP_ROLE_PRIMARY) {
++			this.startDeletePromoteObject();
++			return (true);
++		}
++		return (false);
++	}
++
++	/*
++	 * Only a sync can depose a primary, which is what needs to happen if
++	 * the sync is being promoted.  For any other promotion, the primary is
++	 * responsible.
++	 */
++	if (promote.role === MP_ROLE_SYNC) {
++		if (this.mp_role !== MP_ROLE_SYNC) {
++			return (false);
++		}
++	} else {
++		if (this.mp_role !== MP_ROLE_PRIMARY) {
++			return (false);
++		}
++	}
++
++	/*
++	 * We can deduce whether a takeover is happening based on whether the
++	 * promotion is for either the sync or the first async.  Any other
++	 * promotion still valid at this point must be to change the order of
++	 * the async chain.
++	 */
++	isTakeover = promote.role === MP_ROLE_SYNC || promote.asyncIndex === 0;
++
++	if (isTakeover) {
++		var takeoverMsg = sprintf('promotion of "%s"', promote.id);
++		/*
++		 * startTakeover() can return a false value if there are no
++		 * asyncs to replace the sync, in which case the promotion
++		 * request cannot be fulfilled.  The caller of promotion() needs
++		 * to be made aware of this result, so we return
++		 * startTakeover()'s return value.
++		 */
++		return (this.startTakeover(takeoverMsg,
++		    this.mp_zkstate.initWal, promote));
++	}
++
++	mod_assertplus.ok(promote.asyncIndex > 0);
++	mod_assertplus.equal(this.mp_zkstate.async[promote.asyncIndex].id,
++	    promote.id);
++
++	/*
++	 * Swap positions in the async chain of the promoted peer and the peer
++	 * directly upstream.
++	 */
++	newIndex = promote.asyncIndex-1;
++
++	newasyncs = mod_jsprim.deepCopy(this.mp_zkstate.async);
++	newasyncs[newIndex] = newasyncs.splice(
++	    promote.asyncIndex, 1, newasyncs[newIndex])[0];
++
++	mod_assertplus.ok(newasyncs.length == this.mp_zkstate.async.length);
++	mod_assertplus.ok(newasyncs[newIndex].id == this.mp_zkstate.async[
++	    promote.asyncIndex].id);
++
++	this.startUpdateAsyncs(newasyncs);
++	return (true);
++};
++
++ManateePeer.prototype.startDeletePromoteObject = function ()
++{
++	var peer = this;
++
++	mod_assertplus.equal(this.mp_role, MP_ROLE_PRIMARY);
++	mod_assertplus.ok(!this.mp_updating);
++	mod_assertplus.ok(this.mp_updating_state === null);
++
++	peer.mp_updating = true;
++	peer.mp_updating_state = mod_jsprim.deepCopy(peer.mp_zkstate);
++
++	delete (peer.mp_updating_state.promote);
++
++	peer.mp_log.info(peer.mp_updating_state, 'deleting promote object');
++	peer.mp_zk.putClusterState(peer.mp_updating_state, function (err) {
++		peer.mp_updating = false;
++
++		if (err) {
++			err = new VError(err, 'failed to update cluster state');
++			peer.mp_log.warn(err);
++		} else {
++			peer.mp_zkstate = peer.mp_updating_state;
++			peer.mp_log.info('updated cluster state');
++		}
++
++		peer.mp_updating_state = null;
++		peer.evalClusterState();
++	});
++};
++
++ManateePeer.prototype.startTakeover = function (reason, minwal, promote)
+ {
++	mod_assertplus.optionalObject(promote, 'promote');
++	if (promote) {
++		mod_assertplus.string(promote.id, 'promote.id');
++		mod_assertplus.string(promote.role, 'promote.role');
++	}
++
+ 	var peer = this;
+ 	var i, whichasync, newsync, newasyncs, newdeposed;
+ 
+@@ -735,6 +866,18 @@ ManateePeer.prototype.startTakeover = function (reason, minwal)
+ 		return (peer.peerIsPresent(async));
+ 	});
+ 
++	/*
++	 * In the event of a promotion, startTakeover() is only appropriate
++	 * when called by the primary in the event that the first async is
++	 * being promoted (the other cases are handled by startUpdateAsyncs()
++	 * or by the sync deposing the primary).
++	 */
++	if (promote && this.mp_zkstate.primary.id == this.mp_id) {
++		mod_assertplus.equal(promote.role, 'async');
++		mod_assertplus.equal(promote.id, peer.mp_zkstate.async[0].id);
++		newasyncs = [ peer.mp_zkstate.sync ].concat(newasyncs);
++	}
++
+ 	/*
+ 	 * If we're not already the primary, then we're deposing the current
+ 	 * primary.
+diff --git a/lib/schemas.js b/lib/schemas.js
+index ad2cee4..91e6c4c 100644
+--- a/lib/schemas.js
++++ b/lib/schemas.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -78,3 +78,29 @@ exports.pgStatus = {
+ 	}
+     }
+ };
++
++exports.promote = {
++    'type': 'object',
++    'properties': {
++	'id': sStringRequired,
++	'role': {
++	    'enum': [ 'sync', 'async' ],
++	    'required': true
++	},
++	/*
++	 * "asyncIndex" can only be null if "role" is not "async", validated in
++	 * lib/validation.js
++	 */
++	'asyncIndex': {
++	    'type': [ 'null', 'integer' ]
++	},
++	'generation': {
++	    'type': 'integer',
++	    'required': true
++	},
++	'expireTime': {
++	    'type': 'string',
++	    'required': true
++	}
++    }
++};
+diff --git a/lib/sim.js b/lib/sim.js
+index b8d9586..733770d 100644
+--- a/lib/sim.js
++++ b/lib/sim.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -109,6 +109,8 @@ function Simulator(args)
+ 	        'list simulated peers' ],
+ 	    [ 'peer', this.cmdPeer, 'peer([raw])',
+ 	        'dump peer\'s current state' ],
++	    [ 'promote', this.cmdPromote, 'promote([object])',
++		'simulate a promotion request' ],
+ 	    [ 'rmpeer', this.cmdRmPeer, 'rmpeer(id)',
+ 	        'simulate a peer being removed from the ZK cluster' ],
+ 	    [ 'setClusterState', this.cmdSetClusterState,
+@@ -713,6 +715,35 @@ Simulator.prototype.onRest = function ()
+ 	cmd.callback(null, cmd.rv);
+ };
+ 
++/*
++ * Puts whatever object the test suite requests into clusterState.promote.
++ * Does very little in the way of assertions in order to test the state
++ * machine's verification of the object.  The exception here is the "expireIn"
++ * property, which if set will dynamically add "expireIn" to the current time in
++ * milliseconds, in order to emulate an "expireTime" in the future ahead of when
++ * the test suite is executed, if required.
++ */
++Simulator.prototype.cmdPromote = function (promote)
++{
++	var t, zkstate;
++
++	mod_assertplus.object(promote, 'promote');
++	mod_assertplus.optionalNumber(promote.expireIn, 'promote.expireIn');
++
++	if (promote.expireIn) {
++		t = new Date().getTime() + promote.expireIn;
++		promote.expireTime = mod_jsprim.iso8601(new Date(t));
++		delete (promote.expireIn);
++	}
++
++	zkstate = this.ms_zk.currentClusterState();
++	zkstate.promote = promote;
++
++	this.ms_zk.setClusterState(zkstate);
++
++	return (this.simpleZkState(this.ms_zk.currentClusterState()));
++};
++
+ /*
+  * Given an acyclic, plain-old JavaScript object constructed from another
+  * context that contains nothing but Objects, Arrays, and booleans, construct an
+diff --git a/lib/validation.js b/lib/validation.js
+index e73b015..2732f7e 100644
+--- a/lib/validation.js
++++ b/lib/validation.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2019, Joyent, Inc.
+  */
+ 
+ /*
+@@ -29,6 +29,7 @@ var schemas = require('./schemas');
+ exports.validateZkState = validateZkState;
+ exports.validateZkPeers = validateZkPeers;
+ exports.validatePgStatus = validatePgStatus;
++exports.validatePromoteRequest = validatePromoteRequest;
+ 
+ function validateZkState(clusterState)
+ {
+@@ -82,3 +83,51 @@ function validateAndCopy(schema, obj)
+ 		return (error);
+ 	return (mod_jsprim.deepCopy(obj));
+ }
++
++function validatePromoteRequest(clusterState)
++{
++	var promote, error, expireTime;
++	promote = mod_jsprim.pluck(clusterState, 'promote');
++
++	if (!promote)
++		return (undefined);
++
++	error = validateAndCopy(schemas.promote, promote);
++	if (error instanceof Error)
++		return (error);
++
++	expireTime = mod_jsprim.parseDateTime(promote.expireTime);
++	if (isNaN(expireTime.getTime())) {
++		return (new VError('expireTime is not parseable (found "%s")',
++		    promote.expireTime));
++	}
++
++	if (promote.generation !== clusterState.generation) {
++		return (new VError('generation does not match (expected %d, ' +
++		    'found %d)', clusterState.generation, promote.generation));
++	}
++
++	if (expireTime.getTime() < new Date().getTime())
++		return (new VError('expireTime has passed ("%s")',
++		    promote.expireTime));
++
++	if (promote.role === 'async') {
++		if (!promote.hasOwnProperty('asyncIndex')) {
++			return (new VError(
++			    'asyncIndex required but is missing'));
++		}
++		if (promote.asyncIndex < 0 ||
++		    promote.asyncIndex >= clusterState.async.length) {
++			return (new VError('asyncIndex is out of range'));
++		}
++		if (promote.id !== clusterState.async[promote.asyncIndex].id) {
++			return (new VError('asyncIndex refers to wrong peer'));
++		}
++	} else {
++		if (promote.id !== clusterState[promote.role].id) {
++			return (new VError('id refers to peer in wrong role'));
++		}
++	}
++
++	return (clusterState.promote);
++}
+diff --git a/test/tst.promote_primary.js b/test/tst.promote_primary.js
+new file mode 100644
+index 0000000..a955cc1
+--- /dev/null
++++ b/test/tst.promote_primary.js
+@@ -0,0 +1,234 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2019, Joyent, Inc.
++ */
++
++/*
++ * tst.promote_primary.js: promotion tests where the primary is responsible.
++ */
++
++var mod_jsprim = require('jsprim');
++var mod_test = require('./common');
++var activeNodes, ignoredState, sim, cmds;
++
++activeNodes = [ 'node1', 'node2', 'node3', 'node4', 'node5', 'node6' ];
++ignoredState = {
++    'clusterState': {
++	'generation': 2,
++	'primary': 'node1',
++	'sync': 'node3',
++	'async': [ 'node4', 'node2', 'node6', 'node5' ],
++	'initWal': '0/0000000a'
++    },
++    'activeNodes': activeNodes
++};
++
++sim = mod_test.createTestSimulator();
++
++cmds = [
++    { 'cmd': 'addpeer', 'args': [ 'node1' ] },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'startPeer' },
++    { 'cmd': 'zk', 'check': {
++	'clusterState': {
++	    'generation': 1,
++	    'primary': 'node1',
++	    'sync': 'node2',
++	    'async': [ 'node3', 'node4', 'node5', 'node6' ],
++	    'initWal': '0/00000000'
++	},
++	'activeNodes': activeNodes
++    } },
++    { 'cmd': 'echo', 'args': [ 'test: promote first async' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node3',
++	'role': 'async',
++	'asyncIndex': 0,
++	'generation': 1,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': {
++	'clusterState': {
++	    'generation': 2,
++	    'primary': 'node1',
++	    'sync': 'node3',
++	    'async': [ 'node2', 'node4', 'node5', 'node6' ],
++	    'initWal': '0/0000000a'
++	},
++	'activeNodes': activeNodes
++    } },
++
++    { 'cmd': 'echo', 'args': [ 'test: promote last async' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node6',
++	'role': 'async',
++	'asyncIndex': 3,
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': {
++	'clusterState': {
++	    'generation': 2,
++	    'primary': 'node1',
++	    'sync': 'node3',
++	    'async': [ 'node2', 'node4', 'node6', 'node5' ],
++	    'initWal': '0/0000000a'
++	},
++	'activeNodes': activeNodes
++    } },
++
++    { 'cmd': 'echo', 'args': [ 'test: promote second async' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node4',
++	'role': 'async',
++	'asyncIndex': 1,
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': {
++	'clusterState': {
++	    'generation': 2,
++	    'primary': 'node1',
++	    'sync': 'node3',
++	    'async': [ 'node4', 'node2', 'node6', 'node5' ],
++	    'initWal': '0/0000000a'
++	},
++	'activeNodes': activeNodes
++    } },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (promotePrimary)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node1',
++	'role': 'primary',
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (expireTimePassed)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node5',
++	'role': 'async',
++	'asyncIndex': 2,
++	'generation': 2,
++	'expireTime': mod_jsprim.iso8601(new Date('2010-01-01T00:00:00.000Z'))
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (invalidIdAtRole)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node4',
++	'role': 'sync',
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (invalidIdAtAsyncIndex)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node2',
++	'role': 'async',
++	'asyncIndex': 2,
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (asyncIndexUpperOOR)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node2',
++	'role': 'async',
++	'asyncIndex': 999,
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (asyncIndexLowerOOR)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node2',
++	'role': 'async',
++	'asyncIndex': -1,
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (generationLowerOOR)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node2',
++	'role': 'async',
++	'asyncIndex': 1,
++	'generation': 100,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (generationMismatch)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node2',
++	'role': 'async',
++	'asyncIndex': 1,
++	'generation': 1,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (generationInvalid)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node2',
++	'role': 'async',
++	'asyncIndex': 1,
++	'generation': 'test',
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (expireTimeInvalid)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node2',
++	'role': 'async',
++	'asyncIndex': 1,
++	'generation': 2,
++	'expireTime': 'test'
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (nonexistentId)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node999',
++	'role': 'sync',
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (idMissing)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'role': 'async',
++	'asyncIndex': 1,
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 },
++
++    { 'cmd': 'echo', 'args': [ 'test: ignore (invalidRole)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node1',
++	'role': 'test',
++	'generation': 2,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': ignoredState, 'wait': 300 }
++];
++
++mod_test.runTestCommands(sim, cmds, process.argv[2] == '-v');
+diff --git a/test/tst.promote_sync.js b/test/tst.promote_sync.js
+new file mode 100644
+index 0000000..b2d31e3
+--- /dev/null
++++ b/test/tst.promote_sync.js
+@@ -0,0 +1,114 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2019, Joyent, Inc.
++ */
++
++/*
++ * tst.promote_sync.js: promotion tests where the sync is responsible.
++ */
++
++var mod_jsprim = require('jsprim');
++var mod_test = require('./common');
++var ignoredState, sim, cmds;
++
++sim = mod_test.createTestSimulator();
++
++cmds = [
++    { 'cmd': 'addpeer', 'args': [ 'node1' ] },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'bootstrap', 'args': [ 'node2' ] },
++    { 'cmd': 'zk', 'check': {
++	'clusterState': {
++	    'generation': 1,
++	    'primary': 'node2',
++	    'sync': 'node1',
++	    'async': [ ],
++	    'initWal': '0/00000000'
++	},
++	'activeNodes': [ 'node1', 'node2' ]
++    } },
++    { 'cmd': 'startPeer' },
++    { 'cmd': 'peer', 'check': {
++	'role': 'sync',
++	'zkstate': {
++	    'generation': 1,
++	    'primary': 'node2',
++	    'sync': 'node1',
++	    'async': [ ],
++	    'initWal': '0/00000000'
++	},
++	'zkpeers': [ 'node1', 'node2' ],
++	'pg': {
++	    'online': true,
++	    'config': {
++		'role': 'sync',
++		'upstream': 'tcp://postgres@10.0.0.2:5432/postgres',
++		'downstream': null
++	    }
++	}
++    } },
++    { 'cmd': 'catchUp' },
++    { 'cmd': 'echo', 'args': [ 'test: ignored (no asyncs)' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node1',
++	'role': 'sync',
++	'generation': 1,
++	'expireIn': 200
++    } ] },
++    { 'cmd': 'zk', 'check': {
++	'clusterState': {
++	    'generation': 1,
++	    'primary': 'node2',
++	    'sync': 'node1',
++	    'async': [ ],
++	    'initWal': '0/00000000'
++	}
++    }, 'wait': 300 },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'addpeer' },
++    { 'cmd': 'peer', 'check': {
++	'role': 'sync',
++	'zkstate': {
++	    'generation': 1,
++	    'primary': 'node2',
++	    'sync': 'node1',
++	    'async': [ 'node3', 'node4', 'node5' ],
++	    'initWal': '0/00000000'
++	},
++	'zkpeers': [ 'node1', 'node2', 'node3', 'node4', 'node5' ],
++	'pg': {
++	    'online': true,
++	    'config': {
++		'role': 'sync',
++		'upstream': 'tcp://postgres@10.0.0.2:5432/postgres',
++		'downstream': null
++	    }
++	}
++    } },
++    { 'cmd': 'echo', 'args': [ 'test: promote sync' ] },
++    { 'cmd': 'promote', 'args': [ {
++	'id': 'node1',
++	'role': 'sync',
++	'generation': 1,
++	'expireIn': 200
++    } ], 'wait': 300 },
++    { 'cmd': 'zk', 'check': {
++	'clusterState': {
++	    'generation': 2,
++	    'primary': 'node1',
++	    'sync': 'node3',
++	    'async': [ 'node4', 'node5' ],
++	    'deposed': [ 'node2' ],
++	    'initWal': '0/0000000a'
++	},
++	'activeNodes': [ 'node1', 'node2', 'node3', 'node4', 'node5' ]
++    } }
++];
++
++mod_test.runTestCommands(sim, cmds, process.argv[2] == '-v');

@@ -1,0 +1,2447 @@
+commit 34ff4430dfe3fd5a5b6f12d32790b52e14c2bd74
+Author: John Levon <john.levon@joyent.com>
+Date:   2019-07-24T14:42:53+00:00 (3 months ago)
+    
+    MANTA-3269 muppet could include muskie zonenames in haproxy backend names
+    MANTA-4414 muppet could test more units
+    MANTA-4415 ZK error response handling needs work
+    MANTA-4430 fix haproxy CFLAGS
+
+diff --git a/Makefile b/Makefile
+index 5031a85..1337a28 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,7 @@ NAME		:= muppet
+ # Tools
+ #
+ BUNYAN		:= ./node_modules/.bin/bunyan
+-NODEUNIT	:= ./node_modules/.bin/nodeunit
++TAP_EXEC	:= ./node_modules/.bin/tap
+ 
+ #
+ # Files
+@@ -64,10 +64,6 @@ include ./deps/eng/tools/mk/Makefile.smf.defs
+ #
+ PATH	:= $(NODE_INSTALL)/bin:${PATH}
+ 
+-#
+-# MG Variables
+-#
+-
+ RELEASE_TARBALL		:= muppet-pkg-$(STAMP).tar.gz
+ ROOT			:= $(shell pwd)
+ RELSTAGEDIR			:= /tmp/$(NAME)-$(STAMP)
+@@ -83,19 +79,15 @@ AGENTS		= amon config registrar
+ # Repo-specific targets
+ #
+ .PHONY: all
+-all: $(SMF_MANIFESTS) | $(NODEUNIT) $(REPO_DEPS) $(HAPROXY_EXEC) scripts
+-	$(NPM) install
+-
+-$(NODEUNIT): | $(NPM_EXEC)
++all $(TAP_EXEC): $(SMF_MANIFESTS) | $(NPM_EXEC) $(REPO_DEPS) $(HAPROXY_EXEC) scripts
+ 	$(NPM) install
+ 
+-CLEAN_FILES += $(NODEUNIT) ./node_modules/nodeunit
+ DISTCLEAN_FILES += ./node_modules
+ 
+ .PHONY: test
+ 
+-test: $(NODEUNIT)
+-	$(NODEUNIT) test/*.test.js 2>&1 | $(BUNYAN)
++test: $(TAP_EXEC)
++	$(TAP_EXEC) -T 60 test/*.test.js
+ 
+ .PHONY: scripts
+ scripts: deps/manta-scripts/.git
+diff --git a/lib/app.js b/lib/app.js
+index e245d3e..9f34c89 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -8,6 +8,20 @@
+  * Copyright 2019 Joyent, Inc.
+  */
+ 
++/*
++ * muppet: this runs in the loadbalancer service and manages the HAProxy
++ * configuration. It tracks the registrar-listed webapi (muskie) instances that
++ * are backend servers to the load balancer.
++ *
++ * Rather than using DNS / binder, like other clients, we subscribe directly to
++ * Zookeeper. This is probably for a few reasons, such as reducing load on
++ * binder and avoiding the multi-stage timeouts from that path.
++ *
++ * When watch.js:serversChanged fires, we need to update haproxy. If we can, we
++ * directly modify the running haproxy via haproxy_sock.js. If not, then we
++ * "reload" haproxy via lb_manager.js.
++ */
++
+ /*jsl:ignore*/
+ 'use strict';
+ /*jsl:end*/
+@@ -49,9 +63,7 @@ function AppFSM(cfg) {
+     this.a_path = domainToPath(cfg.name);
+     this.a_lastError = null;
+     this.a_lastCleanTime = 0;
+-    this.a_beIdx = {};
+-    this.a_lastServersMap = null;
+-    this.a_hosts = null;
++    this.a_servers = {};
+ 
+     this.a_reloadCmd = cfg.reload;
+ 
+@@ -155,7 +167,7 @@ AppFSM.prototype.state_zksetup = function (S) {
+     }, 'Creating ZooKeeper client');
+ 
+     this.a_zk = new mod_zkstream.Client(opts);
+-    this.a_nsf = new lib_watch.HostWatcherFSM({
++    this.a_nsf = new lib_watch.ServerWatcherFSM({
+         zk: this.a_zk,
+         path: this.a_path,
+         log: this.a_log
+@@ -188,24 +200,36 @@ AppFSM.prototype.state_running = function (S) {
+         S.gotoState('watch');
+     });
+ 
+-    S.on(this.a_nsf, 'hostsChanged', function (hosts, diff) {
+-        var newHosts = diff.added.filter(function (h) {
+-            return (self.a_beIdx[h] === undefined);
+-        });
++    S.on(this.a_nsf, 'serversChanged', function (servers) {
++        var new_servers = false;
++
++        for (var name in self.a_servers) {
++            if (servers[name] === undefined) {
++                self.a_servers[name].enabled = false;
++            }
++        }
++
++        for (name in servers) {
++            if (self.a_servers[name] === undefined) {
++                self.a_servers[name] = servers[name];
++                new_servers = true;
++            }
++
++            self.a_servers[name].enabled = true;
++        }
++
+         /*
+-         * If new hosts have been added that we've never seen before, we must
+-         * regenerate the configuration.
++         * If new servers have been added that we've never seen before, we must
++         * regenerate the configuration and reload haproxy.
+          */
+-        if (newHosts.length > 0) {
+-            self.a_hosts = hosts;
++        if (new_servers) {
+             S.gotoState('running.reload');
+         } else {
+             /*
+              * But, if that's not the case, we can apply the change using the
+              * stats socket. This makes us "dirty" because there are in-memory
+-             * changes not in the config file.
++             * changes not in the config file. FIXME
+              */
+-            self.a_hosts = hosts;
+             S.gotoState('running.dirty');
+         }
+     });
+@@ -215,7 +239,7 @@ AppFSM.prototype.state_running = function (S) {
+      * state in memory matches what we expect.
+      */
+     S.interval(BESTATE_DOUBLECHECK, function () {
+-        if (!self.a_beIdx)
++        if (Object.keys(self.a_servers).length === 0)
+             return;
+         const statopts = {
+             log: self.a_log.child({ component: 'haproxy_sock' })
+@@ -228,7 +252,7 @@ AppFSM.prototype.state_running = function (S) {
+                 S.gotoState('running.dirty');
+                 return;
+             }
+-            var res = self.checkStats(srvs);
++            var res = self.checkStats(self.a_servers, srvs);
+             if (res.wrong.length > 0 || res.reload) {
+                 log.warn(res, 'haproxy server state was out of sync during ' +
+                     'periodic check');
+@@ -247,7 +271,6 @@ AppFSM.prototype.state_running = function (S) {
+ 
+ AppFSM.prototype.state_running.clean = function (S) {
+     var self = this;
+-    this.a_lastServersMap = null;
+     this.a_lastCleanTime = Date.now();
+     /*
+      * We use lastCleanTime in running.dirty to decide how long it has been
+@@ -272,39 +295,51 @@ AppFSM.prototype.state_running.clean = function (S) {
+ AppFSM.prototype.state_running.reload = function (S) {
+     var self = this;
+     var log = this.a_log;
+-    var hosts = this.a_hosts;
++
++    /*
++     * We're going to reload, so disabled servers will be going away altogether.
++     */
++
++    var servers = {};
++
++    for (var name in self.a_servers) {
++        if (self.a_servers[name].enabled)
++            servers[name] = self.a_servers[name];
++    }
++
++    self.a_servers = servers;
++
+     const opts = {
+         trustedIP: self.a_trustedIP,
+         untrustedIPs: self.a_untrustedIPs,
+-        hosts: hosts,
++        servers: self.a_servers,
+         log: self.a_log.child({ component: 'lb_manager' }),
+         reload: self.a_reloadCmd
+     };
+-    log.trace({ hosts: hosts }, 'going to reload lb config');
+-    lib_lbman.reload(opts, S.callback(function (err, beIdx) {
++    log.trace({ servers: self.a_servers }, 'going to reload lb config');
++    lib_lbman.reload(opts, S.callback(function (err) {
+         if (err) {
+             log.error(err, 'lb reload failed');
+             S.gotoState('running.dirty');
+             return;
+         }
+-        self.a_beIdx = beIdx;
+-        log.info({ hosts: hosts }, 'lb config reloaded');
++        log.info({ servers: self.a_servers }, 'lb config reloaded');
++
+         S.gotoState('running.clean');
+     }));
+ };
+ 
+-function hasDisabledServers(map) {
+-    for (var svname in map) {
+-        if (map[svname] === false) {
++function hasDisabledServers(servers) {
++    for (var name in servers) {
++        if (servers[name].enabled === false)
+             return (true);
+-        }
+     }
+     return (false);
+ }
+ 
+ /*
+  * We sit in this state when things are "dirty" (there has been a change to
+- * the set of enabled backends that isn't in the config file).
++ * the set of enabled servers that isn't in the config file) FIXME
+  *
+  * This state applies the change to the haproxy in-memory state and waits
+  * for at most MAX_DIRTY_TIME before reloading.
+@@ -313,35 +348,17 @@ AppFSM.prototype.state_running.dirty = function (S) {
+     var self = this;
+     var log = this.a_log;
+ 
+-    /*
+-     * The syncServerState call takes a map of server name => bool
+-     * where 'true' indicates that a server should be enabled, and
+-     * 'false' indicates that it should be disabled (in MAINT).
+-     */
+-    var servers = {};
+-    /*
+-     * Start with all of the hosts that we set up last time generated
+-     * a new config set to false
+-     */
+-    for (var host in self.a_beIdx) {
+-        servers[self.a_beIdx[host]] = false;
+-    }
+-    /* Then set just the hosts we actually want enabled to true. */
+-    this.a_hosts.forEach(function (h) {
+-        servers[self.a_beIdx[h]] = true;
+-    });
+-
+     var now = Date.now();
+     var delta = now - this.a_lastCleanTime;
+-    if (delta > MAX_DIRTY_TIME && hasDisabledServers(servers)) {
++    if (delta > MAX_DIRTY_TIME && hasDisabledServers(self.a_servers)) {
+         S.gotoState('running.reload');
+         return;
+     }
+ 
+     var timeout = MAX_DIRTY_TIME - delta;
+     S.timeout(timeout, function () {
+-        if (hasDisabledServers(servers)) {
+-            log.info('dirty changes to haproxy backend set have persisted ' +
++        if (hasDisabledServers(self.a_servers)) {
++            log.info('dirty changes to haproxy server set have persisted ' +
+                 'for MAX_DIRTY_TIME, will now reload');
+             S.gotoState('running.reload');
+         }
+@@ -349,8 +366,9 @@ AppFSM.prototype.state_running.dirty = function (S) {
+ 
+     const syncopts = {
+         log: self.a_log.child({ component: 'haproxy_sock' }),
+-        servers: servers
++        servers: self.a_servers
+     };
++
+     lib_hasock.syncServerState(syncopts, function (err) {
+         if (err) {
+             log.error(err, 'failed to sync server state with ' +
+@@ -358,13 +376,13 @@ AppFSM.prototype.state_running.dirty = function (S) {
+             S.gotoState('running.reload');
+             return;
+         }
+-        self.a_lastServersMap = servers;
+-        log.info({ hosts: self.a_hosts }, 'lb updated using control socket');
++        log.info({ servers: self.a_servers },
++            'lb updated using control socket');
+         /*
+          * If we changed to a state where no servers are disabled then we're
+          * back to being "clean" with respect to the config file.
+          */
+-        if (!hasDisabledServers(servers))
++        if (!hasDisabledServers(self.a_servers))
+             S.gotoState('running.clean');
+     });
+ };
+@@ -373,12 +391,7 @@ AppFSM.prototype.state_running.dirty = function (S) {
+  * Matches the output of lib_hasock.serverStats() against our idea of which
+  * servers are in the haproxy config and whether they are enabled or disabled.
+  */
+-AppFSM.prototype.checkStats = function (stats) {
+-    var self = this;
+-    var invmap = {};
+-    for (var x in this.a_beIdx) {
+-        invmap[this.a_beIdx[x]] = x;
+-    }
++function checkStats(servers, stats) {
+     var wrong = [];
+     var reload = false;
+     stats.forEach(function (srv) {
+@@ -395,14 +408,16 @@ AppFSM.prototype.checkStats = function (stats) {
+             status: srv.status,
+             addr: srv.addr
+         };
+-        var host = invmap[srv.svname];
++
++        var server = servers[srv.svname];
++
+         /*
+          * If we've never heard of the svname, that means the config must be
+-         * really badly out of sync (not even same number of backends).
++         * really badly out of sync (not even same number of servers).
+          */
+-        if (host === undefined) {
++        if (server === undefined) {
+             wrong.push(srv);
+-            srv.reason = 'no-host';
++            srv.reason = 'no-server';
+             reload = true;
+             return;
+         }
+@@ -410,43 +425,32 @@ AppFSM.prototype.checkStats = function (stats) {
+          * The "addr" field was added in newer haproxy versions, if we have
+          * it, check that our expected IP address is there.
+          */
+-        if (srv.addr && srv.addr.indexOf(host + ':') === -1) {
++        if (srv.addr && srv.addr.indexOf(server.address + ':') === -1) {
+             wrong.push(srv);
+             srv.reason = 'addr-mismatch';
+             reload = true;
+             return;
+         }
+         /*
+-         * Finally check that it's in our enabled/disabled map, if we have
+-         * one (if we're dirty).
++         * Finally check that our enabled state is correct.
+          */
+-        if (self.a_lastServersMap) {
+-            var ena = self.a_lastServersMap[srv.svname];
+-            if (ena === true && srv.status === 'MAINT') {
+-                wrong.push(srv);
+-                srv.reason = 'want-enabled';
+-                return;
+-            }
+-            if (ena === false && srv.status !== 'MAINT') {
+-                wrong.push(srv);
+-                srv.reason = 'want-disabled';
+-                return;
+-            }
+-            if (ena === undefined) {
+-                wrong.push(srv);
+-                srv.reason = 'no-map';
+-                reload = true;
+-                return;
+-            }
+-        } else if (srv.status === 'MAINT') {
++        if (server.enabled && srv.status === 'MAINT') {
+             wrong.push(srv);
+-            srv.reason = 'disabled-but-not-dirty';
++            srv.reason = 'want-enabled';
++            return;
++        }
++        if (!server.enabled && srv.status !== 'MAINT') {
++            wrong.push(srv);
++            srv.reason = 'want-disabled';
+             return;
+         }
+     });
++
+     return ({ wrong: wrong, reload: reload });
+-};
++}
+ 
+ module.exports = {
+-    AppFSM: AppFSM
++    AppFSM: AppFSM,
++    // for testing
++    checkStats: checkStats
+ };
+diff --git a/lib/haproxy_sock.js b/lib/haproxy_sock.js
+index b625047..9e263b4 100644
+--- a/lib/haproxy_sock.js
++++ b/lib/haproxy_sock.js
+@@ -221,14 +221,11 @@ function serverStats(opts, cb) {
+ }
+ 
+ /*
+- * Note that this makes some assumptions about the haproxy config structure
+- * (particularly that server naming is consistent across all the frontends
+- * present). These assumptions are safe within muppet, but not for general use.
++ * The "opt.servers" argument is an object where each key corresponds to the
++ * 'svname' of an haproxy server name (<pxname/<svname>).
+  *
+- * The "opt.servers" argument is a map of server name => true/false, where
+- * server name is the second part of an haproxy server spec (<pxname>/<svname>)
+- * and 'true' indicates that a server should be enabled, while false indicates
+- * that it should be disabled (put into MAINT).
++ * We assume that the different backends all have identical server lists - this
++ * is true for muppet's secure_api / insecure_api backend pxnames.
+  */
+ function syncServerState(opts, cb) {
+     mod_assert.object(opts, 'options');
+@@ -249,30 +246,31 @@ function syncServerState(opts, cb) {
+         }
+ 
+         stats.forEach(function (stat) {
+-            if (servers[stat.svname] === false &&
+-                stat.status !== 'MAINT') {
++            var server = servers[stat.svname];
+ 
++            if (server === undefined) {
++                /*
++                 * haproxy config is probably out of sync with what we think it
++                 * is. This is bad, and we should restart muppet and re-do
++                 * everything.
++                 */
++                err = new VError('unmapped server: "%s/%s"', stat.pxname,
++                    stat.svname);
++                return;
++            }
++
++            if (!server.enabled && stat.status !== 'MAINT') {
+                 toDisable.push({
+                     log: opts.log,
+                     backend: stat.pxname,
+                     server: stat.svname
+                 });
+-            } else if (servers[stat.svname] === true &&
+-                stat.status === 'MAINT') {
+-
++            } else if (server.enabled && stat.status === 'MAINT') {
+                 toEnable.push({
+                     log: opts.log,
+                     backend: stat.pxname,
+                     server: stat.svname
+                 });
+-            } else if (servers[stat.svname] === undefined) {
+-                /*
+-                 * haproxy config is probably out of sync with what we think it
+-                 * is. This is bad, and we should restart muppet and re-do
+-                 * everything.
+-                 */
+-                err = new VError('unmapped server: "%s/%s"', stat.pxname,
+-                    stat.svname);
+             }
+         });
+ 
+diff --git a/lib/lb_manager.js b/lib/lb_manager.js
+index 8444715..6fd3420 100644
+--- a/lib/lb_manager.js
++++ b/lib/lb_manager.js
+@@ -32,22 +32,16 @@ const CFG_IN = fs.readFileSync(path.resolve(__dirname, '../etc/haproxy.cfg.in'),
+                              'utf8');
+ const HAPROXY_FMRI = 'svc:/manta/haproxy:default';
+ const RELOAD = '/usr/sbin/svcadm refresh ' + HAPROXY_FMRI;
+-/* JSSTYLED */
+-const CLEAR_SERVER_LINE = '        server be%d %s:81 check inter 30s slowstart 10s\n';
+-/* JSSTYLED */
+-const SSL_SERVER_LINE =   '        server be%d %s:80 check inter 30s slowstart 10s\n';
++const CLEAR_SERVER_LINE =
++    '        server %s %s:81 check inter 30s slowstart 10s\n';
++const SSL_SERVER_LINE =
++    '        server %s %s:80 check inter 30s slowstart 10s\n';
+ const INSECURE_FRONTEND =
+     'frontend http_external\n        default_backend insecure_api\n';
+ const INSECURE_BIND_LINE = '        bind %s:80\n';
+ 
+-// Locks for single reset run
+-var RELOAD_RUNNING = false;
+-var RELOAD_NEEDS_RUN = false;
+-
+-// Storage for objects we might lose if we block on a reload lock
+-var RELOAD_OPTS = {};
+-var RELOAD_CB = null;
+-
++// sanity check
++var reload_running = false;
+ 
+ /*
+  * Generate a haproxy configuration file using the provided parameters
+@@ -55,14 +49,14 @@ var RELOAD_CB = null;
+  * Options:
+  * - trustedIP, an address on the Manta network that is considered preauthorized
+  * - untrustedIPs, an array of addresses that untrusted traffic comes in over
+- * - hosts, an array of Muskie backends to forward requests to
++ * - servers, an array of Muskie backend servers to forward requests to
+  * - configFileOut (optional), the config file to write out
+  * - log, a Bunyan logger
+  */
+ function writeHaproxyConfig(opts, cb) {
+     assert.string(opts.trustedIP, 'options.trustedIP');
+     assert.arrayOfString(opts.untrustedIPs, 'options.untrustedIPs');
+-    assert.arrayOfString(opts.hosts, 'hosts');
++    assert.object(opts.servers, 'servers');
+     assert.optionalString(opts.configFileOut, 'options.configFileOut');
+     assert.object(opts.log, 'options.log');
+     assert.func(cb, 'callback');
+@@ -71,20 +65,17 @@ function writeHaproxyConfig(opts, cb) {
+ 
+     cb = once(cb);
+ 
++    if (Object.keys(opts.servers).length === 0) {
++        return (cb(new Error('Haproxy config error: No servers given')));
++    }
++
+     var clear = '';
+     var ssl = '';
+-    var index = {};
+-    // Fail fast if there are no backend hosts given
+-    if (opts.hosts.length > 0) {
+-        opts.hosts.forEach(function (h, i) {
+-            clear += sprintf(CLEAR_SERVER_LINE, i, h);
+-            ssl += sprintf(SSL_SERVER_LINE, i, h);
+-            index[h] = sprintf('be%d', i);
+-        });
+-    } else {
+-        return (cb(new Error('Haproxy config error: No hosts given')));
++
++    for (var name in opts.servers) {
++        clear += sprintf(CLEAR_SERVER_LINE, name, opts.servers[name].address);
++        ssl += sprintf(SSL_SERVER_LINE, name, opts.servers[name].address);
+     }
+-    opts.backendIndex = index;
+ 
+     var untrusted = '';
+     if (opts.untrustedIPs.length > 0) {
+@@ -240,7 +231,7 @@ function checkHaproxyConfig(opts, cb) {
+  * Options:
+  * - trustedIP, an address on the Manta network that is considered preauthorized
+  * - untrustedIPs, an array of addresses that untrusted traffic comes in over
+- * - hosts, an array of Muskie backends to forward requests to
++ * - servers, Muskie backend servers to forward requests to
+  * - reload (optional), the command to run to reload HAProxy config
+  * - log, a Bunyan logger
+  */
+@@ -248,39 +239,19 @@ function reload(opts, cb) {
+     assert.object(opts, 'options');
+     assert.string(opts.trustedIP, 'options.trustedIP');
+     assert.arrayOfString(opts.untrustedIPs, 'options.untrustedIPs');
+-    assert.arrayOfString(opts.hosts, 'options.hosts');
++    assert.object(opts.servers, 'options.servers');
+     assert.object(opts.log, 'options.log');
+     assert.func(cb, 'callback');
+     // For testing
+     assert.optionalString(opts.reload, 'options.reload');
+     assert.optionalString(opts.configFileIn, 'options.configFileIn');
+ 
+-    /*
+-     * Wrap config reload logic in a cheap & simple lock to ensure we are not
+-     * writing a new temp config file while renaming the temp config file in a
+-     * previous cycle. In addition, save the options from the queued reload().
+-     * If the most diabolical timing issue happened where multiple reload()'s
+-     * got queued, we'd only care about at most two (the current, and the last
+-     * one queued).
+-     */
+-    /*
+-     * TODO: If a third reload() call happened, and a delay
+-     * happened to the first and second call, the second call's
+-     * callback would get lost since we only save/restore the
+-     * one queued reload. This will be filed in a separate
+-     * issue. This issue however is an extremely unlikely event
+-     * considering the speed in which we get ZK notifications.
+-     */
+-    if (RELOAD_RUNNING) {
+-        opts.log.debug('Config reload is already running, queueing reload...');
+-        opts.log.debug('Hosts we are saving for queued reload: %s',
+-            opts.hosts);
+-        RELOAD_OPTS = jsprim.deepCopy(opts);
+-        RELOAD_CB = jsprim.deepCopy(cb);
+-        RELOAD_NEEDS_RUN = true;
++    if (reload_running) {
++        cb(new Error('reload running already'));
+         return;
+     }
+-    RELOAD_RUNNING = true;
++
++    reload_running = true;
+ 
+     cb = once(cb);
+ 
+@@ -292,10 +263,9 @@ function reload(opts, cb) {
+      * - Rename temporary file to final file once check passes
+      * - Tell haproxy to reload with a known-good config file
+      */
+-    var tmpOpts = jsprim.deepCopy(opts);
+-    tmpOpts.configFileOut = CFG_FILE_TMP;
++    opts.configFileOut = CFG_FILE_TMP;
+ 
+-    vasync.pipeline({ arg: tmpOpts, funcs: [
++    vasync.pipeline({ arg: opts, funcs: [
+         writeHaproxyConfig,
+         checkHaproxyConfig,
+         function finalRenameConfig(_, callback) {
+@@ -303,21 +273,12 @@ function reload(opts, cb) {
+         function finalReload(_, callback) {
+             reloadHaproxy(opts, callback); }
+     ]}, function (err) {
++        reload_running = false;
+         if (err) {
+             opts.log.error(err, 'Error reconfiguring haproxy');
+             cb(err);
+         } else {
+-            cb(null, tmpOpts.backendIndex);
+-        }
+-
+-        // Clear the lock now that we are finished
+-        RELOAD_RUNNING = false;
+-        // Call a reload if one is pending
+-        if (RELOAD_NEEDS_RUN) {
+-            RELOAD_NEEDS_RUN = false;
+-            opts.log.debug('Calling queued reload, using saved hosts: %s',
+-                          RELOAD_OPTS.hosts);
+-            reload(RELOAD_OPTS, RELOAD_CB);
++            cb();
+         }
+     });
+ }
+diff --git a/lib/watch.js b/lib/watch.js
+index 7c24160..46a8326 100644
+--- a/lib/watch.js
++++ b/lib/watch.js
+@@ -24,69 +24,91 @@ const FSM = require('mooremachine').FSM;
+ 
+ /*
+  * Timing parameters for our heuristic rules below (see the FSM state diagram
+- * and explanation above HostWatcherFSM).
++ * and explanation above ServerWatcherFSM).
+  */
+ const COLLECTION_TIMEOUT = 15000;   /* ms */
+ const HOLD_TIME = 30000;            /* ms */
+ const REMOVAL_THROTTLE = 0.2;       /* 0.2 = 20% */
+ const RETRY_TIMEOUT = 15000;        /* ms */
++const SMEAR = 5000;                 /* ms */
+ const FETCH_CONCURRENCY = 4;
+ 
+ /* Debugging: how many previous diffs to keep in memory */
+ const HISTORY_LENGTH = 32;
+ 
+-/*
+- * We add Math.random() * SMEAR to most of the timeouts listed above to "smear"
+- * them out a bit and randomize the load we put on zookeeper. This is meant to
+- * keep lots of muppet processes from hammering it all at once.
+- */
+-const SMEAR = 5000;                 /* ms */
+-
+ 
+-function diffSets(list1, list2) {
++function diffArrays(s1, s2) {
+     var idx1 = {};
+     var idx2 = {};
+     var out = { added: [], removed: [] };
+-    list1.forEach(function (val) {
++    s1.forEach(function (val) {
+         idx1[val] = true;
+     });
+-    list2.forEach(function (val) {
++    s2.forEach(function (val) {
+         if (idx1[val] !== true)
+             out.added.push(val);
+         idx2[val] = true;
+     });
+-    list1.forEach(function (val) {
++    s1.forEach(function (val) {
+         if (idx2[val] !== true)
+             out.removed.push(val);
+     });
+     return (out);
+ }
+ 
++function diffObjects(o1, o2) {
++    var out = { added: {}, removed: {} };
++
++    for (var key in o1) {
++        if (o2[key] === undefined)
++            out.removed[key] = o1[key];
++    }
++
++    for (key in o2) {
++        if (o1[key] === undefined)
++            out.added[key] = o2[key];
++    }
++
++    return (out);
++}
++
+ /*
+- * The HostWatcherFSM manages turning the childrenChanged watch events into
+- * a list of hosts, emitted whenever we should reload haproxy.
++ * The ServerWatcherFSM manages turning the childrenChanged watch events into
++ * a list of servers, emitted whenever we should update haproxy.
++ *
++ * The server list looks like this:
++ *
++ * [
++ *     '<zoneuuid>': {
++ *         'address': <ip-address>
++ *     },
++ *     ...
++ * ]
+  *
+- * It uses a couple of rules/heuristics to control this list and the timing
+- * of reloads to avoid causing unnecessary churn and outages.
++ * which corresponds to a particular webapi zone's name and address.  The
++ * port(s) and their meanings to haproxy are currently hard-coded when we
++ * generate the config.
++ *
++ * We use a couple of rules/heuristics to control this list and the timing
++ * of updates to avoid causing unnecessary churn and outages.
+  *
+  * In particular:
+  *
+- *   - All changes to the backend list are "collected"/spooled for
++ *   - All changes to the server list are "collected"/spooled for
+  *     COLLECTION_TIMEOUT milliseconds before being applied (this happens
+  *     in FSM state 'collecting'). This has a few goals:
+  *       1. Don't react to short transient glitches where a registrar loses
+  *          its session but immediately re-registers
+- *       2. Only reload once when a whole lot of backends come online at
+- *          the same time
++ *       2. Only update once when multiple servers change state at the same time
+  *
+- *   - Removals from the backend list are throttled, first by time -- we ignore
++ *   - Removals from the server list are throttled, first by time -- we ignore
+  *     any removal for HOLD_TIME milliseconds and only actually remove it from
+- *     our backends list once that much time has elapsed (plus/minus the
++ *     our servers list once that much time has elapsed (plus/minus the
+  *     collection timeout). This is double insurance against transient glitches.
+  *
+- *   - Removals are also throttled by percentage of backend set removed -- if
++ *   - Removals are also throttled by percentage of server set removed -- if
+  *     a fraction of the current list greater than REMOVAL_THROTTLE are removed
+- *     at once, we only obey up to that fraction in any one reload, and we
++ *     at once, we only obey up to that fraction in any one update, and we
+  *     wait HOLD_TIME before looking again. This protects us against DC-wide
+  *     ZK glitches where everything gets cut-off and has to re-register.
+  *
+@@ -105,7 +127,7 @@ function diffSets(list1, list2) {
+  *  |            |      |
+  *  |            |      |
+  *  |            |      |
+- *  |       host |      | childrenChanged
++ *  |     server |      | childrenChanged
+  *  |     expiry |      | && diff >0
+  *  | (HOLD_TIME)|      |
+  *  |            |      |
+@@ -129,7 +151,7 @@ function diffSets(list1, list2) {
+  *  |          |         |                 | (RETRY_TIMEOUT)
+  *  |          +--+---+--+                 |
+  *  |             |   |                    | zk 'connect'
+- *  |   got hosts |   | error              |
++ *  | got servers |   | error              |
+  *  |          ok |   |                    |
+  *  |      && ... |   |               +----+----+
+  *  |             |   |               |         |
+@@ -137,55 +159,70 @@ function diffSets(list1, list2) {
+  *                                    |         |
+  *                                    +---------+
+  */
+-function HostWatcherFSM(opts) {
+-    this.hw_zk = opts.zk;
+-    this.hw_path = opts.path;
+-    this.hw_log = opts.log;
+-
+-    this.hw_lastSeen = {};
+-    this.hw_lastHosts = [];
+-    this.hw_lastKids = [];
+-    this.hw_kids = [];
+-    this.hw_history = [];
+-    this.hw_hostHistory = [];
+-    this.hw_nextExpiry = null;
+-
+-    this.hw_lastError = null;
++function ServerWatcherFSM(opts) {
++    this.sw_zk = opts.zk;
++    this.sw_path = opts.path;
++    this.sw_log = opts.log;
++
++    this.sw_lastSeen = {};
++    this.sw_lastServers = {};
++    this.sw_lastKids = [];
++    this.sw_kids = [];
++    this.sw_history = [];
++    this.sw_serverHistory = [];
++    this.sw_nextExpiry = null;
++
++    this.sw_lastError = null;
++
++    this.sw_collectionTimeout = COLLECTION_TIMEOUT;
++    this.sw_holdTime = HOLD_TIME;
++    this.sw_retryTimeout = RETRY_TIMEOUT;
++    this.sw_smearTime = SMEAR;
+ 
+     FSM.call(this, 'idle');
+ }
+-mod_util.inherits(HostWatcherFSM, FSM);
++mod_util.inherits(ServerWatcherFSM, FSM);
+ 
+-HostWatcherFSM.prototype.childrenChanged = function (kids) {
++/*
++ * We add Math.random() * SMEAR to most of the timeouts listed above to "smear"
++ * them out a bit and randomize the load we put on zookeeper. This is meant to
++ * keep lots of muppet processes from hammering it all at once.
++ */
++ServerWatcherFSM.prototype.smear = function (value) {
++    return (Math.round(value + (Math.random() * this.sw_smearTime)));
++};
++
++ServerWatcherFSM.prototype.childrenChanged = function (kids) {
++    this.sw_log.trace({kids: kids}, 'childrenChanged');
+     this.emit('childrenChangedAsserted', kids);
+ };
+ 
+-HostWatcherFSM.prototype._newDiff = function (diff) {
+-    this.hw_history.push({ time: new Date(), diff: diff });
+-    while (this.hw_history.length > HISTORY_LENGTH)
+-        this.hw_history.shift();
++ServerWatcherFSM.prototype._newDiff = function (diff) {
++    this.sw_history.push({ time: new Date(), diff: diff });
++    while (this.sw_history.length > HISTORY_LENGTH)
++        this.sw_history.shift();
+ };
+ 
+-HostWatcherFSM.prototype._newHostDiff = function (diff) {
+-    this.hw_hostHistory.push({ time: new Date(), diff: diff });
+-    while (this.hw_hostHistory.length > HISTORY_LENGTH)
+-        this.hw_hostHistory.shift();
++ServerWatcherFSM.prototype._newServerDiff = function (diff) {
++    this.sw_serverHistory.push({ time: new Date(), diff: diff });
++    while (this.sw_serverHistory.length > HISTORY_LENGTH)
++        this.sw_serverHistory.shift();
+ };
+ 
+-HostWatcherFSM.prototype.state_idle = function (S) {
++ServerWatcherFSM.prototype.state_idle = function (S) {
+     var self = this;
+     var now = Date.now();
+     /*
+-     * hw_nextExpiry would have been set last time we finished "fetch", only
++     * sw_nextExpiry would have been set last time we finished "fetch", only
+      * if we ran into something that needs to expire (e.g. a HOLD_TIME
+      * or REMOVAL_THROTTLE violation). If we don't run into either of those
+      * it should have been set to null.
+      */
+-    if (this.hw_nextExpiry !== null) {
+-        var delta = (this.hw_nextExpiry - now);
++    if (this.sw_nextExpiry !== null) {
++        var delta = (this.sw_nextExpiry - now);
+         if (delta > 0) {
+             S.timeout(delta, function () {
+-                self.hw_log.info('expiry timeout reached (hold time/throttle)');
++                self.sw_log.info('expiry timeout reached (hold time/throttle)');
+                 S.gotoState('collecting');
+             });
+         } else {
+@@ -198,43 +235,153 @@ HostWatcherFSM.prototype.state_idle = function (S) {
+      * nodes in ZK changes.
+      */
+     S.on(this, 'childrenChangedAsserted', function (kids) {
+-        var diff = diffSets(self.hw_lastKids, kids);
++        var diff = diffArrays(self.sw_lastKids, kids);
+         if (diff.added.length > 0 || diff.removed.length > 0) {
+-            self.hw_log.info('received change notification from ZK');
++            self.sw_log.info('received change notification from ZK');
+             self._newDiff(diff);
+-            self.hw_kids = kids;
++            self.sw_kids = kids;
+             S.gotoState('collecting');
+         }
+     });
+ };
+ 
+-HostWatcherFSM.prototype.state_collecting = function (S) {
++ServerWatcherFSM.prototype.state_collecting = function (S) {
+     var self = this;
+-    this.hw_nextExpiry = null;
+-    var timeout = Math.round(COLLECTION_TIMEOUT + Math.random() * SMEAR);
+-    this.hw_log.info('collecting diff for %d sec...',
++    this.sw_nextExpiry = null;
++    var timeout = self.smear(self.sw_collectionTimeout);
++    this.sw_log.info('collecting diff for %d sec...',
+         timeout / 1000);
+     /*
+      * Keep collecting any further changes to the child nodes, but don't
+      * transition until COLLECTION_TIMEOUT elapses.
+      */
+     S.on(this, 'childrenChangedAsserted', function (kids) {
+-        var diff = diffSets(self.hw_kids, kids);
++        var diff = diffArrays(self.sw_kids, kids);
+         if (diff.added.length > 0 || diff.removed.length > 0) {
+             self._newDiff(diff);
+-            self.hw_kids = kids;
++            self.sw_kids = kids;
+         }
+     });
+     S.gotoStateTimeout(timeout, 'fetch');
+ };
+ 
+-HostWatcherFSM.prototype.state_fetch = function (S) {
++/*
++ * We have a new set of Zookeeper children. Process them against our last known
++ * state, potentially keeping hold of some removed servers.
++ */
++ServerWatcherFSM.prototype._processRemovals = function (servers) {
+     var self = this;
+-    var zk = this.hw_zk;
+-    var log = this.hw_log;
++    var log = this.sw_log;
++
++    var diff = diffObjects(self.sw_lastServers, servers);
++
++    var now = Date.now();
++    for (var name in servers) {
++        self.sw_lastSeen[name] = now;
++    }
++
++    /*
++     * Sort the removed servers so that the ones we've seen least recently
++     * (oldest/lowest lastSeen values) are at the front (lowest indices).
++     * That is, we want it in ascending order of lastSeen value.
++     *
++     * If we hit the throttle below we will decide to only actually remove
++     * the first N of these in their sorted order.
++     *
++     * We also take advantage of this sorting when looking at HOLD_TIME
++     * enforcement.
++     */
++    var removed = Object.keys(diff.removed).sort(function (a, b) {
++        if (self.sw_lastSeen[a] < self.sw_lastSeen[b])
++            return (-1);
++        if (self.sw_lastSeen[a] > self.sw_lastSeen[b])
++            return (1);
++        /* Sort by name if lastSeen is the same, to keep it consistent */
++        if (a < b)
++            return (-1);
++        if (a > b)
++            return (1);
++        return (0);
++    });
++
++    if (removed.length > 0) {
++        log.info({ removed: removed }, 'servers have been removed in ZK');
++    }
++
++    var nextExpiry = null;
++
++    var rmThresh = Math.ceil(REMOVAL_THROTTLE *
++        Object.keys(self.sw_lastServers).length);
++
++    log.trace('checking removal throttle (removing %d, threshold %d)',
++        removed.length, rmThresh);
++
++    if (removed.length > rmThresh) {
++        log.warn('throttling server removal to %d servers (tried to ' +
++            'remove %d)', rmThresh, removed.length);
++        /*
++         * We want to only remove the first rmThresh entries on the removed
++         * list, so we resurrect the rest of the list.
++         *
++         * Remember .slice(N) returns the *rest* of the list after chopping
++         * off the first N.
++         */
++        var toRestore = removed.slice(rmThresh);
++        toRestore.forEach(function (s) {
++            servers[s] = self.sw_lastServers[s];
++        });
++        /* Those first entries are the ones actually removed now. */
++        removed = removed.slice(0, rmThresh);
++        /*
++         * Come back in HOLD_TIME and look again if nothing else happens
++         * to re-process the throttle.
++         */
++        nextExpiry = self.smear(now + self.sw_holdTime);
++    }
++
++    /*
++     * Now check for HOLD_TIMEs on individual servers. The 'removed' array
++     * is sorted so that the most recently seen entries are *last*, so we
++     * work from the end of the list here (calling .pop()).
++     */
++    while (removed.length > 0) {
++        var sname = removed.pop();
++        var lastSeen = self.sw_lastSeen[sname];
++        var delta = now - lastSeen;
++        if (delta >= self.sw_holdTime) {
++            break;
++        }
++
++        log.info('keeping removed server %s around for hold time (%d s)',
++            sname, self.sw_holdTime / 1000);
++        servers[sname] = self.sw_lastServers[sname];
++        var exp = self.smear(lastSeen + self.sw_holdTime);
++        if (nextExpiry === null || exp < nextExpiry)
++            nextExpiry = exp;
++    }
++
++    /*
++     * Always set sw_nextExpiry: if we didn't encounter anything that needs
++     * to expire, we want it to go to null so that "idle" doesn't wake up
++     * spuriously.
++     *
++     * Note that if we're encountering errors that prevent us from ever
++     * completing a run through fetch here (e.g. servers.length is 0), we
++     * might leave this set and keep retrying from "idle" a lot.
++     * That's fine.
++     */
++    self.sw_nextExpiry = nextExpiry;
++
++    return (servers);
++};
++
++ServerWatcherFSM.prototype.state_fetch = function (S) {
++    var self = this;
++    var zk = this.sw_zk;
++    var log = this.sw_log;
+ 
+     /* Save the set of kids we're going to fetch now. */
+-    var kids = this.hw_kids;
++    var kids = this.sw_kids;
+ 
+     /*
+      * If we receive another childrenChanged watch event while processing
+@@ -243,146 +390,50 @@ HostWatcherFSM.prototype.state_fetch = function (S) {
+      */
+     var repeat = false;
+     S.on(this, 'childrenChangedAsserted', function (nkids) {
+-        var diff = diffSets(self.hw_lastKids, nkids);
++        var diff = diffArrays(self.sw_lastKids, nkids);
+         if (diff.added.length > 0 || diff.removed.length > 0) {
+             self._newDiff(diff);
+-            self.hw_kids = nkids;
++            self.sw_kids = nkids;
+             repeat = true;
+         }
+     });
+ 
+-    log.trace('fetching info about hosts...');
++    log.trace('fetching info about servers...');
+ 
+-    var hosts = [];
++    var servers = {};
++    var seen_error = false;
+ 
+     var opts = {
+         worker: doKid,
+         concurrency: FETCH_CONCURRENCY
+     };
+-    this.hw_kidq = mod_vasync.queuev(opts);
+-    S.on(this.hw_kidq, 'end', S.callback(function () {
+-        if (hosts.length === 0) {
+-            log.warn('tried to generate empty backends list, ignoring');
+-            S.gotoState('collecting');
+-            return;
+-        }
+-
+-        var hostDiff = diffSets(self.hw_lastHosts, hosts);
+-
+-        var removed = hostDiff.removed;
+-
+-        var now = Date.now();
+-        hosts.forEach(function (h) {
+-            self.hw_lastSeen[h] = now;
+-        });
+-
+-        /*
+-         * Sort the removed hosts so that the ones we've seen least recently
+-         * (oldest/lowest lastSeen values) are at the front (lowest indices).
+-         * That is, we want it in ascending order of lastSeen value.
+-         *
+-         * If we hit the throttle below we will decide to only actually remove
+-         * the first N of these in their sorted order.
+-         *
+-         * We also take advantage of this sorting when looking at HOLD_TIME
+-         * enforcement.
+-         */
+-        removed = removed.sort(function (a, b) {
+-            if (self.hw_lastSeen[a] < self.hw_lastSeen[b])
+-                return (-1);
+-            if (self.hw_lastSeen[a] > self.hw_lastSeen[b])
+-                return (1);
+-            /* Sort by name if lastSeen is the same, to keep it consistent */
+-            if (a < b)
+-                return (-1);
+-            if (a > b)
+-                return (1);
+-            return (0);
+-        });
+-
+-        if (removed.length > 0) {
+-            log.info({ removed: removed }, 'hosts have been removed in ZK');
+-        }
+ 
+-        var nextExpiry = null;
++    this.sw_kidq = mod_vasync.queuev(opts);
+ 
+-        var rmThresh = Math.ceil(REMOVAL_THROTTLE * self.hw_lastHosts.length);
+-
+-        log.trace('checking removal throttle (removing %d, threshold %d)',
+-            removed.length, rmThresh);
+-
+-        if (removed.length > rmThresh) {
+-            log.warn('throttling backend removal to %d backends (tried to ' +
+-                'remove %d)', rmThresh, removed.length);
+-            /*
+-             * We want to only remove the first rmThresh entries on the removed
+-             * list, so we take the rest of it and push it back into the
+-             * 'hosts' list (they were already missing from 'hosts', since this
+-             * came from the diff).
+-             *
+-             * Remember .slice(N) returns the *rest* of the list after chopping
+-             * off the first N
+-             */
+-            var toRestore = removed.slice(rmThresh);
+-            toRestore.forEach(function (h) {
+-                hosts.push(h);
+-            });
+-            /* Those first entries are the ones actually removed now. */
+-            removed = removed.slice(0, rmThresh);
+-            /*
+-             * Come back in HOLD_TIME and look again if nothing else happens
+-             * to re-process the throttle.
+-             */
+-            nextExpiry = Math.round(now + HOLD_TIME + Math.random() * SMEAR);
+-        }
+-
+-        /*
+-         * Now check for HOLD_TIMEs on individual hosts. The 'removed' array
+-         * is sorted so that the most recently seen entries are *last*, so we
+-         * work from the end of the list here (calling .pop()).
+-         */
+-        while (removed.length > 0) {
+-            var host = removed.pop();
+-            var lastSeen = self.hw_lastSeen[host];
+-            var delta = now - lastSeen;
+-            if (delta < HOLD_TIME) {
+-                log.info('keeping removed host %s around for HOLD_TIME (%d s)',
+-                    host, HOLD_TIME / 1000);
+-                hosts.push(host);
+-                var exp = Math.round(lastSeen + HOLD_TIME +
+-                    Math.random() * SMEAR);
+-                if (nextExpiry === null || exp < nextExpiry)
+-                    nextExpiry = exp;
+-            } else {
+-                removed.push(host);
+-                break;
+-            }
++    S.on(this.sw_kidq, 'end', S.callback(function () {
++        if (seen_error) {
++            S.gotoState('retry');
++            return;
++        } else if (servers.length === 0) {
++            log.warn('tried to generate empty servers list, ignoring');
++            S.gotoState('collecting');
++            return;
+         }
+ 
+-        /*
+-         * Always set hw_nextExpiry: if we didn't encounter anything that needs
+-         * to expire, we want it to go to null so that "idle" doesn't wake up
+-         * spuriously.
+-         *
+-         * Note that if we're encountering errors that prevent us from ever
+-         * completing a run through fetch here (e.g. hosts.length is 0), we
+-         * might leave this set and keep retrying from "idle" a lot.
+-         * That's fine.
+-         */
+-        self.hw_nextExpiry = nextExpiry;
++        servers = self._processRemovals(servers);
+ 
+-        hostDiff = diffSets(self.hw_lastHosts, hosts);
+-        self._newHostDiff(hostDiff);
++        var serverDiff = diffObjects(self.sw_lastServers, servers);
++        self._newServerDiff(serverDiff);
+ 
+-        if (hostDiff.added.length !== 0 || hostDiff.removed.length !== 0) {
+-            log.info({ diff: hostDiff }, 'making changes to hosts (after ' +
+-                'throttle and hold)');
+-            self.hw_lastHosts = hosts;
++        if (Object.keys(serverDiff.added).length !== 0 ||
++            Object.keys(serverDiff.removed).length !== 0) {
++            log.info({ diff: serverDiff }, 'servers have changed');
++            self.sw_lastServers = servers;
+             setImmediate(function () {
+-                self.emit('hostsChanged', hosts, hostDiff);
++                self.emit('serversChanged', servers);
+             });
+         } else {
+-            log.info('no net change to hosts detected, will not reload lb');
++            log.info('no net change to servers detected');
+         }
+ 
+         if (repeat) {
+@@ -392,12 +443,19 @@ HostWatcherFSM.prototype.state_fetch = function (S) {
+         }
+     }));
+     kids.forEach(function (kid) {
+-        self.hw_kidq.push(kid);
++        self.sw_kidq.push(kid);
+     });
+-    self.hw_kidq.close();
++    self.sw_kidq.close();
+ 
+     function doKid(name, cb) {
+-        const path = self.hw_path + '/' + name;
++        /* presume that any failure will need a pass through retry */
++        if (seen_error) {
++            cb();
++            return;
++        }
++
++        const path = self.sw_path + '/' + name;
++
+         zk.get(path, S.callback(function (err, json) {
+             /*
+              * The one error we can safely ignore here is NO_NODE, it just means
+@@ -413,12 +471,13 @@ HostWatcherFSM.prototype.state_fetch = function (S) {
+             } else if (err) {
+                 /*
+                  * Queues don't really give us a nice way to return an error and
+-                 * abort, but the kill() function is close. Note that the 'end'
+-                 * handler won't run after kill() so we transition here.
++                 * abort. We'll just mark ourselves as in error, and handle this
++                 * in the 'end' callback.
+                  */
+-                self.hw_lastError = err;
+-                self.hw_kidq.kill();
+-                S.gotoState('retry');
++                log.debug({ err: err }, 'got ZK error for ' + path);
++                self.sw_lastError = err;
++                seen_error = true;
++                cb();
+                 return;
+             }
+ 
+@@ -439,32 +498,32 @@ HostWatcherFSM.prototype.state_fetch = function (S) {
+                 cb();
+                 return;
+             }
+-            hosts.push(obj.host.address);
++
++            servers[name] = { address: obj.host.address };
+             cb();
+         }));
+     }
+ };
+ 
+-HostWatcherFSM.prototype.state_retry = function (S) {
++ServerWatcherFSM.prototype.state_retry = function (S) {
+     var self = this;
+-    this.hw_log.warn(this.hw_lastError, 'error while updating backend list');
++    this.sw_log.warn(this.sw_lastError, 'error while updating server list');
+     S.on(this, 'childrenChangedAsserted', function (kids) {
+-        var diff = diffSets(self.hw_kids, kids);
++        var diff = diffArrays(self.sw_kids, kids);
+         if (diff.added.length > 0 || diff.removed.length > 0) {
+             self._newDiff(diff);
+-            self.hw_kids = kids;
++            self.sw_kids = kids;
+         }
+     });
+-    if (!this.hw_zk.isConnected()) {
+-        S.on(this.hw_zk, 'connect', function () {
+-            S.gotoStateTimeout(Math.round(Math.random() * SMEAR), 'fetch');
++    if (!this.sw_zk.isConnected()) {
++        S.on(this.sw_zk, 'connect', function () {
++            S.gotoStateTimeout(self.smear(0), 'fetch');
+         });
+         return;
+     }
+-    const timeout = Math.round(RETRY_TIMEOUT + Math.random() * SMEAR);
+-    S.gotoStateTimeout(timeout, 'fetch');
++    S.gotoStateTimeout(self.smear(self.sw_retryTimeout), 'fetch');
+ };
+ 
+ module.exports = {
+-    HostWatcherFSM: HostWatcherFSM
++    ServerWatcherFSM: ServerWatcherFSM
+ };
+diff --git a/package.json b/package.json
+index e164460..f598de6 100644
+--- a/package.json
++++ b/package.json
+@@ -20,12 +20,9 @@
+     "zkstream": "0.11.8"
+   },
+   "devDependencies": {
+-    "nodeunit": "0.11.2",
++    "tap": "12.6.1",
+     "diff": "4.0.1"
+   },
+-  "scripts": {
+-    "start": "node ./muppet.js"
+-  },
+   "sdcDependencies": {
+     "config-agent": ">=1.2.0"
+   },
+diff --git a/test/app.test.js b/test/app.test.js
+new file mode 100644
+index 0000000..212dca4
+--- /dev/null
++++ b/test/app.test.js
+@@ -0,0 +1,149 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++/*jsl:ignore*/
++'use strict';
++/*jsl:end*/
++
++const app = require('../lib/app.js');
++const haproxy_sock = require('../lib/haproxy_sock.js');
++const helper = require('./helper.js');
++const tap = require('tap');
++
++var log = helper.createLogger();
++
++tap.beforeEach(function (cb, t) {
++    helper.startHaproxy(cb);
++});
++
++tap.afterEach(function (cb, t) {
++    helper.killHaproxy(cb);
++});
++
++tap.test('app.checkStats no-server', function (t) {
++    const servers = {
++        '4afa9ff4-d918-42ed-9972-9ac20b7cf869': {
++            'enabled': true,
++            'address': '127.0.0.1'
++        }
++        // intentionally missing
++        // '5c679a71-9ef7-4079-9a4c-45c9f5b97d45': { 'enabled': true }
++    };
++
++    haproxy_sock.serverStats({ log: log }, function (err, stats) {
++        t.notOk(err);
++
++        const res = app.checkStats(servers, stats);
++
++        t.equal(res.reload, true, 'must reload');
++        t.equal(res.wrong.length, 2, 'one wrong server in 2 backends');
++        t.equal(res.wrong[0].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++            'correct svname');
++        t.equal(res.wrong[0].reason, 'no-server', 'correct reason');
++        t.equal(res.wrong[1].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++            'correct svname');
++        t.equal(res.wrong[1].reason, 'no-server', 'correct reason');
++        t.done();
++    });
++});
++
++tap.test('app.checkStats addr-mismatch', function (t) {
++    const servers = {
++        '4afa9ff4-d918-42ed-9972-9ac20b7cf869': {
++            'enabled': true,
++            'address': '127.0.0.1'
++        },
++        '5c679a71-9ef7-4079-9a4c-45c9f5b97d45': {
++            'enabled': true,
++            'address': '127.0.0.2'
++        }
++    };
++
++    haproxy_sock.serverStats({ log: log }, function (err, stats) {
++        t.notOk(err);
++
++        const res = app.checkStats(servers, stats);
++
++        t.equal(res.reload, true, 'must reload');
++        t.equal(res.wrong.length, 2, 'one addr-mismatch in 2 backends');
++        t.equal(res.wrong[0].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++            'correct svname');
++        t.equal(res.wrong[0].reason, 'addr-mismatch', 'correct reason');
++        t.equal(res.wrong[1].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++            'correct svname');
++        t.equal(res.wrong[1].reason, 'addr-mismatch', 'correct reason');
++        t.done();
++    });
++});
++
++tap.test('app.checkStats want-disabled', function (t) {
++    const servers = {
++        '4afa9ff4-d918-42ed-9972-9ac20b7cf869': {
++            'enabled': true,
++            'address': '127.0.0.1'
++        },
++        '5c679a71-9ef7-4079-9a4c-45c9f5b97d45': {
++            'enabled': false,
++            'address': '127.0.0.1'
++        }
++    };
++
++    haproxy_sock.serverStats({ log: log }, function (err, stats) {
++        t.notOk(err);
++
++        const res = app.checkStats(servers, stats);
++
++        t.equal(res.reload, false, 'must reload is false');
++        t.equal(res.wrong.length, 2, 'one want-disabled in 2 backends');
++        t.equal(res.wrong[0].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++            'correct svname');
++        t.equal(res.wrong[0].reason, 'want-disabled', 'correct reason');
++        t.equal(res.wrong[1].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++            'correct svname');
++        t.equal(res.wrong[1].reason, 'want-disabled', 'correct reason');
++        t.done();
++    });
++});
++
++tap.test('app.checkStats want-enabled', function (t) {
++    const servers = {
++        '4afa9ff4-d918-42ed-9972-9ac20b7cf869': {
++            'enabled': true,
++            'address': '127.0.0.1'
++        },
++        '5c679a71-9ef7-4079-9a4c-45c9f5b97d45': {
++            'enabled': false,
++            'address': '127.0.0.1'
++        }
++    };
++
++    haproxy_sock.syncServerState({ log: log, servers: servers },
++      function (err) {
++        t.notOk(err);
++
++        servers['5c679a71-9ef7-4079-9a4c-45c9f5b97d45'].enabled = true;
++
++        haproxy_sock.serverStats({ log: log }, function (err2, stats) {
++            t.notOk(err2);
++
++            const res = app.checkStats(servers, stats);
++
++            t.equal(res.reload, false, 'must reload is false');
++            t.equal(res.wrong.length, 2, 'one want-enabled in 2 backends');
++            t.equal(res.wrong[0].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++                'correct svname');
++            t.equal(res.wrong[0].reason, 'want-enabled', 'correct reason');
++            t.equal(res.wrong[1].svname, '5c679a71-9ef7-4079-9a4c-45c9f5b97d45',
++                'correct svname');
++            t.equal(res.wrong[1].reason, 'want-enabled', 'correct reason');
++            t.done();
++        });
++    });
++});
+diff --git a/test/config.test.js b/test/config.test.js
+index f627831..b6384c4 100644
+--- a/test/config.test.js
++++ b/test/config.test.js
+@@ -13,9 +13,9 @@ var lbm = require('../lib/lb_manager.js');
+ var path = require('path');
+ var fs = require('fs');
+ var jsdiff = require('diff');
++var tap = require('tap');
+ 
+ ///--- Globals
+-var test = helper.test;
+ var log = helper.createLogger();
+ 
+ // The good file to test against
+@@ -46,7 +46,7 @@ var haproxy_exec = path.resolve(__dirname, '../deps/haproxy-1.8/haproxy');
+ 
+ ///--- Tests
+ 
+-test('test good config file', function (t) {
++tap.test('test good config file', function (t) {
+     var opts = { log: helper.createLogger(),
+         haproxyExec: haproxy_exec,
+         configFileOut: haproxy_good};
+@@ -56,51 +56,54 @@ test('test good config file', function (t) {
+     });
+ });
+ 
+-test('test no-listener config file (should error)', function (t) {
++tap.test('test no-listener config file (should error)', function (t) {
+     var opts = { log: helper.createLogger(),
+         haproxyExec: haproxy_exec,
+         configFileOut: haproxy_no_listener};
+     lbm.checkHaproxyConfig(opts, function (err) {
+-        t.notEqual(null, err);
++        t.ok(err);
+         t.done();
+     });
+ });
+ 
+-test('test empty config file (should error)', function (t) {
++tap.test('test empty config file (should error)', function (t) {
+     var opts = { log: helper.createLogger(),
+         haproxyExec: haproxy_exec,
+         configFileOut: haproxy_empty_error};
+     lbm.checkHaproxyConfig(opts, function (err) {
+-        t.notEqual(null, err);
++        t.ok(err);
+         t.done();
+     });
+ });
+ 
+-test('test parse error config file (should error)', function (t) {
++tap.test('test parse error config file (should error)', function (t) {
+     var opts = { log: helper.createLogger(),
+         haproxyExec: haproxy_exec,
+         configFileOut: haproxy_parse_error};
+     lbm.checkHaproxyConfig(opts, function (err) {
+-        t.notEqual(null, err);
++        t.ok(err);
+         t.done();
+     });
+ });
+ 
+-test('test no-frontend config file (should error)', function (t) {
++tap.test('test no-frontend config file (should error)', function (t) {
+     var opts = { log: helper.createLogger(),
+         haproxyExec: haproxy_exec,
+         configFileOut: haproxy_no_frontend};
+     lbm.checkHaproxyConfig(opts, function (err) {
+-        t.notEqual(null, err);
++        t.ok(err);
+         t.done();
+     });
+ });
+ 
+-test('test writeHaproxyConfig', function (t) {
++tap.test('test writeHaproxyConfig', function (t) {
+     var opts = {
+         trustedIP: '127.0.0.1',
+         untrustedIPs: ['::1', '255.255.255.255'],
+-        hosts: ['foo.joyent.us', 'bar.joyent.us'],
++        servers: {
++            'foo.joyent.us': { address: '127.0.0.1' },
++            'bar.joyent.us': { address: '127.0.0.2' }
++        },
+         configFileOut: updConfig_out,
+         haproxyExec: haproxy_exec,
+         log: helper.createLogger()
+@@ -130,12 +133,12 @@ test('test writeHaproxyConfig', function (t) {
+     });
+ });
+ 
+-test('test writeHaproxyConfig bad config (should error)', function (t) {
+-    // haproxy shouldn't like empty hosts (no listen or backend)
++tap.test('test writeHaproxyConfig bad config (should error)', function (t) {
++    // haproxy shouldn't like empty servers
+     var opts = {
+         trustedIP: '',
+         untrustedIPs: [],
+-        hosts: [],
++        servers: {},
+         configFileOut: updConfig_out,
+         configFileIn: haproxy_config_in,
+         haproxyExec: haproxy_exec,
+@@ -146,17 +149,17 @@ test('test writeHaproxyConfig bad config (should error)', function (t) {
+         lbm.writeHaproxyConfig,
+         lbm.checkHaproxyConfig
+     ]}, function (err) {
+-        t.notEqual(null, err);
++        t.ok(err);
+         t.done();
+     });
+ });
+ 
+-test('test reload', function (t) {
++tap.test('test reload', function (t) {
+     var opts = {
+         trustedIP: '127.0.0.1',
+         untrustedIPs: ['::1', '255.255.255.255'],
+         // This must resolve, so pick something public
+-        hosts: ['google.com'],
++        servers: { 'google.com': { 'address': '8.8.8.8' } },
+         reload: '/bin/true',
+         configFileIn: haproxy_config_in,
+         haproxyExec: haproxy_exec,
+@@ -164,7 +167,7 @@ test('test reload', function (t) {
+     };
+ 
+     lbm.reload(opts, function (err, data) {
+-        t.equal(null, err);
++        t.equal(undefined, err);
+         t.doesNotThrow(function () {
+             // Check if reload created the proper file
+             // this will throw if the file doesn't exist
+@@ -177,11 +180,11 @@ test('test reload', function (t) {
+     });
+ });
+ 
+-test('test reload bad config (should error)', function (t) {
++tap.test('test reload bad config (should error)', function (t) {
+     var opts = {
+         trustedIP: '127.0.0.1',
+         untrustedIPs: ['::1', '255.255.255.255'],
+-        hosts: [],
++        servers: {},
+         reload: '/bin/true',
+         configFileIn: haproxy_config_in,
+         haproxyExec: haproxy_exec,
+@@ -189,16 +192,19 @@ test('test reload bad config (should error)', function (t) {
+     };
+ 
+     lbm.reload(opts, function (err, data) {
+-        t.notEqual(null, err);
++        t.ok(err);
+         t.done();
+     });
+ });
+ 
+-test('test dueling reloads', function (t) {
++tap.test('test dueling reloads', function (t) {
+     var opts = {
+         trustedIP: '127.0.0.1',
+         untrustedIPs: ['::1', '255.255.255.255'],
+-        hosts: ['google.com', 'joyent.com'],
++        servers: {
++            'google.com': { 'address': '8.8.8.8' },
++            'google2.com': { 'address': '8.8.4.4' }
++        },
+         reload: '/bin/sleep 2',
+         configFileIn: haproxy_config_in,
+         haproxyExec: haproxy_exec,
+@@ -209,22 +215,26 @@ test('test dueling reloads', function (t) {
+         trustedIP: '127.0.0.1',
+         untrustedIPs: ['::1', '255.255.255.255'],
+         // This must resolve, so pick something public
+-        hosts: ['google.com'],
++        servers: { 'google.com': { 'address': '8.8.8.8' } },
+         reload: '/bin/true',
+         configFileIn: haproxy_config_in,
+         haproxyExec: haproxy_exec,
+         log: helper.createLogger()
+     };
+ 
+-    // Reload twice, calling the functions as fast as possible
+-    // Using a /bin/sleep call to make sure the first one is still
+-    // busy for the second call.
++    console.log('hello');
++
++    /*
++     * The first reload is slower due to the sleep, so we expect the second one
++     * to receive an error first, and then get the first callback.
++     */
++
+     lbm.reload(opts, function (err, data) {
+-        t.equal(null, err);
++        t.equal(undefined, err);
++        t.done();
+     });
+ 
+     lbm.reload(opts2, function (err, data) {
+-        t.equal(null, err);
+-        t.done();
++        t.ok(err);
+     });
+ });
+diff --git a/test/haproxy.cfg.out-check b/test/haproxy.cfg.out-check
+index 7514e0e..a9642bb 100644
+--- a/test/haproxy.cfg.out-check
++++ b/test/haproxy.cfg.out-check
+@@ -33,14 +33,14 @@ defaults
+ 
+ backend secure_api
+         option httpchk GET /ping
+-        server be0 foo.joyent.us:80 check inter 30s slowstart 10s
+-        server be1 bar.joyent.us:80 check inter 30s slowstart 10s
++        server foo.joyent.us 127.0.0.1:80 check inter 30s slowstart 10s
++        server bar.joyent.us 127.0.0.2:80 check inter 30s slowstart 10s
+ 
+ 
+ backend insecure_api
+         option httpchk GET /ping
+-        server be0 foo.joyent.us:81 check inter 30s slowstart 10s
+-        server be1 bar.joyent.us:81 check inter 30s slowstart 10s
++        server foo.joyent.us 127.0.0.1:81 check inter 30s slowstart 10s
++        server bar.joyent.us 127.0.0.2:81 check inter 30s slowstart 10s
+ 
+ 
+ backend haproxy-stats_http
+diff --git a/test/haproxy.cfg.test b/test/haproxy.cfg.test
+new file mode 100644
+index 0000000..5f0b285
+--- /dev/null
++++ b/test/haproxy.cfg.test
+@@ -0,0 +1,44 @@
++global
++	log 127.0.0.1 local0
++	#user nobody
++	#group nobody
++	daemon
++	maxconn 2048
++	pidfile /tmp/haproxy.pid.test
++	stats socket /tmp/haproxy mode 0600 level admin
++
++defaults
++	balance leastconn
++	log     global
++	maxconn 2048
++	mode http
++	option forwardfor
++	option http-tunnel
++	option httplog
++	option redispatch
++	no option httpclose
++	no option http-server-close
++	retries 3
++	timeout connect 500
++	timeout client  120000
++	timeout server  240000
++
++frontend https
++	bind 127.0.0.1:6600 accept-proxy
++	default_backend secure_api
++	reqadd x-secure:\ true
++
++backend secure_api
++	option httpchk GET /ping
++	server 4afa9ff4-d918-42ed-9972-9ac20b7cf869 127.0.0.1:6780 check inter 1s slowstart 10s
++	server 5c679a71-9ef7-4079-9a4c-45c9f5b97d45 127.0.0.1:6781 check inter 1s slowstart 10s
++
++
++frontend http
++	bind 127.0.0.1:6700
++	default_backend insecure_api
++
++backend insecure_api
++	option httpchk GET /ping
++	server 4afa9ff4-d918-42ed-9972-9ac20b7cf869 127.0.0.1:6681 check inter 1s slowstart 10s
++	server 5c679a71-9ef7-4079-9a4c-45c9f5b97d45 127.0.0.1:6682 check inter 1s slowstart 10s
+diff --git a/test/haproxy_sock.test.js b/test/haproxy_sock.test.js
+new file mode 100644
+index 0000000..43e8dd3
+--- /dev/null
++++ b/test/haproxy_sock.test.js
+@@ -0,0 +1,161 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++/*jsl:ignore*/
++'use strict';
++/*jsl:end*/
++
++const haproxy_sock = require('../lib/haproxy_sock.js');
++const helper = require('./helper.js');
++const tap = require('tap');
++
++var log = helper.createLogger();
++
++tap.beforeEach(function (cb, t) {
++    helper.startHaproxy(cb);
++});
++
++tap.afterEach(function (cb, t) {
++    helper.killHaproxy(cb);
++});
++
++tap.test('haproxy_sock.serverStats', function (t) {
++    haproxy_sock.serverStats({log: log}, function (err, stats) {
++        t.notOk(err);
++
++        stats.forEach(function (srv) {
++            t.match(srv.pxname, /insecure_api|secure_api/, 'pxname is valid');
++            t.match(srv.addr, /127\.0\.0\.1:6[0-9]{3}/, 'addr is valid');
++            t.equal(srv.act, '1', 'act is 1');
++            // no server behind these, so DOWN
++            t.equal(srv.status, 'DOWN', 'status is DOWN');
++        });
++
++        t.done();
++    });
++});
++
++tap.test('haproxy_sock.syncServerState 1', function (t) {
++    const servers = {
++        '4afa9ff4-d918-42ed-9972-9ac20b7cf869': { 'enabled': true },
++        '5c679a71-9ef7-4079-9a4c-45c9f5b97d45': { 'enabled': true }
++    };
++
++    haproxy_sock.syncServerState({ log: log, servers: servers },
++      function (err) {
++        t.notOk(err);
++
++        haproxy_sock.serverStats({log: log}, function (er2, stats) {
++            t.notOk(er2);
++
++            stats.forEach(function (srv) {
++                t.match(srv.pxname, /insecure_api|secure_api/,
++                    'pxname is valid');
++                t.match(srv.addr, /127\.0\.0\.1:6[0-9]{3}/, 'addr is valid');
++                t.equal(srv.act, '1', 'act is 1');
++                // no server behind these, so DOWN
++                t.equal(srv.status, 'DOWN', 'status is DOWN');
++            });
++
++            t.done();
++        });
++    });
++});
++
++tap.test('haproxy_sock.syncServerState 2', function (t) {
++    const servers = {
++        '4afa9ff4-d918-42ed-9972-9ac20b7cf869': { 'enabled': true }
++        // intentionally missing
++        // '5c679a71-9ef7-4079-9a4c-45c9f5b97d45': { 'enabled': true }
++    };
++
++    haproxy_sock.syncServerState({ log: log, servers: servers },
++      function (err) {
++        t.ok(err);
++        t.done();
++    });
++});
++
++tap.test('haproxy_sock.syncServerState 3', function (t) {
++    const servers = {
++        '4afa9ff4-d918-42ed-9972-9ac20b7cf869': { 'enabled': true },
++        '5c679a71-9ef7-4079-9a4c-45c9f5b97d45': { 'enabled': false }
++    };
++
++    haproxy_sock.syncServerState({ log: log, servers: servers },
++      function (err) {
++        t.notOk(err);
++
++        haproxy_sock.serverStats({log: log}, function (err2, stats) {
++            t.notOk(err2);
++
++            stats.forEach(function (srv) {
++                t.match(srv.pxname, /insecure_api|secure_api/,
++                    'pxname is valid');
++                t.match(srv.addr, /127\.0\.0\.1:6[0-9]{3}/, 'addr is valid');
++                t.equal(srv.act, '1', 'act is 1');
++
++                switch (srv.svname) {
++                case '4afa9ff4-d918-42ed-9972-9ac20b7cf869':
++                    // no server behind these, so DOWN
++                    t.equal(srv.status, 'DOWN', 'status is DOWN');
++                    break;
++
++                case '5c679a71-9ef7-4079-9a4c-45c9f5b97d45':
++                    t.equal(srv.status, 'MAINT', 'status is MAINT');
++                    break;
++
++                default:
++                    t.ok(false, 'unknown server ' + srv.svname);
++                    break;
++                }
++            });
++
++            reEnableServer(t, servers);
++        });
++    });
++});
++
++function reEnableServer(t, servers) {
++    servers['5c679a71-9ef7-4079-9a4c-45c9f5b97d45'].enabled = true;
++
++    haproxy_sock.syncServerState({ log: log, servers: servers },
++      function (err) {
++        t.notOk(err);
++
++        haproxy_sock.serverStats({log: log}, function (err2, stats) {
++            t.notOk(err2);
++
++            stats.forEach(function (srv) {
++                t.match(srv.pxname, /insecure_api|secure_api/,
++                    'pxname is valid');
++                t.match(srv.addr, /127\.0\.0\.1:6[0-9]{3}/, 'addr is valid');
++                t.equal(srv.act, '1', 'act is 1');
++                switch (srv.svname) {
++                case '4afa9ff4-d918-42ed-9972-9ac20b7cf869':
++                    // no server behind these, so DOWN
++                    t.equal(srv.status, 'DOWN', 'status is DOWN');
++                    break;
++
++                case '5c679a71-9ef7-4079-9a4c-45c9f5b97d45':
++                    // after re-enabling a L4-failed server, we get UP 1/3 here
++                    t.equal(srv.status, 'UP 1/3', 'status is UP 1/3');
++                    break;
++
++                default:
++                    t.ok(false, 'unknown server ' + srv.svname);
++                    break;
++                }
++            });
++
++            t.done();
++        });
++    });
++}
+diff --git a/test/helper.js b/test/helper.js
+index da31160..eac57ce 100644
+--- a/test/helper.js
++++ b/test/helper.js
+@@ -13,69 +13,58 @@
+ /*jsl:end*/
+ 
+ const bunyan = require('bunyan');
+-const vasync = require('vasync');
+-const zkstream = require('zkstream');
++const child_process = require('child_process');
++const fs = require('fs');
++const path = require('path');
+ 
++const haproxy_exec = path.resolve(__dirname, '../deps/haproxy-1.8/haproxy');
++const haproxy_cfgfile = path.resolve(__dirname, './haproxy.cfg.test');
++const haproxy_pidfile = '/tmp/haproxy.pid.test';
+ 
+ ///--- Helpers
+ 
+ function createLogger(name, stream) {
+-        var log = bunyan.createLogger({
+-                level: (process.env.LOG_LEVEL || 'warn'),
+-                name: name || process.argv[1],
+-                stream: stream || process.stdout,
+-                src: true,
+-                serializers: {
+-                        err: bunyan.stdSerializers.err
+-                }
+-        });
+-        return (log);
++    var log = bunyan.createLogger({
++        level: (process.env.LOG_LEVEL || 'warn'),
++        name: name || process.argv[1],
++        stream: stream || process.stdout,
++        src: true,
++        serializers: {
++            err: bunyan.stdSerializers.err
++        }
++    });
++    return (log);
+ }
+ 
+ 
+-///--- Exports
+-
+-module.exports = {
+-
+-        after: function after(teardown) {
+-                module.parent.exports.tearDown = function _teardown(callback) {
+-                        try {
+-                                teardown.call(this, callback);
+-                        } catch (e) {
+-                                console.error('after:\n' + e.stack);
+-                                process.exit(1);
+-                        }
+-                };
+-        },
++function startHaproxy(cb) {
++    child_process.execFile(haproxy_exec, [ '-f', haproxy_cfgfile ],
++      function (error, stdout, stderr) {
++        if (error) {
++            cb(error);
++            return;
++        }
+ 
+-        before: function before(setup) {
+-                module.parent.exports.setUp = function _setup(callback) {
+-                        try {
+-                                setup.call(this, callback);
+-                        } catch (e) {
+-                                console.error('before:\n' + e.stack);
+-                                process.exit(1);
+-                        }
+-                };
+-        },
++        setTimeout(cb, 1000);
++    });
++}
+ 
+-        test: function test(name, tester) {
+-                module.parent.exports[name] = function _(t) {
+-                        var _done = false;
+-                        t.end = function end() {
+-                                if (!_done) {
+-                                        _done = true;
+-                                        t.done();
+-                                }
+-                        };
+-                        t.notOk = function notOk(ok, message) {
+-                                return (t.ok(!ok, message));
+-                        };
++function killHaproxy(cb) {
++    fs.readFile(haproxy_pidfile, function (err, haproxy_pid) {
++        if (err) {
++            cb(err);
++            return;
++        }
+ 
+-                        tester(t);
+-                };
+-        },
++        process.kill(haproxy_pid);
++        cb();
++    });
++}
+ 
+-        createLogger: createLogger
++///--- Exports
+ 
++module.exports = {
++        createLogger: createLogger,
++        startHaproxy: startHaproxy,
++        killHaproxy: killHaproxy
+ };
+diff --git a/test/watch.test.js b/test/watch.test.js
+new file mode 100644
+index 0000000..b215f1a
+--- /dev/null
++++ b/test/watch.test.js
+@@ -0,0 +1,399 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2019 Joyent, Inc.
++ */
++
++/*jsl:ignore*/
++'use strict';
++/*jsl:end*/
++
++const mod_vasync = require('vasync');
++const tap = require('tap');
++const helper = require('./helper.js');
++const watch = require('../lib/watch.js');
++
++var log = helper.createLogger();
++
++// tests run faster than real life
++const COLLECTION_TIMEOUT = 500;
++const HOLD_TIME = 3000;
++const RETRY_TIMEOUT = 1500;
++const SMEAR = 0;
++
++tap.jobs = 4;
++
++function MockZookeeper() {
++    this.res = {};
++    this.res_no_node = {};
++    this.res_error = {};
++    this.connected = true;
++}
++
++MockZookeeper.prototype.get = function (path, cb) {
++    if (this.res_no_node[path]) {
++            cb({ name: 'ZKError', code: 'NO_NODE'});
++            return;
++    } else if (this.res_error[path]) {
++            cb({ name: this.res_error[path], code: 'ZK_ERROR'});
++            return;
++    }
++    cb(null, this.res[path]);
++};
++
++MockZookeeper.prototype.isConnected = function () {
++    return (this.connected);
++};
++
++function setup(zk) {
++    var watcher = new watch.ServerWatcherFSM({
++        zk: new MockZookeeper(),
++        path: '',
++        log: log
++    });
++
++    watcher.sw_collectionTimeout = COLLECTION_TIMEOUT;
++    watcher.sw_holdTime = HOLD_TIME;
++    watcher.sw_retryTimeout = RETRY_TIMEOUT;
++    watcher.sw_smearTime = SMEAR;
++
++    return (watcher);
++}
++
++tap.test('test collecting serversChanged', function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res['/c2'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.2' }
++    });
++
++    watcher.on('serversChanged', function (servers) {
++        t.comment('serversChanged: expecting c1,c2');
++        t.equal(servers['c1'].address, '127.0.0.1');
++        t.equal(servers['c2'].address, '127.0.0.2');
++        t.done();
++    });
++
++    t.comment('adding c1');
++    watcher.childrenChanged(['c1']);
++
++    setTimeout(function () {
++        t.comment('adding c2,c3');
++        watcher.childrenChanged(['c1', 'c2', 'c3']);
++        setTimeout(function () {
++            t.comment('removing c3');
++            watcher.childrenChanged(['c1', 'c2']);
++        }, 100);
++    }, 100);
++});
++
++tap.test('test no net change', function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res['/c2'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.2' }
++    });
++
++    t.comment('adding c1');
++    watcher.childrenChanged(['c1']);
++
++    // wait for the first notification, then proceed
++    setTimeout(function () {
++        watcher.on('serversChanged', function (servers) {
++            t.fail('got serversChanged');
++        });
++
++        setTimeout(function () {
++            t.done();
++        }, 800);
++
++        setTimeout(function () {
++            t.comment('adding c2');
++            watcher.childrenChanged(['c1', 'c2']);
++            setTimeout(function () {
++                t.comment('back to just c1');
++                watcher.childrenChanged(['c1']);
++            }, 100);
++        }, 100);
++    }, COLLECTION_TIMEOUT + 300);
++
++});
++
++tap.test('test hold time', function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res['/c2'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.2' }
++    });
++    watcher.sw_zk.res['/c3'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.3' }
++    });
++
++    t.comment('adding c1, c2');
++    watcher.childrenChanged(['c1', 'c2']);
++
++    var ok = false;
++
++    setTimeout(function () {
++        watcher.on('serversChanged', function (servers) {
++            t.comment('got serversChanged with ok ' + ok);
++            t.ok(ok, 'serversChanged expected');
++            if (ok) {
++                t.ok(servers['c1']);
++                t.notOk(servers['c2']);
++                t.done();
++            }
++        });
++
++        setTimeout(function () {
++            t.comment('removing c2');
++            watcher.childrenChanged(['c1']);
++            t.comment('expecting c2 to stay');
++
++            setTimeout(function () {
++                ok = true;
++                t.comment('expecting c2 removal');
++            }, COLLECTION_TIMEOUT + 300);
++        }, COLLECTION_TIMEOUT + 300);
++    }, COLLECTION_TIMEOUT + 300);
++
++});
++
++tap.test('test non-host children', function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res['/c2'] = JSON.stringify({
++        type: 'load_balancer', host: { address: '127.0.0.2' }
++    });
++
++    watcher.on('serversChanged', function (servers) {
++        t.equal(servers['c1'].address, '127.0.0.1');
++        t.notOk(servers['c2']);
++        t.done();
++    });
++
++    t.comment('adding load_balancer c2');
++    watcher.childrenChanged(['c1', 'c2']);
++});
++
++tap.test('test NO_NODE response', function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res_no_node['/c2'] = true;
++
++    t.comment('adding c1, NO_NODE c2');
++    watcher.childrenChanged(['c1', 'c2']);
++
++    watcher.on('serversChanged', function (servers) {
++        t.equal(servers['c1'].address, '127.0.0.1');
++        t.notOk(servers['c2']);
++        t.done();
++    });
++});
++
++tap.test('test ZK error response', function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res['/c2'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.2' }
++    });
++    watcher.sw_zk.res['/c3'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.3' }
++    });
++
++    watcher.sw_zk.res_error['/c2'] = 'lost connection';
++
++    t.comment('adding c1, c2, c3');
++    watcher.childrenChanged(['c1', 'c2', 'c3']);
++
++    watcher.on('serversChanged', function (servers) {
++        t.comment('serversChanged arrived');
++        t.equal(servers['c1'].address, '127.0.0.1');
++        t.equal(servers['c2'].address, '127.0.0.2');
++        t.equal(servers['c3'].address, '127.0.0.3');
++        t.notOk(watcher.sw_zk.res_error['/c2']);
++        t.done();
++    });
++
++    t.comment('running in ZK failure mode');
++    setTimeout(function () {
++        t.comment('fixing up ZK to work again');
++        watcher.sw_zk.res_error['/c2'] = undefined;
++    }, COLLECTION_TIMEOUT + 300);
++});
++
++tap.test('test removal throttle', {timeout: 40000}, function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res['/c2'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.2' }
++    });
++    watcher.sw_zk.res['/c3'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.3' }
++    });
++    watcher.sw_zk.res['/c4'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.4' }
++    });
++    watcher.sw_zk.res['/c5'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.5' }
++    });
++    watcher.sw_zk.res['/c5'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.5' }
++    });
++    watcher.sw_zk.res['/c6'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.6' }
++    });
++    watcher.sw_zk.res['/c7'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.7' }
++    });
++    watcher.sw_zk.res['/c8'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.8' }
++    });
++    watcher.sw_zk.res['/c9'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.9' }
++    });
++    watcher.sw_zk.res['/ca'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.10' }
++    });
++
++    t.comment('adding c1-ca');
++    watcher.childrenChanged(['c1', 'c2', 'c3', 'c4', 'c5',
++        'c6', 'c7', 'c8', 'c9', 'ca']);
++
++    // NB: this is relying on removal sort ordering by name
++    var expect = [
++        [ 'c1', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'ca' ],
++        [ 'c1', 'c6', 'c7', 'c8', 'c9', 'ca' ],
++        [ 'c1', 'c8', 'c9', 'ca' ],
++        [ 'c1', 'c9', 'ca' ],
++        [ 'c1', 'ca' ],
++        [ 'c1' ]
++    ];
++
++    var count = 0;
++
++    setTimeout(function () {
++        watcher.on('serversChanged', function (servers) {
++            t.comment('checking server list is as expected: got ' +
++                JSON.stringify(servers));
++            expect[count].forEach(function (s) {
++                t.ok(servers[s]);
++            });
++
++            count += 1;
++            if (count === expect.length)
++                t.done();
++        });
++
++        t.comment('removing c2-ca');
++        watcher.childrenChanged(['c1']);
++
++    }, COLLECTION_TIMEOUT + 300);
++});
++
++tap.test('test last seen removal ordering', function (t) {
++    var watcher = setup();
++
++    watcher.sw_zk.res['/c1'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.1' }
++    });
++    watcher.sw_zk.res['/c2'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.2' }
++    });
++    watcher.sw_zk.res['/c3'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.3' }
++    });
++    watcher.sw_zk.res['/c4'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.4' }
++    });
++    watcher.sw_zk.res['/c5'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.5' }
++    });
++    watcher.sw_zk.res['/c5'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.5' }
++    });
++    watcher.sw_zk.res['/c6'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.6' }
++    });
++    watcher.sw_zk.res['/c7'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.7' }
++    });
++    watcher.sw_zk.res['/c8'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.8' }
++    });
++    watcher.sw_zk.res['/c9'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.9' }
++    });
++    watcher.sw_zk.res['/ca'] = JSON.stringify({
++        type: 'host', host: { address: '127.0.0.10' }
++    });
++
++    t.comment('adding c1-ca');
++    watcher.childrenChanged(['c1', 'c2', 'c3', 'c4', 'c5',
++        'c6', 'c7', 'c8', 'c9', 'ca']);
++
++    // NB: this is relying on removal sort ordering by name as well as last seen
++    var expect = [
++        [ 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9', 'ca' ],
++        [ 'c1', 'c2', 'c3', 'c4', 'c7', 'c8', 'c9', 'ca' ],
++        [ 'c1', 'c3', 'c4', 'c8', 'c9', 'ca' ],
++        [ 'c1', 'c8', 'c9', 'ca' ]
++    ];
++
++    var count = 0;
++
++    watcher.on('serversChanged', function (servers) {
++        t.comment('checking server list is as expected: got ' +
++            JSON.stringify(servers));
++        expect[count].forEach(function (s) {
++            t.ok(servers[s]);
++        });
++
++        count += 1;
++        if (count === expect.length)
++            t.done();
++    });
++
++    mod_vasync.pipeline({'funcs': [
++        function (_, cb) {
++            setTimeout(function () {
++                t.comment('remove c5-c7');
++                watcher.childrenChanged(['c1', 'c2', 'c3', 'c4',
++                    'c8', 'c9', 'ca']);
++                cb();
++            }, COLLECTION_TIMEOUT + 300);
++        },
++        function (_, cb) {
++            setTimeout(function () {
++                t.comment('remove c2-c4');
++                watcher.childrenChanged(['c1', 'c8', 'c9', 'ca']);
++                cb();
++            }, COLLECTION_TIMEOUT + 300);
++        }
++    ]}, function () { });
++});
+diff --git a/tools/mk/Makefile.haproxy.targ b/tools/mk/Makefile.haproxy.targ
+index eacb922..25bea55 100644
+--- a/tools/mk/Makefile.haproxy.targ
++++ b/tools/mk/Makefile.haproxy.targ
+@@ -13,7 +13,7 @@
+ # Makefile.haproxy.targ: building and shipping a private haproxy
+ #
+ 
+-BUILDFLAGS = -j8 TARGET=solaris CFLAGS=-D_XPG6
++BUILDFLAGS = -j8 TARGET=solaris SILENT_DEFINE=-D_XPG6
+ $(HAPROXY_EXEC): $(HAPROXY_SRC)/.git
+ 	cd $(HAPROXY_SRC) && \
+ 	    $(MAKE) $(BUILDFLAGS) && \

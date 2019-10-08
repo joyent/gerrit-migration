@@ -1,0 +1,247 @@
+commit 41983824271df0916174cd0a52ff6f642c78fc60
+Author: Pedro Palazon Candel <pedro@joyent.com>
+Date:   2019-06-20T17:25:24+02:00 (4 months ago)
+    
+    TRITON-1764 VMAPI doesn't support "remaining" disk size for machine creation
+
+diff --git a/lib/common/validation.js b/lib/common/validation.js
+index 8a7b980..be69401 100644
+--- a/lib/common/validation.js
++++ b/lib/common/validation.js
+@@ -2560,13 +2560,18 @@ exports.setDefaultValues = function (params, options) {
+ 
+     // Add additional values for bhyve or kvm disks
+     if (['bhyve', 'kvm'].indexOf(params.brand) !== -1) {
+-        console.log(params);
++        // Set the disks to be used to package disks in case none is given:
++        if (!params.disks && params.package.disks) {
++            params.disks = params.package.disks;
++        }
++
+         params.disks[0].image_name = params.image.name;
+ 
+         if (!params.disks[0].image_size) {
+             params.disks[0].image_size = params.image.image_size;
+         }
+ 
++
+         // We don't set the refreservation via VMAPI for bhyve and instead
+         // allow SmartOS to determine the refreservation.
+         if (params.brand === 'kvm') {
+diff --git a/lib/endpoints/vms.js b/lib/endpoints/vms.js
+index 6d24871..0e47d67 100644
+--- a/lib/endpoints/vms.js
++++ b/lib/endpoints/vms.js
+@@ -2119,6 +2119,7 @@ function createVm(req, res, next) {
+         arg: req,
+         funcs: [
+             validateCreateVmParams,
++            setBhyveDisksSizes,
+             checkAllNfsVolumesReachable,
+             allocateServer,
+             getNicTags,
+@@ -2321,6 +2322,86 @@ function createVm(req, res, next) {
+         handleUpdateVMResponse(req, res, next, juuid);
+         return;
+     }
++
++    function setBhyveDisksSizes(_, done) {
++        var params = req.params;
++        if (params.brand !== 'bhyve') {
++            done();
++            return;
++        }
++
++        var error = [ errors.invalidParamErrorsElem('disks') ];
++
++        if (params.flexible_disk_size ||
++            (params.package && params.package.flexible_disk)) {
++            var remainingIdx;
++            try {
++                var disksSum = params.disks.reduce(
++                    function sumDisk(sum, disk, idx) {
++                    var diskSize;
++                    if (remainingIdx !== undefined &&
++                        disk.size === 'remaining') {
++                        throw new errors.ValidationFailedError(
++                            'Only one disk.size can be set to ' +
++                            '`remaining`', error);
++                    }
++
++                    if (disk.size === 'remaining') {
++                        remainingIdx = idx;
++                        diskSize = 0;
++                    } else {
++                        diskSize = disk.size;
++                    }
++
++                    if (diskSize === undefined && disk.image_uuid) {
++                        if (idx !== 0) {
++                            throw new errors.ValidationFailedError(
++                                'disk.size must be set if disk is ' +
++                                'not the boot disk', error);
++                        }
++
++                        diskSize = params.image.image_size;
++                    }
++
++                    return sum + diskSize;
++                }, 0);
++            } catch (e) {
++                done(e);
++                return;
++            }
++
++            if (remainingIdx !== undefined) {
++                var quota = params.quota ||
++                    (params.package && params.package.quota);
++                if (!quota) {
++                    done(new errors.ValidationFailedError(
++                        'disk.size cannot not be set to `remaining` ' +
++                        'without either a `package` or `quota` params.',
++                        error));
++                    return;
++                }
++
++                var remaining = quota - disksSum;
++
++                if ((remainingIdx === 0 &&
++                    params.image.image_size > remaining) || (remaining <= 0)) {
++                    done(new errors.ValidationFailedError(
++                        'The size of the disks must not be ' +
++                        'greater than the package quota', error));
++                    return;
++                }
++
++                params.disks[remainingIdx].size = remaining;
++                disksSum += remaining;
++            }
++        }
++
++        // With bhyve we also need to always set boot=true for the image
++        // disk. This avoids the problem described in OS-6604.
++        params.disks[0].boot = true;
++
++        done();
++    }
+ }
+ 
+ /*
+diff --git a/test/vms.disks.test.js b/test/vms.disks.test.js
+index aace437..ae439d7 100644
+--- a/test/vms.disks.test.js
++++ b/test/vms.disks.test.js
+@@ -34,8 +34,8 @@ var VM_OPTS = {
+     vcpus: 1,
+     cpu_cap: 100,
+     ram: 1024,
+-    disks: [],     // filled in later
+-    networks: [],  // filled in later
++    disks: [], // filled in later
++    networks: [], // filled in later
+     creator_uuid: CUSTOMER_UUID,
+     tags: {
+         'triton.placement.exclude_virtual_servers': true
+@@ -47,6 +47,7 @@ var CALLER = {
+     keyId: '/foo@joyent.com/keys/id_rsa'
+ };
+ 
++var IMG_DISK_SIZE;
+ 
+ // --- Helpers
+ 
+@@ -104,6 +105,16 @@ function deleteVm(t) {
+ }
+ 
+ 
++function createVmAttempt(t, vmOpts) {
++    var opts = createOpts('/vms', vmOpts);
++    CLIENT.post(opts, vmOpts, function postCb(err, req, res) {
++        t.ok(err, 'Failed Attempt Error');
++        t.equal(res.statusCode, 409, 'status code: ' + res.statusCode);
++        t.done();
++    });
++}
++
++
+ // --- Tests
+ 
+ 
+@@ -129,6 +140,7 @@ exports.setup = function setup(t) {
+                 })[0];
+ 
+                 VM_OPTS.disks.push({ image_uuid: newestImg.uuid });
++                IMG_DISK_SIZE = newestImg.image_size;
+ 
+                 t.done();
+             });
+@@ -137,6 +149,61 @@ exports.setup = function setup(t) {
+ };
+ 
+ 
++exports.attempt_to_create_image_disk_with_remaining_size =
++function attempt_to_create_image_disk_with_remaining_size(t) {
++    var opts = jsprim.deepCopy(VM_OPTS);
++    opts.alias = VM_ALIAS_BASE + '-' + process.pid;
++    opts.flexible_disk_size = 20480;
++    opts.disks = [ {
++        size: 'remaining',
++        image_uuid: VM_OPTS.disks[0].image_uuid
++    }];
++    createVmAttempt(t, opts);
++};
++
++exports.attempt_to_create_machine_with_two_remaining_disks =
++function attempt_to_create_machine_with_two_remaining_disks(t) {
++    var opts = jsprim.deepCopy(VM_OPTS);
++    opts.alias = VM_ALIAS_BASE + '-' + process.pid;
++    opts.flexible_disk_size = 20480;
++    opts.disks.push({size: 'remaining'});
++    opts.disks.push({size: 'remaining'});
++    createVmAttempt(t, opts);
++};
++
++exports.attempt_to_use_remaining_disk_size_without_quota =
++function attempt_to_use_remaining_disk_size_without_quota(t) {
++    var opts = jsprim.deepCopy(VM_OPTS);
++    opts.alias = VM_ALIAS_BASE + '-' + process.pid;
++    opts.flexible_disk_size = 20480;
++    opts.disks.push({size: 'remaining'});
++    createVmAttempt(t, opts);
++};
++
++
++exports.attempt_to_use_remaining_disk_size_not_enough_quota =
++function attempt_to_use_remaining_disk_size_not_enough_quota(t) {
++    var opts = jsprim.deepCopy(VM_OPTS);
++    opts.alias = VM_ALIAS_BASE + '-' + process.pid;
++    opts.flexible_disk_size = IMG_DISK_SIZE / 2;
++    opts.quota = IMG_DISK_SIZE / 2;
++    opts.disks.push({size: 'remaining'});
++    createVmAttempt(t, opts);
++};
++
++
++exports.initialize_remaining_correctly =
++function initialize_remaining_correctly(t) {
++    var opts = jsprim.deepCopy(VM_OPTS);
++    opts.alias = VM_ALIAS_BASE + '-' + process.pid;
++    opts.flexible_disk_size = 11264;
++    opts.quota = 22528;
++    opts.disks.push({size: 'remaining'});
++    createVm(t, opts);
++};
++
++exports.destroy_remaining_correctly = deleteVm;
++
+ exports.initialize_non_flexible_disk_vm =
+ function initialize_non_flexible_disk_vms(t) {
+     var opts = jsprim.deepCopy(VM_OPTS);
+@@ -164,6 +231,7 @@ exports.initialize_flexible_disk_vm = function initialize_flexible_disk_vm(t) {
+     var opts = jsprim.deepCopy(VM_OPTS);
+     opts.alias = VM_ALIAS_BASE + '-' + process.pid;
+     opts.flexible_disk_size = 11264;
++    opts.quota = 22528;
+     createVm(t, opts);
+ };
+ 

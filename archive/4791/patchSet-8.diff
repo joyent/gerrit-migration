@@ -1,0 +1,662 @@
+commit 6b4bef6abe50f2badec5deb13ed0fa7f4f4182f0
+Author: Jason King <jason.king@joyent.com>
+Date:   2019-06-25T01:44:13+00:00 (4 months ago)
+    
+    OS-7183 Support early configuration of admin network during CN boot
+
+diff --git a/overlay/generic/lib/sdc/network.sh b/overlay/generic/lib/sdc/network.sh
+index 4155dd06..a1deab2c 100644
+--- a/overlay/generic/lib/sdc/network.sh
++++ b/overlay/generic/lib/sdc/network.sh
+@@ -2,7 +2,7 @@
+ #
+ # network-related functions (intended to be sourced from other scripts)
+ #
+-# Copyright (c) 2010 Joyent Inc., All rights reserved.
++# Copyright 2019 Joyent, Inc.
+ #
+ 
+ 
+@@ -35,3 +35,161 @@ function ip_netmask_to_cidr {
+ 
+     echo "$a.$b.$c.$d/$bits"
+ }
++
++function valid_ipv4 {
++    typeset ip=(${1//\./ })
++    typeset ip_type="$2"
++    typeset -i i=0
++
++    if (( ${#ip[@]} != 4 )); then
++        echo "ERROR: IPv4 ${ip_type} '$1' does not have four octets" >&2
++        return 1
++    fi
++
++    while (( i < 4 )); do
++        if [[ ${ip[$i]} != +([0-9]) ]]; then
++            echo "ERROR: IPv4 ${ip_type} '$1' contains a non-numeric octet" \
++                "(${ip[$i]})" >&2
++            return 1
++        fi
++        if (( ip[i] > 255 )); then
++            echo "ERROR: IPv4 ${ip_type} '$1' contains an octet value > 255" \
++                "(${ip[$i]})" >&2
++            return 1
++        fi
++        (( i++ ))
++    done
++
++    return 0
++}
++
++# Check if two IPv4 addresses reside on the same network (as determined by
++# a given netmask.  Typically one of the two IPs are a network address, e.g.
++# ip_in_net 192.168.1.0 192.168.1.42 255.255.255.0, however there is no
++# requirement that this is the case.
++function ip_in_net {
++    typeset ip1=(${1//\./ })
++    typeset ip2=(${2//\./ })
++    typeset mask=(${3//\./ })
++    typeset -i x y i=0
++
++    valid_ipv4 "$1" address && valid_ipv4 "$2" address && \
++        valid_ipv4 "$3" netmask || return 1
++
++    while (( i < ${#ip1[@]} )); do
++        ((x = ip1[i] & mask[i]))
++        ((y = ip2[i] & mask[i]))
++        if (( x != y )); then
++            return 1
++        fi
++        ((i++))
++    done
++
++    return 0
++}
++
++function log_if_state
++{
++    echo "== debug start: $1 =="
++    if ! nictagadm list; then
++        echo "WARNING: 'nictagadm list' failed" 2>&2
++    fi
++    if ! /usr/sbin/dladm show-phys; then
++        echo "WARNING: 'dladm show-phys' failed" >&2
++    fi
++    # NOTE: DO NOT do a 'dladm show-linkprop' when using the bnx driver,
++    # as it puts it into an unusable state!
++    if ! /sbin/ifconfig -a; then
++        echo "WARNING: 'ifconfig -a' failed" >&2
++    fi
++    if ! /usr/bin/netstat -rcn; then
++        echo "WARNING: 'netstat -rcn' failed" >&2
++    fi
++    echo "== debug end: $1 =="
++}
++
++function get_link_state
++{
++    /usr/sbin/dladm show-phys -po state "$1" 2>/dev/null
++}
++
++function wait_for_nic_state
++{
++    typeset interface="$1"
++    typeset state="$2"
++    typeset current_state
++    typeset -i i=1
++
++    echo "wait_for_nic_state: waiting for state '$state'"
++    while (( i <= 10 )); do
++        current_state="$(get_link_state $interface)"
++        [[ "$current_state" == "$state" ]] && break
++        echo "  $i: link_state=$current_state"
++        sleep 1
++        (( i++ ))
++    done
++    echo "wait_for_nic_state: finished in state '$current_state'"
++}
++
++function valid_mac
++{
++    typeset re='^([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}$'
++    [[ "$1" =~ $re ]]
++}
++
++function normalize_mac
++{
++    typeset mac="$1"
++
++    # Note that we want to expand $mac out into multiple parameters
++    # so that printf has enough arguments for the format string.
++    # It is assumed that valid_mac() has been called on $mac prior
++    # to calling normalize_mac()
++    printf '%02x:%02x:%02x:%02x:%02x:%02x\n' 0x${mac//:/ 0x}
++}
++
++function valid_mtu
++{
++    set -o xtrace
++    typeset tag mtu
++
++    tag="$1"
++    mtu="$2"
++
++    if ! [[ $mtu =~ [1-9][0-9][0-9][0-9] ]] ; then
++        echo "Invalid mtu specified for tag $tag: $mtu"
++        echo "Valid MTU range is from 1500-9000"
++        exit $SMF_EXIT_ERR_FATAL
++    fi
++
++    if ((mtu > 9000 || $mtu < 1500 )); then
++        echo "Invalid mtu specified for tag $tag: $mtu"
++        echo "Valid MTU range is from 1500-9000"
++        exit $SMF_EXIT_ERR_FATAL
++    fi
++}
++
++# Plumbs the admin interface, and attempts to work around poorly-behaved
++# drivers that can't handle plumb commands too quicky after one another
++function plumb_admin
++{
++    set -o xtrace
++    typeset admin_if="$1"
++    typeset admin_mtu="${2:-1500}"
++    typeset driver=${admin_if%%[0-9]*}
++
++    if [[ "$(get_link_state "$admin_if")" == "down" ]]; then
++        echo "admin nic '$admin_if' is down: unplumbing"
++        /sbin/ifconfig "$admin_if" down unplumb
++        wait_for_nic_state "$admin_if" unknown
++    fi
++
++    # There's some sort of race condition in the bnx driver: if the plumb
++    # command comes too soon after the unplumb, the interface can come up
++    # in a state where it never fires interrupts for link state changes.
++    if [[ "$driver" == "bnx" ]]; then
++        sleep 5
++    fi
++    /sbin/ifconfig "$admin_if" plumb mtu $admin_mtu
++    wait_for_nic_state "$admin_if" "up"
++}
+diff --git a/overlay/generic/lib/svc/manifest/network/network-early-admin.xml b/overlay/generic/lib/svc/manifest/network/network-early-admin.xml
+new file mode 100644
+index 00000000..6566f31b
+--- /dev/null
++++ b/overlay/generic/lib/svc/manifest/network/network-early-admin.xml
+@@ -0,0 +1,73 @@
++<?xml version="1.0"?>
++<!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
++<!--
++ Copyright 2019, Joyent, Inc.
++
++  This file and its contents are supplied under the terms of the
++  Common Development and Distribution License ("CDDL"), version 1.0.
++  You may only use this file in accordance with the terms of version
++  1.0 of the CDDL.
++
++  A full copy of the text of the CDDL should have accompanied this
++  source.  A copy of the CDDL is also available via the Internet at
++  http://www.illumos.org/license/CDDL.
++
++-->
++
++<service_bundle type='manifest' name='network-early-admin'>
++
++<service
++	name='network/early-admin'
++	type='service'
++	version='1'>
++
++	<!-- ifconfig needs loopback for IPC with dhcpagent -->
++	<dependency
++		name='network'
++		grouping='require_all'
++		restart_on='none'
++		type='service'>
++		<service_fmri value='svc:/network/loopback' />
++		<service_fmri value='svc:/network/datalink-management' />
++		<service_fmri value='svc:/network/ip-interface-management' />
++	</dependency>
++
++	<instance name='default' enabled='true'>
++
++	<exec_method
++		type='method'
++		name='start'
++		exec='/lib/svc/method/net-early-admin'
++		timeout_seconds='600' />
++
++	<exec_method
++		type='method'
++		name='stop'
++		exec=':true'
++		timeout_seconds='3' />
++
++	<property_group name='startd' type='framework'>
++		<propval name='duration' type='astring' value='transient' />
++	</property_group>
++
++	<template>
++		<common_name>
++			<loctext xml:lang='C'>
++				Triton admin network on compute nodes
++			</loctext>
++		</common_name>
++		<documentation>
++			<manpage title='ifconfig' section='1M'
++				manpath='/usr/share/man' />
++			<manpage title='dladm' section='1M'
++				manpath='/usr/share/man' />
++		</documentation>
++	</template>
++
++	</instance>
++
++	<stability value='Unstable' />
++
++</service>
++
++</service_bundle>
+diff --git a/overlay/generic/lib/svc/manifest/network/network-physical.xml b/overlay/generic/lib/svc/manifest/network/network-physical.xml
+index d5ca9036..62b89bbc 100644
+--- a/overlay/generic/lib/svc/manifest/network/network-physical.xml
++++ b/overlay/generic/lib/svc/manifest/network/network-physical.xml
+@@ -4,6 +4,8 @@
+  Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
+  Use is subject to license terms.
+ 
++ Copyright 2019 Joyent, Inc.
++
+  CDDL HEADER START
+ 
+  The contents of this file are subject to the terms of the
+@@ -60,7 +62,17 @@
+ 		type='service'>
+ 		<service_fmri value='svc:/smartdc/mdata:fetch' />
+ 	</dependency>
+-	
++
++	<!-- Prevent this and network/early-admin from trying to configure the
++		admin interface at the same time -->
++	<dependency
++		name='early-admin'
++		grouping='optional_all'
++		restart_on='none'
++		type='service'>
++		<service_fmri value='svc:/network/early-admin:default' />
++	</dependency>
++
+ 	<instance name='default' enabled='true'>
+ 
+ 	<exec_method
+diff --git a/overlay/generic/lib/svc/method/net-early-admin b/overlay/generic/lib/svc/method/net-early-admin
+new file mode 100644
+index 00000000..abfd5fbd
+--- /dev/null
++++ b/overlay/generic/lib/svc/method/net-early-admin
+@@ -0,0 +1,214 @@
++#!/bin/ksh93
++#
++#
++# This file and its contents are supplied under the terms of the
++# Common Development and Distribution License ("CDDL"), version 1.0.
++# You may only use this file in accordance with the terms of version
++# 1.0 of the CDDL.
++#
++# A full copy of the text of the CDDL should have accompanied this
++# source.  A copy of the CDDL is also available via the Internet at
++# http://www.illumos.org/license/CDDL.
++#
++
++#
++# Copyright 2019 Joyent, Inc.
++#
++
++# Traditionally, when a Triton compute node boots, the network is not
++# configured until after the local filesystems are mounted (in fact
++# network/physical:default depends upon /system/filesystem/smartdc).  Most
++# obviously, in the case of a head node or a standalone SmartOS install, the
++# network configuration is stored on the local zpool, so the network cannot
++# be configured until this happens.
++#
++# For Triton compute nodes with encrypted zpools, we must enable the admin
++# network before the local zpool filesytems are online -- we have to be able
++# to communicate to the head node services to obtain the pin to unlock the
++# local zpool.  For PXE booted Triton compute nodes, we therefore configure
++# the admin network sooner via the network/early-admin:default service.  When
++# network/physical:default runs, it will skip the configuration of the admin
++# network and configuring the remaining interfaces.
++#
++# If we are not a Triton compute node, we exit successfully almost immediately
++# without configuring the admin network.  When the network/physical:default
++# service runs, it will configure all the network interfaces as it traditionally
++# has
++
++PATH=/bin:/usr/bin:/sbin:/usr/sbin
++
++. /lib/svc/share/smf_include.sh
++. /lib/sdc/config.sh
++. /lib/sdc/network.sh
++
++PS4='+ [$LINENO] '
++
++set -o xtrace
++
++if ! smf_is_globalzone; then
++    echo "Non-global zone; no action required; exiting"
++    exit $SMT_EXIT_OK
++fi
++
++if ! boot_file_config_enabled; then
++    echo "Boot-time networking files not present; exiting"
++    exit $SMF_EXIT_OK
++fi
++
++function fatal
++{
++    # XXX: For SMF methods, does it matter/better to redirect to stderr?
++    echo "Error: $*" >&2
++    exit $SMF_EXIT_ERR_FATAL
++}
++
++if ! boot_file_config_valid; then
++    echo "ERROR: boot-time network config file incorrect" >&2
++    exit $SMF_EXIT_ERR_CONFIG
++fi
++
++unset aggrs
++unset tags
++typeset -A tagv
++typeset -A aggr_links aggr_mode
++typeset -A ip ip6 netmask gateway gateway6 mtu mac
++/usr/lib/sdc/net-boot-config | while IFS="=" read var value; do
++    if [[ "$var" =~ _nic$ ]]; then
++        name=${var%_nic}
++        tags+=("${name}")
++        tagv[$name]="$value"
++    elif [[ "$var" =~ _aggr$ ]]; then
++        name=${var%_aggr}
++        aggrs+=(${name})
++        aggr_links[$name]="${value//,/ }"
++    elif [[ "$var" =~ _lacp_mode$ ]]; then
++        name=${var%_lacp_mode}
++        aggr_mode[$name]="$value"
++    elif [[ "$var" =~ _mtu$ ]]; then
++        (( value < 1500 || value > 9000 )) &&
++            fatal "ERROR: $var MTU value \'$value\' is not in" \
++            "range [1500, 9000]"
++
++        name=${var%_mtu}
++        mtu[$name]="$value"
++    elif [[ "$var" =~ _ip$ ]]; then
++        name=${var%_ip}
++        ip[$name]="$value"
++    elif [[ "$var" =~ _ip6$ ]]; then
++        name=${var%_ip6}
++        ip6[$name]="$value"
++    elif [[ "$var" =~ _netmask$ ]]; then
++        name=${var%_netmask}
++        netmask[$name]="$value"
++    elif [[ "$var" =~ _gateway$ ]]; then
++        name=${var%_gateway}
++        gateway[$name]="$value"
++    elif [[ "$var" =~ _gateway6$ ]]; then
++        name=${var%_gateway6}
++        gateway6[$name]="$value"
++    elif [[ "$var" =~ _mac$ ]]; then
++        name=${var%_mac}
++        mac[$name]="$value"
++    elif [[ "$var" == "dns_resolvers" ]]; then
++        dns_resolvers=(${value//,/ })
++    fi
++
++    eval "CONFIG_$var"="$value"
++done
++
++# This must happen befor any other dladm commands (which includes log_if_state)
++# or else dladm commands can fail
++dladm init-phys
++
++log_if_state before
++
++typeset -A mac_to_link
++out=$(dladm show-phys -mpo link,address)
++(( $? == 0 )) || fatal "dladm show-phys failed"
++while IFS=: read link addr; do
++    mac=$(normalize_mac $addr)
++    mac_to_link["$mac"]="$link"
++done <<< "$out"
++
++ADMIN_NIC_TAG=${CONFIG_admin_tag:-"admin"}
++[[ -n "${tagv[$ADMIN_NIC_TAG]}" ]] || \
++    fatal "ERROR: admin nic tag '$ADMIN_NIC_TAG' not present"
++
++nic="${tagv[$ADMIN_NIC_TAG]}"
++
++if [[ -n "${aggr_links[$nic]}" ]]; then
++    mode=${aggr_mode[$nic]:-"off"}
++
++    for l in ${aggr_links[$nic]}; do
++        [[ -n "${mac_to_link[$l]}" ]] || fatal "MAC '$l' not present"
++        links+="${mac_to_link[$l]} "
++    done
++    links="${links% }"
++
++    echo "Creating aggr: $nic (mode=$mode, links=${links})"
++    dladm create-aggr -l ${links// / -l } -L $mode $nic
++
++    if [[ -n "${mtu[$nic]}" ]]; then
++        dladm set-linkprop -p mtu=${mtu[$nic]} $nic || \
++            fatal "ERROR: Failed to set mtu on aggr $nic to ${mtu[$nic]}"
++    fi
++elif valid_mac "$nic"; then
++    [[ -n "${mac_to_link[$nic]}" ]] || \
++        fatal "ERROR: admin mac address $nic not found on system"
++    nic=${mac_to_link[$nic]}
++else
++    fatal "ERROR: Invalid value of ${ADMIN_NIC_TAG}_nic ($nic)"
++fi
++
++driver=${nic%%[0-9]*}
++get_link_state $nic
++if [[ "$link_state" == "down" ]]; then
++    echo "admin nic '${nic}' is down: unplumbing"
++    /sbin/ifconfig $nic down unplumb
++    wait_for_nic_state $nic "unknown"
++fi
++
++# There's some sort of race condition in the bnx driver: if the plumb
++# command comes too soon after the unplumb, the interface can come up
++# in a state where it never fires interrupts for link state changes.
++if [[ "$driver" == "bnx" ]]; then
++    sleep 5
++fi
++
++/sbin/ifconfig $nic plumb mtu ${mtu[$ADMIN_NIC_TAG]}
++wait_for_nic_state $nic "up"
++
++if [[ -n "${ip[$ADMIN_NIC_TAG]}" ]]; then
++    /sbin/ifconfig $nic inet ${ip[$ADMIN_NIC_TAG]} \
++        netmask ${netmask[$ADMIN_NIC_TAG]:-"+"} up
++    [[ -n "${gateway[$ADMIN_NIC_TAG]}" ]] && \
++        /usr/sbin/route add default ${gateway[$ADMIN_NIC_TAG]}
++fi
++
++if [[ -n "${ip6[$ADMIN_NIC_TAG]}" ]]; then
++    /sbin/ifconfig $nic inet6 plumb mtu ${mtu[$ADMIN_NIC_TAG]}
++    [[ "${ip6[$ADMIN_NIC_TAG]}" != "addrconf" ]] && \
++        /sbin/ifconfig $nic inet6 addif ${ip6[$ADMIN_NIC_TAG]} preferred up
++    [[ -n "${gateway6[$ADMIN_NIC_TAG]}" ]] && \
++        /usr/sbin/route add -inet6 default ${gateway6[$ADMIN_NIC_TAG]}
++fi
++
++# Add just the routes reachable through the admin network -- usually these are
++# only present with rack aware networking (RAN)
++/usr/lib/sdc/net-boot-config --routes | while read dst gw; do
++    if ! ip_in_net $gw ${ip[$ADMIN_NIC_TAG]} ${netmask[$ADMIN_NIC_TAG]}; then
++        continue
++    fi
++    route add "$dst" "$gw"
++done
++
++if [[ -n "${CONFIG_dns_domain}" && -n ${dns_resolvers[0]} ]]; then
++    echo "search ${CONFIG_dns_domain}" > /etc/resolv.conf
++    for serv in ${dns_resolvers[@]}; do
++        echo "nameserver $serv" >> /etc/resolv.conf
++    done
++fi
++
++touch /etc/svc/volatile/.early_admin_setup
++
++log_if_state after
+diff --git a/overlay/generic/lib/svc/method/net-physical b/overlay/generic/lib/svc/method/net-physical
+index 86af5b33..d4868c6d 100644
+--- a/overlay/generic/lib/svc/method/net-physical
++++ b/overlay/generic/lib/svc/method/net-physical
+@@ -22,7 +22,7 @@
+ #
+ # Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T. All rights reserved.
+ # Copyright (c) 1999, 2010, Oracle and/or its affiliates. All rights reserved.
+-# Copyright 2017 Joyent, Inc.
++# Copyright 2019 Joyent, Inc.
+ #
+ 
+ . /lib/svc/share/smf_include.sh
+@@ -60,64 +60,10 @@ function add_active_aggr_links
+     done
+ }
+ 
+-function log_if_state
+-{
+-    set -o xtrace
+-    echo "== debug start: $1 =="
+-    nictagadm list
+-    if ! /usr/sbin/dladm show-phys; then
+-        echo "WARNING: 'dladm show-phys' failed"
+-    fi
+-    # NOTE: DO NOT do a 'dladm show-linkprop' when using the bnx driver,
+-    # as it puts it into an unusable state!
+-    if ! /sbin/ifconfig -a; then
+-        echo "WARNING: 'ifconfig -a' failed"
+-    fi
+-    echo "== debug end: $1 =="
+-}
+-
+-# Gets the link state for the given interface
+-function get_link_state
+-{
+-    set -o xtrace
+-    link_state=$(/usr/sbin/dladm show-phys -po state $1 2>/dev/null)
+-}
+-
+ # Waits for up to 10 seconds for the link state to change to the given value
+ function wait_for_admin_nic_state
+ {
+-    set -o xtrace
+-    echo "wait_for_admin_nic_state: waiting for state '$1'"
+-    i=0
+-    get_link_state ${SYSINFO_NIC_admin}
+-    while [[ "$link_state" != "$1" ]] && [[ $i -ne 10 ]]; do
+-        sleep 1
+-        echo "  $i: link_state=$link_state"
+-        ((i++))
+-        get_link_state ${SYSINFO_NIC_admin}
+-    done
+-    echo "wait_for_admin_nic_state: finished in state '$link_state'"
+-}
+-
+-function valid_mtu
+-{
+-    set -o xtrace
+-    typeset tag mtu
+-
+-    tag="$1"
+-    mtu="$2"
+-
+-    if ! [[ $mtu =~ [1-9][0-9][0-9][0-9] ]] ; then
+-        echo "Invalid mtu specified for tag $tag: $mtu"
+-        echo "Valid MTU range is from 1500-9000"
+-        exit $SMF_EXIT_ERR_FATAL
+-    fi
+-
+-    if [[ $mtu -gt 9000 || $mtu -lt 1500 ]]; then
+-        echo "Invalid mtu specified for tag $tag: $mtu"
+-        echo "Valid MTU range is from 1500-9000"
+-        exit $SMF_EXIT_ERR_FATAL
+-    fi
++    wait_for_nic_state "${SYSINFO_NIC_admin}" "$1"
+ }
+ 
+ # Plumbs the admin interface, and attempts to work around poorly-behaved
+@@ -457,8 +403,9 @@ function plumbif
+ }
+ 
+ if smf_is_globalzone; then
+-
+-    /usr/sbin/dladm init-phys
++    EARLY_ADMIN=
++    [[ -f /etc/svc/volatile/.early_admin_setup ]] && EARLY_ADMIN=1
++    [[ -n "$EARLY_ADMIN" ]] || /usr/sbin/dladm init-phys
+ 
+     # The next command is for logging purposes only
+     log_if_state before
+@@ -478,6 +425,10 @@ if smf_is_globalzone; then
+         fi
+ 
+         load_boot_file_config
++
++        # NOTE: some of the routes boot_file_config_init tries to add may
++        # fail if they are admin network routes added by the
++        # network/early-admin service.  This is expected and not a problem.
+         boot_file_config_init
+     else
+         # Load config variables with CONFIG_ prefix,
+@@ -546,7 +497,7 @@ if smf_is_globalzone; then
+         exit ${SMF_EXIT_ERR_CONFIG}
+     fi
+ 
+-    plumb_admin
++    [[ -n "$EARLY_ADMIN" ]] || plumb_admin
+ 
+     # Prefer the config file for admin nic values, but use
+     # bootparams if present
+@@ -567,6 +518,9 @@ if smf_is_globalzone; then
+ 
+     if [[ $admin_ip == 'none' ]]; then
+         echo 'INFO: not configuring IP on admin interface (admin_ip=none)'
++    elif [[ -n "$EARLY_ADMIN" ]]; then
++        echo 'INFO: admin interface already configured (early setup)'
++        ADMIN_NIC_UP=true
+     elif [[ -n $admin_ip ]] && [[ -n $admin_netmask ]]; then
+         /sbin/ifconfig ${SYSINFO_NIC_admin} inet ${admin_ip} \
+             netmask ${admin_netmask} up
+@@ -607,7 +561,7 @@ if smf_is_globalzone; then
+         fi
+     fi
+ 
+-    if [[ -n ${admin_ip6} ]]; then
++    if [[ -n ${admin_ip6} && -z "$EARLY_ADMIN" ]]; then
+         # Plumb interface for inet6
+         ifconfig ${SYSINFO_NIC_admin} inet6 \
+             plumb mtu ${CONFIG_admin_mtu:-1500} up
+diff --git a/overlay/generic/manifest b/overlay/generic/manifest
+index 2bf722f6..c273c0d9 100644
+--- a/overlay/generic/manifest
++++ b/overlay/generic/manifest
+@@ -74,6 +74,7 @@ d lib/svc/manifest 0755 root sys
+ d lib/svc/manifest/network 0755 root sys
+ f lib/svc/manifest/network/ipfilter.xml 0444 root sys
+ f lib/svc/manifest/network/network-physical.xml 0444 root sys
++f lib/svc/manifest/network/network-early-admin.xml 0444 root sys
+ d lib/svc/manifest/system 0755 root sys
+ f lib/svc/manifest/system/auditd.xml 0444 root sys
+ f lib/svc/manifest/system/console-login.xml 0444 root sys
+@@ -95,6 +96,7 @@ f lib/svc/method/ipfilter 0555 root sys
+ f lib/svc/method/manifest-import 0555 root bin
+ f lib/svc/method/mdata-execute 0555 root bin
+ f lib/svc/method/mdata-fetch 0555 root bin
++f lib/svc/method/net-early-admin 0555 root bin
+ f lib/svc/method/net-physical 0555 root sys
+ f lib/svc/method/smartdc-config 0555 root bin
+ f lib/svc/method/smartdc-init 0555 root sys

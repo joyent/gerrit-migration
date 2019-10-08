@@ -1,0 +1,301 @@
+commit 5a3eda78668bae1ac2520d51d6f7225dcf1fc114
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2019-05-08T23:22:00+00:00 (5 months ago)
+    
+    TRITON-389 net-agent should subscribe to NAPI changefeed
+
+diff --git a/lib/aggr-fsm.js b/lib/aggr-fsm.js
+index 2ad6210..aeb977e 100644
+--- a/lib/aggr-fsm.js
++++ b/lib/aggr-fsm.js
+@@ -121,7 +121,7 @@ AggrFSM.prototype.state_waiting = function (S) {
+     this.gotoStateOn(S, this, 'releaseAsserted', 'release');
+ 
+     /*
+-     * Refresh periodically.
++     * Refresh periodically for installations w/o changefeed.
+      */
+     this.gotoStateTimeout(S, 60 * 60 * 1000, 'refresh');
+ };
+diff --git a/lib/net-agent.js b/lib/net-agent.js
+index a437f38..bcbb48e 100644
+--- a/lib/net-agent.js
++++ b/lib/net-agent.js
+@@ -74,6 +74,7 @@
+ 'use strict';
+ 
+ var assert = require('assert-plus');
++var mod_changefeed = require('changefeed');
+ var mod_clients = require('sdc-clients');
+ var mod_common = require('./common');
+ var mod_cueball = require('cueball');
+@@ -101,6 +102,10 @@ function getNetAgentVersion() {
+     return _versionCache;
+ }
+ 
++function refreshFSM(_, fsm) {
++    fsm.refresh();
++}
++
+ 
+ // --- Exports
+ 
+@@ -157,6 +162,52 @@ function NetAgent(options) {
+     this.watcher = null;
+     this.eventSource = null;
+ 
++    this.feed = mod_changefeed.createListener({
++        log: this.log.child({
++            component: 'changefeed',
++            level: 'info'
++        }),
++        url: options.napi.url,
++        instance: this.agent_uuid,
++        service: 'net-agent',
++        resources: [
++            {
++                resource: 'network',
++                subResources: [
++                    'create',
++                    'delete',
++                    'gateway',
++                    'resolvers',
++                    'routes'
++                ]
++            },
++            {
++                resource: 'nic',
++                subResources: [
++                    'create',
++                    'delete',
++                    'allow_dhcp_spoofing',
++                    'allow_ip_spoofing',
++                    'allow_mac_spoofing',
++                    'allow_restricted_traffic',
++                    'allow_unfiltered_promisc'
++                ]
++            },
++            {
++                resource: 'aggregation',
++                subResources: [
++                    'create',
++                    'delete'
++                ]
++            }
++        ],
++        backoff: {
++            maxTimeout: 30000,
++            minTimeout: 5000,
++            retries: Infinity
++        }
++    });
++
+     this.server = new ServerFSM(serverfsmopts);
+     this.aggrs = {};
+     this.insts = {};
+@@ -323,7 +374,7 @@ NetAgent.prototype.state_starting.determineEventSource = function (S) {
+ };
+ 
+ NetAgent.prototype.state_starting.startWatcher = function (S) {
+-    S.validTransitions([ 'running' ]);
++    S.validTransitions([ 'starting.watchfeeds' ]);
+ 
+     switch (this.eventSource) {
+     case 'default':
+@@ -344,6 +395,18 @@ NetAgent.prototype.state_starting.startWatcher = function (S) {
+ 
+     this.watcher.start();
+ 
++    S.gotoState('starting.watchfeeds');
++};
++
++NetAgent.prototype.state_starting.watchfeeds = function (S) {
++    S.validTransitions([ 'running' ]);
++
++    /*
++     * Ideally we'd wait for the "bootstrap" event so we know
++     * we're connected, but older NAPIs don't have changefeeds.
++     */
++    this.feed.register();
++
+     S.gotoState('running');
+ };
+ 
+@@ -355,6 +418,19 @@ NetAgent.prototype.state_running = function (S) {
+     S.on(self, 'stopAsserted', function () {
+         S.gotoState('stopping');
+     });
++
++    /*
++     * Watch events from the NAPI changefeed.
++     */
++    S.on(self.feed, 'readable', function onFeedReadable() {
++        self._cfdrain();
++    });
++
++    S.on(self.feed, 'bootstrap', function onBootstrap(bsinfo) {
++        self._cfbootstrap(bsinfo);
++    });
++
++    self._cfdrain();
+ };
+ 
+ NetAgent.prototype.state_stopping = function (S) {
+@@ -362,6 +438,7 @@ NetAgent.prototype.state_stopping = function (S) {
+ 
+     S.validTransitions([ 'stopped' ]);
+ 
++    self.feed.close();
+     self.cueballAgent.stop();
+ 
+     S.gotoState('stopped');
+@@ -371,4 +448,111 @@ NetAgent.prototype.state_stopped = function (S) {
+     S.validTransitions([ ]);
+ };
+ 
++NetAgent.prototype._processAggr = function (change) {
++    var aggr = this.aggrs[change.name];
++
++    if (change.changeKind.subResources.indexOf('delete') !== -1) {
++        if (aggr) {
++            /*
++             * XXX: Instead of relying on the subsequent 404, have a special
++             * method.
++             */
++            aggr.refresh();
++        }
++        return;
++    }
++
++    if (aggr) {
++        aggr.refresh();
++        return;
++    }
++
++    if (change.belongs_to_uuid === this.cn_uuid) {
++        this.watchAggr(change.name);
++        return;
++    }
++};
++
++NetAgent.prototype._processNetwork = function processNetwork(change) {
++    if (!mod_jsprim.hasKey(this.nets, change.changedResourceId)) {
++        return;
++    }
++
++    if (change.changeKind.subResources.indexOf('delete') !== -1) {
++        this.releaseNet(change.changedResourceId);
++        return;
++    }
++
++    this.nets[change.changedResourceId].refresh();
++};
++
++NetAgent.prototype._processNic = function processNic(change) {
++    var mac = change.changedResourceId;
++    var nic = this.nics[mac];
++
++    if (change.changeKind.subResources.indexOf('delete') !== -1) {
++        if (nic) {
++            /*
++             * XXX: Instead of relying on the subsequent 404, have a special
++             * method.
++             */
++            nic.refresh();
++        }
++        return;
++    }
++
++    if (nic) {
++        nic.refresh();
++        return;
++    }
++
++    if (change.cn_uuid === this.cn_uuid) {
++        this.watchNic(mac);
++        return;
++    }
++};
++
++NetAgent.prototype._cfdrain = function drainChangeFeed() {
++    var change, resource;
++
++    while ((change = this.feed.read()) !== null) {
++        resource = change.changeKind.resource;
++
++        switch (resource) {
++        case 'aggregation':
++            this._processAggr(change);
++            break;
++        case 'network':
++            this._processNetwork(change);
++            break;
++        case 'nic':
++            this._processNic(change);
++            break;
++        default:
++            this.log.warn({ change: change },
++                'unknown resource type %j', resource);
++            break;
++        }
++    }
++};
++
++NetAgent.prototype._cfbootstrap = function bootstrapChangeFeed(bsinfo) {
++    assert.object(bsinfo, 'bsinfo');
++
++    switch (bsinfo.resource) {
++    case 'aggregation':
++        mod_jsprim.forEachKey(this.aggrs, refreshFSM);
++        break;
++    case 'network':
++        mod_jsprim.forEachKey(this.nets, refreshFSM);
++        break;
++    case 'nic':
++        mod_jsprim.forEachKey(this.nics, refreshFSM);
++        break;
++    default:
++        this.log.warn({ bootstrap: bsinfo }, 'unrecognized bootstrap resource');
++        break;
++    }
++};
++
+ module.exports = NetAgent;
+diff --git a/lib/net-fsm.js b/lib/net-fsm.js
+index 092c4d8..ae0fa82 100644
+--- a/lib/net-fsm.js
++++ b/lib/net-fsm.js
+@@ -72,7 +72,7 @@ NetworkFSM.prototype.state_waiting = function (S) {
+     S.validTransitions([ 'refresh' ]);
+ 
+     /*
+-     * Refresh periodically.
++     * Refresh periodically for installations w/o changefeed.
+      */
+     this.gotoStateTimeout(S, 5 * 60 * 1000, 'refresh');
+ 
+diff --git a/lib/nic-fsm.js b/lib/nic-fsm.js
+index cba53e5..516e34b 100644
+--- a/lib/nic-fsm.js
++++ b/lib/nic-fsm.js
+@@ -190,7 +190,7 @@ NicFSM.prototype.state_waiting = function (S) {
+     this.gotoStateOn(S, this, 'releaseAsserted', 'release');
+ 
+     /*
+-     * Refresh periodically.
++     * Refresh periodically for installations w/o changefeed.
+      *
+      * Since most of our important attributes live on the network object, we
+      * wait an hour to check here, and rely on the network information refresh
+diff --git a/package.json b/package.json
+index cd620e0..ee93f21 100644
+--- a/package.json
++++ b/package.json
+@@ -7,6 +7,7 @@
+     "dependencies": {
+         "assert-plus": "^1.0.0",
+         "bunyan": "1.8.12",
++        "changefeed": "git+https://github.com/joyent/node-sdc-changefeed.git#new-registration",
+         "cueball": "2.5.1",
+         "forkexec": "1.1.0",
+         "jsprim": "1.4.1",

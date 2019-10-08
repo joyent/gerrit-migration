@@ -1,0 +1,719 @@
+commit fb4aca84125cee82cb9c74650a865584c6af6985
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2019-04-26T13:45:41-04:00 (5 months ago)
+    
+    joyent/electric-boray#6 want sort, limit, and prefix support for listing buckets and objects
+    Reviewed by: Kelly McLaughlin <kelly.mclaughlin@joyent.com>
+    Approved by: Kelly McLaughlin <kelly.mclaughlin@joyent.com>
+
+diff --git a/lib/data_placement.js b/lib/data_placement.js
+index 8e2be44..b22cfc8 100644
+--- a/lib/data_placement.js
++++ b/lib/data_placement.js
+@@ -238,6 +238,32 @@ DataDirector.prototype.getVnodes = function getVnodes(pnode) {
+     }
+ };
+ 
++DataDirector.prototype.getAllNodes = function getAllNodes() {
++    var self = this;
++    var log = self.log_;
++    var ret = [];
++
++    if (self.dataPlacement.version !== '1.0.0') {
++        return ret;
++    }
++
++    log.debug('DataDirectory.getAllNodes(): entered');
++
++    var map = self.dataPlacement.ring.vnodeToPnodeMap_;
++    Object.keys(map).forEach(function (vnode) {
++        vnode = parseInt(vnode, 10);
++        assert.number(vnode, 'vnode');
++
++        var obj = {
++            vnode: vnode,
++            pnode: map[vnode].pnode
++        };
++        ret.push(obj);
++    });
++
++    return (ret);
++};
++
+ 
+ ///--- Privates
+ 
+diff --git a/lib/moray_client.js b/lib/moray_client.js
+index 9e77da9..0f85b2d 100644
+--- a/lib/moray_client.js
++++ b/lib/moray_client.js
+@@ -120,7 +120,7 @@ function createBucketClient(options, callback) {
+             component: 'moray-client-' + pnodeUrl.hostname
+         });
+ 
+-        var client = boray.createBucketClient(morayargs);
++        var client = boray.createClient(morayargs);
+         clientMap[pnode] = client;
+         clientArray.push(client);
+ 
+diff --git a/lib/server.js b/lib/server.js
+index 58f0859..ccecc76 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -10,12 +10,14 @@
+ 
+ var assert = require('assert-plus');
+ var artedi = require('artedi');
++var events = require('events');
+ var fast = require('fast');
+ var fs = require('fs');
+ var kang = require('kang');
+ var net = require('net');
+ var os = require('os');
+ var restify = require('restify');
++var util = require('util');
+ var uuid = require('node-uuid');
+ var vasync = require('vasync');
+ var verror = require('verror');
+@@ -27,6 +29,7 @@ var data_placement = require('./data_placement');
+ var InvocationError = errors.InvocationError;
+ 
+ var KANG_VERSION = '1.2.0';
++var BORAY_LIMIT = 1000;
+ 
+ var CB_ARGS_SCHEMA = [
+     { name: 'owner', type: 'string' },
+@@ -39,7 +42,11 @@ var DB_ARGS_SCHEMA = [
+ ];
+ 
+ var LB_ARGS_SCHEMA = [
+-    { name: 'owner', type: 'string' }
++    { name: 'owner', type: 'string' },
++    { name: 'sorted', type: 'boolean' },
++    { name: 'order_by', type: 'string' },
++    { name: 'prefix', type: 'string' },
++    { name: 'limit', type: 'number' }
+ ];
+ 
+ var GB_ARGS_SCHEMA = [
+@@ -67,9 +74,148 @@ var PO_ARGS_SCHEMA = [
+ 
+ var LO_ARGS_SCHEMA = [
+     { name: 'owner', type: 'string' },
+-    { name: 'bucket_id', type: 'string' }
++    { name: 'bucket_id', type: 'string' },
++    { name: 'sorted', type: 'boolean' },
++    { name: 'order_by', type: 'string' },
++    { name: 'prefix', type: 'string' },
++    { name: 'limit', type: 'number' }
+ ];
+ 
++util.inherits(LimitOffsetStream, events.EventEmitter);
++function LimitOffsetStream(opts) {
++    var self = this;
++
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.number(opts.limit, 'opts.limit');
++    assert.func(opts.getStream, 'opts.getStream');
++
++    self.offset = 0;
++    self.limit = opts.limit;
++    self.done = false;
++    self.log = opts.log;
++
++    self.getStream = opts.getStream;
++}
++
++LimitOffsetStream.prototype._getNewStream = function _getNewStream(cb) {
++    var self = this;
++
++    assert.func(cb, 'cb');
++
++    self.log.debug({
++        offset: self.offset,
++        limit: self.limit
++    }, 'calling getStream(offset=%d, limit=%d)',
++        self.offset,
++        self.limit);
++
++    if (self.res) {
++        self.res.removeAllListeners();
++    }
++
++    self.res = self.getStream(self.offset, self.limit);
++    self.numRecords = 0;
++    self.resEnded = false;
++    self.recordPending = false;
++
++    self.res.on('end', function () {
++        self.log.debug('getNewStream ended');
++        self.resEnded = true;
++    });
++
++    self.res.on('error', function (err) {
++        self.log.error(err, 'getNewStream error');
++        self.emit('error', err);
++    });
++};
++
++LimitOffsetStream.prototype.getNextRecord =
++    function getNextRecord(cb, skipCheck) {
++
++    var self = this;
++
++    assert.func(cb, 'cb');
++    assert.optionalBool(skipCheck, skipCheck);
++
++    if (!skipCheck) {
++        assert(!self.recordingPending, 'self.recordPending');
++        self.recordPending = true;
++    }
++
++    if (!self.res) {
++        // hasn't opened initial stream yet
++        self.log.debug('requesting initial stream');
++        self._getNewStream(cb);
++        setImmediate(function () {
++            self.getNextRecord(cb, true);
++        });
++        return;
++    }
++
++    var record = self.res.read();
++
++    if (record) {
++        self.log.trace({record: record}, 'record available - sending');
++        sendRecord(record);
++        return;
++    }
++
++    if (self.resEnded) {
++        self.log.debug('self.resEnded is true');
++        if (self.numRecords === self.limit) {
++            self.log.debug('requesting new stream');
++            self.offset += self.numRecords;
++            self._getNewStream(cb);
++            setImmediate(function () {
++                self.getNextRecord(cb, true);
++            });
++            return;
++        }
++
++        self.log.debug('no more pagination required');
++        self.done = true;
++    }
++
++    if (self.done) {
++        self.log.debug('self.done is true, sending final event');
++        cb(null, true);
++        return;
++    }
++
++    self.log.debug('attaching to readable and end events');
++
++    self.res.on('readable', tryRead);
++    self.res.on('end', tryRead);
++    var done = false;
++
++    function tryRead() {
++        if (done) {
++            return;
++        }
++
++        self.log.debug('detaching readable and end events');
++
++        done = true;
++        self.removeListener('readable', tryRead);
++        self.removeListener('end', tryRead);
++
++        setImmediate(function () {
++            self.getNextRecord(cb, true);
++        });
++    }
++
++    function sendRecord(_record) {
++        assert.object(_record, '_record');
++
++        setImmediate(function () {
++            self.numRecords++;
++            self.recordPending = false;
++            cb(_record, false);
++        });
++    }
++};
++
+ function createServer(options, callback) {
+     assert.object(options, 'options');
+     assert.func(callback, 'callback');
+@@ -457,7 +603,15 @@ function listBuckets(options) {
+             return;
+         }
+ 
+-        var o = argv[0];
++        var owner = argv[0];
++        var sorted = argv[1];
++        var order_by = argv[2];
++        var prefix = argv[3];
++        var limit = argv[4];
++
++        if (limit === 0) {
++            limit = Infinity;
++        }
+ 
+         var id = options.req_id || uuid.v1();
+         var log = options.log.child({
+@@ -465,71 +619,88 @@ function listBuckets(options) {
+         });
+ 
+         log.debug({
+-            owner: o
++            owner: owner,
++            sorted: sorted,
++            order_by: order_by,
++            prefix: prefix,
++            limit: limit
+         }, 'listBuckets: entered');
+ 
+-        var pnodes = Object.keys(options.clients.map);
++        var nodes = options.dataDirector.getAllNodes();
+         var vnodes = {};
+-
+-        // convert pnodes to vnodes
+-        pnodes.forEach(function (pnode) {
+-            var nodes = options.dataDirector.getVnodes(pnode);
+-            nodes.forEach(function (vnode) {
+-                vnodes[vnode] = options.clients.map[pnode];
+-            });
++        var totalVnodes = nodes.length;
++
++        // Find an appropriate limit to use with boray
++        var borayLimit = Math.ceil(limit / totalVnodes);
++        borayLimit = Math.min(borayLimit, BORAY_LIMIT);
++
++        log.debug('%d vnodes found total, want %d records, using limit of %d',
++            totalVnodes, limit, borayLimit);
++
++        // Create a mapping of vnodes to pnodes.
++        nodes.forEach(function (node) {
++            var client = options.clients.map[node.pnode];
++            assert.object(client, 'client for pnode: ' + node.pnode);
++
++            vnodes[node.vnode] = {
++                lostream: new LimitOffsetStream({
++                    limit: borayLimit,
++                    log: log.child({vnode: node.vnode}),
++                    getStream: function (offset, _limit) {
++                        return client.listBuckets(owner, order_by,
++                            prefix, _limit, offset, node.vnode);
++                    }
++                }),
++                record: null
++            };
+         });
+ 
+-        vasync.forEachPipeline({
+-            inputs: Object.keys(vnodes),
+-            func: function (vnode, cb) {
+-                var client = vnodes[vnode];
+-
+-                vnode = parseInt(vnode, 10);
+-
+-                log.debug({vnode: vnode, owner: o}, 'listBuckets vasync');
+-
+-                var res = client.listBuckets(o, vnode);
+-
+-                /*
+-                 * Format the record to look like a find/search result
+-                 */
+-                res.on('record', function (record) {
+-                    /*
+-                     * name: r.key.split('/').pop(),
+-                     * etag: r.value.etag,
+-                     * size: r.value.contentLength,
+-                     * type: r.value.type,
+-                     * contentType: r.value.contentType,
+-                     * contentMD5: r.value.contentMD5,
+-                     * mtime: new Date(r.value.mtime).toISOString()
+-                     */
+-                    var obj = {
+-                        key: record.name,
+-                        value: {
+-                            type: 'bucket',
+-                            mtime: record.created
+-                        }
+-                    };
+-                    rpc.write(obj);
+-                });
+-
+-                res.on('end', function () {
+-                    cb();
+-                });
++        var opts = {
++            limit: limit,
++            prefix: prefix,
++            order_by: order_by,
++            log: log,
++            vnodes: vnodes,
++            sorted: sorted
++        };
++        paginationStream(opts,
++            function onRecord(record) {
++                rpc.write(formatRecord(record));
++            },
++            function done(err) {
++                if (err) {
++                    log.error(err, 'listBuckets error');
++                    rpc.fail(err);
++                    return;
++                }
+ 
+-                res.once('error', function (err) {
+-                    cb(err);
+-                });
+-            }
+-        }, function (err, results) {
+-            if (err) {
+-                log.error(err, 'listBuckets error');
+-                rpc.fail(err);
+-                return;
+-            }
++                log.debug('listBuckets done');
++                rpc.end();
++            });
+ 
+-            rpc.end();
+-        });
++        function formatRecord(record) {
++            assert.object(record, 'record');
++            assert.string(record.name, 'record.name');
++            assert.date(record.created, 'record.created');
++
++            /*
++             * name: r.key.split('/').pop(),
++             * etag: r.value.etag,
++             * size: r.value.contentLength,
++             * type: r.value.type,
++             * contentType: r.value.contentType,
++             * contentMD5: r.value.contentMD5,
++             * mtime: new Date(r.value.mtime).toISOString()
++             */
++            var obj = {
++                key: record.name,
++                value: {
++                    type: 'bucket',
++                    mtime: record.created
++                }
++            };
++            return obj;
++        }
+     }
+ 
+     return _listBuckets;
+@@ -785,6 +956,14 @@ function listObjects(options) {
+ 
+         var owner = argv[0];
+         var bucket_id = argv[1];
++        var sorted = argv[2];
++        var order_by = argv[3];
++        var prefix = argv[4];
++        var limit = argv[5];
++
++        if (limit === 0) {
++            limit = Infinity;
++        }
+ 
+         var id = options.req_id || uuid.v1();
+ 
+@@ -801,75 +980,217 @@ function listObjects(options) {
+             bucket_id: bucket_id
+         }, 'listObjects: entered');
+ 
+-        var pnodes = Object.keys(options.clients.map);
+         var vnodes = {};
++        var nodes = options.dataDirector.getAllNodes();
++        var totalVnodes = nodes.length;
++
++        // Find an appropriate limit to use with boray
++        var borayLimit = Math.ceil(limit / totalVnodes);
++        borayLimit = Math.min(borayLimit, BORAY_LIMIT);
++
++        log.debug('%d vnodes found total, want %d records, using limit of %d',
++            totalVnodes, limit, borayLimit);
++
++        // Create a mapping of vnodes to pnodes.
++        nodes.forEach(function (node) {
++            var client = options.clients.map[node.pnode];
++            assert.object(client, 'client for pnode: ' + node.pnode);
++
++            vnodes[node.vnode] = {
++                lostream: new LimitOffsetStream({
++                    limit: borayLimit,
++                    log: log.child({vnode: node.vnode}),
++                    getStream: function (offset, _limit) {
++                        return client.listObjects(owner, bucket_id,
++                            order_by, prefix, _limit, offset, node.vnode);
++                    }
++                }),
++                record: null
++            };
++        });
+ 
+-        // convert pnodes to vnodes
+-        pnodes.forEach(function (pnode) {
+-            var nodes = options.dataDirector.getVnodes(pnode);
+-            nodes.forEach(function (vnode) {
+-                vnodes[vnode] = options.clients.map[pnode];
++        var opts = {
++            limit: limit,
++            prefix: prefix,
++            order_by: order_by,
++            log: log,
++            vnodes: vnodes,
++            sorted: sorted
++        };
++        paginationStream(opts,
++            function onRecord(record) {
++                rpc.write(formatRecord(record));
++            },
++            function done(err) {
++                if (err) {
++                    log.error(err, 'listObjects error');
++                    rpc.fail(err);
++                    return;
++                }
++
++                log.debug('listObjects done');
++                rpc.end();
+             });
+-        });
+ 
+-        vasync.forEachPipeline({
+-            inputs: Object.keys(vnodes),
+-            func: function (vnode, cb) {
+-                var client = vnodes[vnode];
++        function formatRecord(record) {
++            assert.object(record, 'record');
++            assert.uuid(record.id, 'record.id');
++            assert.string(record.name, 'record.name');
++            assert.date(record.created, 'record.created');
++            assert.string(record.content_type, 'record.content_type');
++            assert.string(record.content_md5, 'record.content_md5');
++            assert.number(record.content_length, 'record.content_length');
++
++            /*
++             * name: r.key.split('/').pop(),
++             * etag: r.value.etag,
++             * size: r.value.contentLength,
++             * type: r.value.type,
++             * contentType: r.value.contentType,
++             * contentMD5: r.value.contentMD5,
++             * mtime: new Date(r.value.mtime).toISOString()
++             */
++            var obj = {
++                key: record.name,
++                value: {
++                    type: 'bucketobject',
++                    etag: record.id,
++                    mtime: record.created,
++                    contentType: record.content_type,
++                    contentMD5: record.content_md5,
++                    contentLength: record.content_length
++                }
++            };
+ 
+-                vnode = parseInt(vnode, 10);
++            return obj;
++        }
++    }
+ 
+-                log.debug({vnode: vnode, owner: owner}, 'listObjects vasync');
++    return _listObjects;
++}
+ 
+-                var res = client.listObjects(owner, bucket_id, vnode);
++function paginationStream(opts, onRecord, done) {
++    assert.object(opts, 'opts');
++    assert.bool(opts.sorted, 'opts.sorted');
++    assert.object(opts.vnodes, 'opts.vnodes');
++    assert.object(opts.log, 'opts.log');
++    assert.number(opts.limit, 'opts.limit');
++    assert.string(opts.order_by, 'opts.order_by');
++    assert.func(onRecord, 'onRecord');
++    assert.func(done, 'done');
++
++    var log = opts.log;
++    var vnodes = opts.vnodes;
++    var limit = opts.limit;
++
++    var totalRecordsSent = 0;
++
++    if (!opts.sorted) {
++        log.debug('paginationStream unsorted');
++        vasync.forEachParallel({
++            inputs: Object.keys(vnodes),
++            func: function (vnode, cb2) {
++                var o = vnodes[vnode];
++
++                function next() {
++                    o.lostream.getNextRecord(function (record, isDone) {
++                        if (isDone) {
++                            cb2();
++                            return;
++                        }
+ 
+-                /*
+-                 * Format the record to look like a find/search result
+-                 */
+-                res.on('record', function (record) {
+-                    /*
+-                     * name: r.key.split('/').pop(),
+-                     * etag: r.value.etag,
+-                     * size: r.value.contentLength,
+-                     * type: r.value.type,
+-                     * contentType: r.value.contentType,
+-                     * contentMD5: r.value.contentMD5,
+-                     * mtime: new Date(r.value.mtime).toISOString()
+-                     */
+-                    var obj = {
+-                        key: record.name,
+-                        value: {
+-                            type: 'bucketobject',
+-                            etag: record.id,
+-                            mtime: record.created,
+-                            contentType: record.content_type,
+-                            contentMD5: record.content_md5,
+-                            contentLength: record.content_length
++                        if (totalRecordsSent >= limit) {
++                            log.debug('limit hit (%d) - ending early',
++                                limit);
++                            cb2();
++                            return;
+                         }
+-                    };
+-                    rpc.write(obj);
+-                });
+ 
+-                res.on('end', function () {
+-                    cb();
+-                });
++                        assert.object(record, 'record');
++                        assert.string(record.created, 'record.created');
++                        record.created = new Date(record.created);
+ 
+-                res.once('error', function (err) {
+-                    cb(err);
+-                });
+-            }
+-        }, function (err, results) {
+-            if (err) {
+-                log.error(err, 'listObjects error');
+-                rpc.fail(err);
+-                return;
++                        onRecord(record);
++                        totalRecordsSent++;
++
++                        setImmediate(next);
++                    });
++                }
++
++                next();
+             }
++        }, done);
++        return;
++    }
++
++    log.debug('paginationStream sorted');
++    vasync.whilst(
++        function () {
++            return Object.keys(vnodes).length > 0;
++        },
++        function (cb) {
++            vasync.forEachParallel({
++                inputs: Object.keys(vnodes),
++                func: function (vnode, cb2) {
++                    var o = vnodes[vnode];
++
++                    if (o.record) {
++                        cb2();
++                        return;
++                    }
++
++                    o.lostream.getNextRecord(function (record, isDone) {
++                        if (isDone) {
++                            delete vnodes[vnode];
++                            cb2();
++                            return;
++                        }
+ 
+-            rpc.end();
++                        assert.object(record, 'record');
++                        assert.string(record.created, 'record.created');
++                        record.created = new Date(record.created);
++                        o.record = record;
++                        cb2();
++                    });
++                }
++            }, function (err) {
++                if (totalRecordsSent >= limit) {
++                    log.debug('limit hit (%d) - ending early', limit);
++                    vnodes = {};
++                    cb(err);
++                    return;
++                }
++
++                processRecords();
++                cb(err);
++            });
++        }, done);
++
++    function processRecords() {
++        var keys = Object.keys(vnodes);
++
++        if (keys.length === 0) {
++            log.debug('no more records to process, we are done');
++            return;
++        }
++
++        keys.sort(function (a, b) {
++            a = vnodes[a].record;
++            b = vnodes[b].record;
++            return a[opts.order_by] < b[opts.order_by] ? -1 : 1;
+         });
+-    }
+ 
+-    return _listObjects;
++        var vnode = parseInt(keys[0], 10);
++        assert.number(vnode, 'vnode');
++
++        var o = vnodes[vnode];
++        assert.object(o, 'o');
++
++        onRecord(o.record);
++        totalRecordsSent++;
++
++        o.record = null;
++    }
+ }
+ 
+ module.exports = {
+diff --git a/package.json b/package.json
+index e1fba53..b378284 100644
+--- a/package.json
++++ b/package.json
+@@ -21,13 +21,13 @@
+         "jsprim": "2.0.0",
+         "kang": "1.2.0",
+         "ldapjs": "0.6.3",
+-        "imgapi-cli": "git+https://github.com/joyent/sdc-imgapi-cli.git#v2.4.1",        ,
++        "imgapi-cli": "git+https://github.com/joyent/sdc-imgapi-cli.git#v2.4.1",
+         "boray": "git+https://github.com/joyent/node-boray.git#master",
+         "node-uuid": "1.4.0",
+         "posix-getopt": "^1.0.0",
+         "restify": "6.3.1",
+         "strsplit": "1.0.0",
+-        "vasync": "^1.4.3",
++        "vasync": "^2.2.0",
+         "verror": "1.9.0",
+         "xtend": "2.0.6"
+     },
