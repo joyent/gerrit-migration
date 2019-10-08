@@ -1,0 +1,406 @@
+commit 2f4668ffc08738810e0327e50f94309cf8c286c0 (refs/changes/09/2909/15)
+Author: Pedro Palazon Candel <pedro@joyent.com>
+Date:   2018-06-12T10:28:45+02:00 (1 year, 4 months ago)
+    
+    TOOLS-1896 sdcadm update sapi could avoid using a temporary instance
+
+diff --git a/lib/procedures/index.js b/lib/procedures/index.js
+index f3dd6c2..d5ab316 100644
+--- a/lib/procedures/index.js
++++ b/lib/procedures/index.js
+@@ -46,6 +46,9 @@ var ALL_HA_READY_SVCS = HA_READY_SIMPLE_SVCS.concat([
+ // --- Disallowed agents
+ var DISALLOWED_AGENTS = ['provisioner', 'heartbeater', 'zonetracker'];
+ 
++// --- From this version, SAPI can be updated w/o using a temporary instance:
++var FIRST_NON_CIRCULAR_SAPI_VERSION = '20171102T150835Z';
++
+ // --- internal support stuff
+ 
+ function NoOp() {}
+@@ -67,6 +70,8 @@ var UpdateSingleHeadnodeImgapi =
+ var UpdateMorayV2 = require('./update-moray-v2').UpdateMorayV2;
+ var UpdateSingleHNSapiV1 =
+     require('./update-single-hn-sapi-v1').UpdateSingleHNSapiV1;
++// --- New SAPI versions w/o circular dependencies with itself for updates:
++var UpdateSapiV2 = require('./update-sapi-v2').UpdateSapiV2;
+ var UpdateManateeV2 = require('./update-manatee-v2').UpdateManateeV2;
+ var UpdateBinderV2 = require('./update-binder-v2').UpdateBinderV2;
+ // --- Create service instance also from procedures:
+@@ -358,6 +363,14 @@ function coordinatePlan(opts, cb) {
+             var currHostname = os.hostname();
+             var badState = false;
+             changes.forEach(function (change) {
++                var parts = change.image.version.split('-');
++                if (parts.length && parts.length > 2) {
++                    var curVer = parts[parts.length - 2];
++                    if (curVer >= FIRST_NON_CIRCULAR_SAPI_VERSION) {
++                        remaining.push(change);
++                        return;
++                    }
++                }
+                 var svcInsts = instsFromSvcName[change.service.name] || [];
+                 if (change.type === 'update-instance' &&
+                     change.service.name === 'sapi') {
+@@ -442,6 +455,52 @@ function coordinatePlan(opts, cb) {
+             }
+         },
+ 
++        /**
++         * Starting with FIRST_NON_CIRCULAR_SAPI_VERSION we can update SAPI
++         * w/o going through a temporary instance, w/o caring about HA
++         */
++        function updateSapi(_, next) {
++            var handle = [];
++            var remaining = [];
++            changes.forEach(function (change) {
++                if (change.type === 'update-instance' &&
++                    change.service.name === 'sapi') {
++                    change.inst = change.instance;
++                    handle.push(change);
++                } else if ((change.type === 'update-service' ||
++                    change.type === 'rollback-service') &&
++                    change.service.name === 'sapi') {
++                    var svcInsts = instsFromSvcName[change.service.name] || [];
++                    if (svcInsts.length) {
++                        if (svcInsts.length > 1) {
++                            var chInsts = forceSameImage ? svcInsts :
++                                    svcInsts.filter(function (ins) {
++                                        return (ins.image !==
++                                            change.image.uuid);
++                                    });
++                            change.insts = chInsts;
++                        } else {
++                            change.inst = svcInsts[0];
++                        }
++                    }
++                    handle.push(change);
++                } else {
++                    remaining.push(change);
++                }
++            });
++            if (handle.length) {
++                changes = remaining;
++                log.debug({changes: handle},
++                    'updateSapi will handle %d change(s)',
++                    handle.length);
++                procs.push(new UpdateSapiV2({
++                    changes: handle
++                }));
++            }
++            next();
++
++        },
++
+         /**
+          * Manatee service upgrade.
+          * Note we assume there's at least one manatee on the server from where
+diff --git a/lib/procedures/shared.js b/lib/procedures/shared.js
+index f20c70b..094b157 100644
+--- a/lib/procedures/shared.js
++++ b/lib/procedures/shared.js
+@@ -2146,6 +2146,76 @@ function waitForJob(opts, cb) {
+     });
+ }
+ 
++/*
++ * Update VM metadata using vmadm update through sdc-oneachnode
++ *
++ * @param {Object} arg: All the following options are required:
++ * @param {String} arg.zonename: UUID of the VM to update
++ * @param {String} arg.server: vm's server UUID
++ * @param {Object} arg.log: sdcadm's logger (bunyan) object instance
++ * @param {Object} arg.progress: sdcadm progress function
++ * @param {Object} arg.metadata: customer metadata value to update
++ *
++ * @param {Function} cb: Callback of the form f(err);
++ */
++function updateVmMetadataRemote(arg, next) {
++    assert.object(arg, 'arg');
++    assert.object(arg.sdcadm, 'arg.sdcadm');
++    assert.object(arg.log, 'arg.log');
++    assert.object(arg.metadata, 'arg.metadata');
++    assert.func(arg.progress, 'arg.progress');
++    assert.string(arg.zonename, 'arg.zonename');
++    assert.string(arg.server, 'arg.server');
++    assert.func(next, 'next');
++
++    var sdcadm = arg.sdcadm;
++    var zonename = arg.zonename;
++    var log = arg.log;
++
++    arg.progress('Update VM metadata %s', zonename);
++    log.trace({inst: zonename, metadata: arg.metadata},
++        'Update VM metadata');
++
++    var vmUpdatePath = util.format('/servers/%s/vms/%s/update',
++        arg.server, arg.zonename);
++    sdcadm.cnapi.post({
++        path: vmUpdatePath
++    }, {
++        set_customer_metadata: arg.metadata
++    }, function updateVmCb(err, task) {
++        if (err) {
++            next(new errors.SDCClientError(err, 'cnapi'));
++            return;
++        }
++
++        if (!task || !task.id) {
++            next(new errors.InternalError({
++                message: 'Unexpected response from CNAPI'
++            }));
++            return;
++        }
++
++        sdcadm.cnapi.waitTask(task.id, {
++            // 5 minutes should be more than enough for these update tasks:
++            timeout: 5 * 60
++        }, function waitTaskCb(waitTaskErr, fullTask) {
++            if (waitTaskErr) {
++                next(new errors.SDCClientError(waitTaskErr, 'cnapi'));
++                return;
++            }
++            if (!fullTask || !fullTask.status ||
++                fullTask.status !== 'complete') {
++                next(new errors.InternalError({
++                    message: 'Unexpected Task response from CNAPI'
++                }));
++                return;
++            }
++            next();
++        });
++    });
++}
++
++
+ // --- exports
+ 
+ module.exports = {
+@@ -2188,6 +2258,7 @@ module.exports = {
+     wait4Morays: wait4Morays,
+     manateeSitterSvcStatus: manateeSitterSvcStatus,
+     waitForManatee: waitForManatee,
+-    waitForJob: waitForJob
++    waitForJob: waitForJob,
++    updateVmMetadataRemote: updateVmMetadataRemote
+ };
+ // vim: set softtabstop=4 shiftwidth=4:
+diff --git a/lib/procedures/update-sapi-v2.js b/lib/procedures/update-sapi-v2.js
+new file mode 100644
+index 0000000..59e8758
+--- /dev/null
++++ b/lib/procedures/update-sapi-v2.js
+@@ -0,0 +1,213 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++var assert = require('assert-plus');
++var sprintf = require('extsprintf').sprintf;
++var util = require('util');
++var vasync = require('vasync');
++
++var common = require('../common');
++var errors = require('../errors');
++var Procedure = require('./procedure').Procedure;
++var s = require('./shared');
++
++function UpdateSapiV2(options) {
++    assert.arrayOfObject(options.changes, 'options.changes');
++    this.changes = options.changes;
++}
++util.inherits(UpdateSapiV2, Procedure);
++
++UpdateSapiV2.prototype.summarize = function sapiv2Summarize() {
++    var out = [];
++    this.changes.forEach(function summarizeChange(ch) {
++        if (ch.type === 'update-instance') {
++            out.push(sprintf('update instance "%s" (%s)\n' +
++                        'of service "%s" to image %s\n', ch.inst.instance,
++                        ch.inst.alias, ch.service.name, ch.image.uuid),
++                    common.indent(sprintf('(%s@%s)',
++                        ch.image.name, ch.image.version)));
++        } else {
++            var word = (ch.type === 'rollback-service') ?
++                'rollback' : 'update';
++            var img = ch.image;
++            var msg = sprintf('%s "%s" service to image %s\n',
++                        word, ch.service.name, img.uuid) +
++                    common.indent(sprintf('(%s@%s)', img.name, img.version));
++
++            if (ch.insts) {
++                msg += ':\n';
++                msg += ch.insts.map(function (inst) {
++                    return common.indent(sprintf(
++                        'instance "%s" (%s) on server %s',
++                        inst.zonename, inst.alias, inst.server));
++                }).join('\n');
++            } else if (ch.inst) {
++                msg += ':\n';
++                msg += common.indent(sprintf(
++                        'instance "%s" (%s) on server %s',
++                        ch.inst.zonename, ch.inst.alias, ch.inst.server));
++            }
++            out.push(msg);
++        }
++    });
++
++    return out.join('\n');
++};
++
++
++UpdateSapiV2.prototype.execute = function sapiv2Execute(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.sdcadm, 'opts.sdcadm');
++    assert.object(opts.plan, 'opts.plan');
++    assert.object(opts.log, 'opts.log');
++    assert.func(opts.progress, 'opts.progress');
++    assert.string(opts.wrkDir, 'opts.wrkDir');
++    assert.func(cb, 'cb');
++    var self = this;
++    var progress = opts.progress;
++    var rollback = opts.plan.rollback || false;
++    var sdcadm = opts.sdcadm;
++
++
++    function updateSapi(change, nextSvc) {
++
++        const SAPI_URL = 'http://' + change.service.metadata.SERVICE_DOMAIN;
++
++        var arg = {
++            change: change,
++            opts: opts,
++            userScript: false,
++            tmpUUID: null
++        };
++
++        if (!change.insts) {
++            change.insts = change.inst ? [change.inst] : [];
++        }
++
++        if (opts.plan.changes.length > 1) {
++            progress('');
++            progress('--- Updating %s ...', change.service.name);
++        }
++
++        var funcs = [
++            function ensureFullMode(_, next) {
++                progress('Verifying SAPI full mode');
++                sdcadm.sapi.getMode(function (err, m) {
++                    if (err) {
++                        next(err);
++                        return;
++                    }
++
++                    if (m !== 'full') {
++                        var msg = 'SAPI is not in full mode. ' +
++                            'This could mean initial setup failed. ' +
++                            'Please fix SAPI VMs before continue.';
++                        next(new errors.UpdateError(new Error(msg), 'sapi'));
++                        return;
++                    }
++                    next();
++                });
++            }
++        ];
++
++        if (rollback) {
++            funcs.push(s.getOldUserScript);
++        } else {
++            funcs.push(s.getUserScript);
++            funcs.push(s.writeOldUserScriptForRollback);
++        }
++        funcs.push(s.updateSvcUserScript);
++
++        change.insts.forEach(function updateInstsVmUserScript(ins) {
++            funcs.push(function updateVmUserScript(_, next) {
++                s.updateVmUserScriptRemote({
++                    service: change.service,
++                    progress: progress,
++                    zonename: ins.zonename,
++                    log: opts.log,
++                    server: ins.server,
++                    userScript: arg.userScript
++                }, next);
++            });
++        });
++
++        funcs.push(s.updateSapiSvc);
++        // Workaround SAPI-199 and TOOLS-638
++        funcs.push(function updateServiceSapiURL(_, next) {
++            progress('Updating \'sapi-url\' in SAPI');
++            sdcadm.sapi.updateService(change.service.uuid, {
++                metadata: {
++                    'sapi-url': SAPI_URL
++                }
++            }, errors.sdcClientErrWrap(next, 'sapi'));
++        });
++
++        change.insts.forEach(function (ins) {
++            funcs = funcs.concat(
++                function imgadmInstallForInstance(_, next) {
++                    return s.imgadmInstallRemote({
++                        progress: progress,
++                        img: change.image,
++                        log: opts.log,
++                        server: ins.server
++                    }, next);
++                },
++                function reprovisionInstance(_, next) {
++                    s.reprovisionRemote({
++                        server: ins.server,
++                        img: change.image,
++                        zonename: ins.zonename,
++                        progress: progress,
++                        log: opts.log,
++                        sdcadm: opts.sdcadm
++                    }, next);
++                },
++                function waitForInstanceToBeUp(_, next) {
++                    s.waitForInstToBeUp({
++                        opts: {
++                            progress: progress,
++                            sdcadm: opts.sdcadm,
++                            log: opts.log
++                        },
++                        change: {
++                            inst: ins
++                        }
++                    }, next);
++                },
++                function updateVmSapiUrl(_, next) {
++                    s.updateVmMetadataRemote({
++                        sdcadm: opts.sdcadm,
++                        progress: progress,
++                        zonename: ins.zonename,
++                        log: opts.log,
++                        server: ins.server,
++                        metadata: {
++                            'sapi-url': SAPI_URL
++                        }
++                    }, next);
++                }
++            );
++        });
++
++        vasync.pipeline({funcs: funcs, arg: arg}, nextSvc);
++
++    }
++
++    vasync.forEachPipeline({
++        inputs: self.changes,
++        func: updateSapi
++    }, cb);
++};
++
++// --- exports
++
++module.exports = {
++    UpdateSapiV2: UpdateSapiV2
++};
++// vim: set softtabstop=4 shiftwidth=4:

@@ -1,0 +1,290 @@
+commit d33f84d5ef8ae0bc5d422551a7a9e472c570560b (refs/changes/63/3863/1)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2018-04-23T14:33:53-07:00 (1 year, 6 months ago)
+    
+    TRITON-52 x-DC image copy
+
+diff --git a/lib/images.js b/lib/images.js
+index 4ded88d..db58e0c 100644
+--- a/lib/images.js
++++ b/lib/images.js
+@@ -1594,6 +1594,17 @@ function apiListImages(req, res, next) {
+ function apiGetImage(req, res, next) {
+     var serialized = req._image.serialize(req._app.mode, req.getVersion(),
+         req.inclAdminFields);
++
++    // TRITON-52 Include the manta file path.
++    if (req.inclAdminFields && req._image.files.length > 0 &&
++            req._image.files[0].stor === 'manta') {
++        var stor = req._app.getStor('manta');
++        if (stor) {
++            serialized.files[0].path = stor._storPathFromImageUuid(
++                req._image.uuid, 'file0');
++        }
++    }
++
+     resSetEtag(req, res, serialized);
+     res.send(serialized);
+     next();
+@@ -2371,6 +2382,82 @@ function apiAdminImportRemoteImage(req, res, callback) {
+ }
+ 
+ 
++/**
++ * Allow a user to import an image that resides in another datacenter within
++ * the same cloud (e.g. an image that resides in a different JPC region).
++ *
++ * This creates and returns a workflow 'import-remote-image' job.
++ */
++function apiImportImageFromDc(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(req.log, 'req.log');
++    assert.object(req.params, 'req.params');
++    assert.object(req.query, 'req.query');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    if (req.query.action !== 'import-from-dc') {
++        return next();
++    }
++
++    var app = req._app;
++    var dc = req.query.dc;
++    var errs;
++    var log = req.log;
++    var skipOwnerCheck = false;
++    var uuid = req.params.uuid;
++
++    if (!UUID_RE.test(uuid)) {
++        errs = [ { field: 'uuid', code: 'Invalid' } ];
++        next(new errors.ValidationFailedError(
++            format('invalid image "uuid" (not a UUID): %s', uuid), errs));
++        return;
++    }
++
++    if (dc === undefined) {
++        errs = [ { field: 'dc', code: 'MissingParameter' } ];
++        next(new errors.ValidationFailedError('missing dc parameter', errs));
++        return;
++    }
++
++    if (!app.config.imgapiUrlFromDc ||
++            !app.config.imgapiUrlFromDc.hasOwnProperty(dc)) {
++        errs = [ { field: 'dc', code: 'Invalid' } ];
++        next(new errors.ValidationFailedError('unknown dc: ' + dc, errs));
++        return;
++    }
++
++    log.debug({uuid: uuid}, 'ImportDcImage: check if image already exists');
++
++    Image.get(app, uuid, log, function (gErr, image) {
++        if (!gErr) {
++            assert.object(image, 'image');
++            return next(new errors.ImageUuidAlreadyExistsError(uuid));
++        } else if (gErr.restCode !== 'ResourceNotFound') {
++            return next(gErr);
++        }
++
++        var source = app.config.imgapiUrlFromDc[dc];
++        assert.string(source, 'source');
++
++        log.debug({dc: dc, uuid: uuid, source: source},
++            'ImportDcImage: start import');
++
++        Image.createImportImageJob(req, uuid, source, skipOwnerCheck, log,
++                function (err, jobUuid) {
++            if (err) {
++                return next(err);
++            }
++
++            // Allow clients to know where is wfapi located
++            res.header('workflow-api', app.config.wfapi.url);
++            res.send({ image_uuid: uuid, job_uuid: jobUuid });
++            return next(false);
++        });
++    });
++}
++
++
+ function apiAdminImportDockerImage(req, res, next) {
+     if (req.query.action !== 'import-docker-image') {
+         return next();
+@@ -2579,10 +2666,44 @@ function apiAddImageFileFromSource(req, res, next) {
+         url: req.query.source,
+         log: req.log
+     }, req));
++
+     // Get the image so we can get the manifest files details
+-    client.getImage(uuid, addImageFileFromSource);
++    client.getImage(uuid, undefined, {inclAdminFields: true},
++        addImageFileFromSharedMantaSource);
++
++    // TRITON-52 Check if the given IMGAPI source uses the same manta storage,
++    // if yes then the manta file can be snaplinked rather than bit-copied.
++    function addImageFileFromSharedMantaSource(err, manifest) {
++        var config = req._app.config;
++
++        if (manifest.files[0].path && config.imgapiUrlFromDc &&
++                Object.keys(config.imgapiUrlFromDc).some(function _urlSome(dc) {
++                     return config.imgapiUrlFromDc[dc] === req.query.source;
++                 })) {
++            var stor = req._app.getStor('manta');
++            if (!stor) {
++                addImageFileFromImgapiSource(null, manifest);
++                return;
++            }
+ 
+-    function addImageFileFromSource(err, manifest) {
++            // The image file can be manta snaplinked.
++            // Passing some vars onto `finishMoveImageFile`.
++            req.file = objCopy(manifest.files[0]);
++            req.file.stor = stor.type;
++            req.storage = stor.type;
++
++            assert.string(req.file.path, 'req.file.path');
++            req.mantaSnaplinkPath = req.file.path;
++            // Remove file.path - we don't want that saved in the metadata.
++            delete req.file.path;
++
++            next();
++            return;
++        }
++        addImageFileFromImgapiSource(null, manifest);
++    }
++
++    function addImageFileFromImgapiSource(err, manifest) {
+         if (err) {
+             req.log.error(err, 'failed to get manifest for image %s',
+                 uuid);
+@@ -2698,32 +2819,59 @@ function apiAddImageFileFromSource(req, res, next) {
+  * into its final (non-tmp) place.
+  */
+ function finishMoveImageFile(req, res, next) {
+-    req.log.debug({image: req._image}, 'MoveImageFile: start');
++    assert.object(req, 'req');
++    assert.object(req.file, 'req.file');
++    assert.object(req._image, 'req._image');
++    assert.string(req.storage, 'req.storage');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    req.log.debug({uuid: req._image.uuid}, 'FinishMoveImageFile: start');
+ 
+     if (req._image.activated) {
+         return next(new errors.ImageAlreadyActivatedError(req._image.uuid));
+     }
+ 
+-    var stor = req._app.getStor(req.storage);
+-    stor.moveImageFile(req._image, req.tmpFilename, req.filename,
+-      function (mErr) {
+-        if (mErr) {
+-            return next(mErr);
++    vasync.pipeline({ funcs: [
++        function moveImageFile(_, cb) {
++            var stor = req._app.getStor(req.storage);
++            assert.object(stor, 'stor');
++            if (req.mantaSnaplinkPath) {
++                req.log.debug({uuid: req._image.uuid,
++                     mantaSnaplinkPath: req.mantaSnaplinkPath},
++                    'Snaplinking from existing manta file');
++                stor.snapLinkImageFileFromPath(req._image,
++                    req.mantaSnaplinkPath, cb);
++            } else {
++                assert.string(req.filename, 'req.filename');
++                assert.string(req.tmpFilename, 'req.tmpFilename');
++                stor.moveImageFile(req._image, req.tmpFilename, req.filename,
++                    cb);
++            }
++        },
++        function addImageFileDetails(_, cb) {
++            req._image.addFile(req._app, req.file, req.log, function (err) {
++                if (err) {
++                    req.log.error(err, 'error adding file info to Image');
++                    cb(new errors.InternalError(err, 'could not save image'));
++                    return;
++                }
++                cb();
++            });
+         }
+ 
+-        req._image.addFile(req._app, req.file, req.log, function (err2) {
+-            if (err2) {
+-                req.log.error(err2, 'error adding file info to Image');
+-                return next(new errors.InternalError(err2,
+-                    'could not save image'));
+-            }
++    ]}, function _onFinishMoveImageFileCb(err) {
++        if (err) {
++            next(err);
++            return;
++        }
+ 
+-            var serialized = req._image.serialize(req._app.mode,
+-                    req.getVersion());
+-            resSetEtag(req, res, serialized);
+-            res.send(serialized);
+-            next();
+-        });
++        req.log.debug({uuid: req._image.uuid}, 'FinishMoveImageFile: success');
++
++        var serialized = req._image.serialize(req._app.mode, req.getVersion());
++        resSetEtag(req, res, serialized);
++        res.send(serialized);
++        next();
+     });
+ }
+ 
+@@ -4102,6 +4250,7 @@ function mountApi(server, reqAuth, reqPassiveAuth) {
+         apiAdminImportRemoteImage, // before `reqGetImage` b/c shouldn't be one
+         apiAdminImportImage,       // before `reqGetImage` b/c shouldn't be one
+         apiAdminImportImageFromSource,
++        apiImportImageFromDc,
+         reqGetImage,               // add `req._image`, ensure access
+         apiAdminChangeImageStor,
+         reqEnsureAccountIsImageOwner,
+diff --git a/lib/storage.js b/lib/storage.js
+index db83ddf..c0e2679 100644
+--- a/lib/storage.js
++++ b/lib/storage.js
+@@ -663,6 +663,26 @@ function (image, toPath, callback) {
+     this.client.ln(fromPath, toPath, callback);
+ };
+ 
++MantaStorage.prototype.snapLinkImageFileFromPath =
++function (image, fromPath, callback) {
++    assert.object(image, 'image');
++    assert.string(image.uuid, 'image.uuid');
++    assert.string(fromPath, 'fromPath');
++    assert.func(callback, 'callback');
++
++    var self = this;
++    var toPath = this._storPathFromImageUuid(image.uuid, 'file0');
++    var toDir = path.dirname(toPath);
++
++    self.client.mkdirp(toDir, function _snapLinkMkdirpCb(err) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        self.client.ln(fromPath, toPath, callback);
++    });
++};
++
+ MantaStorage.prototype.createImageFileReadStream =
+         function (image, filename, opts, callback) {
+     assert.object(image, 'image');
+diff --git a/sapi_manifests/imgapi/template b/sapi_manifests/imgapi/template
+index ef9a862..9adf696 100644
+--- a/sapi_manifests/imgapi/template
++++ b/sapi_manifests/imgapi/template
+@@ -48,6 +48,10 @@
+ {{/IMGAPI_MANTA_URL}}
+         "local"
+     ],
++    "XXX": "Can this come from SAPI, or be generated from CloudAPI.ListDataCenters?",
++    "imgapiUrlFromDc": {
++        "dingo": "http://localhost:8880"
++    },
+     "wfapi": {
+         "forceMd5Check": true,
+         "workflows": ["create-from-vm", "import-remote-image"],

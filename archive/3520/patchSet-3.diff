@@ -1,0 +1,982 @@
+commit 20df988dca203ea2c6e17914f9d743f4c855e51e (refs/changes/20/3520/3)
+Author: David Pacheco <dap@joyent.com>
+Date:   2018-03-01T09:36:16-08:00 (1 year, 7 months ago)
+    
+    joyent/mdb_v8#111 want `::v8whatis`
+    joyent/mdb_v8#112 stack corruption in jsobj_properties()
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 985b768..b6aaa11 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -12,7 +12,8 @@
+ 
+ ## Unreleased changes
+ 
+-None.
++* #111 want `::v8whatis`
++* #112 stack corruption in jsobj_properties()
+ 
+ ## v1.3.0 (2018-02-09)
+ 
+diff --git a/docs/usage.md b/docs/usage.md
+index 7b0ddf9..29efebc 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -1042,6 +1042,8 @@ Walking V8 structures:
+ * v8scopeinfo: print information about a V8 ScopeInfo object
+ * v8str: print the contents of a V8 string (optionally show details of structure)
+ * v8type: print the V8 type of a heap object
++* v8whatis: print information about any V8 heap object containing the given
++  address
+ 
+ Modifying configuration:
+ 
+diff --git a/package.json b/package.json
+index dd2bd6d..9f4051c 100644
+--- a/package.json
++++ b/package.json
+@@ -4,6 +4,7 @@
+ 	"description": "package used only to install devDependencies for mdb_v8",
+ 	"private": true,
+ 	"devDependencies": {
++		"jsprim": "^2.0.0",
+ 		"vasync": "^2.2.0",
+ 		"verror": "^1.10.0"
+ 	}
+diff --git a/src/mdb_v8.c b/src/mdb_v8.c
+index a81dfa3..c436e0b 100644
+--- a/src/mdb_v8.c
++++ b/src/mdb_v8.c
+@@ -2251,6 +2251,92 @@ obj_print_class(uintptr_t addr, v8_class_t *clp)
+ 	return (rv);
+ }
+ 
++/*
++ * Attempts to determine whether the object at "addr" might contain the address
++ * "target".  This is used for low-level heuristic analysis.  Note that it's
++ * possible that we cannot tell whether the address is contained (e.g., if this
++ * is a variable-length object and we can't read how big it is).
++ */
++static int
++obj_contains(uintptr_t addr, uint8_t type, uintptr_t target,
++    boolean_t *containsp, int memflags)
++{
++	size_t size;
++	uintptr_t objsize;
++
++	/*
++	 * For sequential strings, we need to look at how many characters there
++	 * are, and how many bytes per character are used to encode the string.
++	 * For other types of strings, the V8 heap object is not variable-sized,
++	 * so we can treat it like the other cases below.
++	 */
++	if (V8_TYPE_STRING(type) && V8_STRREP_SEQ(type)) {
++		v8string_t *strp;
++		size_t length;
++
++		if ((strp = v8string_load(addr, memflags)) == NULL) {
++			return (-1);
++		}
++
++		length = v8string_length(strp);
++
++		if (V8_STRENC_ASCII(type)) {
++			size = V8_OFF_SEQASCIISTR_CHARS + length;
++		} else {
++			size = V8_OFF_SEQTWOBYTESTR_CHARS + (2 * length);
++		}
++
++		v8string_free(strp);
++		*containsp = target < addr + size;
++		return (0);
++	}
++
++	if (type == V8_TYPE_FIXEDARRAY) {
++		v8fixedarray_t *arrayp;
++		size_t length;
++
++		if ((arrayp = v8fixedarray_load(addr, memflags)) == NULL) {
++			return (-1);
++		}
++
++		length = v8fixedarray_length(arrayp);
++		size = V8_OFF_FIXEDARRAY_DATA + length * sizeof (uintptr_t);
++		v8fixedarray_free(arrayp);
++		*containsp = target < addr + size;
++		return (0);
++	}
++
++	if (read_size(&objsize, addr) != 0) {
++		return (-1);
++	}
++
++	size = objsize;
++	if (type == V8_TYPE_JSOBJECT) {
++		/*
++		 * Instances of JSObject can also contain a number of property
++		 * values directly in the object.  To find out how many, we need
++		 * to read the count out of the map.  See jsobj_properties() for
++		 * details on how this works.
++		 */
++		uintptr_t map;
++		uint8_t ninprops;
++		if (mdb_vread(&map, sizeof (map),
++		    addr + V8_OFF_HEAPOBJECT_MAP) == -1) {
++			return (-1);
++		}
++
++		if (mdb_vread(&ninprops, sizeof (ninprops),
++		    map + V8_OFF_MAP_INOBJECT_PROPERTIES) == -1) {
++			return (-1);
++		}
++
++		size += ninprops * sizeof (uintptr_t);
++	}
++
++	*containsp = target < addr + size;
++	return (0);
++}
++
+ /*
+  * Print the ASCII string for the given JS string, expanding ConsStrings and
+  * ExternalStrings as needed.
+@@ -2702,7 +2788,7 @@ jsobj_properties(uintptr_t addr,
+ 	 */
+ 	if (read_size(&size, addr) != 0)
+ 		size = 0;
+-	if (mdb_vread(&ninprops, ps,
++	if (mdb_vread(&ninprops, sizeof (ninprops),
+ 	    map + V8_OFF_MAP_INOBJECT_PROPERTIES) == -1)
+ 		goto err;
+ 
+@@ -6763,6 +6849,170 @@ dcmd_v8warnings(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 	return (DCMD_OK);
+ }
+ 
++/*
++ * "v8whatis" scours the memory just prior to the given address looking for
++ * structure that indicates a V8 heap object.  This is a heuristic way to find
++ * the V8 heap object containing a specific address.
++ */
++static int
++dcmd_v8whatis(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
++{
++	uintptr_t origaddr, curaddr, curvalue, ptrlowbits;
++	size_t curoffset, maxoffset = 4096;
++	boolean_t contained, verbose = B_FALSE;
++	uint8_t typebyte;
++
++	if (!(flags & DCMD_ADDRSPEC)) {
++		mdb_warn("must specify address for ::v8whatis\n");
++		return (DCMD_ERR);
++	}
++
++	if (mdb_getopts(argc, argv,
++	    'v', MDB_OPT_SETBITS, B_TRUE, &verbose,
++	    'd', MDB_OPT_UINTPTR, &maxoffset, NULL) != argc) {
++		return (DCMD_USAGE);
++	}
++
++	if (maxoffset > INT16_MAX) {
++		mdb_warn("warn: very large value supplied for \"-d\": %u\n",
++		    maxoffset);
++	}
++
++	origaddr = addr;
++
++	/*
++	 * Objects will always be stored at pointer-aligned addresses.  If we're
++	 * given an address that's not pointer-aligned, clear the low bits to
++	 * find the pointer-sized value containing the address given.
++	 */
++	ptrlowbits = sizeof (uintptr_t) - 1;
++	addr &= ~ptrlowbits;
++	assert(addr <= origaddr && origaddr - addr < sizeof (uintptr_t));
++
++	/*
++	 * On top of that, set the heap object tag bits.  Recall that most
++	 * mdb_v8 commands interpret values the same way as V8: if the tag bits
++	 * are set, then this is a heap object; otherwise, it's not.  And this
++	 * command only makes sense for heap objects, so one might expect that
++	 * we would bail if we're given something else.  But in practice, this
++	 * command is expected to be chained with `::ugrep` or some other
++	 * command that reports heap objects without the tag bits set, so it
++	 * makes sense to just assume they were supposed to be set.
++	 */
++	addr |= V8_HeapObjectTag;
++	if (verbose && origaddr != addr) {
++		mdb_warn("assuming heap object at %p\n", addr);
++	}
++
++	/*
++	 * At this point, we walk backwards from the address we're given looking
++	 * for something that looks like a V8 heap object.
++	 */
++	for (curoffset = 0; curoffset < maxoffset;
++	    curoffset += sizeof (uintptr_t)) {
++		curaddr = addr - curoffset;
++		assert(V8_IS_HEAPOBJECT(curaddr));
++
++		if (read_heap_ptr(&curvalue, curaddr,
++		    V8_OFF_HEAPOBJECT_MAP) != 0 ||
++		    read_typebyte(&typebyte, curvalue) != 0) {
++			/*
++			 * The address we're looking at was either unreadable,
++			 * or we could not follow its Map pointer to find the
++			 * type byte.  This cannot be a valid heap object
++			 * because every heap object has a Map pointer as its
++			 * first field.
++			 */
++			continue;
++		}
++
++		if (typebyte != V8_TYPE_MAP) {
++			/*
++			 * The address we're looking at refers to something
++			 * other than a Map.  Again, this cannot be the address
++			 * of a valid heap object.
++			 */
++			continue;
++		}
++
++		/*
++		 * We've found what looks like a valid Map object.  See if we
++		 * can read its type byte, too.  If not, this is likely garbage.
++		 */
++		if (read_typebyte(&typebyte, curaddr) != 0) {
++			continue;
++		}
++
++		break;
++	}
++
++	if (curoffset >= maxoffset) {
++		if (verbose) {
++			mdb_warn("%p: no heap object found in previous "
++			    "%u bytes\n", addr, maxoffset);
++		}
++		return (DCMD_OK);
++	}
++
++	/*
++	 * At this point, check to see if the address that we were given might
++	 * be contained in this object.  If not, that means we found a Map for a
++	 * heap object that doesn't contain our target address.  We could have
++	 * checked this in the loop above so that we'd keep walking backwards in
++	 * this case, but we assume that Map objects aren't likely to appear
++	 * inside the middle of other valid objects, and thus that if we found a
++	 * Map and its heap object doesn't contain our target address, then
++	 * we're done -- there is no heap object containing our target.
++	 */
++	if (obj_contains(curaddr, typebyte, addr, &contained,
++	    UM_SLEEP | UM_GC) == 0 && !contained) {
++		if (verbose) {
++			mdb_warn("%p: heap object found at %p "
++			    "(%p-0x%x, type %s) does not appear to contain "
++			    "%p\n", addr, curaddr, addr, curoffset,
++			    enum_lookup_str(v8_types, typebyte, "(unknown)"),
++			    addr);
++		}
++		return (DCMD_OK);
++	}
++
++	if (!verbose) {
++		mdb_printf("%p\n", curaddr);
++		return (DCMD_OK);
++	}
++
++	mdb_printf("%p (found Map at %p (%p-0x%x) for type %s)", curaddr,
++	    curaddr, origaddr, origaddr - curaddr,
++	    enum_lookup_str(v8_types, typebyte, "(unknown)"));
++	return (DCMD_OK);
++}
++
++static void
++dcmd_v8whatis_help(void)
++{
++	mdb_printf("%s\n\n",
++"Given an address, attempt to determine what V8 heap object, if any,\n"
++"contains the address.  V8 heap objects have a reasonably consistent header\n"
++"structure.  This command walks back from the given address looking for this\n"
++"structure.  This is believed to be reasonably reliable, but it's ultimately\n"
++"heuristic and may produce the wrong output.\n"
++"\n"
++"Note that unlike other dcmds, this command accepts untagged heap addresses\n"
++"(which would normally be considered non-heap, small integer values) and \n"
++"implicitly adds the tag, allowing it to be more easily used with ::ugrep.\n");
++
++	mdb_dec_indent(2);
++	mdb_printf("%<b>OPTIONS%</b>\n");
++	mdb_inc_indent(2);
++
++	mdb_printf("%s\n",
++"  -v       Verbose mode -- print details about any matches found\n"
++"           (or why a found match was not reported)\n"
++"  -d BYTES Scan up to BYTES bytes below the initial target.  Default: 4096\n");
++}
++
++
++
+ typedef struct jselement_walk_data {
+ 	mdb_walk_state_t *jsew_wsp;
+ 	int		 jsew_memflags;
+@@ -7039,6 +7289,8 @@ static const mdb_dcmd_t v8_mdb_dcmds[] = {
+ 		dcmd_v8types },
+ 	{ "v8warnings", NULL, "toggle V8 warnings",
+ 		dcmd_v8warnings },
++	{ "v8whatis", NULL, "attempt to identify containing V8 heap object",
++		dcmd_v8whatis, dcmd_v8whatis_help },
+ 
+ 	{ NULL }
+ };
+diff --git a/test/standalone/common.js b/test/standalone/common.js
+index c3fd776..8ecfbf9 100644
+--- a/test/standalone/common.js
++++ b/test/standalone/common.js
+@@ -26,9 +26,12 @@ var gcoreSelf = require('./gcore_self');
+ /* Public interface */
+ exports.dmodpath = dmodpath;
+ exports.createMdbSession = createMdbSession;
++exports.finalizeTestObject = finalizeTestObject;
+ exports.standaloneTest = standaloneTest;
++exports.findTestObject = findTestObject;
++exports.splitMdbLines = splitMdbLines;
+ 
+-var MDB_SENTINEL = 'MDB_SENTINEL\n';
++var MDB_SENTINEL = 'MDB_SENTINEL';
+ 
+ /*
+  * Returns the path to the built dmod, for loading into mdb during testing.
+@@ -55,7 +58,8 @@ function MdbSession()
+ 	/* runtime state */
+ 	this.mdb_exited = false;
+ 	this.mdb_error = null;
+-	this.mdb_output = '';	/* buffered output */
++	this.mdb_stdout = '';	/* buffered stdout */
++	this.mdb_stderr = '';	/* buffered stderr */
+ 	this.mdb_findleaks = null;
+ }
+ 
+@@ -79,7 +83,8 @@ MdbSession.prototype.runCmd = function (str, callback)
+ 	this.mdb_pending_callback = callback;
+ 	process.stderr.write('> ' + str);
+ 	this.mdb_child.stdin.write(str);
+-	this.mdb_child.stdin.write('!echo ' + MDB_SENTINEL);
++	this.mdb_child.stdin.write('!printf ' + MDB_SENTINEL + '; ');
++	this.mdb_child.stdin.write('!printf ' + MDB_SENTINEL + ' >&2\n');
+ };
+ 
+ MdbSession.prototype.onExit = function (code)
+@@ -94,20 +99,33 @@ MdbSession.prototype.onExit = function (code)
+ 
+ MdbSession.prototype.doWork = function ()
+ {
+-	var i, chunk, callback;
++	var outi, outchunk;
++	var erri, errchunk;
++	var callback;
+ 
+-	i = this.mdb_output.indexOf(MDB_SENTINEL);
+-	assert.ok(i >= 0);
+-	chunk = this.mdb_output.substr(0, i);
+-	this.mdb_output = this.mdb_output.substr(i + MDB_SENTINEL.length);
+-	console.error(chunk);
++	outi = this.mdb_stdout.indexOf(MDB_SENTINEL);
++	erri = this.mdb_stderr.indexOf(MDB_SENTINEL);
++	if (outi == -1 || erri == -1) {
++		return;
++	}
++
++	outchunk = this.mdb_stdout.substr(0, outi);
++	this.mdb_stdout = this.mdb_stdout.substr(outi + MDB_SENTINEL.length);
++	console.error(outchunk);
++
++	errchunk = this.mdb_stderr.substr(0, erri);
++	this.mdb_stderr = this.mdb_stderr.substr(erri + MDB_SENTINEL.length);
++
++	if (errchunk.length > 0) {
++		console.log('mdb: stderr: ' + errchunk);
++	}
+ 
+ 	assert.notStrictEqual(this.mdb_pending_cmd, null);
+ 	assert.notStrictEqual(this.mdb_pending_callback, null);
+ 	callback = this.mdb_pending_callback;
+ 	this.mdb_pending_callback = null;
+ 	this.mdb_pending_cmd = null;
+-	callback(chunk);
++	callback(outchunk, errchunk);
+ };
+ 
+ MdbSession.prototype.finish = function (error)
+@@ -183,7 +201,6 @@ function createMdbSessionFile(filename, callback)
+ function createMdbSession(args, callback)
+ {
+ 	var mdb, loaddmod;
+-	var loaded = false;
+ 
+ 	assert.equal('object', typeof (args));
+ 	assert.equal('string', typeof (args.targetType));
+@@ -230,10 +247,8 @@ function createMdbSession(args, callback)
+ 	});
+ 
+ 	mdb.mdb_child.stdout.on('data', function (chunk) {
+-		mdb.mdb_output += chunk;
+-		while (mdb.mdb_output.indexOf(MDB_SENTINEL) != -1) {
+-			mdb.doWork();
+-		}
++		mdb.mdb_stdout += chunk;
++		mdb.doWork();
+ 	});
+ 
+ 	mdb.mdb_onprocexit = function (code) {
+@@ -245,25 +260,26 @@ function createMdbSession(args, callback)
+ 	process.on('exit', mdb.mdb_onprocexit);
+ 
+ 	mdb.mdb_child.stderr.on('data', function (chunk) {
+-		console.log('mdb: stderr: ' + chunk);
+-		assert.ok(!loaddmod || loaded,
+-		    'dmod emitted stderr before ::load was complete');
++		mdb.mdb_stderr += chunk;
++		mdb.doWork();
+ 	});
+ 
+ 	/*
+ 	 * The '1000$w' sets the terminal width to a large value to keep MDB
+ 	 * from inserting newlines at the default 80 columns.
+ 	 */
+-	mdb.runCmd('1000$w\n', function () {
++	mdb.runCmd('1000$w\n', function (output, erroutput) {
+ 		var cmdstr;
+ 		if (!loaddmod) {
+ 			callback(null, mdb);
+ 			return;
+ 		}
+ 
++		assert.strictEqual(erroutput.length, 0);
+ 		cmdstr = '::load ' + dmodpath() + '\n';
+-		mdb.runCmd(cmdstr, function () {
+-			loaded = true;
++		mdb.runCmd(cmdstr, function (loadoutput, loaderroutput) {
++			assert.strictEqual(loaderroutput.length, 0,
++			    'expected no stderr from ::load');
+ 			callback(null, mdb);
+ 		});
+ 	});
+@@ -313,3 +329,90 @@ function standaloneTest(funcs, callback)
+ 		callback(err);
+ 	});
+ }
++
++/*
++ * This function should be invoked by callers of standaloneTest immediately
++ * before invoking common.standaloneTest().  The argument should be a test
++ * object that you will want to locate in the core file with findTestObject().
++ *
++ * For context: the standalone tests generally use a single test object from
++ * which other objects of interest may be referenced.  In order to verify mdb_v8
++ * functionality, these tests usually have to first locate this test object in
++ * the core file.  This is easiest if the object has a unique, well-known
++ * property with a well-known value.  This is a little cheesy, but we set this
++ * property here to a boolean value.  Because we're doing this immediately
++ * prior to invoking gcoreSelf(), we minimize the chance that findTestObject()
++ * finds multiple copies of the object created by intervening GC operations.
++ */
++function finalizeTestObject(obj)
++{
++	obj['testObjectFinished'] = true;
++}
++
++/*
++ * Uses the specified MDB session to locate our test object in the core file.
++ * The test object is whatever object was nominated by a previous call to
++ * finalizeTestObject().
++ */
++function findTestObject(mdb, callback)
++{
++	var cmdstr, rv;
++
++	cmdstr = '::findjsobjects -p testObjectFinished | ' +
++	    '::findjsobjects | ' +
++	    '::jsprint -b testObjectFinished\n';
++	mdb.runCmd(cmdstr, function (output) {
++		var lines, li, parts;
++
++		lines = output.split('\n');
++		assert.strictEqual(lines[lines.length - 1].length, 0,
++		    'last line was not empty');
++
++		for (li = 0; li < lines.length - 1; li++) {
++			parts = lines[li].split(':');
++			if (parts.length == 2 && parts[1] == ' true') {
++				if (rv !== undefined) {
++					/*
++					 * We've probably found a garbage object
++					 * that's convincing enough that we
++					 * can't tell that it's wrong.
++					 */
++					callback(new Error(
++					    'found more than one possible ' +
++					    'test object'));
++					return;
++				}
++
++				rv = parts[0];
++			}
++		}
++
++		if (rv === undefined) {
++			callback(new Error('did not find test object'));
++		} else {
++			console.error('test object: ', rv);
++			callback(null, rv);
++		}
++	});
++}
++
++/*
++ * Splits MDB output into lines, optionally verifying other properties.
++ */
++function splitMdbLines(output, options)
++{
++	var lines;
++
++	assert.equal('string', typeof (output));
++	assert.equal('object', typeof (options));
++
++	lines = output.split('\n');
++	assert.strictEqual(lines[lines.length - 1].length, 0,
++	    'expected last line to be empty');
++	if (options.count !== undefined) {
++		assert.equal('number', typeof (options.count));
++		assert.strictEqual(options.count, lines.length - 1);
++	}
++
++	return (lines.slice(0, lines.length - 1));
++}
+diff --git a/test/standalone/tst.arrays.js b/test/standalone/tst.arrays.js
+index f5b5393..63cb242 100644
+--- a/test/standalone/tst.arrays.js
++++ b/test/standalone/tst.arrays.js
+@@ -203,15 +203,7 @@ function main()
+ 		mdb.checkMdbLeaks(callback);
+ 	});
+ 
+-	/*
+-	 * This is a little cheesy, but we set this property to a boolean value
+-	 * immediately before saving the core file to minimize the chance that
+-	 * when we go look for this object that we'll find several other garbage
+-	 * objects having the same property with the same value (because they've
+-	 * been copied around by intervening GC operations).
+-	 */
+-	testObject['testObjectFinished'] = true;
+-
++	common.finalizeTestObject(testObject);
+ 	common.standaloneTest(testFuncs, function (err) {
+ 		if (err) {
+ 			throw (err);
+@@ -237,42 +229,9 @@ function eltvalue(name, i)
+  * phases.
+  */
+ function findTestObjectAddr(mdb, callback) {
+-	var cmdstr;
+-
+-	cmdstr = '::findjsobjects -p testObjectFinished | ::findjsobjects | ' +
+-	    '::jsprint -b testObjectFinished\n';
+-	mdb.runCmd(cmdstr, function (output) {
+-		var lines, li, parts;
+-
+-		lines = output.split('\n');
+-		assert.strictEqual(lines[lines.length - 1].length, 0,
+-		    'last line was not empty');
+-
+-		for (li = 0; li < lines.length - 1; li++) {
+-			parts = lines[li].split(':');
+-			if (parts.length == 2 && parts[1] == ' true') {
+-				if (testObjectAddr !== undefined) {
+-					/*
+-					 * We've probably found a garbage object
+-					 * that's convincing enough that we
+-					 * can't tell that it's wrong.
+-					 */
+-					callback(new Error(
+-					    'found more than one possible ' +
+-					    'test object'));
+-					return;
+-				}
+-
+-				testObjectAddr = parts[0];
+-			}
+-		}
+-
+-		if (testObjectAddr === undefined) {
+-			callback(new Error('did not find test object'));
+-		} else {
+-			console.error('test object: ', testObjectAddr);
+-			callback();
+-		}
++	common.findTestObject(mdb, function (err, addr) {
++		testObjectAddr = addr;
++		callback(err);
+ 	});
+ }
+ 
+diff --git a/test/standalone/tst.v8whatis.js b/test/standalone/tst.v8whatis.js
+new file mode 100644
+index 0000000..53bbc9b
+--- /dev/null
++++ b/test/standalone/tst.v8whatis.js
+@@ -0,0 +1,353 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * tst.v8whatis.js: exercises the ::v8whatis dcmd.
++ *
++ * Like most of the standalone tests, this test works by creating a bunch of
++ * structures in memory, using gcore(1M) to save a core file of the current
++ * process, and then using an MDB session against the core file to pull out
++ * those structures and verify that the debugger interprets them correctly.
++ */
++
++var assert = require('assert');
++var jsprim = require('jsprim');
++var util = require('util');
++var VError = require('verror');
++
++var common = require('./common');
++
++/*
++ * "testObject" is the root object from which we will hang the objects used for
++ * our test cases.  Because this test mostly involves walking backwards, the
++ * actual "test object" that we find with "::findjsobjects" is the one inside
++ * "myArray".  (See the call to finalizeTestObject().)
++ */
++var testObject = {
++    'myArray': [ 1, { 'aTest': 'hello_world' } ]
++};
++
++/*
++ * Addresses found in the core file for "testObject" itself as well as the
++ * arrays hanging off of it.
++ */
++var addrTestObjectTest;
++
++function main()
++{
++	var testFuncs;
++	var addrFixedArray, addrJsArray, addrJsObject;
++	var addrJsObjectPlus12, addrEndMapping;
++	var sizeMapping;
++
++	testFuncs = [];
++
++	/*
++	 * First, exercise a few simple cases of invalid input.
++	 */
++	testFuncs.push(function badInputNoAddr(mdb, callback) {
++		console.error('test: bad input: no address');
++		mdb.runCmd('::v8whatis\n', function (output, erroutput) {
++			assert.strictEqual(output, '');
++			assert.ok(/must specify address for ::v8whatis/.test(
++			    erroutput));
++			callback();
++		});
++	});
++	testFuncs.push(function badInputNoDarg(mdb, callback) {
++		console.error('test: bad input: no address');
++		mdb.runCmd('0::v8whatis -d\n', function (output, erroutput) {
++			assert.strictEqual(output, '');
++			assert.ok(/option requires an argument/.test(
++			    erroutput));
++			callback();
++		});
++	});
++
++	/*
++	 * Now, locate our test object for the rest of the tests.
++	 */
++	testFuncs.push(function findTestObjectAddress(mdb, callback) {
++		common.findTestObject(mdb, function (err, addr) {
++			addrTestObjectTest = addr;
++			callback(err);
++		});
++	});
++
++	/*
++	 * Walk backwards from the test object.   Since it's contained inside an
++	 * array, the immediate parent should be a FixedArray.
++	 */
++	testFuncs.push(function walkToFixedArray(mdb, callback) {
++		console.error(
++		    'test: walking back from array element to FixedArray');
++		walkOneStep(addrTestObjectTest, mdb, function (err, step) {
++			if (err) {
++				callback(err);
++				return;
++			}
++
++			assert.equal('string', typeof (step.parentBase));
++			assert.strictEqual(step.parentType, 'FixedArray');
++			addrFixedArray = step.parentBase;
++			callback();
++		});
++	});
++
++	/*
++	 * Walk backwards again from the FixedArray.  This should take us to the
++	 * JSArray that contains it.
++	 */
++	testFuncs.push(function eltDoUgrep(mdb, callback) {
++		console.error(
++		    'test: walking back from FixedArray to JSArray');
++		walkOneStep(addrFixedArray, mdb, function (err, step) {
++			if (err) {
++				callback(err);
++				return;
++			}
++
++			assert.equal('string', typeof (step.parentBase));
++			assert.strictEqual(step.parentType, 'JSArray');
++			addrJsArray = step.parentBase;
++			callback();
++		});
++	});
++
++	/*
++	 * Now dump the array contents to prove it contains our test object.
++	 */
++	testFuncs.push(function checkArrayContents(mdb, callback) {
++		var cmdstr;
++		cmdstr = addrJsArray + '::jsarray\n';
++		mdb.runCmd(cmdstr, function (output) {
++			var lines;
++			lines = common.splitMdbLines(output, { 'count': 2 });
++			assert.equal(lines[1], addrTestObjectTest);
++			callback();
++		});
++	});
++
++	/*
++	 * At this point, we've verified a couple of types of references:
++	 * JSArrays and FixedArrays.  Let's check object properties by walking
++	 * back once more.  Note that this could generate false positives, if V8
++	 * has decided to organize this object differently than it usually does
++	 * (e.g., with a separate "properties" array), but that doesn't seem
++	 * likely here.  If it becomes a problem, we can make this test case
++	 * more flexible.
++	 */
++	testFuncs.push(function propUgrep1(mdb, callback) {
++		console.error('test: walking back from JSArray to JSObject');
++		walkOneStep(addrJsArray, mdb, function (err, step) {
++			if (err) {
++				callback(err);
++				return;
++			}
++
++			assert.equal('string', typeof (step.parentBase));
++			assert.strictEqual(step.parentType, 'JSObject');
++			addrJsObject = step.parentBase;
++			callback();
++		});
++	});
++
++	/*
++	 * Now, print the object contents, following object properties and array
++	 * elements to get back to our original test object, proving that these
++	 * backwards references we found correspond to legitimate forward
++	 * references.
++	 */
++	testFuncs.push(function checkObjectContents(mdb, callback) {
++		var cmdstr;
++		cmdstr = addrJsObject + '::jsprint myArray[1].aTest\n';
++		mdb.runCmd(cmdstr, function (output) {
++			var lines;
++			lines = common.splitMdbLines(output, { 'count': 1 });
++			assert.ok(/hello_world/.test(lines[0]),
++			    'bad output for "::jsprint ..."');
++			callback();
++		});
++	});
++
++	/*
++	 * This next two tests take the address that we now know refers to the
++	 * base of a JSObject and try several pointer values within the object
++	 * that should report the same base address.
++	 */
++	testFuncs.push(function objCheckBase(mdb, callback) {
++		console.error('test: providing base address to ::v8whatis');
++		runWhatisVerbose(addrJsObject, mdb, function (step) {
++			assert.strictEqual(step.parentType, 'JSObject');
++			assert.strictEqual(step.parentBase, addrJsObject);
++			assert.strictEqual(step.symbolicOffset,
++			    addrJsObject + '-0x0');
++			callback();
++		});
++	});
++
++	testFuncs.push(function objCheckBasePlus12(mdb, callback) {
++		console.error('test: providing address+12 to ::v8whatis');
++		addrJsObjectPlus12 = jsprim.parseInteger(addrJsObject, {
++		    'base': 16,
++		    'allowSign': false,
++		    'allowImprecise': false,
++		    'allowPrefix': false,
++		    'allowTrailing': false,
++		    'trimWhitespace': false,
++		    'leadingZeroIsOctal': false
++		});
++		if (addrJsObjectPlus12 instanceof Error) {
++			callback(new VError(addrJsObjectPlus12,
++			    'could not parse address of test object: %s',
++			    addrTestObjectTest));
++			return;
++		}
++
++		addrJsObjectPlus12 = (addrJsObjectPlus12 + 12).toString(16);
++		runWhatisVerbose(addrJsObjectPlus12, mdb, function (step) {
++			assert.strictEqual(step.parentType, 'JSObject');
++			assert.strictEqual(step.parentBase, addrJsObject);
++			assert.strictEqual(step.symbolicOffset,
++			    addrJsObjectPlus12 + '-0xc');
++			callback();
++		});
++	});
++
++	/*
++	 * On the other hand, if we take this last address (12 bytes into the
++	 * JSObject) and limit our search to only 4 bytes, we should not find a
++	 * parent reference.  This exercises the error case where we didn't
++	 * search back far enough.
++	 */
++	testFuncs.push(function objCheckBasePlus12Limit4(mdb, callback) {
++		console.error('test: providing address+12 with limit of 4');
++		mdb.runCmd(addrJsObjectPlus12 + '::v8whatis -v -d4\n',
++		    function (output, erroutput) {
++			assert.ok(/no heap object found in previous 4 bytes/.
++			    test(erroutput));
++			assert.strictEqual(output, '');
++			callback();
++		    });
++	});
++
++	/*
++	 * Now test the case where we find a V8 heap object, but it doesn't seem
++	 * to contain our target address.  Since V8 often allocates objects
++	 * sequentially without gaps, it can be a little tricky to locate an
++	 * address that we can use to test this case.  Here's how we do it: we
++	 * take one of the known-good addresses, find the address at the end of
++	 * its virtual memory mapping, and use that address.  We'll use the size
++	 * of the mapping as an argument to "-d".  By construction, we know
++	 * there exists a heap object within the specified range, and we know
++	 * that it won't contain our address because it's not even in the same
++	 * mapping (if our address is even mapped at all).
++	 */
++	testFuncs.push(function getEndOfMapping(mdb, callback) {
++		console.error('test: end-of-mapping address');
++		mdb.runCmd(addrJsObjectPlus12 + '$m\n', function (output) {
++			var lines, parts;
++
++			lines = common.splitMdbLines(output, { 'count': 2 });
++			parts = lines[1].trim().split(/\s+/);
++			assert.ok(parts.length >= 3, 'garbled mapping line');
++			addrEndMapping = parts[1];
++			sizeMapping = parts[2];
++			callback();
++		});
++	});
++	testFuncs.push(function useEndOfMapping(mdb, callback) {
++		mdb.runCmd(addrEndMapping + '::v8whatis -v -d ' +
++		    sizeMapping + '\n', function (output, erroutput) {
++			assert.ok(
++			    /heap object found.*does not appear to contain/.
++			    test(erroutput));
++			assert.strictEqual(output, '');
++			callback();
++		});
++	});
++
++	testFuncs.push(function (mdb, callback) {
++		mdb.checkMdbLeaks(callback);
++	});
++
++	common.finalizeTestObject(testObject['myArray'][1]);
++	common.standaloneTest(testFuncs, function (err) {
++		if (err) {
++			throw (err);
++		}
++
++		console.log('%s passed', process.argv[1]);
++	});
++}
++
++function walkOneStep(addr, mdb, callback)
++{
++	var rv = {
++	    'addr': addr,		/* address itself */
++	    'ugrep': null,		/* where address is referenced */
++	    'parentBase': null,		/* base addr of containing V8 object */
++	    'parentType': null,		/* type of containing V8 object */
++	    'parentRaw': null,		/* raw verbose output */
++	    'symbolicOffset': null	/* offset from "addr" to "parentBase" */
++	};
++
++	mdb.runCmd(addr + '::ugrep\n', function (uoutput) {
++		var lines;
++
++		lines = common.splitMdbLines(uoutput, { 'count': 1 });
++		rv.ugrep = lines[0].trim();
++
++		mdb.runCmd(rv.ugrep + '::v8whatis\n',
++		    function (woutput, werroutput) {
++			assert.strictEqual(werroutput.length, 0);
++			lines = common.splitMdbLines(woutput, { 'count': 1 });
++			rv.parentBase = lines[0].trim();
++
++			runWhatisVerbose(rv.ugrep, mdb, function (whatis) {
++				assert.strictEqual(rv.parentBase,
++				    whatis.parentBase);
++				rv.parentType = whatis.parentType;
++				rv.parentRaw = whatis.parentRaw;
++				rv.symbolicOffset = whatis.symbolicOffset;
++				callback(null, rv);
++			});
++		    });
++	});
++}
++
++function runWhatisVerbose(addr, mdb, callback)
++{
++	var rv;
++
++	rv = {
++	    'parentBase': null,
++	    'parentType': null,
++	    'parentRaw': null,
++	    'symbolicOffset': null
++	};
++
++	mdb.runCmd(addr + '::v8whatis -v\n', function (output) {
++		var lines, rex, match;
++
++		lines = common.splitMdbLines(output, { 'count': 1 });
++		rv.parentRaw = lines[0];
++		rex = new RegExp('^([a-z0-9]+) \\(found Map at ' +
++		    '[a-z0-9]+ \\((.*)\\) for type ([a-zA-Z]+)\\)$');
++		match = rv.parentRaw.match(rex);
++		assert.notStrictEqual(match, null, 'garbled verbose output');
++		rv.parentBase = match[1];
++		rv.symbolicOffset = match[2];
++		rv.parentType = match[3];
++		callback(rv);
++	});
++}
++
++main();

@@ -1,0 +1,463 @@
+commit 43d2610047fed65adc99e33bde8031f3d3cfd88a (refs/changes/30/2630/3)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2017-09-20T22:50:18+00:00 (2 years, 1 month ago)
+    
+    MANTA-3284 want operator-configurable throttle on muskie requests
+
+diff --git a/etc/config.coal.json b/etc/config.coal.json
+index ea3521f..f17d84b 100644
+--- a/etc/config.coal.json
++++ b/etc/config.coal.json
+@@ -7,6 +7,13 @@
+             "type": "udp"
+         }
+     },
++    "throttle": {
++        "enabled": false,
++        "concurrency": 1000,
++        "requestRateCapacity": 1000,
++        "rateCheckInterval": 1,
++        "queueTolerance": 100
++    },
+     "maxObjectCopies": 6,
+     "maxRequestAge": 600,
+     "enableMPU": true,
+diff --git a/lib/errors.js b/lib/errors.js
+index 8e1e22d..08e7405 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -593,6 +593,14 @@ function SSLRequiredError() {
+ }
+ util.inherits(SSLRequiredError, MuskieError);
+ 
++function ThrottledError() {
++    MuskieError.call(this, {
++        restCode: 'ThrottledError',
++        statusCode: 429,
++        message: 'manta throttled this request'
++    });
++}
++util.inherits(ThrottledError, MuskieError);
+ 
+ function UploadAbandonedError() {
+     MuskieError.call(this, {
+diff --git a/lib/server.js b/lib/server.js
+index b04eb4b..706dfc0 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -29,6 +29,7 @@ var obj = require('./obj');
+ var other = require('./other');
+ var picker = require('./picker');
+ var uploads = require('./uploads');
++var throttle = require('./throttle');
+ 
+ // injects into the global namespace
+ require('./errors');
+@@ -201,6 +202,9 @@ function createServer(options, clearProxy) {
+         } else if (!options.medusa()) {
+             req.log.error('medusa unavailable');
+             ok = !req.isMedusaRequest();
++        } else if (!options.throttle()) {
++            req.log.error('throttle unavailable');
++            ok = false;
+         }
+ 
+         if (!ok) {
+@@ -210,6 +214,7 @@ function createServer(options, clearProxy) {
+         }
+     });
+ 
++    server.use(throttle.throttleHandler(options.throttle()));
+     server.use(auth.authenticationHandler({
+         log: log,
+         mahi: options.mahi,
+@@ -681,7 +686,9 @@ module.exports = {
+ 
+     picker: picker,
+ 
+-    startKangServer: other.startKangServer,
++    getMetricsHandler: other.getMetricsHandler,
++
++    throttle: throttle,
+ 
+-    getMetricsHandler: other.getMetricsHandler
++    startKangServer: other.startKangServer
+ };
+diff --git a/lib/throttle.js b/lib/throttle.js
+new file mode 100644
+index 0000000..abb7f03
+--- /dev/null
++++ b/lib/throttle.js
+@@ -0,0 +1,222 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
++var vasync = require('vasync');
++var uuid = require('node-uuid');
++var util = require('util');
++var mod_url = require('url');
++var fs = require('fs');
++var dtrace = require('dtrace-provider');
++var restify = require('restify');
++
++require('./errors');
++
++
++// Overview of Tunables
++//
++// requestRateCapacity - the request rate, in units of requests per second,
++// above which, after 'queueTolerance' requests are queued up in the pending
++// state, the throttle will begin to return HTTP 429s to clients issuing any
++// new requests.
++//
++// rateCheckInterval - the amount of time, in seconds, that the throttle
++// should wait before checking the request rate again. The request rate is
++// measured only for a given check interval to avoid past measurements from
++// skewing the throttle's notion of what load manta is currently under.
++//
++// queueTolerance - after the requestRateCapacity is reached, the throttle
++// will allow up to 'queueTolerance' requests to be put in the pending state
++// before returning 429s.
++//
++// concurrency - the number of slots the request vasync queue has for scheduling
++// request-handling worker callbacks concurrently. When all the slots are
++// filled, the request queue will starting putting callbacks in the 'pending'
++// state.
++//
++// enabled - if true, the throttle will work as specified in RFD 110. It will
++// queue and throttle requests. If false, the throttle will do everything BUT
++// queue and throttle requests. This means that clients can still use dtrace
++// to see when the throttle _would have_ throttled a request and can also
++// view related statistics described in RFD 110 and further comments.
++
++///--- Exports
++
++module.exports = {
++
++    createThrottle: function createThrottle(options) {
++        return (new Throttle(options));
++    },
++
++    throttleHandler: function (throttle) {
++        function doThrottle(req, res, next) {
++            throttle.wait(req, res, next);
++        }
++        return (doThrottle);
++    }
++
++};
++
++
++// The Throttle object:
++//      - Exposes the 'wait' function that should called by invokers
++//        in any request-processing codepath to enable throttle
++//        functionality.
++//      - Runs a configuration server that exposes the fields in the
++//        global TUNABLES array to dynamic configuration via HTTP.
++//        All the fields that are configurable in this regard are
++//        top-level members of the throttle object.
++//      - Registers it's own dtrace-provider to expose statistics and
++//        other relevant throttle state information.
++function Throttle(options) {
++    assert.bool(options.enabled, 'options.enabled');
++    assert.number(options.concurrency, 'options.concurrency');
++    assert.ok(options.concurrency > 0, 'concurrency must positive');
++    assert.number(options.requestRateCapacity,
++            'options.requestRateCapacity');
++    assert.ok(options.requestRateCapacity > 0, 'requestRateCapacity must ' +
++            'be positive');
++    assert.number(options.rateCheckInterval,
++            'options.rateCheckInterval');
++    assert.ok(options.rateCheckInterval > 0, 'rateCheckInterval must be ' +
++            'positive');
++    assert.number(options.queueTolerance, 'options.queueTolerance');
++    assert.ok(options.queueTolerance > 0, 'queueTolerance must be positive');
++    assert.optionalObject(options.log, 'options.log');
++
++    if (options.log) {
++        this.log = options.log;
++    } else {
++        this.log = bunyan.createLogger({ name: 'throttle' });
++    }
++
++    this.dtp = dtrace.createDTraceProvider('muskie-throttle');
++
++    this.throttle_probes = {
++        // number of 'pending' requests in the request queue
++        request_received: this.dtp.addProbe('request_received', 'char *',
++                                  'char *', 'int'),
++        // most recent observed request rate
++        request_rate_checked: this.dtp.addProbe('request_rate_checked', 'int'),
++        // latency of the handled request, average request latency
++        request_handled: this.dtp.addProbe('request_handled', 'char *',
++                'char *', 'int'),
++        // number of pending requestsm, request rate, url, method
++        request_throttled: this.dtp.addProbe('request_throttled', 'int', 'int',
++                'char *', 'char *')
++    };
++    this.dtp.enable();
++
++    this.enabled = options.enabled;
++    this.concurrency = options.concurrency;
++    this.requestRateCapacity = options.requestRateCapacity;
++    this.rateCheckInterval = options.rateCheckInterval;
++    this.queueTolerance = options.queueTolerance;
++
++    this.requestQueue = vasync.queue(function (task, callback) {
++        task(callback);
++    }, this.concurrency);
++
++    this.lastCheck = Date.now();
++    this.mostRecentRequestTime = 0;
++    this.mostRecentRequestRate = 0.0;
++    this.requestsPerCheckInterval = 0;
++
++    this.requestsHandled = 0;
++}
++
++// Computes the observed request rate in the most recent
++// check interval. This function is called approximately
++// every 'rateCheckInterval' seconds. The returned figure
++// has unit requests per second.
++Throttle.prototype.computeRequestRate = function computeRequestRate() {
++    var timeInterval = (this.mostRecentRequestTime - this.lastCheck)/1000;
++    if (timeInterval === 0) {
++        return (0);
++    }
++    var requestRate = (this.requestsPerCheckInterval / timeInterval);
++    this.lastCheck = this.mostRecentRequestTime;
++
++    return (requestRate);
++};
++
++// This is the API method that users of the module
++// invoke in a request-processing code path. Roughly,
++// The function notes that a new request has arrived,
++// checks how long it's been since the last time the
++// module checked the request rate and, if that figure
++// is above a configurable theshold, it computes the
++// request rate, caching it as the most recent request
++// rate available.
++//
++// If at any point, the most recently observed request
++// rate is above a configurable capacity and there are
++// too many request already queued, the request is
++// throttled. If the request is not throttled, a worker
++// function is placed on the request queue that issues
++// the callback required to handle the request and, as
++// an auxiliary operation, computes the request's latency
++// defined to be the difference between the time the
++// request is queued, and the time that it's handler
++// function finishes executing.
++Throttle.prototype.wait = function wait(req, res, next) {
++    var self = this;
++
++    self.mostRecentRequestTime = Date.now();
++    self.requestsPerCheckInterval++;
++
++    var elapsedSec = (self.mostRecentRequestTime - self.lastCheck)/1000;
++    if (elapsedSec > self.rateCheckInterval) {
++        self.mostRecentRequestRate = self.computeRequestRate();
++        self.requestsPerCheckInterval = 0;
++
++        self.throttle_probes.request_rate_checked.fire(function () {
++            return ([self.mostRecentRequestRate]);
++        });
++    }
++
++    self.throttle_probes.request_received.fire(function () {
++        return ([req.method, req.url, self.requestQueue.length()]);
++    });
++
++    if ((self.mostRecentRequestRate > self.requestRateCapacity) &&
++            (self.requestQueue.length() >= self.queueTolerance)) {
++        self.throttle_probes.request_throttled.fire(function () {
++            return ([self.requestQueue.length(), self.mostRecentRequestRate,
++                req.url, req.method]);
++        });
++        if (self.enabled) {
++            next(new ThrottledError());
++            return;
++        }
++    }
++
++    var latency;
++    var startTime = Date.now();
++    if (self.enabled) {
++        self.requestQueue.push(function (cb) {
++            next();
++            cb();
++
++            latency = Date.now() - startTime;
++
++            self.throttle_probes.request_handled.fire(function () {
++                return ([req.method, req.url, latency]);
++            });
++        });
++    } else {
++        next();
++        latency = Date.now() - startTime;
++        self.throttle_probes.request_handled.fire(function () {
++            return ([req.method, req.url, latency]);
++        });
++    }
++};
+diff --git a/main.js b/main.js
+index 8f1b83e..3f8c6b0 100644
+--- a/main.js
++++ b/main.js
+@@ -18,11 +18,8 @@ var artedi = require('artedi');
+ var assert = require('assert-plus');
+ var bsyslog = require('bunyan-syslog');
+ var bunyan = require('bunyan');
+-var cueball = require('cueball');
+ var dashdash = require('dashdash');
+ var dtrace = require('dtrace-provider');
+-var kang = require('kang');
+-var keyapi = require('keyapi');
+ var libmanta = require('libmanta');
+ var LRU = require('lru-cache');
+ var mahi = require('mahi');
+@@ -31,9 +28,11 @@ var once = require('once');
+ var restify = require('restify');
+ var vasync = require('vasync');
+ var medusa = require('./lib/medusa');
++var keyapi = require('keyapi');
++var cueball = require('cueball');
++var kang = require('kang');
+ 
+ var app = require('./lib');
+-var uploadsCommon = require('./lib/uploads/common');
+ 
+ 
+ 
+@@ -84,6 +83,7 @@ var OPTIONS = [
+ ];
+ 
+ var PICKER;
++var THROTTLE;
+ var MORAY;
+ var MEDUSA;
+ var VERSION = false;
+@@ -151,26 +151,6 @@ function configure() {
+         cfg.storage.defaultMaxStreamingSizeMB = 51200;
+     }
+ 
+-    if (!cfg.hasOwnProperty('multipartUpload')) {
+-        cfg.multipartUpload = {};
+-    }
+-
+-    if (cfg.multipartUpload.hasOwnProperty('prefixDirLen')) {
+-        var len = cfg.multipartUpload.prefixDirLen;
+-        assert.number(len, '"prefixDirLen" value must be a number');
+-
+-        if (len < uploadsCommon.MIN_PREFIX_LEN ||
+-            len > uploadsCommon.MAX_PREFIX_LEN) {
+-
+-            LOG.fatal('invalid "prefixDirLen" value: must be between ' +
+-                uploadsCommon.MIN_PREFIX_LEN + ' and ' +
+-                uploadsCommon.MAX_PREFIX_LEN);
+-            process.exit(1);
+-        }
+-    } else {
+-        cfg.multipartUpload.prefixDirLen = uploadsCommon.DEF_PREFIX_LEN;
+-    }
+-
+     cfg.collector = artedi.createCollector({
+         labels: {
+             datacenter: cfg.datacenter,
+@@ -354,6 +334,10 @@ function createPickerClient(cfg) {
+     });
+ }
+ 
++function createThrottle(cfg) {
++    cfg.log = LOG.child({component: 'throttle'}, true);
++    THROTTLE = app.throttle.createThrottle(cfg);
++}
+ 
+ function createAuthCacheClient(options) {
+     assert.object(options, 'options');
+@@ -508,6 +492,7 @@ function version() {
+     createAuthCacheClient(cfg.auth);
+     createMorayClient(cfg.moray);
+     createMedusaConnector(cfg.medusa);
++    createThrottle(cfg.throttle);
+     createKeyAPIClient(cfg);
+ 
+     cfg.jobCache = LRU({
+@@ -522,6 +507,7 @@ function version() {
+     cfg.moray = function moray() { return (MORAY); };
+     cfg.medusa = function medusaClient() { return (MEDUSA); };
+     cfg.sharkAgent = function sharkAgent() { return (SHARKAGENT); };
++    cfg.throttle = function throttle() { return (THROTTLE); };
+ 
+     cfg.name = 'ssl';
+ 
+diff --git a/sapi_manifests/muskie/template b/sapi_manifests/muskie/template
+index 998e3ed..8973d9a 100644
+--- a/sapi_manifests/muskie/template
++++ b/sapi_manifests/muskie/template
+@@ -7,6 +7,42 @@
+       "type": "udp"
+     }
+   },
++  "throttle": {
++    {{#MUSKIE_THROTTLE_ENABLED}}
++    "enabled": {{MUSKIE_THROTTLE_ENABLED}},
++    {{/MUSKIE_THROTTLE_ENABLED}}
++    {{^MUSKIE_THROTTLE_ENABLED}}
++    "enabled": false,
++    {{/MUSKIE_THROTTLE_ENABLED}}
++
++    {{#MUSKIE_THROTTLE_CONCURRENCY}}
++    "concurrency": {{MUSKIE_THROTTLE_CONCURRENCY}}
++    {{/MUSKIE_THROTTLE_CONCURRENCY}}
++    {{^MUSKIE_THROTTLE_CONCURRENCY}}
++    "concurrency": 1000,
++    {{/MUSKIE_THROTTLE_CONCURRENCY}}
++
++    {{#MUSKIE_THROTTLE_REQUEST_RATE_CAP}}
++    "requestRateCapacity": {{MUSKIE_THROTTLE_REQUEST_RATE_CAP}},
++    {{/MUSKIE_THROTTLE_REQUEST_RATE_CAP}}
++    {{^MUSKIE_THROTTLE_REQUEST_RATE_CAP}}
++    "requestRateCapacity": 1000,
++    {{/MUSKIE_THROTTLE_REQUEST_RATE_CAP}}
++
++    {{#MUSKIE_THROTTLE_CHECK_INTERVAL}}
++    "rateCheckInterval": {{MUSKIE_THROTTLE_CHECK_INTERVAL}},
++    {{/MUSKIE_THROTTLE_CHECK_INTERVAL}}
++    {{^MUSKIE_THROTTLE_CHECK_INTERVAL}}
++    "rateCheckInterval": 5,
++    {{/MUSKIE_THROTTLE_CHECK_INTERVAL}}
++
++    {{#MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++    "queueTolerance": {{MUSKIE_THROTTLE_QUEUE_TOLERANCE}},
++    {{/MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++    {{^MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++    "queueTolerance": 100
++    {{/MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++  },
+   "maxObjectCopies": 6,
+   "maxRequestAge": 600,
+   "numWorkers": 4,
+diff --git a/tools/jsl.node.conf b/tools/jsl.node.conf
+index 76a1fc1..293bc4c 100644
+--- a/tools/jsl.node.conf
++++ b/tools/jsl.node.conf
+@@ -185,6 +185,7 @@
+ +define ServiceUnavailableError
+ +define SharksExhaustedError
+ +define SSLRequiredError
+++define ThrottledError
+ +define UploadAbandonedError
+ +define UploadTimeoutError
+ +define UserDoesNotExistError

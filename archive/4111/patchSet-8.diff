@@ -1,0 +1,1427 @@
+commit 7edb6f7c7c91c5dd9f2548377550dfe9ae1ad668 (refs/changes/11/4111/8)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2018-06-20T19:03:28+00:00 (1 year, 4 months ago)
+    
+    MORAY-418 Moray should queue requests when new PG connections fail
+    MORAY-339 Moray needs to use exponential backoff when connecting to Postgres
+    MORAY-294 Suspect Moray doesn't honor its connection limit properly
+    MORAY-427 Moray queuing needs work
+    Co-Author: Tim Kordas <tim.kordas@joyent.com>
+    Reviewed by: Kody Kantor <kody.kantor@joyent.com>
+    Reviewed by: Jan Wyszynski <jan.wyszynski@joyent.com>
+
+diff --git a/bin/moraystat.d b/bin/moraystat.d
+index 8414cb8..8d98eaa 100755
+--- a/bin/moraystat.d
++++ b/bin/moraystat.d
+@@ -1,19 +1,22 @@
+ #!/usr/sbin/dtrace -Cs
+-/* Run with -DMORAY_LEGACY on older moray systems */
+-#ifdef MORAY_LEGACY
+-#define PGPROBE pgpool-*
+-#else
+-#define PGPROBE moray-pgpool-*
+-#endif
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
+ 
+ #pragma D option quiet
+ 
+-PGPROBE:::acquire
++moray*:::pool-checkout
+ {
+-        this->j = copyinstr(arg1);
+-        @nconn[pid] = max(strtoll(json(this->j, "resources")) - strtoll(json(this->j, "available")));
+-        @qlen[pid] = max(strtoll(json(this->j, "queue")));
++        @nconn[pid] = max(arg0 - arg1 - arg2);
++        @qlen[pid] = max(arg3);
+ }
++
+ moray*:::query-start
+ {
+         @query[pid] = count();
+@@ -45,13 +48,10 @@ moray*:::batch-start
+         @batch[pid] = count();
+ }
+ 
+-#ifndef MORAY_LEGACY
+-/* not supported in older versions of moray */
+ moray*:::reindex*-start
+ {
+         @reindex[pid] = count();
+ }
+-#endif
+ 
+ BEGIN
+ {
+@@ -69,18 +69,10 @@ profile:::tick-1sec
+ profile:::tick-1sec
+ {
+         lines -= 1;
+-#ifndef MORAY_LEGACY
+-        printa("%-8d %@4u %@4u %@4u  %@4u %@4u %@4u %@4u %@4u %@4d %@4d\n",
+-                        @nconn, @qlen, @query,
+-                        @gets, @finds, @puts, @upds, @dels, @batch, @reindex
+-        );
+-        clear(@reindex);
+-#else
+         printa("%-8d %@4u %@4u %@4u  %@4u %@4u %@4u %@4u %@4u %@4d    0\n",
+                         @nconn, @qlen, @query,
+                         @gets, @finds, @puts, @upds, @dels, @batch
+         );
+-#endif
+         clear(@nconn);
+         clear(@qlen);
+         clear(@query);
+diff --git a/lib/dtrace.js b/lib/dtrace.js
+index a135c94..65db367 100644
+--- a/lib/dtrace.js
++++ b/lib/dtrace.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var dtrace = require('dtrace-provider');
+@@ -15,6 +15,9 @@ var dtrace = require('dtrace-provider');
+ // --- Globals
+ 
+ var PROBES = {
++    // total/idle/pending connections, waiters
++    'pool-checkout': [ 'int', 'int', 'int', 'int' ],
++
+     // msgid, req_id, bucket, key, value
+     'putobject-start': ['int', 'char *', 'char *', 'char *', 'char *'],
+ 
+diff --git a/lib/manatee.js b/lib/manatee.js
+deleted file mode 100644
+index a00727b..0000000
+--- a/lib/manatee.js
++++ /dev/null
+@@ -1,276 +0,0 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- */
+-
+-/*
+- * Copyright (c) 2017, Joyent, Inc.
+- */
+-
+-var EventEmitter = require('events').EventEmitter;
+-var util = require('util');
+-
+-var assert = require('assert-plus');
+-var bunyan = require('bunyan');
+-var manatee = require('node-manatee');
+-var url = require('url');
+-
+-var postgresPool = require('./pg');
+-
+-var NoDatabasePeersError = require('./errors').NoDatabasePeersError;
+-
+-
+-// --- Globals
+-
+-var sprintf = util.format;
+-
+-var DBNAME = process.env.MORAY_DB_NAME || 'moray';
+-var SERIALIZERS = {
+-    pg: function (c) {
+-        return (c ? c._moray_id : undefined);
+-    },
+-    pool: function (pool) {
+-        var obj = {};
+-
+-        Object.keys(pool).forEach(function (k) {
+-            obj[k] = pool[k] ? pool[k].url : undefined;
+-        });
+-
+-        return (obj);
+-    },
+-    db: function (db) {
+-        try {
+-            var p = db.pool;
+-
+-            return ({
+-                available: p.available.length,
+-                max: p.max,
+-                size: p.resources.length,
+-                waiting: p.queue.length
+-            });
+-        } catch (_) {
+-            return null;
+-        }
+-    },
+-    err: bunyan.stdSerializers.err
+-};
+-
+-
+-
+-// --- API
+-
+-function Manatee(options) {
+-    assert.object(options, 'options');
+-    assert.object(options.log, 'options.log');
+-    assert.object(options.pg, 'options.pg');
+-    assert.string(options.pg.user, 'options.pg.user');
+-    assert.object(options.manatee, 'options.manatee');
+-    assert.object(options.collector, 'options.collector');
+-
+-    var self = this;
+-    EventEmitter.call(this);
+-
+-    this._log = options.log.child({
+-        component: 'manatee',
+-        serializers: SERIALIZERS
+-    });
+-    this._pgConfig = options.pg;
+-    this._whatami = 'Manatee';
+-    this._manateeCfg = options.manatee;
+-    self._manateeCfg.log = self._log;
+-    this._manatee = null;
+-    this._database = null;
+-    this._pgUser = options.pg.user;
+-    this._collector = options.collector;
+-
+-    /*
+-     * Collect connection pool information when metrics are scraped.
+-     */
+-    self._collector.addTriggerFunction(function (_, cb) {
+-        if (self._database) {
+-            self._database.getPoolStats();
+-        }
+-        setImmediate(cb);
+-    });
+-
+-    self._manatee = manatee.createClient(self._manateeCfg);
+-    self._manatee.on('ready', function () {
+-        self._log.info('manatee ready');
+-        self.emit('ready');
+-    });
+-
+-    self._manatee.on('topology', function (urls) {
+-        self._log.info({urls: urls}, 'topology changed');
+-        self._refresh(urls);
+-    });
+-}
+-util.inherits(Manatee, EventEmitter);
+-
+-
+-
+-// --- Exports
+-
+-module.exports = {
+-    createClient: function createClient(options) {
+-        return (new Manatee(options));
+-    }
+-};
+-
+-
+-
+-// --- API
+-
+-Manatee.prototype.pg = function pg(callback) {
+-    assert.func(callback, 'callback');
+-
+-    var self = this;
+-    var db = self._database;
+-    var log = self._log;
+-
+-    if (!db) {
+-        setImmediate(callback, new NoDatabasePeersError(
+-            'no manatee peers available'));
+-        return;
+-    }
+-
+-    log.debug({
+-        db: db
+-    }, 'pg: entered');
+-    db.checkout(function pgCallback(err, client) {
+-        if (err) {
+-            log.debug(err, 'pg: failed');
+-            if (client)
+-                db.release(client);
+-            callback(err);
+-            return;
+-        }
+-
+-        log.debug({pg: client}, 'pg: done');
+-        callback(null, client);
+-    });
+-};
+-
+-
+-Manatee.prototype.toString = function toString() {
+-    var self = this;
+-    var str = '[object Manatee <';
+-    str += sprintf('manatee=%j, ', self._manateeCfg);
+-    str += '>]';
+-
+-    return (str);
+-};
+-
+-
+-Manatee.prototype.close = function close() {
+-    if (this._database) {
+-        this._database.close();
+-        this._database = null;
+-    }
+-    if (this._manatee) {
+-        this._manatee.close();
+-        this._manatee = null;
+-    }
+-    this.emit('close');
+-};
+-
+-
+-
+-// --- Private Methods
+-
+-
+-/**
+- * This is our workhorse for managing Postgres connections. Whenever manatee
+- * sends a notification we need to actually see if topology changed
+- * (MANTA-1085), and if so shutdown the old connections and reconnect to the
+- * new leader.
+- *
+- * Topology change means that one of:
+- *
+- * - a new peer was added
+- * - a peer went away
+- * - a peer changed roles
+- *
+- * However, moray only cares if the primary went away. For reference, the
+- * topology object manatee emits is an array ordered by priority of each node
+- * in the shard. i.e. [tcp://postgres@foo:5432, tcp://postgres@bar:5432,
+- * tcp://postgres@baz:5432], then foo is the primary, bar is the
+- * sync, and baz is the async
+- *
+- * Even though sync and async might change, we only care if the primary
+- * changes.  The self._database object will change accordingly, FIF there's a
+- * change in the primary.
+- */
+-Manatee.prototype._refresh = function _refresh(topology) {
+-    var self = this;
+-    var log = self._log;
+-
+-    function createPGPool(opts) {
+-        assert.object(opts, 'options');
+-        assert.object(opts.log, 'options.log');
+-        assert.object(opts.pgConfig, 'options.pgConfig');
+-        assert.string(opts.url, 'options.url');
+-
+-        log.info({url: opts.url}, '_refresh.createPGPool: create new pg pool');
+-
+-        var pool = postgresPool.createPool({
+-            log: opts.log,
+-            checkInterval: opts.pgConfig.checkInterval,
+-            connectTimeout: opts.pgConfig.connectTimeout,
+-            maxConnections: opts.pgConfig.maxConnections,
+-            maxIdleTime: opts.pgConfig.maxIdleTime,
+-            maxQueueLength: opts.pgConfig.maxQueueLength,
+-            role: 'primary',
+-            queryTimeout: opts.pgConfig.queryTimeout,
+-            url: opts.url,
+-            collector: opts.collector
+-        });
+-
+-        return (pool);
+-    }
+-
+-    var previous = self._database;
+-    var newPrimary = topology[0];
+-    // update the url's user, and table name to what moray uses.
+-    if (newPrimary) {
+-        newPrimary = url.parse(newPrimary);
+-        newPrimary.auth = self._pgUser;
+-        newPrimary.pathname = DBNAME;
+-        newPrimary = url.format(newPrimary);
+-    }
+-
+-    log.info({
+-        currentPrimary: previous ? previous.url : 'none',
+-        newPrimary: newPrimary ? newPrimary : 'none'
+-    }, '_refresh: manatee topology updated');
+-
+-    /*
+-     * always close the previous if it exists, since by definition the
+-     * primary has changed
+-     */
+-    if (previous) {
+-        log.info({
+-            oldPrimary: previous.url,
+-            newPrimary: newPrimary ? newPrimary : 'none'
+-        }, '_refresh: primary gone, closing');
+-        previous.close();
+-    }
+-
+-    /*
+-     * MORAY-225 We always connect to the new primary regardless of the
+-     * previous primary. Even if the old primary == new primary, we still will
+-     * want to connect, since the old primary's connections might be
+-     * disconnected.
+-     */
+-    if (newPrimary) {
+-        log.info({
+-            newPrimary: newPrimary
+-        }, '_refresh: connecting to new primary');
+-        self._database = createPGPool({
+-            log: log,
+-            pgConfig: self._pgConfig,
+-            collector: self._collector,
+-            url: newPrimary
+-        });
+-    }
+-};
+diff --git a/lib/pg.js b/lib/pg.js
+index d25186f..b083c4b 100644
+--- a/lib/pg.js
++++ b/lib/pg.js
+@@ -15,10 +15,10 @@ var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var jsprim = require('jsprim');
+ var libuuid = require('libuuid');
+-var once = require('once');
+ var pg = require('pg');
+ require('pg-parse-float')(pg);
+-var pooling = require('pooling');
++
++var mod_cueball = require('cueball');
+ var VError = require('verror');
+ 
+ var dtrace = require('./dtrace');
+@@ -36,8 +36,17 @@ var TYPES = require('./types').TYPES;
+ // --- Globals
+ 
+ var CLIENT_ID = 0;
++var DBNAME = process.env.MORAY_DB_NAME || 'moray';
+ 
+ var SERIALIZERS = {
++    pool: function _serializePool(p) {
++        try {
++            var s = p.getStats();
++            return s;
++        } catch (_) {
++            return undefined;
++        }
++    },
+     client: function _serializeClient(c) {
+         return ({
+             id: c._moray_id,
+@@ -50,6 +59,28 @@ var SERIALIZERS = {
+ };
+ 
+ 
++// --- Internal helpers
++
++/*
++ * This is an extremely unfortunate interface that we need to maintain for
++ * backwards compatibility. Moray's old pooling logic used to return the
++ * node.js connection error to the consumer directly, without translating it
++ * into something easier to check like "NoDatabasePeersError".
++ *
++ * To mimic the old behaviour, when we fail to claim a connection, we return an
++ * error with the name "Error", and the message "connect ECONNREFUSED".
++ * Services like SAPI and Marlin rely on this as part of checking whether Moray
++ * is effectively down.
++ */
++function createNoBackendError() {
++    return new Error('connect ECONNREFUSED');
++}
++
++function createOverloadedError() {
++    return new NoDatabasePeersError(
++        'unable to acquire backend connection due to service being overloaded',
++        'OverloadedError', 'maximum moray queue length reached');
++}
+ 
+ // --- Postgres Client Wrapper Class
+ 
+@@ -70,8 +101,14 @@ function PGClient(options) {
+ 
+     this.client = options.client;
+     this.client.on('error', this._handleClientError.bind(this));
++    this.pool = options.pool; // the pool to which we belong.
+ 
+-    this.pool = options.pool;
++    /*
++     * "handle" is the connection handle we get back from the cueball pool.
++     * When handle is non-null we're "checked out" of the pool, and when null
++     * we're idle in-pool.
++     */
++    this.handle = null;
+ 
+     this._moray_id = CLIENT_ID;
+     this._defaultTimeout = options.queryTimeout;
+@@ -88,7 +125,6 @@ function PGClient(options) {
+ }
+ util.inherits(PGClient, EventEmitter);
+ 
+-
+ /*
+  * The underlying Postgres will emit errors when it has a connection
+  * problem. This can fire multiple times: once when the connection goes
+@@ -145,7 +181,21 @@ PGClient.prototype.clearRequestId = function clearRequestId() {
+  * client back to the pool.
+  */
+ PGClient.prototype.release = function clientRelease() {
+-    assert.equal(false, this._moray_txn, 'finished transaction');
++    var ok = false;
++    try {
++        ok = pgAssert(this);
++    } catch (_) {
++        ok = false;
++    }
++
++    // We aren't intact, don't release ourselves back to the pool.
++    if (!ok && this.handle) {
++        var handle = this.handle;
++        this.handle = null;
++        handle.close();
++        return;
++    }
++
+     this.setTimeout(this._defaultTimeout);
+     this.clearRequestId();
+     this.pool.release(this);
+@@ -165,10 +215,12 @@ PGClient.prototype.query = function clientQuery(sql, args) {
+     var self = this;
+     var timer;
+ 
+-    // Moray will periodically issue the query 'SELECT NOW() AS when' to
+-    // available PGClients via the node-pooling library health checking
+-    // facility (see pgCheck). These queries originate at Moray and are not
+-    // associated with an RPC. Therefore, the _reqid member will be null.
++    /*
++     * Moray will periodically issue the query 'SELECT NOW() AS when' to
++     * available PGClients as a health checking facility (see pgCheck).
++     * These queries originate at Moray and are not associated with an RPC.
++     * Therefore, the _reqid member will be null.
++     */
+     var reqid = (this._reqid === null) ? libuuid.create() : this._reqid;
+     var ended = false;
+ 
+@@ -408,7 +460,7 @@ PGClient.prototype.rollback = function transactionRollback(cb) {
+ };
+ 
+ 
+-PGClient.prototype.close = function closePGClient() {
++PGClient.prototype.destroy = function closePGClient() {
+     var self = this;
+ 
+     self.log.warn({ client: self }, 'pg: destroying connection');
+@@ -417,6 +469,7 @@ PGClient.prototype.close = function closePGClient() {
+         self.client = null;
+         self._deadbeef = true;
+     });
++    self.emit('close');
+ };
+ 
+ 
+@@ -434,52 +487,99 @@ function pgAssert(_pg) {
+     assert.ok(_pg.client.connection.stream.readable, 'pg readable');
+     assert.ok(!_pg.client.connection.stream.destroyed, 'pg not destroyed');
+     assert.ok(_pg.client.connection.stream.writable, 'pg writable');
++    assert.equal(false, _pg._moray_txn, 'finished transaction');
+ 
+     return (_pg._moray_had_err === null);
+ }
+ 
+-
+-function pgCheck(_) {
+-    function _pgCheck(client, cb) {
+-        var ok = false;
+-        var req = client.query('SELECT NOW() AS when');
+-        req.once('error', cb);
+-        req.once('row', function (__) {
+-            ok = true;
+-        });
+-        req.once('end', function () {
+-            if (!ok) {
+-                cb(new Error('no rows received'));
+-            } else {
+-                cb();
+-            }
+-        });
+-    }
+-
+-    return (_pgCheck);
++/*
++ * node-cueball's checker interface expects does an "implied claim" on the idle
++ * connection we're checking: it expects us to call either handle.release() for
++ * check-success, or handle.close() for check-failure.
++ */
++function pgCheck(handle, pgc) {
++    var ok = false;
++    var req = pgc.query('SELECT NOW() AS when');
++    req.once('error', function () {
++        handle.close();
++    });
++    req.once('row', function (_) {
++        ok = true;
++    });
++    req.once('end', function () {
++        if (ok) {
++            handle.release();
++        } else {
++            handle.close();
++        }
++    });
+ }
+ 
+-
+ function pgCreate(opts) {
+     assert.object(opts, 'options');
+     assert.object(opts.log, 'options.log');
+     assert.object(opts.pool, 'options.pool');
+-    assert.string(opts.url, 'options.url');
++    assert.optionalString(opts.url, 'options.url');
++    assert.optionalString(opts.user, 'options.user');
+ 
+     var log = opts.log;
+ 
+-    function _pgCreate(cb) {
+-        cb = once(cb);
++    function _pgCreate(backend) {
++        var client = null;
++        var copts = null;
++        var timer = null;
++        var pgc = null;
++
++        if (opts.url) {
++            copts = {
++                connectionString: opts.url,
++                keepAlive: true
++            };
++        } else {
++            copts = {
++                user: opts.user,
++                host: backend.address,
++                port: backend.port,
++                database: DBNAME,
++                keepAlive: true
++            };
++        }
++
++        client = new pg.Client(copts);
++
++        function onError(err) {
++            log.fatal({
++                options: copts,
++                err: err
++            }, 'unable to create PG client');
+ 
+-        var client = new pg.Client({
+-            connectionString: opts.url,
+-            keepAlive: true
++            clearTimeout(timer);
++            client.removeAllListeners('connect');
++
++            if (client.connection && client.connection.stream) {
++                client.connection.stream.destroy();
++            }
++
++            // We have not successfully created a client.
++            pgc._handleClientError(err);
++        }
++
++        client.once('error', onError);
++
++        pgc = new PGClient({
++            client: client,
++            connectTimeout: opts.connectTimeout,
++            log: opts.log,
++            pool: opts.pool,
++            queryTimeout: opts.queryTimeout
+         });
+ 
+         if (opts.connectTimeout > 0) {
+-            var timer = setTimeout(function () {
+-                // do not remove error listener as node may
+-                // still throw
++            timer = setTimeout(function () {
++                /*
++                 * We don't remove the "error" listener since node may
++                 * then throw for this timed out connection.
++                 */
+                 client.removeAllListeners('connect');
+                 if (client.connection &&
+                     client.connection.stream) {
+@@ -487,54 +587,24 @@ function pgCreate(opts) {
+                 }
+ 
+                 var t = opts.connectTimeout;
+-                cb(new ConnectTimeoutError(t));
++                pgc._handleClientError(new ConnectTimeoutError(t));
+             }, opts.connectTimeout);
+         }
+ 
+         client.once('connect', function onConnect() {
++            // Remove the timeout handlers
+             clearTimeout(timer);
+-
+-            client.removeAllListeners('error');
+-
+-            var pgc = new PGClient({
+-                client: client,
+-                connectTimeout: opts.connectTimeout,
+-                log: opts.log,
+-                pool: opts.pool,
+-                queryTimeout: opts.queryTimeout,
+-                url: opts.url
+-            });
+-
+-            cb(null, pgc);
+-        });
+-
+-        client.once('error', function onError(err) {
+-            log.fatal(err, 'unable to create PG client');
+-
+-            clearTimeout(timer);
+-            client.removeAllListeners('connect');
+-
+-            if (client.connection && client.connection.stream)
+-                client.connection.stream.destroy();
+-
+-            cb(err);
++            client.removeListener('error', onError);
++            pgc.emit('connect');
+         });
+ 
+         client.connect();
++        return (pgc);
+     }
+ 
+     return (_pgCreate);
+ }
+ 
+-
+-function pgDestroy(_) {
+-    function _pgDestroy(client) {
+-        client.close();
+-    }
+-
+-    return (_pgDestroy);
+-}
+-
+ // --- End Pool Functions
+ 
+ 
+@@ -573,17 +643,14 @@ function PGPool(options) {
+     assert.number(options.checkInterval, 'options.checkInterval');
+     assert.number(options.connectTimeout, 'options.connectTimeout');
+     assert.object(options.log, 'options.log');
++    assert.object(options.resolver, 'options.resolver');
+     assert.number(options.maxConnections, 'options.maxConnections');
+-    assert.number(options.maxIdleTime, 'options.maxIdleTime');
++    assert.number(options.minSpareConnections, 'options.minSpareConnections');
++    assert.number(options.targetClaimDelay, 'options.targetClaimDelay');
+     assert.number(options.queryTimeout, 'options.queryTimeout');
+     assert.number(options.maxQueueLength, 'options.maxQueueLength');
+     assert.object(options.collector, 'options.collector');
+-
+-    var self = this;
+-
+-    this._whatami = 'PGPool';
+-
+-    EventEmitter.call(this);
++    assert.string(options.domain, 'options.domain');
+ 
+     this.checkInterval = options.checkInterval;
+     this.connectTimeout = options.connectTimeout;
+@@ -592,7 +659,6 @@ function PGPool(options) {
+         serializers: SERIALIZERS
+     });
+     this.maxConnections = options.maxConnections;
+-    this.maxIdleTime = options.maxIdleTime;
+     this.queryTimeout = options.queryTimeout;
+     this.maxQueueLength = options.maxQueueLength;
+     this.collector = options.collector;
+@@ -619,36 +685,47 @@ function PGPool(options) {
+     });
+ 
+     var pgOpts = {
+-        connectTimeout: self.connectTimeout,
+-        firstResultTimeout: self.firstResultTimeout,
+-        log: self.log,
+-        pool: self,
+-        queryTimeout: self.queryTimeout,
++        connectTimeout: this.connectTimeout,
++        firstResultTimeout: this.firstResultTimeout,
++        log: this.log,
++        pool: this,
++        queryTimeout: this.queryTimeout,
++        user: options.user,
+         url: options.url
+     };
+-    this.pool = pooling.createPool({
+-        assert: pgAssert,
+-        checkInterval: options.checkInterval,
+-        max: options.maxConnections,
+-        maxIdleTime: options.maxIdleTime,
+-        log: self.log,
+-        name: 'moray-pgpool' + (options.role ? '-' + options.role : ''),
+-        check: pgCheck(pgOpts),
+-        create: pgCreate(pgOpts),
+-        destroy: pgDestroy(pgOpts)
++    /*
++     * Our node-cueball connection-pool constructor is built with the smarts
++     * required to connect to the current primary (see pgOpts above).
++     *
++     * Note: our custom resolver takes care of connecting to the current
++     * primary -- so some options provided to node-cueball are dummy values
++     * (i.e. not used to actually do connections).
++     */
++    this.pool = new mod_cueball.ConnectionPool({
++        domain: options.domain,
++        service: '_postgres._tcp',
++        defaultPort: 12345, // dummy value not used.
++        spares: options.minSpareConnections,
++        maximum: options.maxConnections,
++        constructor: pgCreate(pgOpts),
++        resolver: options.resolver,
++        checkTimeout: options.checkInterval,
++        checker: pgCheck,
++        targetClaimDelay: options.targetClaimDelay,
++        recovery: {
++            default: {
++                timeout: this.connectTimeout,
++                maxTimeout: 10000,
++                retries: 10,
++                delay: 250,
++                maxDelay: 2500
++            }
++        }
+     });
+ 
+     this.url = options.url;
+ 
+-    function reEmit(event) {
+-        self.log.debug('pool event: %s', event);
+-        self.emit.apply(self, arguments);
+-    }
+-
+-    this.pool.on('death', reEmit.bind(this, 'death'));
+-    this.pool.on('drain', reEmit.bind(this, 'drain'));
+-    this.pool.once('end', reEmit.bind(this, 'end'));
+-    this.pool.once('error', reEmit.bind(this, 'error'));
++    EventEmitter.call(this);
+ }
+ util.inherits(PGPool, EventEmitter);
+ 
+@@ -657,44 +734,79 @@ PGPool.prototype.close = function close(cb) {
+     var self = this;
+ 
+     this.log.trace({pool: self.pool}, 'close: entered');
+-    this.pool.shutdown(function () {
+-        self.removeAllListeners('death');
+-        self.removeAllListeners('drain');
+-        self.removeAllListeners('end');
+-        self.removeAllListeners('error');
++    this.pool.stop();
+ 
+-        self._deadbeef = true;
++    self._deadbeef = true;
+ 
+-        self.log.trace({pool: self.pool}, 'close: closed');
+-        if (typeof (cb) === 'function')
+-            cb();
++    self.log.trace({pool: self.pool}, 'close: closed');
++    if (typeof (cb) === 'function')
++        cb();
+ 
+-        self.emit('close');
+-    });
++    self.emit('close');
+ };
+ 
+ 
+-PGPool.prototype.checkout = function checkout(callback) {
++PGPool.prototype.pg = function checkout(callback) {
+     assert.func(callback, 'callback');
+-    assert.array(this.pool.queue, 'this.pool.queue');
+ 
+     var log = this.log;
++    var stats = this.pool.getStats();
+ 
+     log.trace({pool: this.pool}, 'checkout: entered');
+ 
+-    if (this.pool.queue.length >= this.maxQueueLength) {
+-        setImmediate(callback, new NoDatabasePeersError(
+-            'unable to acquire backend connection due to ' +
+-            'service being overloaded', 'OverloadedError',
+-                'maximum moray queue length reached'));
+-        return;
++    if (this.maxQueueLength > 0) {
++        if (stats.waiterCount >= this.maxQueueLength) {
++            setImmediate(callback, createOverloadedError());
++            return;
++        }
+     }
+ 
+-    this.pool.acquire(function (err, client) {
++    dtrace['pool-checkout'].fire(function onClaimEnabled() {
++        return [
++            stats.totalConnections,
++            stats.idleConnections,
++            stats.pendingConnections,
++            stats.waiterCount
++        ];
++    });
++
++    this.pool.claim(function afterClaim(err, h, client) {
+         if (err) {
++            if (VError.hasCauseWithName(err, 'PoolFailedError')) {
++                callback(createNoBackendError());
++                return;
++            }
++
++            if (VError.hasCauseWithName(err, 'ClaimTimeoutError')) {
++                if (stats.idleConnections === 0 &&
++                    (stats.totalConnections - stats.pendingConnections) <= 2) {
++                    /*
++                     * We need to disambiguate the case where we have timed out
++                     * because we can't connect to the database, so that we can
++                     * return an appropriate error indicating whether we're just
++                     * overloaded, or service is completely unavailable.
++                     *
++                     * When all of our connection slots are trying to connect,
++                     * then we assume that the database is currently down. The
++                     * possible difference of 2 is to handle the point where a
++                     * connection slot has failed, and still counts towards
++                     * total connections but not pending connections.
++                     */
++                    callback(createNoBackendError());
++                } else {
++                    callback(createOverloadedError());
++                }
++                return;
++            }
++
+             log.trace(err, 'checkout: failed');
+             callback(err);
+         } else {
++            /*
++             * Save the pool-handle into our client object (callback
++             * will need it for pool management).
++             */
++            client.handle = h;
+             log.trace({
+                 client: client
+             }, 'checkout: done');
+@@ -708,7 +820,11 @@ PGPool.prototype.checkout = function checkout(callback) {
+ PGPool.prototype.release = function release(client) {
+     assert.object(client, 'client');
+ 
+-    this.pool.release(client);
++    if (client.handle) {
++        var handle = client.handle;
++        client.handle = null;
++        handle.release();
++    }
+ 
+     this.log.trace({
+         client: client,
+@@ -716,12 +832,10 @@ PGPool.prototype.release = function release(client) {
+     }, 'release: done');
+ };
+ 
+-
+ PGPool.prototype.toString = function toString() {
+     var str = '[object PGPool <' +
+         'checkInterval=' + this.checkInterval + ', ' +
+         'maxConnections=' + this.maxConnections + ', ' +
+-        'maxIdleTime=' + this.maxIdleTime + ', ' +
+         'url=' + this.url + '>]';
+ 
+     return (str);
+@@ -731,22 +845,14 @@ PGPool.prototype.toString = function toString() {
+  * Record the connection counts and request queue length.
+  */
+ PGPool.prototype.getPoolStats = function getPoolStats() {
+-    var poolState = this.state();
+-
+-    this.openGauge.set(poolState.resources);
+-    this.pendingGauge.set(poolState.pending);
+-    this.availableGauge.set(poolState.available);
+-    this.queueDepthGauge.set(poolState.queue);
+-};
++    var stats = this.pool.getStats();
+ 
+-/*
+- * Retrieve the underlying pool's connection state information.
+- */
+-PGPool.prototype.state = function state() {
+-    return this.pool._state();
++    this.openGauge.set(stats.totalConnections);
++    this.pendingGauge.set(stats.pendingConnections);
++    this.availableGauge.set(stats.idleConnections);
++    this.queueDepthGauge.set(stats.waiterCount);
+ };
+ 
+-
+ function pgError(e) {
+     var err;
+     var msg;
+@@ -805,10 +911,11 @@ module.exports = {
+ 
+         number('checkInterval', 60000);
+         number('connectTimeout', 1000);
+-        number('maxIdleTime', 120000);
+         number('maxConnections', 5);
++        number('minSpareConnections', 2);
+         number('queryTimeout', 0);
+         number('maxQueueLength', 2000);
++        number('targetClaimDelay', 500);
+ 
+         return (new PGPool(opts));
+     },
+diff --git a/lib/schema.js b/lib/schema.js
+index 4a37e8c..470bbbb 100644
+--- a/lib/schema.js
++++ b/lib/schema.js
+@@ -332,9 +332,26 @@ AJV_ENV.addSchema({
+     properties: {
+         'connectTimeout': { allOf: [ { '$ref': 'integer' } ] },
+         'checkInterval': { allOf: [ { '$ref': 'integer' } ] },
+-        'maxConnections': { allOf: [ { '$ref': 'integer' } ] },
+-        'maxQueueLength': { allOf: [ { '$ref': 'integer' } ] },
+-        'maxIdleTime': { allOf: [ { '$ref': 'integer' } ] },
++        'maxConnections': {
++            description: 'Maximum number of Postgres connection to ever have',
++            allOf: [ { '$ref': 'integer' } ]
++        },
++        'minSpareConnections': {
++            description: 'Minimum number of Postgres connections to have ready',
++            allOf: [ { '$ref': 'integer' } ]
++        },
++        'maxQueueLength': {
++            description: 'Maximum number of pending Postgres client claims',
++            allOf: [ { '$ref': 'integer' } ]
++        },
++        'targetClaimDelay': {
++            description: 'Target wait time when queueing for Postgres clients',
++            allOf: [ { '$ref': 'integer' } ]
++        },
++        'maxIdleTime': {
++            description: 'Deprecated pool management property',
++            allOf: [ { '$ref': 'integer' } ]
++        },
+         'user': { allOf: [ { '$ref': 'string' } ] }
+     }
+ });
+diff --git a/lib/server.js b/lib/server.js
+index 78d7d58..79bc5d2 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var util = require('util');
+@@ -13,9 +13,12 @@ var EventEmitter = require('events').EventEmitter;
+ 
+ var assert = require('assert-plus');
+ var libuuid = require('libuuid');
++var mod_artedi = require('artedi');
++var mod_cueball = require('cueball');
+ var mod_fast = require('fast');
++var mod_jsprim = require('jsprim');
+ var mod_kang = require('kang');
+-var mod_artedi = require('artedi');
++var mod_manatee = require('node-manatee');
+ var mod_net = require('net');
+ var mod_os = require('os');
+ var mod_restify = require('restify');
+@@ -27,6 +30,7 @@ var vasync = require('vasync');
+ var control = require('./control');
+ var buckets = require('./buckets');
+ var objects = require('./objects');
++var pg = require('./pg');
+ var ping = require('./ping');
+ var sql = require('./sql');
+ 
+@@ -79,17 +83,50 @@ function MorayServer(options) {
+         labels: labels
+     });
+ 
+-    var db;
++    var dbopts, dbresolver, dbdomain;
+     if (options.standalone) {
+-        options.standalone.log = log;
+-        options.standalone.collector = collector;
+-        db = require('./standalone').createClient(options.standalone);
++        /*
++         * Standalone mode takes a Postgres URL to determine what to connect
++         * to, which we pass directly to the client. Since this may not be a
++         * hostname (i.e., it could a path for using a Unix domain socket),
++         * we just provide dummy values here for cueball, and ignore them
++         * later on.
++         */
++        dbopts = options.standalone;
++        dbdomain = 'standalone';
++        dbresolver = new mod_cueball.StaticIpResolver({
++            backends: [
++                {
++                    address: '0.0.0.0',
++                    port: 1234
++                }
++            ]
++        });
+     } else {
+-        options.manatee.log = log;
+-        options.manatee.collector = collector;
+-        db = require('./manatee').createClient(options.manatee);
++        dbopts = options.manatee;
++        dbdomain = options.service_name || 'manatee';
++        dbopts.manatee.log = log;
++        dbresolver = mod_manatee.createPrimaryResolver(dbopts.manatee);
+     }
+ 
++    dbresolver.start();
++
++    var db = pg.createPool(mod_jsprim.mergeObjects(dbopts.pg, {
++        log: log,
++        url: dbopts.url,
++        domain: dbdomain,
++        collector: collector,
++        resolver: dbresolver
++    }));
++
++    /*
++     * Collect connection pool information when metrics are scraped.
++     */
++    collector.addTriggerFunction(function (_, cb) {
++        db.getPoolStats();
++        setImmediate(cb);
++    });
++
+     this.ms_bucketCache = new LRU({
+         name: 'BucketCache',
+         max: 100,
+@@ -197,9 +234,8 @@ function MorayServer(options) {
+         });
+     }
+ 
+-
+     /*
+-     * Once both the server socket and the database connection are up,
++     * Once the server socket indicates that we're successfully bound,
+      * emit the "ready" event to indicate that the database is good to
+      * use now.
+      *
+@@ -208,31 +244,16 @@ function MorayServer(options) {
+      * and SMF will either restart us or take the service into
+      * maintenance.
+      */
+-    var sock_ready = false;
+-    var dbc_ready = false;
+-
+-    function emitReady() {
+-        if (sock_ready && dbc_ready) {
+-            self.emit('ready');
+-        }
+-    }
+-
+     self.fast_socket.on('listening', function () {
+         self.log.info({ address: self.fast_socket.address() },
+             'Moray listening on port %d', self.port);
+-        sock_ready = true;
+-        emitReady();
++        self.emit('ready');
+     });
+ 
+     self.fast_socket.on('error', function (err) {
+         self.fast_socket = null;
+         self.emit('error', err);
+     });
+-
+-    self.db_conn.on('ready', function () {
+-        dbc_ready = true;
+-        emitReady();
+-    });
+ }
+ util.inherits(MorayServer, EventEmitter);
+ 
+diff --git a/lib/standalone.js b/lib/standalone.js
+deleted file mode 100644
+index 22402ef..0000000
+--- a/lib/standalone.js
++++ /dev/null
+@@ -1,218 +0,0 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- */
+-
+-/*
+- * Copyright (c) 2017, Joyent, Inc.
+- */
+-
+-var EventEmitter = require('events').EventEmitter;
+-var util = require('util');
+-
+-var assert = require('assert-plus');
+-var bunyan = require('bunyan');
+-
+-var postgresPool = require('./pg');
+-
+-var NoDatabasePeersError = require('./errors').NoDatabasePeersError;
+-
+-
+-// --- Globals
+-
+-var sprintf = util.format;
+-
+-var SERIALIZERS = {
+-    pg: function _serializePg(c) {
+-        return (c ? c._moray_id : undefined);
+-    },
+-    pool: function (pool) {
+-        var obj = {};
+-
+-        Object.keys(pool).forEach(function (k) {
+-            obj[k] = pool[k] ? pool[k].url : undefined;
+-        });
+-
+-        return (obj);
+-    },
+-    db: function (db) {
+-        var p = db.pool;
+-
+-        return ({
+-            available: p.available.length,
+-            max: p.max,
+-            size: p.resources.length,
+-            waiting: p.queue.length
+-        });
+-    },
+-    err: bunyan.stdSerializers.err
+-};
+-
+-
+-
+-// --- Internal Functions
+-//
+-// Simple Wrappers/Helpers First
+-//
+-
+-
+-function createPGPool(opts) {
+-    assert.object(opts, 'options');
+-    assert.object(opts.log, 'options.log');
+-    assert.object(opts.pgConfig, 'options.pgConfig');
+-    assert.object(opts.collector, 'options.collector');
+-    assert.string(opts.url, 'options.url');
+-
+-    var pool = postgresPool.createPool({
+-        log: opts.log,
+-        checkInterval: opts.pgConfig.checkInterval,
+-        connectTimeout: opts.pgConfig.connectTimeout,
+-        maxConnections: opts.pgConfig.maxConnections,
+-        maxIdleTime: opts.pgConfig.maxIdleTime,
+-        maxQueueLength: opts.pgConfig.maxQueueLength,
+-        role: opts.role,
+-        queryTimeout: opts.pgConfig.queryTimeout,
+-        url: opts.url,
+-        collector: opts.collector
+-    });
+-
+-    return (pool);
+-}
+-
+-
+-
+-// --- API
+-
+-function Standalone(options) {
+-    assert.object(options, 'options');
+-    assert.object(options.log, 'options.log');
+-    assert.object(options.pg, 'options.pg');
+-    assert.string(options.url, 'options.url');
+-    assert.object(options.collector, 'options.collector');
+-
+-    var self = this;
+-    EventEmitter.call(this);
+-
+-    this.log = options.log.child({
+-        component: 'standalone',
+-        serializers: SERIALIZERS
+-    });
+-    this.pgConfig = options.pg;
+-    this.timeout = parseInt((options.timeout || 60000), 10);
+-    this._whatami = 'Standalone';
+-    this.pgUser = options.pg.user;
+-    this.url = options.url;
+-    this.collector = options.collector;
+-
+-    /*
+-     * Collect connection pool information when metrics are scraped.
+-     */
+-    this.collector.addTriggerFunction(function (_, cb) {
+-        if (self.database && self.database.primary) {
+-            self.database.primary.getPoolStats();
+-        }
+-        setImmediate(cb);
+-    });
+-
+-
+-    setImmediate(function () {
+-        self._init();
+-    });
+-}
+-util.inherits(Standalone, EventEmitter);
+-
+-
+-Standalone.prototype.pg = function pg(callback) {
+-    assert.func(callback, 'callback');
+-
+-    // XXX MANTA-734 - take out db selection logic for now and solely
+-    // target the primary
+-    var db = (this.database || {}).primary;
+-    var log = this.log;
+-
+-    if (!db) {
+-        setImmediate(callback, new NoDatabasePeersError(
+-            'standalone database not available'));
+-        return;
+-    }
+-
+-    log.debug({
+-        db: db
+-    }, 'pg: entered');
+-    db.checkout(function pgCallback(err, client) {
+-        if (err) {
+-            log.debug(err, 'pg: failed');
+-            if (client)
+-                db.release(client);
+-            callback(err);
+-            return;
+-        }
+-
+-        log.debug({pg: client}, 'pg: done');
+-        callback(null, client);
+-    });
+-};
+-
+-
+-Standalone.prototype.toString = function toString() {
+-    var str = '[object Standalone <';
+-    str += 'listening=' + (this.listener ? 'yes' : 'no') + ', ';
+-    str += sprintf('url=%s', this.url);
+-    str += sprintf('timeout=%d', this.timeout);
+-    str += '>]';
+-
+-    return (str);
+-};
+-
+-
+-Standalone.prototype.close = function close() {
+-    if (this.database && this.database.primary) {
+-        this.database.primary.close();
+-    }
+-    this.emit('close');
+-};
+-
+-
+-
+-// --- Private Methods
+-
+-Standalone.prototype._init = function _init() {
+-    var self = this;
+-    var log = this.log;
+-
+-    log.debug('init: entered');
+-    self._refresh();
+-    setImmediate(self.emit.bind(self, 'ready'));
+-};
+-
+-
+-Standalone.prototype._refresh = function _refresh() {
+-    var self = this;
+-
+-    // If there is an existing connection pool, close it:
+-    if (self.database && self.database.primary) {
+-        self.database.primary.close();
+-    }
+-
+-    // Mock up a topology based on our single PostgreSQL URL:
+-    self.database = {
+-        primary: createPGPool({
+-            log: self.log,
+-            pgConfig: self.pgConfig,
+-            role: 'primary',
+-            url: self.url,
+-            collector: self.collector
+-        })
+-    };
+-};
+-
+-
+-
+-// --- Exports
+-
+-module.exports = {
+-    createClient: function createClient(options) {
+-        return (new Standalone(options));
+-    }
+-};
+diff --git a/package.json b/package.json
+index 6dc39a9..1a6fcd4 100644
+--- a/package.json
++++ b/package.json
+@@ -13,6 +13,7 @@
+         "bunyan-syslog": "0.2.2",
+         "clone": "0.1.11",
+         "crc": "0.2.1",
++        "cueball": "2.5.2",
+         "dtrace-provider": "~0.8",
+         "deep-equal": "0.0.0",
+         "fast": "2.3.2",
+@@ -22,14 +23,13 @@
+         "moray-filter": "1.0.0",
+         "libuuid": "0.1.3",
+         "lru-cache": "2.5.0",
+-        "node-manatee": "git+https://github.com/joyent/node-manatee.git#c2ad9ae",
++        "node-manatee": "git+https://github.com/joyent/node-manatee.git#019e9ca0",
+         "manatee": "git+https://github.com/joyent/manatee.git#86ae52d",
+         "moray": "3.1.1",
+         "microtime": "0.5.1",
+         "once": "1.3.0",
+         "pg": "6.2.4",
+         "pg-parse-float": "0.0.1",
+-        "pooling": "0.4.5",
+         "posix-getopt": "1.2.0",
+         "vasync": "1.6.4",
+         "restify": "5.2.0",
+diff --git a/sapi_manifests/moray/template b/sapi_manifests/moray/template
+index ceeb427..b044a3c 100644
+--- a/sapi_manifests/moray/template
++++ b/sapi_manifests/moray/template
+@@ -25,6 +25,9 @@
+ {{#MORAY_MAX_QUEUE_LENGTH}}
+       "maxQueueLength": {{MORAY_MAX_QUEUE_LENGTH}},
+ {{/MORAY_MAX_QUEUE_LENGTH}}
++{{#MORAY_TARGET_CLAIM_DELAY}}
++      "targetClaimDelay": {{MORAY_TARGET_CLAIM_DELAY}},
++{{/MORAY_TARGET_CLAIM_DELAY}}
+       "maxIdleTime": 270000,
+       "user": "moray"
+     }

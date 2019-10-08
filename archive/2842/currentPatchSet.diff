@@ -1,0 +1,512 @@
+commit 9eb2ef20c05ae8e105fec6bc27380387fad43699 (refs/changes/42/2842/3)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2018-01-23T21:28:41+00:00 (1 year, 8 months ago)
+    
+    MORAY-424 Add new option for indexes to allow disabling Postgres index
+    MORAY-379 Disallow changing an index's type
+
+diff --git a/lib/buckets/common.js b/lib/buckets/common.js
+index 938d6f0..a6c4966 100644
+--- a/lib/buckets/common.js
++++ b/lib/buckets/common.js
+@@ -66,6 +66,16 @@ var RESERVED_INDEXES = [
+ ];
+ 
+ 
++///--- Internal helpers
++
++function indexName(bucket, field) {
++    assert.string(bucket, 'bucket');
++    assert.string(field, 'field');
++
++    return bucket + '_' + field + '_idx';
++}
++
++
+ ///--- API
+ 
+ function buildIndexString(schema) {
+@@ -105,44 +115,77 @@ function mapIndexType(schema, name) {
+ }
+ 
+ 
+-function createIndexes(opts, cb) {
++function createIndexes(opts, callback) {
+     var bucket = opts.bucket;
+     var log = opts.log;
+     var pg = opts.pg;
+ 
+     var queries = opts.indexes.map(function (i) {
+-        var sql = util.format(('CREATE %s INDEX %s_%s_idx ' +
+-                               'ON %s USING %s (%s) ' +
+-                               'WHERE %s IS NOT NULL'),
+-                              (opts.unique ? 'UNIQUE' : ''), bucket, i.name,
+-                              bucket, i.type, i.name,
+-                              i.name);
++        var idxName = indexName(bucket, i.name);
++        var sql = util.format(
++            'CREATE %s INDEX %s ON %s USING %s (%s) WHERE %s IS NOT NULL',
++            (opts.unique ? 'UNIQUE' : ''), idxName,
++            bucket, i.type, i.name, i.name);
+         return (sql);
+     });
+ 
+-    cb = once(cb);
+-
+     log.debug({bucket: bucket}, 'createIndexes: entered');
++
+     vasync.forEachParallel({
+-        func: function createIndex(sql, _cb) {
+-            _cb = once(_cb);
+-            log.debug('createIndexes: running %s', sql);
++        inputs: queries,
++        func: function createIndex(sql, cb) {
++            log.debug('createIndexes: running %j', sql);
++
+             var q = pg.query(sql);
++
+             q.once('error', function (err) {
+-                if (err) {
+-                    log.error({
+-                        err: err,
+-                        sql: sql
+-                    }, 'createIndex: failed');
+-                }
+-                _cb(err);
++                log.error({
++                    err: err,
++                    sql: sql
++                }, 'createIndex: failed');
++
++                cb(err);
+             });
+-            q.once('end', function () {
+-                _cb();
++
++            q.once('end', function (_) {
++                cb();
+             });
+-        },
+-        inputs: queries
+-    }, cb);
++        }
++    }, callback);
++}
++
++
++function dropIndexes(opts, callback) {
++    var bucket = opts.bucket;
++    var log = opts.log;
++
++    var queries = opts.indexes.map(function (name) {
++        return util.format('DROP INDEX IF EXISTS %s',
++            indexName(bucket, name));
++    });
++
++    log.debug({bucket: bucket}, 'dropIndexes: entered');
++
++    vasync.forEachParallel({
++        inputs: queries,
++        func: function dropIndex(sql, cb) {
++            log.debug('dropIndexes: running %j', sql);
++            var q = opts.pg.query(sql);
++
++            q.once('error', function (err) {
++                log.error({
++                    err: err,
++                    sql: sql
++                }, 'dropIndex: failed');
++
++                cb(err);
++            });
++
++            q.once('end', function (_) {
++                cb();
++            });
++        }
++    }, callback);
+ }
+ 
+ 
+@@ -251,6 +294,7 @@ module.exports = {
+     RESERVED_BUCKETS: RESERVED_BUCKETS,
+     buildIndexString: buildIndexString,
+     createIndexes: createIndexes,
++    dropIndexes: dropIndexes,
+     mapIndexType: mapIndexType,
+     shootdownBucket: shootdownBucket,
+     validateBucket: validateBucket
+diff --git a/lib/buckets/creat.js b/lib/buckets/creat.js
+index aefa463..fc6626d 100644
+--- a/lib/buckets/creat.js
++++ b/lib/buckets/creat.js
+@@ -199,16 +199,27 @@ function createTable(req, cb) {
+ 
+ 
+ function createIndexes(req, cb) {
+-    // we can skip unique indexes, as those implicitly have a PG index
+-    // at create table time
++    /*
++     * We skip unique indexes, since those implicitly have a Postgres index
++     * created at table time. We also remove the Moray "indexes" that we
++     * don't actually want to have backing Postgres indexes for.
++     */
++    var create = Object.keys(req.bucket.index).filter(function (k) {
++        var idx = req.bucket.index[k];
++        if (idx.pgIndexDisabled) {
++            return false;
++        }
++
++        return !idx.unique;
++    }).concat('_id', '_etag', '_mtime', '_vnode').map(function (k) {
++        return common.mapIndexType(req.bucket.index, k);
++    });
++
+     common.createIndexes({
+         bucket: req.bucket.name,
+         log: req.log,
+         pg: req.pg,
+-        indexes: Object.keys(req.bucket.index).filter(function (k) {
+-            return (!req.bucket.index[k].unique);
+-        }).concat('_id', '_etag', '_mtime', '_vnode')
+-            .map(common.mapIndexType.bind(null, req.bucket.index))
++        indexes: create
+     }, cb);
+ }
+ 
+diff --git a/lib/buckets/update.js b/lib/buckets/update.js
+index ab297a2..384d347 100644
+--- a/lib/buckets/update.js
++++ b/lib/buckets/update.js
+@@ -10,7 +10,7 @@
+ 
+ var util = require('util');
+ 
+-var deepEqual = require('deep-equal');
++var jsprim = require('jsprim');
+ var once = require('once');
+ var vasync = require('vasync');
+ var clone = require('clone');
+@@ -22,6 +22,7 @@ var dtrace = require('../dtrace');
+ var mod_errors = require('../errors');
+ var BucketNotFoundError = mod_errors.BucketNotFoundError;
+ var BucketVersionError = mod_errors.BucketVersionError;
++var InvalidBucketUpdateError = mod_errors.InvalidBucketUpdateError;
+ 
+ var typeToPg = require('../pg').typeToPg;
+ 
+@@ -42,10 +43,10 @@ var PIPELINE = [
+     calculateDiff,
+     ensureRowVer,
+     updateConfig,
+-    dropColumns,
+     addColumns,
+     createIndexes,
+     createUniqueIndexes,
++    dropIndexes,
+     common.shootdownBucket
+ ];
+ 
+@@ -164,30 +165,80 @@ function ensureReindexProperty(req, cb) {
+ }
+ 
+ 
++/**
++ * Determine what changes we need to make to Postgres in order to
++ * match the new bucket configuration. If someone tries to update
++ * the bucket in a forbidden manner (making something unique that
++ * previously wasn't, for example), then return an error.
++ */
+ function calculateDiff(req, cb) {
++    var fields, i, k;
+     var diff = {
+-        add: [],
+-        del: [],
+-        mod: []
++        columns: {
++            add: []
++        },
++        indexes: {
++            add: [],
++            del: []
++        }
+     };
+     var next = req.bucket.index;
+     var prev = req.index;
+ 
+-    Object.keys(next).forEach(function (k) {
+-        if (prev[k] === undefined) {
+-            diff.add.push(k);
+-        } else if (!deepEqual(next[k], prev[k])) {
+-            diff.mod.push(k);
++    fields = Object.keys(next);
++    for (i = 0; i < fields.length; i++) {
++        k = fields[i];
++
++        if (!jsprim.hasKey(prev, k)) {
++            diff.columns.add.push(k);
++            diff.indexes.add.push(k);
++            continue;
+         }
+-    });
+ 
+-    Object.keys(prev).forEach(function (k) {
+-        if (!next[k]) {
+-            diff.del.push(k);
++        if (prev[k].type !== next[k].type) {
++            cb(new InvalidBucketUpdateError(
++                'Cannot change type of index "%s"', k));
++            return;
++        }
++
++        if (!prev[k].unique && next[k].unique) {
++            cb(new InvalidBucketUpdateError(
++                'Cannot update index "%s" to be unique', k));
++            return;
++        }
++
++        if (prev[k].unique && !next[k].unique) {
++            cb(new Error('XXX: implement'));
++            return;
+         }
+-    });
++
++        if (prev[k].pgIndexDisabled && !next[k].pgIndexDisabled) {
++            diff.indexes.add.push(k);
++        }
++
++        if (!prev[k].pgIndexDisabled && next[k].pgIndexDisabled) {
++            if (next[k].unique) {
++                cb(new InvalidBucketUpdateError('Cannot disable unique index ' +
++                    '"%s" with pgIndexDisabled', k));
++                return;
++            }
++            diff.indexes.del.push(k);
++        }
++    }
++
++    fields = Object.keys(prev);
++    for (i = 0; i < fields.length; i++) {
++        k = fields[i];
++
++        if (!jsprim.hasKey(next, k)) {
++            cb(new InvalidBucketUpdateError(
++                'Cannot remove index "%s"', k));
++            return;
++        }
++    }
+ 
+     req.diff = diff;
++
+     req.log.debug({
+         bucket: req.bucket.name,
+         diff: req.diff
+@@ -308,9 +359,8 @@ function updateConfig(req, cb) {
+     values.push(JSON.stringify(bucket.options || {}));
+     if (!req.opts.no_reindex && req.bucket.options.version) {
+         sql += ', reindex_active=$' + (++idx);
+-        // TODO: include modified columns in this list?
+         values.push(consolidateReindex(req.reindex_active,
+-                    req.bucket.options.version, req.diff.add));
++            req.bucket.options.version, req.diff.columns.add));
+     }
+     sql += ' WHERE name=$' + (++idx);
+     values.push(bucket.name);
+@@ -340,61 +390,22 @@ function updateConfig(req, cb) {
+ }
+ 
+ 
+-function dropColumns(req, cb) {
+-    if (req.diff.del.length === 0) {
+-        cb();
++function addColumns(req, callback) {
++    if (req.diff.columns.add.length === 0) {
++        callback();
+         return;
+     }
+ 
+-    cb = once(cb);
+-
+-    var log = req.log;
+-    var pg = req.pg;
+-    var sql = util.format('ALTER TABLE %s DROP COLUMN ', req.bucket.name);
+-
+-    log.debug({
+-        bucket: req.bucket.name,
+-        del: req.diff.del.join(', ')
+-    }, 'dropColumns: entered');
+-    vasync.forEachParallel({
+-        func: function _drop(c, _cb) {
+-            _cb = once(_cb);
+-            var q = pg.query(sql + c);
+-            q.once('error', _cb);
+-            q.once('end', function () {
+-                _cb();
+-            });
+-        },
+-        inputs: req.diff.del
+-    }, function (err) {
+-        log.debug({
+-            bucket: req.bucket.name,
+-            err: err
+-        }, 'dropColumns: %s', err ? 'failed' : 'done');
+-        cb(err);
+-    });
+-}
+-
+-
+-function addColumns(req, cb) {
+-    if (req.diff.add.length === 0) {
+-        cb();
+-        return;
+-    }
+-
+-    cb = once(cb);
+-
+     var log = req.log;
+     var pg = req.pg;
+     var sql = util.format('ALTER TABLE %s ADD COLUMN ', req.bucket.name);
+ 
+     log.debug({
+         bucket: req.bucket.name,
+-        add: req.diff.add.join(', ')
++        add: req.diff.columns.add
+     }, 'addColumns: entered');
+     vasync.forEachParallel({
+-        func: function _drop(c, _cb) {
+-            _cb = once(_cb);
++        func: function _drop(c, cb) {
+             var str = sql + c +
+                 ' ' + typeToPg(req.bucket.index[c].type);
+             log.debug({
+@@ -402,18 +413,18 @@ function addColumns(req, cb) {
+                 sql: str
+             }, 'addColumns: adding column');
+             var q = pg.query(str);
+-            q.once('error', _cb);
+-            q.once('end', function () {
+-                _cb();
++            q.once('error', cb);
++            q.once('end', function (_) {
++                cb();
+             });
+         },
+-        inputs: req.diff.add
++        inputs: req.diff.columns.add
+     }, function (err) {
+         log.debug({
+             bucket: req.bucket.name,
+             err: err
+-        }, 'dropColumns: %s', err ? 'failed' : 'done');
+-        cb(err);
++        }, 'addColumns: %s', err ? 'failed' : 'done');
++        callback(err);
+     });
+ }
+ 
+@@ -421,14 +432,16 @@ function addColumns(req, cb) {
+ function createIndexes(req, cb) {
+     cb = once(cb);
+ 
+-    if (req.diff.add.length === 0) {
++    if (req.diff.indexes.add.length === 0) {
+         cb();
+         return;
+     }
+ 
+-    var add = req.diff.add.filter(function (k) {
++    var add = req.diff.indexes.add.filter(function (k) {
+         return (!req.bucket.index[k].unique);
+-    }).map(common.mapIndexType.bind(null, req.bucket.index));
++    }).map(function (k) {
++        return common.mapIndexType(req.bucket.index, k);
++    });
+ 
+     if (add.length === 0) {
+         cb();
+@@ -444,17 +457,42 @@ function createIndexes(req, cb) {
+ }
+ 
+ 
++function dropIndexes(req, cb) {
++    var del = req.diff.indexes.del.filter(function (k) {
++        /*
++         * Never drop indexes for unique columns, since the
++         * index is what guarantees uniqueness.
++         */
++        return (!req.bucket.index[k].unique);
++    });
++
++    if (del.length === 0) {
++        cb();
++        return;
++    }
++
++    common.dropIndexes({
++        bucket: req.bucket.name,
++        log: req.log,
++        pg: req.pg,
++        indexes: del
++    }, cb);
++}
++
++
+ function createUniqueIndexes(req, cb) {
+     cb = once(cb);
+ 
+-    if (req.diff.add.length === 0) {
++    if (req.diff.indexes.add.length === 0) {
+         cb();
+         return;
+     }
+ 
+-    var add = req.diff.add.filter(function (k) {
++    var add = req.diff.indexes.add.filter(function (k) {
+         return (req.bucket.index[k].unique);
+-    }).map(common.mapIndexType.bind(null, req.bucket.index));
++    }).map(function (k) {
++        return common.mapIndexType(req.bucket.index, k);
++    });
+ 
+     if (add.length === 0) {
+         cb();
+diff --git a/lib/errors.js b/lib/errors.js
+index aeb343b..03e24db 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -153,6 +153,13 @@ function InvalidBucketNameError(cause, bucket) {
+ util.inherits(InvalidBucketNameError, WError);
+ 
+ 
++function InvalidBucketUpdateError() {
++    WError.apply(this, arguments);
++    this.name = this.constructor.name;
++}
++util.inherits(InvalidBucketUpdateError, WError);
++
++
+ function InvalidIndexDefinitionError(cause, type) {
+     if (arguments.length === 1) {
+         type = cause;
+@@ -364,6 +371,7 @@ module.exports = {
+     InternalError: InternalError,
+     InvalidBucketConfigError: InvalidBucketConfigError,
+     InvalidBucketNameError: InvalidBucketNameError,
++    InvalidBucketUpdateError: InvalidBucketUpdateError,
+     InvalidIndexDefinitionError: InvalidIndexDefinitionError,
+     InvalidIndexTypeError: InvalidIndexTypeError,
+     InvalidRequireError: InvalidRequireError,
+diff --git a/lib/schema.js b/lib/schema.js
+index 8196018..cab3fd2 100644
+--- a/lib/schema.js
++++ b/lib/schema.js
+@@ -281,6 +281,9 @@ AJV_ENV.addSchema({
+     required: [ 'type' ],
+     additionalProperties: false,
+     properties: {
++        'pgIndexDisabled': {
++            type: 'boolean'
++        },
+         'type': {
+             type: 'string',
+             enum: MORAY_TYPES

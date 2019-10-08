@@ -1,0 +1,202 @@
+commit ff590f904d19cfcaaefdb6f18ab9c82dac97812e (refs/changes/94/2694/5)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2017-10-13T09:44:59-07:00 (2 years ago)
+    
+    CNAPI-722 TaskWait request can miss task finish event and timeout even though task completed
+    Reviewed by: Julien Gilli <julien.gilli@joyent.com>
+    Approved by: Julien Gilli <julien.gilli@joyent.com>
+
+diff --git a/lib/app.js b/lib/app.js
+index 618679c..95600ff 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -1281,8 +1281,17 @@ App.prototype.waitForTask = function (opts, callback) {
+     var taskid = opts.taskid;
+     var timeoutSeconds = opts.timeoutSeconds || 3600;
+ 
+-    if (!self.taskCallbacks[taskid]) {
+-        self.taskCallbacks[taskid] = [];
++    if (!self.taskCallbacks.hasOwnProperty(taskid)) {
++        self.taskCallbacks[taskid] = {
++            callbacks: []
++        };
++    }
++
++    // Check if there is a cached response for this task.
++
++    if (self.taskCallbacks[taskid].task) {
++        callback(null, self.taskCallbacks[taskid].task);
++        return;
+     }
+ 
+     /**
+@@ -1293,37 +1302,75 @@ App.prototype.waitForTask = function (opts, callback) {
+                 crypto.randomBytes(128)).digest('hex');
+ 
+     var timeout = setTimeout(function () {
+-        for (var idx in self.taskCallbacks[taskid]) {
+-            if (self.taskCallbacks[taskid][idx].id === id) {
++        for (var idx in self.taskCallbacks[taskid].callbacks) {
++            if (self.taskCallbacks[taskid].callbacks[idx].id === id) {
+ 
+-                self.taskCallbacks[taskid][idx].fn(new Error(
++                self.taskCallbacks[taskid].callbacks[idx].fn(new Error(
+                     'wait timed out after ' + timeoutSeconds));
+-                self.taskCallbacks[taskid].splice(idx, idx+1);
+-                if (self.taskCallbacks[taskid].length === 0) {
++
++                // Remove the matching callback from the list
++                self.taskCallbacks[taskid].callbacks.splice(idx, 1);
++
++                if (self.taskCallbacks[taskid].callbacks.length === 0) {
+                     delete self.taskCallbacks[taskid];
+                 }
+                 break;
+             }
+ 
+-            if (self.taskCallbacks[taskid].length === 0) {
++            if (self.taskCallbacks[taskid].callbacks.length === 0) {
+                 delete self.taskCallbacks[taskid];
+             }
+         }
+     }, timeoutSeconds * 1000);
+ 
+     var obj = { id: id, timeout: timeout, fn: once(callback) };
+-    self.taskCallbacks[taskid].push(obj);
++    self.taskCallbacks[taskid].callbacks.push(obj);
+ };
+ 
+ 
++/**
++ * This function is called when we want to let any waiting callbacks know that
++ * a cn-agent task we initiated has completed.
++ */
++
+ App.prototype.alertWaitingTasks = function (err, taskid, task, callback) {
+     var self = this;
+ 
+-    if (!self.taskCallbacks.hasOwnProperty(taskid)) {
++    /**
++     * If no callbacks were set for this task response when we go to alert
++     * waiting callbacks, cache the value in case we end up trying to wait for
++     * this task to finish after it has already done so.
++     *
++     * This can happen if the task finishes after we do the initial 'get' for
++     * the task, but before we can wait on it. In such a situation, we cache
++     * the task values so we can return it for subsequent waits.
++     */
++
++    if (!self.taskCallbacks.hasOwnProperty(taskid) ||
++            self.taskCallbacks[taskid].callbacks.length === 0)
++    {
++        self.log.warn(
++            'wanted to alert callbacks for task %s, but none found', taskid);
++        self.log.warn({ task: task }, 'caching response for %s', taskid);
++
++        var timeout = setTimeout(function () {
++            delete self.taskCallbacks[taskid];
++        }, TASK_CLEANUP_PERIOD * 1000).unref();
++
++        self.taskCallbacks[taskid] = {
++            task: task,
++            callbacks: [],
++
++            /**
++             * This timer ensures this cached value gets cleaned-up if no one
++             * checks and disposes of it before the expiry.
++             */
++            cleanupTimeout: timeout
++        };
+         return;
+     }
+ 
+-    var toAlert = self.taskCallbacks[taskid];
++    var toAlert = self.taskCallbacks[taskid].callbacks;
+ 
+     for (var idx in toAlert) {
+         clearTimeout(toAlert[idx].timeout);
+diff --git a/lib/endpoints/index.js b/lib/endpoints/index.js
+index 6f36a1f..fd14ad2 100644
+--- a/lib/endpoints/index.js
++++ b/lib/endpoints/index.js
+@@ -371,9 +371,10 @@ function attachTo(http, app) {
+         var taskCallbacks = {};
+ 
+         Object.keys(app.taskCallbacks).forEach(function (taskid) {
+-            taskCallbacks[taskid] = app.taskCallbacks[taskid].map(function (i) {
+-                return { id: i.id }; });
+-        });
++            taskCallbacks[taskid] =
++                app.taskCallbacks[taskid].callbacks.map(function (i) {
++                    return { id: i.id }; });
++                });
+ 
+ 
+         send.taskCallbacks = taskCallbacks;
+diff --git a/test/api/test-tasks.js b/test/api/test-tasks.js
+index 2b07b80..74adc09 100644
+--- a/test/api/test-tasks.js
++++ b/test/api/test-tasks.js
+@@ -92,6 +92,54 @@ function testCreateTask(test) {
+ }
+ 
+ 
++/*
++ * Test that we can create a ticket and immediately wait on it. The intent is
++ * to exercise and reproduce the conditions described in CNAPI-722. However,
++ * due to the timing required to hit, the bug is difficult to reproduce but it
++ * is never the less useful to ensure that this continues to work into the
++ * future.
++ */
++
++function testCreateTaskWaitImmediately(test) {
++    test.expect(7);
++
++    var id;
++
++    async.waterfall([
++        function (next) {
++            client.post(servurl + '/nop', {}, onpost);
++
++            function onpost(err, req, res, obj) {
++                test.ifError(err, 'no error');
++                test.ok(obj.id);
++                id = obj.id;
++                next();
++            }
++        }, function (next) {
++            client.get(sprintf('/tasks/%s/wait', id), onget);
++
++            function onget(err, req, res, obj) {
++                test.ifError(err, 'no error');
++                test.equals(obj.status, 'complete');
++                next();
++            }
++        }, function (next) {
++            client.get(sprintf('/tasks/%s', id), onget);
++
++            function onget(err, req, res, obj) {
++                test.ifError(err, 'no error');
++                test.equals(obj.status, 'complete');
++                next();
++            }
++        }
++    ],
++    function (err) {
++        test.ifError(err, 'no error');
++        test.done();
++    });
++}
++
++
+ function testWaitFinishedTask(test) {
+     test.expect(7);
+ 
+@@ -437,6 +485,7 @@ module.exports = {
+     setUp: setup,
+     tearDown: teardown,
+     'create and wait on task': testCreateTask,
++    'create and wait on task': testCreateTaskWaitImmediately,
+     'create and wait on task already finished': testWaitFinishedTask,
+     'create and wait on task already finished (with error)':
+         testWaitFinishedTaskError,

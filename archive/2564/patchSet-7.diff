@@ -1,0 +1,644 @@
+commit 35b36aaad4c275800d022bf854d8d6aa94db8e2a (refs/changes/64/2564/7)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2017-09-18T17:35:38-07:00 (2 years, 1 month ago)
+    
+    MANTA-3425 want support for reverse lookups in binder
+    MANTA-3424 binder tests should cover SRV records and rcodes
+    MANTA-3429 binder recursion/proxy doesn't work for SRV lookups
+
+diff --git a/lib/recursion.js b/lib/recursion.js
+index d981aff..4a15b58 100644
+--- a/lib/recursion.js
++++ b/lib/recursion.js
+@@ -22,7 +22,7 @@
+  */
+ 
+ var assert = require('assert-plus');
+-var dns = require('native-dns');
++var mname_client = require('mname-client');
+ var mname = require('mname');
+ var events = require('events');
+ var sdc = require('sdc-clients');
+@@ -61,6 +61,22 @@ function Recursion(opts) {
+         self.ufdsConfig = opts.ufds;
+         self.zkCache = opts.zkCache;
+ 
++        self.nsc = new mname_client.DnsClient({
++                concurrency: 2
++        });
++        /*
++         * This is for PTR lookups. Since we have no way to tell which DC a
++         * particular IP belongs to at this level of the stack, we try all the
++         * other binders we know about in parallel. This means we have to set
++         * our concurrency limit to a very high value.
++         *
++         * mname_client doesn't let us set the concurrency limit per-query at
++         * the moment, so we'll make a second client instance.
++         */
++        self.nscMax = new mname_client.DnsClient({
++                concurrency: 100
++        });
++
+         //Init will set these up
+         self.interval = null;
+         self.ufds = null;
+@@ -234,63 +250,32 @@ function refresh(cb) {
+ 
+ 
+ 
+-function lookup(query, hosts, prot, cb) {
+-        var self = this;
+-        var log = query._log;
+-        var domainName = query.name();
+-        var question = dns.Question({
+-                name: domainName,
+-                type: 'A'
+-        });
+-
+-        //Choose a host at random
+-        var host = hosts[Math.floor(Math.random() * hosts.length)];
+-        log.trace('recursion trying upstream %s', host);
+-        var port = 53;
+-        var req = dns.Request({
+-                question: question,
+-                server: { address: host, port: port, type: prot },
++function lookup(query, hosts, cb) {
++        var opts = {
++                domain: query.name(),
++                type: query.type(),
+                 timeout: 3000,
+-                try_edns: true
+-        });
++                resolvers: hosts,
++                filter: function (msg) {
++                        msg.clearFlag('rd');
++                }
++        };
+ 
+-        var error;
+-        var answers = [];
+-        req.on('timeout', function () {
+-                error = new Error('timed out');
+-        });
++        var nsc = this.nsc;
++        /* For PTR lookups, try all the resolvers. */
++        if (query.type === 'PTR') {
++                opts.errorThreshold = hosts.length;
++                nsc = this.nscMax;
++        }
+ 
+-        req.on('message', function (err, answer) {
+-                if (answer && answer.header.tc && prot === 'udp') {
+-                        lookup(query, hosts, 'tcp', cb);
+-                        return;
+-                }
++        nsc.lookup(opts, function afterLookup(err, msg) {
+                 if (err) {
+-                        error = err;
++                        cb(err);
+                         return;
+                 }
+-                answer.answer.forEach(function (a) {
+-                        answers.push({
+-                                addr: a.address,
+-                                ttl: a.ttl
+-                        });
+-                });
+-        });
+-
+-        req.on('end', function () {
+-                if (error) {
+-                        return (cb(error));
+-                }
+-                self.log.debug({
+-                        'host': host,
+-                        'domainName': domainName,
+-                        'answers': answers
+-                }, 'Recursion: dns lookup complete');
+ 
+-                return (cb(null, answers));
++                cb(null, msg.getAnswers());
+         });
+-
+-        req.send();
+ }
+ 
+ 
+@@ -309,10 +294,32 @@ Recursion.prototype.resolve = function (query, cb) {
+                         //See comment in server.js
+                         query.setError('refused');
+                 } else {
+-                        answers.map(function (a) {
+-                                query.addAnswer(domain,
+-                                                new ARecord(a.addr),
+-                                                a.ttl);
++                        query._log.trace({answers: answers},
++                            'recursion got answer from upstream');
++                        answers.map(function (rec) {
++                                var klass = mname[rec.type + 'Record'];
++                                var inst;
++                                assert.func(klass);
++                                switch (rec.type) {
++                                case 'A':
++                                case 'AAAA':
++                                case 'TXT':
++                                case 'PTR':
++                                case 'CNAME':
++                                        inst = new klass(rec.target);
++                                        break;
++                                case 'SRV':
++                                        inst = new klass(rec.target, rec.port,
++                                            { priority: rec.priority,
++                                            weight: rec.weight });
++                                        break;
++                                default:
++                                        query._log.warn('recursion: upstream ' +
++                                            'ns returned unsupported record ' +
++                                            'type "%s", dropping', rec.type);
++                                        return;
++                                }
++                                query.addAnswer(domain, inst, rec.ttl);
+                         });
+                 }
+                 query.respond();
+@@ -320,16 +327,30 @@ Recursion.prototype.resolve = function (query, cb) {
+         }
+ 
+         //Searching in the right dns domain
+-        if (domain.indexOf(self.dnsDomain,
+-                           domain.length - self.dnsDomain.length) === -1) {
++        if (query.type() !== 'PTR' && domain.indexOf(self.dnsDomain,
++            domain.length - self.dnsDomain.length) === -1) {
+                 return (respond());
+         }
+ 
+-        //Find the datacenter resolvers
+-        var p = domain.substring(0, domain.length - self.dnsDomain.length - 1);
+-        var dc = p.substring(p.lastIndexOf('.') + 1);
+-        if (self.dcs[dc] === undefined) {
+-                return (respond());
++        /* For non-PTR lookups we can choose the exact datacenter */
++        var upstreams;
++        if (query.type() !== 'PTR') {
++                var p = domain.substring(0, domain.length -
++                    self.dnsDomain.length - 1);
++                var dc = p.substring(p.lastIndexOf('.') + 1);
++                if (self.dcs[dc] === undefined) {
++                        return (respond());
++                }
++                upstreams = self.dcs[dc];
++
++        } else {
++                /* For PTR we have to ask everybody we know. */
++                upstreams = [];
++                Object.keys(self.dcs).forEach(function (tdc) {
++                        self.dcs[tdc].forEach(function (r) {
++                                upstreams.push(r);
++                        });
++                });
+         }
+ 
+         /*
+@@ -337,7 +358,6 @@ Recursion.prototype.resolve = function (query, cb) {
+          * addresses on our own NICs. This way we avoid recurring into
+          * ourselves and wasting a bunch of effort.
+          */
+-        var upstreams = self.dcs[dc];
+         var now = new Date();
+         if (cachedNics == undefined ||
+             now.getTime() - cachedNicsRefreshed.getTime() > 30000) {
+@@ -359,11 +379,11 @@ Recursion.prototype.resolve = function (query, cb) {
+                 return (respond());
+         }
+ 
+-        lookup.call(self, query, upstreams, 'udp', function (err, ans) {
++        lookup.call(self, query, upstreams, function (err, ans) {
+                 if (!err) {
+                         answers = ans;
+                 }
+-                return (respond());
++                respond();
+         });
+ };
+ 
+diff --git a/lib/server.js b/lib/server.js
+index eae6ee0..2ebe05f 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -19,6 +19,7 @@ var mname = require('mname');
+ 
+ var ARecord = mname.ARecord;
+ var SRVRecord = mname.SRVRecord;
++var PTRRecord = mname.PTRRecord;
+ 
+ 
+ ///--- Helpers
+@@ -52,6 +53,75 @@ function stripSuffix(suffix, str) {
+                 return (str);
+ }
+ 
++function resolvePtr(options, query, cb) {
++        query.response.header.ra = 0;
++        var domain = query.name();
++
++        var parts = domain.split('.').reverse();
++        if (parts.length < 2 || parts[0] !== 'arpa' || parts[1] !== 'in-addr') {
++                query._log.trace('not an ipv4 reverse name');
++                query.setError('refused');
++                query.respond();
++                cb();
++                return;
++        }
++        /*
++         * We don't bother validating the rest of the address, because if it's
++         * invalid we won't find it in ZK anyway, and we'll just return
++         * REFUSED like we should (so the client goes and tries the next NS)
++         */
++        var ip = parts.slice(2).join('.');
++
++        if (!options.zkCache.isReady()) {
++                query._log.error('no ZooKeeper client');
++                query.setError('eserver');
++                query.respond();
++                cb();
++                return;
++        }
++
++        query._log = query._log.child({
++                query: {
++                        ip: ip,
++                        type: query.type()
++                }
++        }, true);
++
++        var log = query._log;
++        var stamp = query._stamp;
++        var zk = options.zkCache;
++
++        var node = zk.reverseLookup(ip);
++
++        if (!node) {
++                log.trace('node not found in ZK cache');
++
++                if (options.recursion && query.testFlag('recursionDesired')) {
++                        log.trace('handing off to recursion');
++                        options.recursion.resolve(query, cb);
++                        return;
++                }
++
++                query.setError('refused');
++                stamp('pre-resp');
++                query.respond();
++                cb();
++                return;
++        }
++
++        var record = node.data;
++        var ttl = 30;
++        if (record.ttl !== undefined)
++                ttl = record.ttl;
++        if (record[record.type].ttl !== undefined)
++                ttl = record[record.type].ttl;
++
++        query.addAnswer(domain, new PTRRecord(node.domain), ttl);
++        stamp('pre-resp');
++        query.respond();
++        cb();
++}
++
+ function resolve(options, query, cb) {
+         query.response.header.ra = 0;
+         var domain = query.name();
+@@ -138,7 +208,7 @@ function resolve(options, query, cb) {
+         if (!node) {
+                 log.trace('node not found in ZK cache');
+ 
+-                if (options.recursion) {
++                if (options.recursion && query.testFlag('recursionDesired')) {
+                         log.trace('handing off to recursion');
+                         options.recursion.resolve(query, cb);
+                         return;
+@@ -220,6 +290,7 @@ function resolve(options, query, cb) {
+         case 'load_balancer':
+         case 'moray_host':
+         case 'redis_host':
++        case 'rr_host':
+                 addr = record[record.type].address;
+                 query.addAnswer(domain, new ARecord(addr), ttl);
+                 break;
+@@ -379,6 +450,9 @@ function createServer(options) {
+                 case 'SRV':
+                         resolve(options, query, cb);
+                         break;
++                case 'PTR':
++                        resolvePtr(options, query, cb);
++                        break;
+ 
+                 default:
+                         // Anything unsupported we tell the client the truth
+diff --git a/lib/zk.js b/lib/zk.js
+index c88a0ea..f1fd475 100644
+--- a/lib/zk.js
++++ b/lib/zk.js
+@@ -30,6 +30,7 @@ function ZKCache(options) {
+         });
+         this.ca_domain = options.domain;
+         this.ca_log = options.log;
++        this.ca_revLookup = {};
+ 
+         var self = this;
+         this.ca_zk.on('session', function () {
+@@ -52,6 +53,9 @@ ZKCache.prototype.getClient = function (cb) {
+ ZKCache.prototype.lookup = function (domain) {
+         return (this.ca_treeNodes[domain]);
+ };
++ZKCache.prototype.reverseLookup = function (ip) {
++        return (this.ca_revLookup[ip]);
++};
+ ZKCache.prototype.rebuildCache = function () {
+         var tn = this.ca_treeNodes[this.ca_domain];
+         if (tn === undefined) {
+@@ -73,6 +77,7 @@ function TreeNode(cache, pDomain, name) {
+         this.tn_cache = cache;
+         this.tn_kids = {};
+         this.tn_data = null;
++        this.tn_ip = undefined;
+         this.tn_log = cache.ca_log.child({
+                 component: 'ZKTreeNode',
+                 domain: this.tn_domain
+@@ -86,6 +91,11 @@ Object.defineProperty(TreeNode.prototype, 'name', {
+                 return (this.tn_name);
+         }
+ });
++Object.defineProperty(TreeNode.prototype, 'domain', {
++        get: function () {
++                return (this.tn_domain);
++        }
++});
+ Object.defineProperty(TreeNode.prototype, 'children', {
+         get: function () {
+                 var self = this;
+@@ -134,6 +144,31 @@ TreeNode.prototype.onDataChanged = function (zk, data, stat) {
+                 return;
+         }
+         this.tn_data = parsedData;
++
++        if (parsedData === null || typeof (parsedData.type) !== 'string')
++                return;
++
++        switch (parsedData.type) {
++        case 'db_host':
++        case 'host':
++        case 'load_balancer':
++        case 'moray_host':
++        case 'redis_host':
++        case 'rr_host':
++                var record = parsedData[parsedData.type];
++                if (typeof (record) !== 'object' || record === null)
++                        break;
++                var addr = record.address;
++                if (this.tn_ip)
++                        delete (this.tn_cache.ca_revLookup[this.tn_ip]);
++                this.tn_ip = addr;
++                if (addr)
++                        this.tn_cache.ca_revLookup[addr] = this;
++                break;
++
++        default:
++                break;
++        }
+ };
+ TreeNode.prototype.unbind = function () {
+         var self = this;
+diff --git a/package.json b/package.json
+index b689def..5f4e700 100644
+--- a/package.json
++++ b/package.json
+@@ -12,10 +12,10 @@
+     "lru-cache": "2.7.0",
+     "mname": "1.3.5",
+     "mooremachine": "^2.1.0",
+-    "native-dns": "0.7.0",
++    "mname-client": "0.6.0",
+     "posix-getopt": "1.0.0",
+     "sdc-clients": "9.0.3",
+-    "vasync": "1.6.3",
++    "vasync": "2.1.0",
+     "verror": "^1.10.0",
+     "xtend": "1.0.3",
+     "zkstream": "0.9.0"
+diff --git a/test/dig.js b/test/dig.js
+index ffc1985..952d17f 100644
+--- a/test/dig.js
++++ b/test/dig.js
+@@ -37,6 +37,11 @@ function parseAnswer(tokens) {
+                 type:   t[3],
+                 target: t[4]
+         };
++        if (t[3] === 'SRV') {
++                r.target = t[7];
++                r.port = parseInt(t[6], 10);
++                r.priority = parseInt(t[5], 10);
++        }
+ 
+         return (r);
+ }
+@@ -57,6 +62,8 @@ function parseDig(output) {
+         lines.forEach(function (l) {
+                 if (l === '') {
+                         section = undefined;
++                } else if (/^;; ->>HEADER<<-/.test(l)) {
++                        section = 'header';
+                 } else if (/^;; QUESTION SECTION:/.test(l)) {
+                         section = 'question';
+                 } else if (/^;; ANSWER SECTION:/.test(l)) {
+@@ -67,6 +74,13 @@ function parseDig(output) {
+                         section = 'authority';
+                 }
+ 
++                if (section === 'header') {
++                        var m = l.match(/, status: ([A-Z]+), /);
++                        if (m && m[1]) {
++                                results.status = m[1];
++                        }
++                }
++
+                 if (section === 'question') {
+                         if (/^;([A-Za-z0-9])*\./.test(l)) {
+                                 results.question =
+@@ -76,7 +90,7 @@ function parseDig(output) {
+ 
+                 if (section === 'answer') {
+                         if (/^([_A-Za-z0-9])+/.test(l)) {
+-                                var tokens = l.match(/(.*)/)[0].split(/\t/);
++                                var tokens = l.split(/[\t ]+/);
+                                 var answer = parseAnswer(tokens);
+                                 if (answer)
+                                         results.answers.push(answer);
+diff --git a/test/host.test.js b/test/host.test.js
+index bcc0cba..3bdbb5b 100644
+--- a/test/host.test.js
++++ b/test/host.test.js
+@@ -99,6 +99,7 @@ test('resolve record ok', function (t) {
+         dig(RECORD, 'A', function (err, results) {
+                 t.ifError(err);
+                 t.ok(results);
++                t.equal(results.status, 'NOERROR');
+                 t.ok(results.answers);
+                 t.equal(results.answers.length, 1);
+                 t.deepEqual(results.answers[0], {
+@@ -110,3 +111,57 @@ test('resolve record ok', function (t) {
+                 t.end();
+         });
+ });
++
++test('resolve reverse record ok', function (t) {
++        var dom = ADDR.split('.').reverse().join('.') + '.in-addr.arpa';
++        dig(dom, 'PTR', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'NOERROR');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 1);
++                t.deepEqual(results.answers[0], {
++                        name: dom,
++                        ttl: 30,
++                        type: 'PTR',
++                        target: RECORD + '.'
++                });
++                t.end();
++        });
++});
++
++test('reverse record not found', function (t) {
++        var dom = '1.2.3.4.in-addr.arpa';
++        dig(dom, 'PTR', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'REFUSED');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 0);
++                t.end();
++        });
++});
++
++test('reverse record invalid', function (t) {
++        var dom = 'foobar.com';
++        dig(dom, 'PTR', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'REFUSED');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 0);
++                t.end();
++        });
++});
++
++test('reverse record invalid ip', function (t) {
++        var dom = '1.2.in-addr.arpa';
++        dig(dom, 'PTR', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'REFUSED');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 0);
++                t.end();
++        });
++});
+diff --git a/test/service.test.js b/test/service.test.js
+index f3fb2e4..39f73a5 100644
+--- a/test/service.test.js
++++ b/test/service.test.js
+@@ -147,6 +147,7 @@ test('resolve record ok', function (t) {
+         dig(SVC, 'A', function (err, results) {
+                 t.ifError(err);
+                 t.ok(results);
++                t.equal(results.status, 'NOERROR');
+                 t.ok(results.answers);
+                 t.equal(results.answers.length, 2);
+                 results.answers.forEach(function (a) {
+@@ -159,11 +160,84 @@ test('resolve record ok', function (t) {
+         });
+ });
+ 
++test('resolve SRV records ok', function (t) {
++        dig('_http._tcp.' + SVC, 'SRV', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'NOERROR');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 2);
++                results.answers.forEach(function (a) {
++                        t.equal(a.ttl, 60);
++                        t.equal(a.type, 'SRV');
++                        t.equal(a.port, 80);
++                        t.ok(/lb[AB]\.bar\.foo\.com\.?/.test(a.target));
++                });
++                t.end();
++        });
++});
++
++test('SRV wrong service', function (t) {
++        dig('_http._udp.' + SVC, 'SRV', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'NXDOMAIN');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 0);
++                t.end();
++        });
++});
++
++test('SRV not exist', function (t) {
++        dig('_http._tcp.foobar.foo.com', 'SRV', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'REFUSED');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 0);
++                t.end();
++        });
++});
++
++test('resolve member record ok', function (t) {
++        dig('lba.' + SVC, 'A', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'NOERROR');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 1);
++                t.deepEqual(results.answers[0], {
++                        name: 'lba.' + SVC,
++                        ttl: 30,
++                        type: 'A',
++                        target: LBS['lbA']
++                });
++                t.end();
++        });
++});
++
++test('resolve reverse record ok', function (t) {
++        var dom = LBS['lbA'].split('.').reverse().join('.') + '.in-addr.arpa';
++        dig(dom, 'PTR', function (err, results) {
++                t.ifError(err);
++                t.ok(results);
++                t.equal(results.status, 'NOERROR');
++                t.ok(results.answers);
++                t.equal(results.answers.length, 1);
++                var a = results.answers[0];
++                t.equal(a.name, dom);
++                t.equal(a.type, 'PTR');
++                t.equal(a.target, 'lba.bar.foo.com.');
++                t.end();
++        });
++});
++
+ 
+ test('resolve record not found', function (t) {
+         dig('blah.blah', 'A', function (err, results) {
+                 t.ifError(err);
+                 t.ok(results);
++                t.equal(results.status, 'REFUSED');
+                 t.ok(results.answers);
+                 t.equal(results.answers.length, 0);
+                 t.end();

@@ -1,0 +1,1029 @@
+commit 5c1a6e717fe18dfbcfcc777bb6065ab4e0b8028b (refs/changes/50/2350/3)
+Author: David Pacheco <dap@joyent.com>
+Date:   2017-08-24T17:33:50-07:00 (2 years, 1 month ago)
+    
+    joyent/mdb_v8#44 want "jsfunction" dcmd
+    joyent/mdb_v8#88 want better support for bound functions
+    joyent/mdb_v8#91 CTRL+C of ::findjsobjects, followed by ::findjsobjects reports only some objects
+
+diff --git a/docs/usage.md b/docs/usage.md
+index d4d35cd..498d811 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -5,7 +5,7 @@
+ -->
+ 
+ <!--
+-    Copyright (c) 2015, Joyent, Inc.
++    Copyright (c) 2017, Joyent, Inc.
+ -->
+ 
+ # Postmortem debugging with mdb_v8
+@@ -558,7 +558,7 @@ constructor, respectively.  The output consists of only the representative
+ objects.
+ 
+ Option summary:
+-  
++
+     -b       Include the heap denoted by the brk(2) (normally excluded)
+     -c cons  Display representative objects with the specified constructor
+     -p prop  Display representative objects that have the specified property
+@@ -615,6 +615,7 @@ like `type` and `listener`.  The `jsclosure` command prints these out:
+ 
+ Of course, you can use other commands to inspect these values further.
+ 
++See also: `jsfunction`
+ 
+ ### jsconstructor
+ 
+@@ -624,6 +625,8 @@ Given an object identified by `addr`, print the name of the JavaScript function
+ that was used as the object's constructor.  With -v, provides the constructor
+ function's underlying V8 heap object address for use with `v8function`.
+ 
++See also: `jsfunction`
++
+ ### jsframe
+ 
+     addr::jsframe [-aiv] [-f function] [-p property] [-n numlines]
+@@ -638,6 +641,38 @@ The "-a", "-v", "-f", "-p", and "-n" arguments are exactly the same as for
+ `jsstack`.
+ 
+ 
++### jsfunction
++
++    addr::jsfunction
++
++Given a function instance identified by the address `addr`, print out
++information about the function.  For most functions, this includes the
++function's name and where it was defined:
++
++    > b17812f5::jsfunction
++    function: afunc
++    defined at /home/dap/mdb_v8/bound.js line 5
++
++For functions created with JavaScript's `Function.bind`, this command instead
++prints out information about the _target_ function (the one that was wrapped
++with `bind`):
++
++    > a8781389::jsfunction
++    bound function that wraps: a87812cd
++    with "this" = a878135d (JSObject: Object)
++          arg0  = 80527875 (SeqAsciiString)
++
++You can use `jsfunction` again on the target function (e.g., `a87812cd` in this
++case) to see information about the underlying function.
++
++See also:
++
++- `jsclosure` for printing out closure variables for this function.
++- `jssource` for printing the source code for this function.
++- `jsprint` for printing the values for "this" and the arguments for bound
++   functions.
++
++
+ ### jsfunctions
+ 
+     ::jsfunctions [-X] [-s file_filter] [-n name_filter] [-x instr_filter]
+diff --git a/src/mdb_v8.c b/src/mdb_v8.c
+index 9790adb..7a50fcb 100644
+--- a/src/mdb_v8.c
++++ b/src/mdb_v8.c
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -125,6 +125,7 @@ intptr_t V8_SmiTagMask;
+ intptr_t V8_SmiValueShift;
+ intptr_t V8_SmiShiftSize;
+ intptr_t V8_PointerSizeLog2;
++intptr_t V8_CompilerHints_BoundFunction;
+ 
+ static intptr_t	V8_ISSHARED_SHIFT;
+ static intptr_t	V8_DICT_SHIFT;
+@@ -149,6 +150,7 @@ intptr_t V8_TYPE_EXECUTABLEACCESSORINFO = -1;
+ intptr_t V8_TYPE_JSOBJECT = -1;
+ intptr_t V8_TYPE_JSARRAY = -1;
+ intptr_t V8_TYPE_JSFUNCTION = -1;
++intptr_t V8_TYPE_JSBOUNDFUNCTION = -1;
+ intptr_t V8_TYPE_JSDATE = -1;
+ intptr_t V8_TYPE_JSREGEXP = -1;
+ intptr_t V8_TYPE_HEAPNUMBER = -1;
+@@ -193,7 +195,11 @@ ssize_t V8_OFF_HEAPOBJECT_MAP;
+ ssize_t V8_OFF_JSARRAY_LENGTH;
+ ssize_t V8_OFF_JSDATE_VALUE;
+ ssize_t V8_OFF_JSREGEXP_DATA;
++ssize_t V8_OFF_JSBOUNDFUNCTION_BOUND_ARGUMENTS;
++ssize_t V8_OFF_JSBOUNDFUNCTION_BOUND_TARGET_FUNCTION;
++ssize_t V8_OFF_JSBOUNDFUNCTION_BOUND_THIS;
+ ssize_t V8_OFF_JSFUNCTION_CONTEXT;
++ssize_t V8_OFF_JSFUNCTION_LITERALS_OR_BINDINGS;
+ ssize_t V8_OFF_JSFUNCTION_SHARED;
+ ssize_t V8_OFF_JSOBJECT_ELEMENTS;
+ ssize_t V8_OFF_JSOBJECT_PROPERTIES;
+@@ -218,6 +224,7 @@ ssize_t V8_OFF_SEQASCIISTR_CHARS;
+ ssize_t V8_OFF_SEQONEBYTESTR_CHARS;
+ ssize_t V8_OFF_SEQTWOBYTESTR_CHARS;
+ ssize_t V8_OFF_SHAREDFUNCTIONINFO_CODE;
++ssize_t V8_OFF_SHAREDFUNCTIONINFO_COMPILER_HINTS;
+ ssize_t V8_OFF_SHAREDFUNCTIONINFO_SCOPE_INFO;
+ ssize_t V8_OFF_SHAREDFUNCTIONINFO_END_POSITION;
+ ssize_t V8_OFF_SHAREDFUNCTIONINFO_FUNCTION_TOKEN_POSITION;
+@@ -428,8 +435,22 @@ static v8_offset_t v8_offsets[] = {
+ 	    "JSArray", "length" },
+ 	{ &V8_OFF_JSDATE_VALUE,
+ 	    "JSDate", "value", B_TRUE },
++
++	{ &V8_OFF_JSBOUNDFUNCTION_BOUND_ARGUMENTS,
++	    "JSBoundFunction", "bound_arguments", B_FALSE,
++	    V8_CONSTANT_ADDED_SINCE(4, 9) },
++	{ &V8_OFF_JSBOUNDFUNCTION_BOUND_TARGET_FUNCTION,
++	    "JSBoundFunction", "bound_target_function", B_FALSE,
++	    V8_CONSTANT_ADDED_SINCE(4, 9) },
++	{ &V8_OFF_JSBOUNDFUNCTION_BOUND_THIS,
++	    "JSBoundFunction", "bound_this", B_FALSE,
++	    V8_CONSTANT_ADDED_SINCE(4, 9) },
++
+ 	{ &V8_OFF_JSFUNCTION_CONTEXT,
+ 	    "JSFunction", "context", B_TRUE },
++	{ &V8_OFF_JSFUNCTION_LITERALS_OR_BINDINGS,
++	    "JSFunction", "literals_or_bindings", B_FALSE,
++	    V8_CONSTANT_REMOVED_SINCE(4, 9) },
+ 	{ &V8_OFF_JSFUNCTION_SHARED,
+ 	    "JSFunction", "shared" },
+ 	{ &V8_OFF_JSOBJECT_ELEMENTS,
+@@ -494,6 +515,8 @@ static v8_offset_t v8_offsets[] = {
+ 	    "SeqTwoByteString", "chars", B_TRUE },
+ 	{ &V8_OFF_SHAREDFUNCTIONINFO_CODE,
+ 	    "SharedFunctionInfo", "code" },
++	{ &V8_OFF_SHAREDFUNCTIONINFO_COMPILER_HINTS,
++	    "SharedFunctionInfo", "compiler_hints" },
+ 	{ &V8_OFF_SHAREDFUNCTIONINFO_END_POSITION,
+ 	    "SharedFunctionInfo", "end_position" },
+ 	{ &V8_OFF_SHAREDFUNCTIONINFO_FUNCTION_TOKEN_POSITION,
+@@ -635,6 +658,7 @@ static int jsobj_print_jsobject(uintptr_t, jsobj_print_t *);
+ static int jsobj_print_jsarray(uintptr_t, jsobj_print_t *);
+ static int jsobj_print_jstyped_array(uintptr_t, jsobj_print_t *);
+ static int jsobj_print_jsfunction(uintptr_t, jsobj_print_t *);
++static int jsobj_print_jsboundfunction(uintptr_t, jsobj_print_t *);
+ static int jsobj_print_jsdate(uintptr_t, jsobj_print_t *);
+ static int jsobj_print_jsregexp(uintptr_t, jsobj_print_t *);
+ 
+@@ -797,6 +821,13 @@ autoconfigure(v8_cfg_t *cfgp)
+ 		if (strcmp(ep->v8e_name, "JSArray") == 0)
+ 			V8_TYPE_JSARRAY = ep->v8e_value;
+ 
++		/*
++		 * JSBoundFunction is only used in relatively modern versions of
++		 * V8 (those used in Node v6 and later).
++		 */
++		if (strcmp(ep->v8e_name, "JSBoundFunction") == 0)
++			V8_TYPE_JSBOUNDFUNCTION = ep->v8e_value;
++
+ 		if (strcmp(ep->v8e_name, "JSFunction") == 0)
+ 			V8_TYPE_JSFUNCTION = ep->v8e_value;
+ 
+@@ -1067,6 +1098,34 @@ again:
+ 		    V8_OFF_SHAREDFUNCTIONINFO_INFERRED_NAME;
+ 	}
+ 
++	/*
++	 * The appropriate values for the "kBoundFunction" bit that lives within
++	 * the SharedFunctionInfo "compiler_hints" field have changed over time.
++	 * It's unlikely we'll ever have metadata in the binary for this field,
++	 * since current versions of V8 and Node (at least V8 4.9.385 and later
++	 * and Node 6.8 and later) don't use it at all.
++	 *
++	 * Important versions:
++	 *
++	 *	Node	V8
++	 *	0.12.0	3.28.73.0
++	 *	0.12.16	3.28.71.19 (note: earlier V8 than that in v0.12.0)
++	 *	4.0.0	4.5.103.30
++	 *	6.0.0	5.0.71.35 (can detect V8_TYPE_JSBOUNDFUNCTION)
++	 */
++	if (V8_TYPE_JSBOUNDFUNCTION == -1) {
++		if (v8_version_current_older(3, 28, 71, 19)) {
++			/* Node 0.10 */
++			V8_CompilerHints_BoundFunction = 13;
++		} else if (v8_version_current_older(4, 5, 103, 30)) {
++			/* Node 0.12 */
++			V8_CompilerHints_BoundFunction = 8;
++		} else {
++			/* Node v4 */
++			V8_CompilerHints_BoundFunction = 10;
++		}
++	}
++
+ 	return (failed ? -1 : 0);
+ }
+ 
+@@ -1671,15 +1730,15 @@ read_heap_byte(uint8_t *valp, uintptr_t addr, ssize_t off)
+ }
+ 
+ /*
+- * This is truly horrific.  Inside the V8 Script class are a number of
+- * small-integer fields like the function_token_position (an offset into the
+- * script's text where the "function" token appears).  For 32-bit processes, V8
+- * stores these as a sequence of SMI fields, which we know how to interpret well
+- * enough.  For 64-bit processes, "to avoid wasting space", they use a different
+- * trick: each 8-byte word contains two integer fields.  The low word is
+- * represented like an SMI: shifted left by one.  They don't bother shifting the
+- * high word, since its low bit will never be looked at (since it's not
+- * word-aligned).
++ * This is truly horrific.  Inside the V8 Script and SharedFunctionInfo classes
++ * are a number of small-integer fields like the function_token_position (an
++ * offset into the script's text where the "function" token appears).  For
++ * 32-bit processes, V8 stores these as a sequence of SMI fields, which we know
++ * how to interpret well enough.  For 64-bit processes, "to avoid wasting
++ * space", they use a different trick: each 8-byte word contains two integer
++ * fields.  The low word is represented like an SMI: shifted left by one.  They
++ * don't bother shifting the high word, since its low bit will never be looked
++ * at (since it's not word-aligned).
+  *
+  * This function is used for cases where we would use read_heap_smi(), except
+  * that this is one of those fields that might be encoded or might not be,
+@@ -1986,7 +2045,19 @@ obj_jstype(uintptr_t addr, char **bufp, size_t *lenp, uint8_t *typep)
+ 	if (typep)
+ 		*typep = typebyte;
+ 
+-	typename = enum_lookup_str(v8_types, typebyte, "<unknown>");
++	typename = enum_lookup_str(v8_types, typebyte, NULL);
++
++	/*
++	 * For not-yet-diagnosed reasons, we don't seem to be able to match the
++	 * type byte for various string classes in Node v0.12 and later.
++	 * However, we can tell from the tag which type of string it is, and
++	 * we're generally able to print them.
++	 */
++	if (typename == NULL && V8_TYPE_STRING(typebyte)) {
++		typename = "<unknown subclass>: String";
++	} else if (typename == NULL) {
++		typename = "<unknown>";
++	}
+ 	(void) bsnprintf(bufp, lenp, typename);
+ 
+ 	if (strcmp(typename, "Oddball") == 0) {
+@@ -2281,6 +2352,8 @@ jsobj_maybe_garbage(uintptr_t addr)
+ 	    type != V8_TYPE_JSOBJECT &&
+ 	    type != V8_TYPE_JSARRAY &&
+ 	    type != V8_TYPE_JSFUNCTION &&
++	    (V8_TYPE_JSBOUNDFUNCTION == -1 ||
++	    type != V8_TYPE_JSBOUNDFUNCTION) &&
+ 	    type != V8_TYPE_JSDATE &&
+ 	    type != V8_TYPE_JSREGEXP &&
+ 	    type != V8_TYPE_JSTYPEDARRAY)));
+@@ -3354,6 +3427,7 @@ jsobj_print_value(v8propvalue_t *valp, jsobj_print_t *jsop)
+ 		{ "JSArray", jsobj_print_jsarray },
+ 		{ "JSTypedArray", jsobj_print_jstyped_array },
+ 		{ "JSFunction", jsobj_print_jsfunction },
++		{ "JSBoundFunction", jsobj_print_jsboundfunction },
+ 		{ "JSDate", jsobj_print_jsdate },
+ 		{ "JSRegExp", jsobj_print_jsregexp },
+ 		{ NULL }
+@@ -3746,6 +3820,16 @@ jsobj_print_jsfunction(uintptr_t addr, jsobj_print_t *jsop)
+ 	return (jsfunc_name(shared, bufp, lenp) != 0);
+ }
+ 
++static int
++jsobj_print_jsboundfunction(uintptr_t addr, jsobj_print_t *jsop)
++{
++	char **bufp = jsop->jsop_bufp;
++	size_t *lenp = jsop->jsop_lenp;
++
++	(void) bsnprintf(bufp, lenp, "<bound function>");
++	return (0);
++}
++
+ static int
+ jsobj_print_jsdate(uintptr_t addr, jsobj_print_t *jsop)
+ {
+@@ -4645,6 +4729,7 @@ typedef struct findjsobjects_state {
+ 	boolean_t fjs_initialized;
+ 	boolean_t fjs_marking;
+ 	boolean_t fjs_referred;
++	boolean_t fjs_finished;
+ 	avl_tree_t fjs_tree;
+ 	avl_tree_t fjs_referents;
+ 	avl_tree_t fjs_funcinfo;
+@@ -5476,6 +5561,8 @@ findjsobjects_run(findjsobjects_state_t *fjs)
+ 			sorted[nobjs - 1]->fjso_next = NULL;
+ 		}
+ 
++		fjs->fjs_finished = B_TRUE;
++
+ 		v8_silent--;
+ 
+ 		if (fjs->fjs_verbose) {
+@@ -5534,6 +5621,12 @@ dcmd_findjsobjects(uintptr_t addr,
+ 	if (findjsobjects_run(fjs) != 0)
+ 		return (DCMD_ERR);
+ 
++	if (!fjs->fjs_finished) {
++		mdb_warn("error: previous findjsobjects "
++		    "heap scan did not complete.\n");
++		return (DCMD_ERR);
++	}
++
+ 	if (listlike && !(flags & DCMD_ADDRSPEC)) {
+ 		if (propname != NULL || constructor != NULL ||
+ 		    propkind != NULL) {
+@@ -5784,6 +5877,88 @@ jsclosure_iter_var(v8scopeinfo_t *sip, v8scopeinfo_var_t *sivp, void *arg)
+ 	return (0);
+ }
+ 
++/* ARGSUSED */
++static int
++jsfunction_bound_arg(v8boundfunction_t *bfp, uint_t which, uintptr_t value,
++    void *unused)
++{
++	char buf[80];
++	size_t len = sizeof (buf);
++	char *bufp;
++
++	bufp = buf;
++	(void) obj_jstype(value, &bufp, &len, NULL);
++
++	mdb_printf("      arg%d  = %p (%s)\n", which, value, buf);
++	return (0);
++}
++
++/* ARGSUSED */
++static int
++dcmd_jsfunction(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
++{
++	v8function_t *fp = NULL;
++	v8funcinfo_t *fip = NULL;
++	v8boundfunction_t *bfp = NULL;
++	mdbv8_strbuf_t *strb = NULL;
++	int memflags = UM_SLEEP | UM_GC;
++	int rv = DCMD_ERR;
++	char buf[80];
++	size_t len = sizeof (buf);
++	char *bufp;
++
++	/*
++	 * Bound functions are separate from other functions.  The regular
++	 * function APIs may not work on them, depending on the Node version.
++	 * Handle them first.
++	 * TODO the API here doesn't really allow you to distinguish between
++	 * something like memory allocation failure and bad input (e.g., not a
++	 * bound function).  It was written assuming you would know what type
++	 * you expected something to be, but this is one of the first cases
++	 * where we don't.
++	 */
++	if ((bfp = v8boundfunction_load(addr, memflags)) != NULL) {
++		uintptr_t thisp;
++
++		mdb_printf("bound function that wraps: %p\n",
++		    v8boundfunction_target(bfp));
++		thisp = v8boundfunction_this(bfp);
++		bufp = buf;
++		(void) obj_jstype(thisp, &bufp, &len, NULL);
++		mdb_printf("with \"this\" = %p (%s)\n", thisp, buf);
++		rv = v8boundfunction_iter_args(bfp, jsfunction_bound_arg, NULL);
++		v8boundfunction_free(bfp);
++		return (rv);
++	}
++
++	v8_warnings++;
++	if ((fp = v8function_load(addr, memflags)) == NULL ||
++	    (fip = v8function_funcinfo(fp, memflags)) == NULL ||
++	    (strb = mdbv8_strbuf_alloc(512, memflags)) == NULL) {
++		goto out;
++	}
++
++	mdbv8_strbuf_sprintf(strb, "function: ");
++
++	if (v8funcinfo_funcname(fip, strb, MSF_ASCIIONLY) != 0) {
++		goto out;
++	}
++
++	mdbv8_strbuf_sprintf(strb, "\ndefined at ");
++	(void) v8funcinfo_scriptpath(fip, strb, MSF_ASCIIONLY);
++	mdbv8_strbuf_sprintf(strb, " ");
++	(void) v8funcinfo_definition_location(fip, strb, MSF_ASCIIONLY);
++	mdb_printf("%s\n", mdbv8_strbuf_tocstr(strb));
++	rv = DCMD_OK;
++
++out:
++	v8funcinfo_free(fip);
++	v8function_free(fp);
++	mdbv8_strbuf_free(strb);
++	v8_warnings--;
++	return (rv);
++}
++
+ /* ARGSUSED */
+ static int
+ dcmd_jsclosure(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+@@ -6103,6 +6278,12 @@ dcmd_jsfunctions(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 		return (DCMD_ERR);
+ 	}
+ 
++	if (!fjs->fjs_finished) {
++		mdb_warn("error: previous findjsobjects "
++		    "heap scan did not complete.\n");
++		return (DCMD_ERR);
++	}
++
+ 	if (flags & DCMD_ADDRSPEC) {
+ 		listlike = B_TRUE;
+ 	}
+@@ -6634,6 +6815,8 @@ static const mdb_dcmd_t v8_mdb_dcmds[] = {
+ 		dcmd_jsconstructor },
+ 	{ "jsframe", ":[-aiv] [-f function] [-p property] [-n numlines]",
+ 		"summarize a JavaScript stack frame", dcmd_jsframe },
++	{ "jsfunction", ":", "print information about a JavaScript function",
++		dcmd_jsfunction },
+ 	{ "jsprint", ":[-ab] [-d depth] [member]", "print a JavaScript object",
+ 		dcmd_jsprint },
+ 	{ "jssource", ":[-n numlines]",
+diff --git a/src/mdb_v8_dbg.h b/src/mdb_v8_dbg.h
+index ebfe8d5..dfae781 100644
+--- a/src/mdb_v8_dbg.h
++++ b/src/mdb_v8_dbg.h
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -99,6 +99,7 @@ typedef struct v8fixedarray v8fixedarray_t;
+ typedef struct v8string v8string_t;
+ 
+ typedef struct v8function v8function_t;
++typedef struct v8boundfunction v8boundfunction_t;
+ typedef struct v8code v8code_t;
+ typedef struct v8funcinfo v8funcinfo_t;
+ typedef struct v8context v8context_t;
+@@ -225,6 +226,8 @@ int v8string_write(v8string_t *, mdbv8_strbuf_t *,
+  * JSFunction objects represent closures, rather than a single instance of the
+  * function in the source code.  There may be many JSFunction objects for what
+  * programmers would typically call a "function" -- one for each active closure.
++ *
++ * If you're working with a bound function, use v8boundfunction_t.
+  */
+ v8function_t *v8function_load(uintptr_t, int);
+ void v8function_free(v8function_t *);
+@@ -262,7 +265,6 @@ uintptr_t v8code_addr(v8code_t *);
+ uintptr_t v8code_instructions_start(v8code_t *);
+ uintptr_t v8code_instructions_size(v8code_t *);
+ 
+-
+ /*
+  * Working with Contexts
+  */
+@@ -298,4 +300,23 @@ int v8scopeinfo_iter_vars(v8scopeinfo_t *, v8scopeinfo_vartype_t,
+ size_t v8scopeinfo_var_idx(v8scopeinfo_t *, v8scopeinfo_var_t *);
+ uintptr_t v8scopeinfo_var_name(v8scopeinfo_t *, v8scopeinfo_var_t *);
+ 
++/*
++ * Working with bound functions.
++ *
++ * In versions of V8 used in Node v4 and earlier, bound functions have their own
++ * valid JSFunction instance (with shared function info, name, and the usual
++ * properties), and you will be able to load them with v8function_load() (as
++ * well as v8boundfunction_load()).  However, later V8 versions use a separate
++ * JSBoundFunction class.  In these versions, there will not be a JSFunction
++ * instance for bound functions, and you will not be able to load them with
++ * v8function_load().  You can use v8boundfunction_load() in all cases.
++ */
++v8boundfunction_t *v8boundfunction_load(uintptr_t, int);
++uintptr_t v8boundfunction_target(v8boundfunction_t *);
++uintptr_t v8boundfunction_this(v8boundfunction_t *);
++size_t v8boundfunction_nargs(v8boundfunction_t *);
++int v8boundfunction_iter_args(v8boundfunction_t *,
++    int (*)(v8boundfunction_t *, uint_t, uintptr_t, void *), void *);
++void v8boundfunction_free(v8boundfunction_t *);
++
+ #endif	/* _MDBV8DBG_H */
+diff --git a/src/mdb_v8_function.c b/src/mdb_v8_function.c
+index a6da0f1..a2b1687 100644
+--- a/src/mdb_v8_function.c
++++ b/src/mdb_v8_function.c
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -64,6 +64,45 @@ struct v8scopeinfo {
+ 	size_t		v8si_nelts;	/* count of slots */
+ };
+ 
++struct v8boundfunction {
++	uintptr_t	v8bf_addr;	/* address of bound function */
++	uintptr_t	v8bf_memflags;	/* memory allocation flags */
++
++	/*
++	 * As mentioned in mdb_v8_dbg.h, earlier versions of V8 use a plain
++	 * JSFunction to represent bound functions.  In those versions, there's
++	 * a "bindings" array that contains the values of the wrapped function,
++	 * "this", and all of the bound arguments.  Newer versions of V8 use a
++	 * separate class for bound functions that has first-class properties
++	 * for these fields.
++	 *
++	 * It's pretty easy to normalize the target function and "this", so we
++	 * do that at load time and store them into v8bf_target and v8bf_this.
++	 */
++	uintptr_t	v8bf_target;	/* target (wrapped) function */
++	uintptr_t	v8bf_this;	/* bound value of "this" */
++
++	/*
++	 * Abstracting over the argument list is only slightly trickier.  In
++	 * both cases, we have a V8 array, but in one case we need to skip the
++	 * first two elements.
++	 */
++	uintptr_t	*v8bf_array;	/* bindings or arguments (see above) */
++	uintptr_t	v8bf_arraylen;	/* length of "v8bf_array" */
++	uintptr_t	v8bf_idx_arg0;	/* first valid argument in */
++					/* "v8bf_args" */
++};
++
++/*
++ * These constants describe the layout of the "bindings" array for bound
++ * functions.  They could in principle come from postmortem metadata, but
++ * they're already obselete in current versions of V8, so it's unlikely they'd
++ * ever come from the binary anyway.
++ */
++static int V8_BINDINGS_INDEX_TARGET = 0;
++static int V8_BINDINGS_INDEX_THIS = 1;
++static int V8_BINDINGS_INDEX_ARGS_START = 2;
++
+ /*
+  * This structure and array describe the statically-defined fields stored inside
+  * each Context.  This is mainly useful for debugger tools that want to dump
+@@ -120,6 +159,8 @@ static size_t v8scopeinfo_nvartypes =
+ static uintptr_t v8context_elt(v8context_t *, unsigned int);
+ static v8scopeinfo_vartype_info_t *v8scopeinfo_vartype_lookup(
+     v8scopeinfo_vartype_t);
++static v8boundfunction_t *v8boundfunction_load_bindings(uintptr_t, int);
++static v8boundfunction_t *v8boundfunction_load_direct(uintptr_t, int);
+ 
+ 
+ /*
+@@ -900,7 +941,7 @@ v8scopeinfo_iter_vars(v8scopeinfo_t *sip,
+ 	nvars = v8scopeinfo_vartype_nvars(sip, scopevartype);
+ 
+ 	/*
+-	 * Skip to the start of the ScopeInfo's dynamic part. See mdb_v8_db.h
++	 * Skip to the start of the ScopeInfo's dynamic part. See mdb_v8_dbg.h
+ 	 * for more details on the layout of ScopeInfo objects.
+ 	 */
+ 	nskip = V8_SCOPEINFO_IDX_FIRST_VARS;
+@@ -999,3 +1040,220 @@ v8scopeinfo_vartype_lookup(v8scopeinfo_vartype_t scopevartype)
+ 
+ 	return (NULL);
+ }
++
++
++/*
++ * Bound functions
++ *
++ * Bound functions are functions returned from JavaScript's Function.bind()
++ * method.  A bound function essentially wraps some other function, but
++ * overrides the "this" and any number of initial arguments:
++ *
++ *     function myFunc(arg1, arg2) { ... }
++ *
++ *     var newctx = {};
++ *     var bound = myFunc.bind(newctx, 'hello');
++ *
++ * In this example:
++ *
++ *     "bound" is the bound function.  Invoking it invokes "myFunc".
++ *     "myFunc" is the target function.
++ *     "newctx" is the value of "this" inside the "myFunc" invocation.
++ *
++ * See the comments in mdb_v8_dbg.h and in the definition of "struct
++ * v8boundfunction" above for implementation notes.
++ */
++
++v8boundfunction_t *
++v8boundfunction_load(uintptr_t addr, int memflags)
++{
++	if (V8_TYPE_JSBOUNDFUNCTION == -1) {
++		/*
++		 * This is Node prior to v6.  Load this as a v8function_t and
++		 * use its bindings array.
++		 */
++		return (v8boundfunction_load_bindings(addr, memflags));
++	} else {
++		/*
++		 * This is a more recent version of V8 that stores information
++		 * directly in a JSBoundFunction.
++		 */
++		return (v8boundfunction_load_direct(addr, memflags));
++	}
++}
++
++static v8boundfunction_t *
++v8boundfunction_load_bindings(uintptr_t addr, int memflags)
++{
++	v8function_t *funcp;
++	v8boundfunction_t *bfp;
++	uintptr_t hints, bindingsp;
++	v8funcinfo_t *fip;
++	int err;
++
++	funcp = v8function_load(addr, memflags);
++	if (funcp == NULL) {
++		return (NULL);
++	}
++
++	/*
++	 * To determine whether this is even a bound function, we need to look
++	 * at the compiler hints hanging off the SharedFunctionInfo.
++	 */
++	fip = v8function_funcinfo(funcp, memflags);
++	v8function_free(funcp);
++	if (fip == NULL) {
++		return (NULL);
++	}
++
++	err = read_heap_maybesmi(&hints, fip->v8fi_addr,
++	    V8_OFF_SHAREDFUNCTIONINFO_COMPILER_HINTS);
++	v8funcinfo_free(fip);
++	if (err != 0) {
++		return (NULL);
++	}
++
++	if (!V8_HINT_BOUND(hints)) {
++		v8_warn("%p: not a bound function\n", addr);
++		return (NULL);
++	}
++
++	if (read_heap_ptr(&bindingsp, addr,
++	    V8_OFF_JSFUNCTION_LITERALS_OR_BINDINGS) != 0) {
++		v8_warn("%p: failed to load bindings\n", addr);
++		return (NULL);
++	}
++
++	if ((bfp = mdb_zalloc(sizeof (*bfp), memflags)) == NULL) {
++		return (NULL);
++	}
++
++	bfp->v8bf_addr = addr;
++	bfp->v8bf_memflags = memflags;
++
++	if (read_heap_array(bindingsp, &bfp->v8bf_array,
++	    &bfp->v8bf_arraylen, memflags) != 0) {
++		v8_warn("%p: failed to load bindings array\n", addr);
++		v8boundfunction_free(bfp);
++		return (NULL);
++	}
++
++	if (bfp->v8bf_arraylen < V8_BINDINGS_INDEX_ARGS_START) {
++		v8_warn("%p: bindings array is too short\n", addr);
++		v8boundfunction_free(bfp);
++		return (NULL);
++	}
++
++	bfp->v8bf_target = bfp->v8bf_array[V8_BINDINGS_INDEX_TARGET];
++	bfp->v8bf_this = bfp->v8bf_array[V8_BINDINGS_INDEX_THIS];
++	bfp->v8bf_idx_arg0 = V8_BINDINGS_INDEX_ARGS_START;
++	return (bfp);
++}
++
++static v8boundfunction_t *
++v8boundfunction_load_direct(uintptr_t addr, int memflags)
++{
++	uint8_t type;
++	uintptr_t boundArgs;
++	v8boundfunction_t *bfp;
++
++	assert(V8_TYPE_JSBOUNDFUNCTION != -1);
++
++	if (!V8_IS_HEAPOBJECT(addr) || read_typebyte(&type, addr) != 0) {
++		v8_warn("%p: not a heap object\n", addr);
++		return (NULL);
++	}
++
++	if (type != V8_TYPE_JSBOUNDFUNCTION) {
++		v8_warn("%p: not a JSBoundFunction\n", addr);
++		return (NULL);
++	}
++
++	if ((bfp = mdb_zalloc(sizeof (*bfp), memflags)) == NULL) {
++		return (NULL);
++	}
++
++	if (read_heap_ptr(&bfp->v8bf_target, addr,
++	    V8_OFF_JSBOUNDFUNCTION_BOUND_TARGET_FUNCTION) == -1 ||
++	    read_heap_ptr(&bfp->v8bf_this, addr,
++	    V8_OFF_JSBOUNDFUNCTION_BOUND_THIS) == -1 ||
++	    read_heap_ptr(&boundArgs, addr,
++	    V8_OFF_JSBOUNDFUNCTION_BOUND_ARGUMENTS) == -1 ||
++	    read_heap_array(boundArgs, &bfp->v8bf_array,
++	    &bfp->v8bf_arraylen, memflags) == -1) {
++		v8_warn("%p: failed to read binding details\n", addr);
++		v8boundfunction_free(bfp);
++		return (NULL);
++	}
++
++	bfp->v8bf_addr = addr;
++	bfp->v8bf_memflags = memflags;
++	return (bfp);
++}
++
++/*
++ * Returns the target of this bound function (i.e., the function that this
++ * function wraps).
++ */
++uintptr_t
++v8boundfunction_target(v8boundfunction_t *bfp)
++{
++	return (bfp->v8bf_target);
++}
++
++/*
++ * Returns the value of "this" specified by this binding.
++ */
++uintptr_t
++v8boundfunction_this(v8boundfunction_t *bfp)
++{
++	return (bfp->v8bf_this);
++}
++
++/*
++ * Returns the number of arguments specified by this binding.
++ */
++size_t
++v8boundfunction_nargs(v8boundfunction_t *bfp)
++{
++	return (bfp->v8bf_arraylen - bfp->v8bf_idx_arg0);
++}
++
++/*
++ * Iterates the arguments specified by this binding.
++ */
++int
++v8boundfunction_iter_args(v8boundfunction_t *bfp,
++    int (*func)(v8boundfunction_t *, uint_t, uintptr_t, void *), void *arg)
++{
++	size_t argi, elti;
++	int rv = 0;
++
++	for (argi = 0, elti = bfp->v8bf_idx_arg0;
++	    elti < bfp->v8bf_arraylen; argi++, elti++) {
++		rv = func(bfp, argi, bfp->v8bf_array[elti], arg);
++		if (rv != 0) {
++			return (rv);
++		}
++	}
++
++	assert(argi == v8boundfunction_nargs(bfp));
++	return (0);
++}
++
++/*
++ * Free a v8boundfunction_t object.
++ * See the patterns in mdb_v8_dbg.h for interface details.
++ */
++void
++v8boundfunction_free(v8boundfunction_t *bfp)
++{
++	if (bfp == NULL) {
++		return;
++	}
++
++	maybefree(bfp->v8bf_array,
++	    bfp->v8bf_arraylen * sizeof (bfp->v8bf_array[0]),
++	    bfp->v8bf_memflags);
++	maybefree(bfp, sizeof (*bfp), bfp->v8bf_memflags);
++}
+diff --git a/src/mdb_v8_impl.h b/src/mdb_v8_impl.h
+index b57528e..b52bca9 100644
+--- a/src/mdb_v8_impl.h
++++ b/src/mdb_v8_impl.h
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -52,6 +52,7 @@ boolean_t jsobj_is_undefined(uintptr_t);
+  * represent all the metadata constants used by multiple C files.
+  */
+ extern intptr_t V8_TYPE_JSFUNCTION;
++extern intptr_t V8_TYPE_JSBOUNDFUNCTION;
+ extern intptr_t V8_TYPE_FIXEDARRAY;
+ 
+ extern intptr_t V8_IsNotStringMask;
+@@ -66,6 +67,7 @@ extern intptr_t V8_SeqStringTag;
+ extern intptr_t V8_ConsStringTag;
+ extern intptr_t V8_SlicedStringTag;
+ extern intptr_t V8_ExternalStringTag;
++extern intptr_t V8_CompilerHints_BoundFunction;
+ 
+ extern ssize_t V8_OFF_CODE_INSTRUCTION_SIZE;
+ extern ssize_t V8_OFF_CODE_INSTRUCTION_START;
+@@ -74,7 +76,11 @@ extern ssize_t V8_OFF_CONSSTRING_SECOND;
+ extern ssize_t V8_OFF_EXTERNALSTRING_RESOURCE;
+ extern ssize_t V8_OFF_FIXEDARRAY_DATA;
+ extern ssize_t V8_OFF_FIXEDARRAY_LENGTH;
++extern ssize_t V8_OFF_JSBOUNDFUNCTION_BOUND_ARGUMENTS;
++extern ssize_t V8_OFF_JSBOUNDFUNCTION_BOUND_TARGET_FUNCTION;
++extern ssize_t V8_OFF_JSBOUNDFUNCTION_BOUND_THIS;
+ extern ssize_t V8_OFF_JSFUNCTION_CONTEXT;
++extern ssize_t V8_OFF_JSFUNCTION_LITERALS_OR_BINDINGS;
+ extern ssize_t V8_OFF_JSFUNCTION_SHARED;
+ extern ssize_t V8_OFF_SCRIPT_LINE_ENDS;
+ extern ssize_t V8_OFF_SCRIPT_NAME;
+@@ -82,6 +88,7 @@ extern ssize_t V8_OFF_SEQASCIISTR_CHARS;
+ extern ssize_t V8_OFF_SEQONEBYTESTR_CHARS;
+ extern ssize_t V8_OFF_SEQTWOBYTESTR_CHARS;
+ extern ssize_t V8_OFF_SHAREDFUNCTIONINFO_CODE;
++extern ssize_t V8_OFF_SHAREDFUNCTIONINFO_COMPILER_HINTS;
+ extern ssize_t V8_OFF_SHAREDFUNCTIONINFO_SCOPE_INFO;
+ extern ssize_t V8_OFF_SHAREDFUNCTIONINFO_INFERRED_NAME;
+ extern ssize_t V8_OFF_SHAREDFUNCTIONINFO_IDENTIFIER;
+diff --git a/src/v8dbg.h b/src/v8dbg.h
+index 38b1d67..7553c28 100644
+--- a/src/v8dbg.h
++++ b/src/v8dbg.h
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -43,6 +43,14 @@
+ #define	V8_VALUE_SMI(value)	\
+ 	((value) << (V8_SmiValueShift + V8_SmiShiftSize))
+ 
++/*
++ * Check compiler hints, which hang off of SharedFunctionInfo objects.
++ */
++#define	V8_HINT_ISSET(hints, whichbit) \
++	(((hints) & (1 << (whichbit))) != 0)
++#define	V8_HINT_BOUND(hints) \
++	(V8_HINT_ISSET((hints), V8_CompilerHints_BoundFunction))
++
+ /*
+  * Determine the encoding and representation of a V8 string.
+  */
+diff --git a/test/standalone/tst.jsclosure.js b/test/standalone/tst.jsclosure.js
+index 27b2885..7919001 100644
+--- a/test/standalone/tst.jsclosure.js
++++ b/test/standalone/tst.jsclosure.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var assert = require('assert');
+@@ -41,7 +41,13 @@ function doStuff(str)
+ 	return (count);
+ }
+ 
++var bindObject = {
++    '__bind': doStuff.bind({ 'thisObj': true },
++	'arg1value', 'arg2value', 'arg3value', 'arg4value')
++};
++
+ doStuff('hello world');
++process.stdout.write(util.format(bindObject).length > 0 ? '' : 'unused');
+ 
+ /*
+  * Now we're going to fork ourselves to gcore
+@@ -126,6 +132,7 @@ function doCmd(str)
+ 
+ var processors, whichproc;
+ var closure;
++var bindPtr;
+ 
+ /*
+  * This is effectively a pipeline of command response handlers.  Each one kicks
+@@ -243,10 +250,9 @@ processors = [
+     function gotScopePtr(chunk) {
+     	var ptr = chunk.trim();
+ 	doCmd(util.format('%s::v8scopeinfo\n', ptr));
+-	mdb.stdin.end();
+     },
+ 
+-    function last(chunk) {
++    function gotScopeInfo(chunk) {
+ 	var lines = chunk.split(/\n/);
+ 	var required = [
+ 	    /* BEGIN JSSTYLED */
+@@ -273,6 +279,86 @@ processors = [
+ 	});
+ 
+ 	assert.deepEqual([], required);
++
++	doCmd(util.format('::findjsobjects -p __bind | ::findjsobjects | ' +
++	    '::jsprint -ad1 __bind\n'));
++    },
++
++    function gotBindCandidates(chunk) {
++	var lines = chunk.split(/\n/);
++	bindPtr = null;
++
++	lines.forEach(function (l) {
++		var parts = l.split(':');
++		if (bindPtr === null && parts.length == 2 &&
++		    /function/.test(parts[1])) {
++			bindPtr = parts[0];
++		}
++	});
++
++	assert.notStrictEqual(null, bindPtr,
++	    'did not find matching pointer');
++
++	doCmd(util.format('%s::jsfunction\n', bindPtr));
++    },
++
++    function gotJsFunction(chunk) {
++	var lines, match, bindTarget, values, cmds;
++	var i;
++
++	lines = chunk.split(/\n/);
++	if (lines.length != 7 ||
++	    !/^bound function that wraps: [a-fA-F0-9]+/.test(lines[0]) ||
++	    !/^with "this" = [a-fA-F0-9]+ \(.*Object\)/.test(lines[1]) ||
++	    !/^      arg0  = [a-fA-F0-9]+ \(.*String\)/.test(lines[2]) ||
++	    !/^      arg1  = [a-fA-F0-9]+ \(.*String\)/.test(lines[3]) ||
++	    !/^      arg2  = [a-fA-F0-9]+ \(.*String\)/.test(lines[4]) ||
++	    !/^      arg3  = [a-fA-F0-9]+ \(.*String\)/.test(lines[5])) {
++		throw (new Error('::jsfunction output mismatch'));
++	}
++
++	match = lines[0].match(/^bound function that wraps: ([a-fA-F0-9]+)/);
++	assert.notStrictEqual(match, null);
++	bindTarget = match[1];
++
++	values = {};
++	for (i = 1; i < 6; i++) {
++		match = lines[i].match(
++		    /* JSSTYLED */
++		    /\s+"?(arg\d+|this)"?\s+= ([a-fA-F0-9]+)/);
++		assert.notStrictEqual(null, match);
++		values[match[1]] = match[2];
++	}
++
++	console.error(values);
++	cmds = [ bindTarget + '::jsfunction' ];
++	Object.keys(values).forEach(function (k) {
++		cmds.push(values[k] + '::jsprint');
++	});
++
++	doCmd(cmds.join(';') + '\n');
++	mdb.stdin.end();
++    },
++
++    function gotJsFunctionValues(chunk) {
++	var lines;
++
++	lines = chunk.split(/\n/);
++	assert.ok(/^defined at.*tst\.jsclosure\.js/.test(lines[1]));
++	lines.splice(1, 1);
++
++	assert.deepEqual(lines, [
++	    'function: doStuff',
++	    '{',
++	    '    "thisObj": true,',
++	    '}',
++	    '"arg1value"',
++	    '"arg2value"',
++	    '"arg3value"',
++	    '"arg4value"',
++	    ''
++	]);
++
+ 	passed = true;
+     }
+ ];
+diff --git a/tools/runtests_node b/tools/runtests_node
+index c502fda..e800495 100755
+--- a/tools/runtests_node
++++ b/tools/runtests_node
+@@ -10,7 +10,7 @@ set -o pipefail
+ #
+ # Static configuration: Node versions to setup and test.
+ #
+-rn_versions="0.10.43 0.12.12 4.4.0 5.9.0 6.0.0 6.6.0 6.9.4 7.4.0"
++rn_versions="0.10.48 0.12.17 4.8.4 6.11.2"
+ rn_platform="sunos"
+ rn_arches="x86 x64"
+ rn_nodebase="https://nodejs.org/dist"

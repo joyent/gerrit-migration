@@ -1,0 +1,716 @@
+commit 84c4db6a1271df92c6cf54df4a8022210359c4f1 (refs/changes/92/4692/12)
+Author: Josh Wilsdon <josh@wilsdon.ca>
+Date:   2018-10-12T16:39:01-07:00 (12 months ago)
+    
+    TRITON-697 net-agent should support dummy backend compatible with mockcloud
+    Reviewed by: Trent Mick <trentm@gmail.com>
+    Approved by: Trent Mick <trentm@gmail.com>
+
+diff --git a/dummy/net-agent.js b/dummy/net-agent.js
+new file mode 100755
+index 0000000..a226a0f
+--- /dev/null
++++ b/dummy/net-agent.js
+@@ -0,0 +1,274 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018 Joyent, Inc.
++ */
++
++/*
++ * net-agent.js
++ */
++
++'use strict';
++
++var child_process = require('child_process');
++var fs = require('fs');
++var path = require('path');
++
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
++var bunyanSerializers = require('sdc-bunyan-serializers');
++var DummyVmadm = require('vmadm/lib/index.dummy_vminfod');
++var uuidv4 = require('uuid/v4');
++var vasync = require('vasync');
++
++var NetAgent = require('../lib');
++
++var logLevel = (process.env.LOG_LEVEL || 'debug');
++var logger = bunyan.createLogger({
++    name: 'net-agent',
++    level: logLevel,
++    serializers: bunyanSerializers
++});
++
++
++// This will blow up if something goes wrong. That's what we want.
++var MOCKCLOUD_ROOT = process.env.MOCKCLOUD_ROOT ||
++    child_process.execSync('/usr/sbin/mdata-get mockcloudRoot',
++    {encoding: 'utf8'}).trim();
++var SERVER_ROOT = MOCKCLOUD_ROOT + '/servers';
++
++
++function mdataGet(key, callback) {
++    assert.string(key, 'key');
++    assert.func(callback, 'callback');
++
++    child_process.execFile('/usr/sbin/mdata-get', [
++        key
++    ], function _onMdata(err, stdout, stderr) {
++        assert.ifError(err, 'mdata-get should always work');
++
++        callback(null, stdout.trim());
++    });
++}
++
++function loadSysinfo(server_uuid, callback) {
++    var filename = SERVER_ROOT + '/' + server_uuid + '/sysinfo.json';
++
++    logger.debug({server_uuid: server_uuid},
++        'loading sysinfo for dummy server');
++
++    fs.readFile(filename, function onData(err, data) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        callback(null, JSON.parse(data.toString()));
++    });
++}
++
++// TODO: should use common method in backends to get rackaware admin IP.
++// For now, just copied this from cn-agent.
++function findZoneAdminIp(ctx, callback) {
++    mdataGet('sdc:nics', function _onMdata(err, nicsData) {
++        var idx;
++        var nic;
++        var nics = JSON.parse(nicsData.toString());
++
++        for (idx = 0; idx < nics.length; idx++) {
++            nic = nics[idx];
++            if (nic.nic_tag === 'admin') {
++                ctx.bindIP = nic.ip;
++                break;
++            }
++        }
++
++        assert.string(ctx.bindIP, 'ctx.bindIP');
++
++        callback();
++    });
++}
++
++function findUfdsAdminUuid(ctx, callback) {
++    mdataGet('ufdsAdmin', function _onMdata(err, data) {
++
++        ctx.ufdsAdminUuid = data.toString();
++        assert.uuid(ctx.ufdsAdminUuid, 'ctx.ufdsAdminUuid');
++
++        callback();
++    });
++}
++
++function findDnsDomain(ctx, callback) {
++    mdataGet('dnsDomain', function _onMdata(err, data) {
++
++        ctx.dnsDomain = data.toString();
++        assert.string(ctx.dnsDomain, 'ctx.dnsDomain');
++
++        callback();
++    });
++}
++
++function findDatacenterName(ctx, callback) {
++    mdataGet('sdc:datacenter_name', function _onMdata(err, data) {
++
++        ctx.datacenterName = data.toString();
++        assert.string(ctx.datacenterName, 'ctx.datacenterName');
++
++        callback();
++    });
++}
++
++function getNetAgentInstanceId(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++
++    var instance_root = path.join(
++        SERVER_ROOT,
++        opts.serverUuid,
++        'agent_instances');
++    var net_agent_instance_file = path.join(instance_root, 'net-agent');
++
++    fs.mkdir(instance_root, function _onMkdir(err) {
++        // check for EEXIST, then ignore err
++        if (err && err.code !== 'EEXIST') {
++            callback(err);
++            return;
++        }
++
++        fs.readFile(net_agent_instance_file, function onData(err, data) {
++            var instanceUuid;
++
++            if (err) {
++                if (err.code !== 'ENOENT') {
++                    callback(err);
++                    return;
++                }
++
++                instanceUuid = uuidv4();
++                fs.writeFile(net_agent_instance_file, instanceUuid,
++                    function _onWrite(err) {
++
++                    assert.ifError(err);
++
++                    callback(null, instanceUuid);
++                });
++                return;
++            }
++
++            instanceUuid = data.toString();
++            callback(null, instanceUuid);
++        });
++    });
++}
++
++function runServer(opts, callback) {
++    var ctx = opts.ctx;
++    var fullDNS = ctx.datacenterName + '.' + ctx.dnsDomain;
++
++    // First we need to build a config for this net-agent
++
++    loadSysinfo(opts.serverUuid, function _onSysinfo(err, sysinfo) {
++        assert.ifError(err);
++
++        var config = {};
++
++        config.admin_uuid = ctx.ufdsAdminUuid;
++        config.bindip = ctx.bindIP;
++        config.cn_uuid = opts.serverUuid;
++        config.cueballAgent = {
++            resolvers: [ 'binder.' + fullDNS ],
++            initialDomains: [ 'napi.' + fullDNS ],
++            spares: 3,
++            maximum: 10,
++            recovery: {
++                'default': {
++                    timeout: 2000,
++                    maxTimeout: 8000,
++                    retries: 3,
++                    delay: 0,
++                    maxDelay: 1000
++                }
++            }
++        };
++        config.datacenterName = ctx.datacenterName;
++        config.dnsDomain = ctx.dnsDomain;
++        config.loadSysinfo = function _loadSysinfo(cb) {
++            loadSysinfo(config.cn_uuid, cb);
++        };
++        config.log = opts.log;
++        config.napi = {
++            url: 'http://napi.' + fullDNS
++        };
++        config.no_rabbit = true;
++        config.sysinfo = sysinfo;
++
++        // Create a new vmadm just for this server
++        config.vmadm = new DummyVmadm({
++            log: opts.log,
++            serverRoot: SERVER_ROOT,
++            sysinfo: sysinfo,
++            uuid: opts.serverUuid
++        });
++
++        getNetAgentInstanceId({
++            serverUuid: opts.serverUuid
++        }, function _onInstanceId(err, instanceUuid) {
++            var netagent;
++
++            assert.ifError(err);
++            config.agent_uuid = instanceUuid;
++
++            netagent = new NetAgent(config);
++            netagent.start();
++
++            callback();
++        });
++    });
++}
++
++function main() {
++    fs.readdir(SERVER_ROOT, function _onReadDir(err, dirs) {
++        var state = {};
++
++        if (err) {
++            console.error('FATAL: %s', err.message);
++            process.exit(2);
++            return;
++        }
++
++        vasync.pipeline({
++            arg: state,
++            funcs: [
++                findDatacenterName,
++                findDnsDomain,
++                findUfdsAdminUuid,
++                findZoneAdminIp
++            ]
++        }, function pipelineComplete(pipelineErr) {
++            assert.ifError(pipelineErr);
++
++            vasync.forEachPipeline({
++                func: function _runServer(serverUuid, cb) {
++                    assert.uuid(serverUuid, 'serverUuid');
++                    runServer({
++                        ctx: state,
++                        log: logger,
++                        serverUuid: serverUuid
++                    }, cb);
++                },
++                inputs: dirs
++            }, function _forEachPipelineComplete(forEachPipelineErr) {
++                logger.info('startup sequence complete');
++            });
++        });
++    });
++}
++
++
++// kick things off
++main();
+diff --git a/lib/event-source.js b/lib/event-source.js
+index 6d28f81..1cce382 100644
+--- a/lib/event-source.js
++++ b/lib/event-source.js
+@@ -11,13 +11,14 @@
+ 'use strict';
+ 
+ var assert = require('assert-plus');
+-var vmadm = require('vmadm');
+ 
+ function determineEventSource(opts, cb) {
+     var vmadmEventsOpts;
+ 
+     assert.object(opts, 'opts');
+     assert.object(opts.log, 'opts.log');
++    assert.ok(['object', 'function']
++        .indexOf(typeof (opts.vmadm)) !== -1, 'opts.vmadm');
+     assert.func(cb, 'cb');
+ 
+     /*
+@@ -29,7 +30,7 @@ function determineEventSource(opts, cb) {
+         name: 'VM Agent determineEventSource'
+     };
+ 
+-    var vs = vmadm.events(vmadmEventsOpts,
++    var vs = opts.vmadm.events(vmadmEventsOpts,
+         function vmadmEventsHandler() {
+             /*
+              * We don't care about any events seen here - we are only
+diff --git a/lib/inst-fsm.js b/lib/inst-fsm.js
+index f6e487f..222a0d8 100644
+--- a/lib/inst-fsm.js
++++ b/lib/inst-fsm.js
+@@ -14,7 +14,6 @@ var assert = require('assert-plus');
+ var mod_jsprim = require('jsprim');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+-var vmadm = require('vmadm');
+ 
+ // --- Globals
+ 
+@@ -49,6 +48,8 @@ function InstanceFSM(opts) {
+     assert.uuid(opts.uuid, 'opts.uuid');
+     assert.object(opts.app, 'opts.app');
+     assert.object(opts.vm, 'opts.vm');
++    assert.ok(['object', 'function']
++        .indexOf(typeof (opts.vmadm)) !== -1, 'opts.vmadm');
+ 
+     this.uuid = opts.uuid;
+     this.app = opts.app;
+@@ -63,6 +64,7 @@ function InstanceFSM(opts) {
+ 
+     this.nics = {};
+     this.vm = null;
++    this.vmadm = opts.vmadm;
+ 
+     this._update(opts.vm);
+ 
+@@ -192,7 +194,7 @@ InstanceFSM.prototype.state_update.vm = function (S) {
+ 
+     payload.log = self.log;
+ 
+-    vmadm.update(payload, S.callback(afterUpdate));
++    self.vmadm.update(payload, S.callback(afterUpdate));
+ };
+ 
+ 
+@@ -304,7 +306,7 @@ InstanceFSM.prototype.addNIC = function (mac, nic, callback) {
+ 
+     nic.mac = mac;
+ 
+-    vmadm.update({
++    self.vmadm.update({
+         uuid: self.uuid,
+         add_nics: [ nic ],
+         log: self.log
+@@ -322,7 +324,7 @@ InstanceFSM.prototype.updateNIC = function (mac, update, callback) {
+ 
+     update.mac = mac;
+ 
+-    vmadm.update({
++    self.vmadm.update({
+         uuid: self.uuid,
+         update_nics: [ update ],
+         log: self.log
+@@ -337,7 +339,7 @@ InstanceFSM.prototype.removeNIC = function (mac, callback) {
+ 
+     self.log.info('Removing NIC %s on VM %s', mac, self.uuid);
+ 
+-    vmadm.update({
++    self.vmadm.update({
+         uuid: self.uuid,
+         remove_nics: [ mac ],
+         log: self.log
+diff --git a/lib/net-agent.js b/lib/net-agent.js
+index c50c023..dbfab48 100644
+--- a/lib/net-agent.js
++++ b/lib/net-agent.js
+@@ -80,6 +80,7 @@ var mod_jsprim = require('jsprim');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+ var VError = require('verror');
++var vmadm = require('vmadm');
+ 
+ var AggrFSM = require('./aggr-fsm');
+ var NetworkFSM = require('./net-fsm');
+@@ -112,6 +113,7 @@ function NetAgent(options) {
+     assert.object(options.napi, 'options.napi');
+     assert.string(options.napi.url, 'options.napi.url');
+     assert.object(options.cueballAgent, 'options.cueballAgent');
++    assert.optionalFunc(options.loadSysinfo, 'options.loadSysinfo');
+ 
+     this.options = options;
+     this.log = options.log;
+@@ -119,6 +121,11 @@ function NetAgent(options) {
+     this.agent_uuid = options.agent_uuid;
+     this.admin_uuid = options.admin_uuid;
+     this.version = getNetAgentVersion();
++    this.vmadm = options.vmadm || vmadm;
++
++    // Depending on the backend vmadm might be an object or a function.
++    assert.ok(['object', 'function']
++        .indexOf(typeof (this.vmadm)) !== -1, 'options.vmadm');
+ 
+     var userAgent = mod_util.format(
+         'net-agent/%s (node/%s) server/%s',
+@@ -128,6 +135,15 @@ function NetAgent(options) {
+         log: this.log.child({ component: 'cueball' })
+     });
+ 
++    var serverfsmopts = {
++        uuid: this.cn_uuid,
++        app: this
++    };
++
++    if (options.loadSysinfo !== undefined) {
++        serverfsmopts.loadSysinfo = options.loadSysinfo;
++    }
++
+     this.cueballAgent = new mod_cueball.HttpAgent(cbopts);
+ 
+     this.napi = new mod_clients.NAPI({
+@@ -141,10 +157,7 @@ function NetAgent(options) {
+     this.watcher = null;
+     this.eventSource = null;
+ 
+-    this.server = new ServerFSM({
+-        uuid: this.cn_uuid,
+-        app: this
+-    });
++    this.server = new ServerFSM(serverfsmopts);
+     this.aggrs = {};
+     this.insts = {};
+     this.nics = {};
+@@ -201,6 +214,7 @@ NetAgent.prototype.updateVMs = function (vms) {
+             vfsm = new InstanceFSM({
+                 uuid: vm.uuid,
+                 vm: vm,
++                vmadm: self.vmadm,
+                 app: self
+             });
+         }
+@@ -235,7 +249,8 @@ NetAgent.prototype.watchNic = function (mac) {
+     if (!mod_jsprim.hasKey(this.nics, mac)) {
+         this.nics[mac] = new NicFSM({
+             app: this,
+-            mac: mac
++            mac: mac,
++            vmadm: this.vmadm
+         });
+     }
+ 
+@@ -253,7 +268,8 @@ NetAgent.prototype.watchAggr = function (name) {
+     if (!mod_jsprim.hasKey(this.aggrs, name)) {
+         this.aggrs[name] = new AggrFSM({
+             app: this,
+-            name: name
++            name: name,
++            vmadm: this.vmadm
+         });
+     }
+ 
+@@ -284,8 +300,10 @@ NetAgent.prototype.state_init = function (S) {
+ NetAgent.prototype.state_init.determineEventSource = function (S) {
+     var self = this;
+ 
+-    determineEventSource({log: self.log},
+-        function determinedEventSource(err, eventSource) {
++    determineEventSource({
++        log: self.log,
++        vmadm: self.vmadm
++    }, function determinedEventSource(err, eventSource) {
+ 
+         if (err) {
+             self.log.error(err, 'error determining event source');
+@@ -308,12 +326,14 @@ NetAgent.prototype.state_init.startWatcher = function (S) {
+     switch (this.eventSource) {
+     case 'default':
+         this.watcher = new WatcherFSM({
+-            app: this
++            app: this,
++            vmadm: this.vmadm
+         });
+         break;
+     case 'vmadm-events':
+         this.watcher = new VmadmWatcherFSM({
+-            app: this
++            app: this,
++            vmadm: this.vmadm
+         });
+         break;
+     default:
+diff --git a/lib/server-fsm.js b/lib/server-fsm.js
+index 92793cb..4214ec8 100644
+--- a/lib/server-fsm.js
++++ b/lib/server-fsm.js
+@@ -28,12 +28,38 @@ function isAdminLike(tag) {
+     return ADMIN_TAG_RE.test(tag.toUpperCase());
+ }
+ 
++function loadSysinfo(callback) {
++    mod_forkexec.forkExecWait({
++        argv: [ '/usr/bin/sysinfo' ],
++        includeStderr: true,
++        timeout: 0
++    }, function (err, info) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        var sysinfo;
++
++        try {
++            sysinfo = JSON.parse(info.stdout.trim());
++        } catch (e) {
++            callback(e);
++            return;
++        }
++
++        callback(null, sysinfo);
++    });
++}
++
++
+ // --- Exports
+ 
+ function ServerFSM(opts) {
+     assert.object(opts, 'opts');
+     assert.uuid(opts.uuid, 'opts.uuid');
+     assert.object(opts.app, 'opts.app');
++    assert.optionalFunc(opts.loadSysinfo, 'opts.loadSysinfo');
+ 
+     this.uuid = opts.uuid;
+     this.app = opts.app;
+@@ -46,6 +72,12 @@ function ServerFSM(opts) {
+     this.aggrs = {};
+     this.nictags = {};
+ 
++    /*
++     * Allow caller to pass in a function for loading sysinfo. Otherwise we'll
++     * default to calling /usr/bin/sysinfo.
++     */
++    this.loadSysinfo = opts.loadSysinfo || loadSysinfo;
++
+     mod_mooremachine.FSM.call(this, 'init');
+ }
+ mod_util.inherits(ServerFSM, mod_mooremachine.FSM);
+@@ -76,25 +108,12 @@ ServerFSM.prototype.state_refresh = function (S) {
+         });
+     }
+ 
+-    mod_forkexec.forkExecWait({
+-        argv: [ '/usr/bin/sysinfo' ],
+-        includeStderr: true,
+-        timeout: 0
+-    }, function (err, info) {
++    self.loadSysinfo(function _onSysinfo(err, sysinfo) {
+         if (err) {
+             retry(err);
+             return;
+         }
+ 
+-        var sysinfo;
+-
+-        try {
+-            sysinfo = JSON.parse(info.stdout.trim());
+-        } catch (e) {
+-            retry(e);
+-            return;
+-        }
+-
+         self._update(sysinfo);
+ 
+         S.gotoState('waiting');
+diff --git a/lib/vmadm-watcher-fsm.js b/lib/vmadm-watcher-fsm.js
+index d844945..25bdbe3 100644
+--- a/lib/vmadm-watcher-fsm.js
++++ b/lib/vmadm-watcher-fsm.js
+@@ -13,7 +13,6 @@
+ var assert = require('assert-plus');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+-var vmadm = require('vmadm');
+ 
+ var WATCHED_FIELDS = [
+     'resolvers',
+@@ -33,6 +32,8 @@ function VmadmEventsFSM(opts) {
+ 
+     assert.object(opts, 'opts');
+     assert.object(opts.log, 'opts.log');
++    assert.ok(['object', 'function']
++        .indexOf(typeof (opts.vmadm)) !== -1, 'opts.vmadm');
+ 
+     self.log = opts.log.child({
+         component: 'vmadm-events'
+@@ -41,6 +42,7 @@ function VmadmEventsFSM(opts) {
+     self.ignore = {};
+     self.emitter = null;
+     self.stopWatcher = null;
++    self.vmadm = opts.vmadm;
+ 
+     mod_mooremachine.FSM.call(self, 'init');
+ }
+@@ -76,6 +78,8 @@ VmadmEventsFSM.prototype.state_init = function (S) {
+ 
+         var needsUpdate = false;
+ 
++        self.log.trace({ev: ev}, 'saw event from "vmadm events"');
++
+         if (ev.vm && ev.vm.do_not_inventory) {
+             self.ignore[ev.zonename] = true;
+             self.log.debug('VM %s ignored - do_not_inventory set',
+@@ -90,6 +94,8 @@ VmadmEventsFSM.prototype.state_init = function (S) {
+             assert(!self.vms.hasOwnProperty(ev.zonename), 'VM already created');
+ 
+             self.vms[ev.zonename] = ev.vm;
++            self.log.debug('VM %s created - setting needsUpdate', ev.zonename);
++            needsUpdate = true;
+             break;
+         case 'modify':
+             assert.object(ev.vm, 'ev.vm');
+@@ -165,7 +171,7 @@ VmadmEventsFSM.prototype.state_init = function (S) {
+         S.gotoState('running');
+     }
+ 
+-    self.emitter = vmadm.events(opts, handler, ready);
++    self.emitter = self.vmadm.events(opts, handler, ready);
+ 
+     S.on(self.emitter, 'error', function (err) {
+         self.log.error(err, 'vmadm events error');
+@@ -237,6 +243,7 @@ function VmadmWatcherFSM(opts) {
+     self.log = opts.app.log.child({
+         component: 'vmadm-watcher'
+     }, true);
++    self.vmadm = opts.vmadm;
+ 
+     mod_mooremachine.FSM.call(self, 'init');
+ }
+@@ -253,7 +260,7 @@ VmadmWatcherFSM.prototype.state_init = function (S) {
+ VmadmWatcherFSM.prototype.state_running = function (S) {
+     var self = this;
+ 
+-    self.vmadmevents = new VmadmEventsFSM({log: self.log});
++    self.vmadmevents = new VmadmEventsFSM({log: self.log, vmadm: self.vmadm});
+ 
+     S.on(self.vmadmevents, 'vms-update', function (vms) {
+         self.app.updateVMs(vms);
+diff --git a/lib/watcher-fsm.js b/lib/watcher-fsm.js
+index ba3137a..abcfb78 100644
+--- a/lib/watcher-fsm.js
++++ b/lib/watcher-fsm.js
+@@ -16,7 +16,6 @@ var mod_fs = require('fs');
+ var mod_jsprim = require('jsprim');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+-var vmadm = require('vmadm');
+ 
+ var LineStream = require('lstream');
+ 
+@@ -74,6 +73,8 @@ function currentMillis() {
+ function ZoneEventFSM(opts) {
+     assert.object(opts, 'opts');
+     assert.object(opts.log, 'opts.log');
++    assert.ok(['object', 'function']
++        .indexOf(typeof (opts.vmadm)) !== -1, 'opts.vmadm');
+ 
+     this.log = opts.log.child({
+         component: 'zoneevent'
+@@ -82,6 +83,7 @@ function ZoneEventFSM(opts) {
+     this.proc = null;
+     this.stdout = null;
+     this.stderr = null;
++    this.vmadm = opts.vmadm;
+ 
+     mod_mooremachine.FSM.call(this, 'init');
+ }
+@@ -264,7 +266,7 @@ WatcherFSM.prototype.state_refresh = function (S) {
+         S.gotoState('waiting');
+     }
+ 
+-    vmadm.lookup({}, {
++    self.vmadm.lookup({}, {
+         log: self.log,
+         include_dni: false,
+         fields: FIELDS
+diff --git a/package.json b/package.json
+index e29dd92..00d495a 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+     "name": "net-agent",
+     "description": "Triton Network Agent",
+-    "version": "2.1.0",
++    "version": "2.2.0",
+     "author": "Joyent (joyent.com)",
+     "private": true,
+     "dependencies": {
+@@ -19,7 +19,7 @@
+         "uuid": "3.2.1",
+         "vasync": "^1.6.4",
+         "verror": "^1.6.1",
+-        "vmadm": "1.1.0"
++        "vmadm": "1.3.0"
+     },
+     "sdcDependencies": {
+         "config-agent": ">=1.3.0"

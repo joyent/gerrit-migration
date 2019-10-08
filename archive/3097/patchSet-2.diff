@@ -1,0 +1,503 @@
+commit 56946cee27875f5c474bfe0560b6cc2c0869deeb (refs/changes/97/3097/2)
+Author: Chris Burroughs <chris.burroughs@joyent.com>
+Date:   2017-12-12T13:58:56-05:00 (1 year, 10 months ago)
+    
+    HEAD-2207 booter should warm cache by writing out files for every CN
+
+diff --git a/lib/boot-files.js b/lib/boot-files.js
+index 5b37db5..2ef65ba 100644
+--- a/lib/boot-files.js
++++ b/lib/boot-files.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -31,7 +31,7 @@ var mod_vasync = require('vasync');
+ function extractBootOpts(opts) {
+     var bootOpts = {
+         adminUuid: opts.config.adminUuid,
+-        cacheDir: fmt('%s/cache', opts.config.tftpRoot),
++        cacheDir: opts.config.cache.dir,
+         cnapi: opts.cnapi,
+         disableHash: opts.config.disableHash || false,
+         disableBootTimeFiles: opts.config.disableBootTimeFiles || false,
+diff --git a/lib/booter.js b/lib/booter.js
+index 16722ea..fe815d5 100644
+--- a/lib/booter.js
++++ b/lib/booter.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -19,7 +19,6 @@ var fs = require('fs');
+ var menu = require('./menulst');
+ var mod_clients = require('./clients');
+ var path = require('path');
+-var util = require('util');
+ 
+ 
+ 
+@@ -59,7 +58,7 @@ function main() {
+     case 'bootparams':
+         bootparams.getBootParams({
+             adminUuid: config.adminUuid,
+-            cacheDir: util.format('%s/cache', config.tftpRoot),
++            cacheDir: config.cache.dir,
+             mac: getArg('MAC address'),
+             napi: napi,
+             cnapi: cnapi,
+@@ -72,7 +71,7 @@ function main() {
+     case 'menu-lst':
+         bootparams.getBootParams({
+             adminUuid: config.adminUuid,
+-            cacheDir: util.format('%s/cache', config.tftpRoot),
++            cacheDir: config.cache.dir,
+             mac: getArg('MAC address'),
+             napi: napi,
+             cnapi: cnapi,
+@@ -93,7 +92,7 @@ function main() {
+     case 'boot-ipxe':
+         bootparams.getBootParams({
+             adminUuid: config.adminUuid,
+-            cacheDir: util.format('%s/cache', config.tftpRoot),
++            cacheDir: config.cache.dir,
+             mac: getArg('MAC address'),
+             napi: napi,
+             cnapi: cnapi,
+diff --git a/lib/cache.js b/lib/cache.js
+new file mode 100644
+index 0000000..01e3dab
+--- /dev/null
++++ b/lib/cache.js
+@@ -0,0 +1,288 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017, Joyent, Inc.
++ */
++/* jsl:ignore */
++'use strict';
++/* jsl:end */
++
++// stdlib
++const fs = require('fs');
++const path = require('path');
++
++// npm
++var assert = require('assert-plus');
++const vasync = require('vasync');
++const verror = require('verror');
++
++// local
++const mod_bootparams = require('./bootparams');
++
++
++/*
++ * From the upstream docs <https://nodejs.org/docs/latest-v4.x/api/timers.html>
++ * "To follow browser behavior, when using delays larger than 2147483647
++ * milliseconds (approximately 25 days) or less than 1, Node will use 1 as the
++ * delay."  Such short intervals would not make sense as intentional values for
++ * booter cache management.
++ */
++function isSafeTimerValueSeconds(val) {
++    const maxSeconds =  Math.floor(2147483647 / 1000);
++    return val > 0 && val < maxSeconds;
++}
++
++
++/*
++ * To boot a CN, booter needs information from other services, such as which
++ * platform image to use.  However, those services could be located on the down
++ * CNs that are trying to boot, resulting in a circular dependency in need of
++ * manual intervention.  To guard against this situation, the bootparams module
++ * writes out local cache of the last used values for each CN.  When there is an
++ * error connecting to the required services, those local files are used as a
++ * fallback.  CacheSentinel performs two period tasks for the maintenance of
++ * those cache files:
++ *
++ * Refresh: On a configurable time interval, gather the list of *all* current
++ * CNs (not just recently booted ones) and pre-populate the cache will their
++ * current configuration.  This narrows the vulnerability window of bad or
++ * missing data to the refresh period.  CNs that boot during the window, or have
++ * their configuration changed through a sdcadm workflow will still have their
++ * cached values updated normally.
++ *
++ * Purge: On a configurable time interval, delete cache files that have not been
++ * updated in a long (configurable) time.  This is to remove cache files for
++ * decommissioned CNs so the cache size does not grow indefinitely with obsolete
++ * data.  Purging is only done if the last refresh completed without error.
++ */
++function CacheSentinel(opts) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.object(opts.cnapi, 'opts.cnapi');
++    assert.object(opts.napi, 'opts.napi');
++    assert.uuid(opts.adminUuid, 'opts.adminUuid');
++
++    assert.object(opts.cacheConfig, 'opts.cacheConfig');
++    assert.string(opts.cacheConfig.dir, 'opts.cacheConfig.dir');
++    assert.number(opts.cacheConfig.refreshIntervalSeconds,
++                  'opts.cacheConfig.refreshIntervalSeconds');
++    assert.ok(isSafeTimerValueSeconds(opts.cacheConfig.refreshIntervalSeconds),
++              'Invalid timer value refreshIntervalSeconds');
++    assert.number(opts.cacheConfig.purgeIntervalSeconds,
++                  'opts.cacheConfig.purgeIntervalSeconds');
++    assert.ok(isSafeTimerValueSeconds(opts.cacheConfig.purgeIntervalSeconds),
++              'Invalid timer value purgeIntervalSeconds');
++    assert.number(opts.cacheConfig.maxCacheFileAgeSeconds,
++                  'opts.cacheConfig.maxCacheFileAgeSeconds');
++    assert.ok(opts.cacheConfig.maxCacheFileAgeSeconds > 0,
++              'maxCacheFileAgeSeconds must be positive');
++    assert.number(opts.cacheConfig.refreshConcurrency,
++                  'opts.cacheConfig.refreshConcurrency');
++    assert.ok(opts.cacheConfig.refreshConcurrency > 0,
++              'refreshConcurrency must be positive');
++
++    this.log = opts.log;
++    this.cnapi = opts.cnapi;
++    this.napi = opts.napi;
++    this.adminUuid = opts.adminUuid;
++
++    this.cacheDir = opts.cacheConfig.dir;
++    this.refreshInterval = opts.cacheConfig.refreshIntervalSeconds * 1000;
++    this.purgeInterval = opts.cacheConfig.purgeIntervalSeconds * 1000;
++    this.maxCacheFileAge = opts.cacheConfig.maxCacheFileAgeSeconds * 1000;
++    this.refreshConcurrency = opts.cacheConfig.refreshConcurrency;
++
++    this.refreshStartTime = undefined;
++    this.purgeStartTime = undefined;
++    // TODO(cburroughs): This should be exposed a metric for operators to
++    // monitor
++    this.lastRefreshSuccessTime = undefined;
++    this.lastRefreshSuccessful = undefined;
++}
++
++
++CacheSentinel.prototype.start = function start() {
++    this.log.info({'adminUuid': this.adminUuid,
++                   'cacheDir': this.cacheDir,
++                   'refreshInterval': this.refreshInterval,
++                   'purgeInterval': this.purgeInterval,
++                   'maxCacheFileAge': this.maxCacheFileAge,
++                   'refreshConcurrency': this.refreshConcurrency},
++                  'starting CacheSentinel');
++    this.setNextRefreshTimeout();
++    this.setNextPurgeTimeout();
++};
++
++
++CacheSentinel.prototype.setNextRefreshTimeout =
++    function setNextRefreshTimeout() {
++        const timeout = setTimeout(this.refreshCache.bind(this),
++                                   this.refreshInterval);
++        timeout.unref();
++};
++
++
++CacheSentinel.prototype.setNextPurgeTimeout = function setNextPurgeTimeout() {
++    const timeout = setTimeout(this.purgeCache.bind(this), this.purgeInterval);
++    timeout.unref();
++};
++
++
++CacheSentinel.prototype.refreshCache = function refreshCache() {
++    this.refreshStartTime = Date.now();
++    this.lastRefreshSuccessful = undefined;
++
++    const self = this;
++    vasync.pipeline({
++        arg: {},
++        funcs: [
++            function stepListServers(stash, next) {
++                self.cnapi.listServers(function onList(err, servers) {
++                    if (err) {
++                        return next(new verror.VError(
++                            err,
++                            'unable to list servers during refresh'));
++                    }
++                    stash.servers = servers;
++                    return next();
++                });
++            },
++            function stepListNics(stash, next) {
++                self.napi.listNics(
++                    {nic_tag: 'admin', belongs_to_type: 'server'},
++                    function onList(err, nics) {
++                        if (err) {
++                        return next(new verror.VError(
++                            err,
++                            'unable to list nics during refresh'));
++                        }
++                        stash.nics = nics;
++                        return next();
++                    });
++            },
++            function stepFilterToMacs(stash, next) {
++                const serverUUIDs = stash.servers.map(function (s) {
++                    return s.uuid;
++                });
++                const currentNics = stash.nics.filter(
++                    function (nic) {
++                        return serverUUIDs.indexOf(nic.belongs_to_uuid) > -1;
++                    });
++                stash.macs = currentNics.map(function (n) {
++                    return n.mac;
++                });
++                self.log.debug(
++                    'found %d current macs ' +
++                        'total-servers:%d total-admin nics:%d',
++                    stash.macs.length, serverUUIDs.length, stash.nics.length);
++                next();
++            },
++            function stepFillCacheViaBootParams(stash, next) {
++                const qErrors = [];
++                const queue = vasync.queue(function worker(mac, cb) {
++                    mod_bootparams.getBootParams({
++                        adminUuid: self.adminUuid,
++                        cacheDir: self.cacheDir,
++                        mac: mac,
++                        napi: self.napi,
++                        cnapi: self.cnapi,
++                        log: self.log
++                    }, cb);
++                }, self.refreshConcurrency);
++                for (var i = 0; i < stash.macs.length; i++) {
++                    queue.push(stash.macs[i], function qDone(qErr) {
++                        if (qErr) {
++                            qErrors.push(qErr);
++                        }
++                    });
++                }
++                queue.on('end', function () {
++                    if (qErrors.length) {
++                        self.log.error(new verror.MultiError(qErrors),
++                                  'error while fetching cache boot params');
++                    } else {
++                        const now = Date.now();
++                        const duration = now - self.refreshStartTime;
++                        self.lastRefreshSuccessTime = now;
++                        self.lastRefreshSuccessful = true;
++                        self.log.info('cache refresh for %d items in %d ms',
++                                      stash.macs.length, duration);
++                    }
++                    self.setNextRefreshTimeout();
++                    next();
++                });
++                queue.close();
++            }
++        ]
++    }, function pipelineDone(err, results) {
++        if (err) {
++            self.log.error(err,
++                           'error while preparing to refresh cache');
++            self.lastRefreshSuccessful = false;
++            self.setNextRefreshTimeout();
++            return;
++        }
++    });
++};
++
++
++CacheSentinel.prototype.purgeCache = function purgeCache() {
++    this.purgeStartTime = Date.now();
++
++    if (!this.lastRefreshSuccessful) {
++        this.log.warn('last refresh failed; delaying purge. Last success at %d',
++                      this.lastRefreshSuccessTime);
++        this.setNextPurgeTimeout();
++        return;
++    }
++
++    const self = this;
++    const purgedPaths = [];
++    const checkAndPurgeCacheFile = function (fpath, cb) {
++        fs.stat(fpath, function withStat(err, stats) {
++            if (err) {
++                return cb(
++                    new verror.Verror(err, 'error stating file %s', fpath));
++            }
++            const age = Date.now() - stats.mtime;
++            if (age > self.maxCacheFileAge) {
++                self.log.debug(
++                    'file %s last modifed %d, %d ms old; unlinking',
++                    fpath, stats.mtime, age);
++                purgedPaths.push(fpath);
++                return fs.unlink(fpath, cb);
++            }
++            return cb();
++        });
++    };
++    fs.readdir(self.cacheDir, function onRead(err, cacheFiles) {
++        if (err) {
++            self.log.error(err);
++            self.setNextPurgeTimeout();
++            return;
++        }
++
++        vasync.forEachParallel({
++            func: checkAndPurgeCacheFile,
++            inputs: cacheFiles.map(function (p) {
++                return path.join(self.cacheDir, p);
++            })
++        }, function (err2, results) {
++            if (err2) {
++                self.log.error(err, 'error during purge process');
++            }
++            self.log.info({purged: purgedPaths},
++                          'purged %d cache entries', purgedPaths.length);
++            self.setNextPurgeTimeout();
++        });
++    });
++};
++
++
++module.exports = {
++    CacheSentinel: CacheSentinel
++};
+diff --git a/lib/dhcpd.js b/lib/dhcpd.js
+index fd974ae..b5ae542 100755
+--- a/lib/dhcpd.js
++++ b/lib/dhcpd.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -20,6 +20,7 @@ var fs = require('fs');
+ var dgram = require('dgram');
+ var dhcp = require('./dhcp');
+ var mod_boot_files = require('./boot-files');
++var mod_cache = require('./cache');
+ var mod_clients = require('./clients');
+ var sprintf = require('sprintf').sprintf;
+ var uuid = require('node-uuid');
+@@ -39,6 +40,10 @@ function DHCPD(opts) {
+     this.cnapi = mod_clients.createCNAPIclient(this.config);
+     this.log = opts.log;
+     this.napi = mod_clients.createNAPIclient(this.config);
++
++    this.cacheSentinel = new mod_cache.CacheSentinel(
++        {log: this.log, cnapi: this.cnapi, napi: this.napi,
++         adminUuid: this.config.adminUuid, cacheConfig: this.config.cache});
+ }
+ 
+ 
+@@ -59,6 +64,7 @@ DHCPD.prototype.start = function () {
+             self.config.listenIp, self.config.port);
+     });
+     this.sock.bind(this.config.port, this.config.listenIp);
++    this.cacheSentinel.start();
+ };
+ 
+ 
+diff --git a/package.json b/package.json
+index 2077e73..06eff60 100644
+--- a/package.json
++++ b/package.json
+@@ -15,7 +15,8 @@
+     "sdc-clients": "10.3.0",
+     "sdc-bunyan-serializers": "git+https://github.com/joyent/sdc-bunyan-serializers.git#a3e7780",
+     "sprintf": "0.1.0",
+-    "vasync": "1.6.2"
++    "vasync": "1.6.2",
++    "verror":  "1.10.0"
+   },
+   "devDependencies": {
+     "clone": "0.1.4",
+diff --git a/sapi_manifests/dhcpd/template b/sapi_manifests/dhcpd/template
+index 8ada40f..abd3aca 100644
+--- a/sapi_manifests/dhcpd/template
++++ b/sapi_manifests/dhcpd/template
+@@ -33,5 +33,12 @@
+   "leaseTime": {{{dhcp_lease_time}}},
+   "resolvers": {{{resolvers}}}{{^resolvers}}[]{{/resolvers}},
+   "netmask": "{{{admin_netmask}}}"{{#allow_missing_class_id}},
+-  "allowMissingClassID": true{{/allow_missing_class_id}}
++  "allowMissingClassID": true{{/allow_missing_class_id}},
++  "cache": {
++    "dir": "/tftpboot/cache",
++    "refreshIntervalSeconds": 300,
++    "purgeIntervalSeconds": 3600,
++    "maxCacheFileAgeSeconds": 604800,
++    "refreshConcurrency": 16
++  }
+ }
+diff --git a/test/lib/mocks.js b/test/lib/mocks.js
+index 0166a3c..610b58f 100644
+--- a/test/lib/mocks.js
++++ b/test/lib/mocks.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -319,13 +319,16 @@ function registerMocks() {
+         'vasync',
+         'verror',
+         '../../lib/boot-files',
++        '../../lib/cache',
+         '../../lib/dhcpd',
+         '../lib/bootparams',
++        '../lib/cache',
+         '../lib/dhcpd',
+         '../lib/menulst',
+         './bootparams',
+         './boot-files',
+         './clients',
++        './cache',
+         './dhcp',
+         './find',
+         './json-file',
+diff --git a/test/lib/server.js b/test/lib/server.js
+index 45631ee..b7b14cf 100644
+--- a/test/lib/server.js
++++ b/test/lib/server.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -90,7 +90,16 @@ function serverConfig() {
+         port: 10067,
+         resolvers: [],
+         serverIp: '10.99.99.9',
+-        tftpRoot: '/tmp/tftpRoot'
++        tftpRoot: '/tmp/tftpRoot',
++        // For testing of other server components, intervals set to a high value
++        // that will not fire during a unit test run of any reasonable length.
++        cache: {
++            dir: '/tmp/tftpRoot/cache',
++            refreshIntervalSeconds: 3000,
++            purgeIntervalSeconds: 36000,
++            maxCacheFileAgeSeconds: 604800,
++            refreshConcurrency: 1
++        }
+     };
+ }
+ 

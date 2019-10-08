@@ -1,0 +1,245 @@
+commit 39754b41041112471f7036088700fdf291e7a602 (refs/changes/71/1271/3)
+Author: Jordan Hendricks <jordan.hendricks@joyent.com>
+Date:   2017-01-23T18:18:26+00:00 (2 years, 8 months ago)
+    
+    MANTA-2169 Support multipart upload of a single file to Manta
+
+diff --git a/lib/dtrace.js b/lib/dtrace.js
+index 2b8b3ba..2c082e1 100644
+--- a/lib/dtrace.js
++++ b/lib/dtrace.js
+@@ -42,7 +42,13 @@ var PROBES = {
+     'findobjects-record': ['int', 'char *', 'int', 'char *', 'char *'],
+ 
+     // msgid, num_records
+-    'findobjects-done': ['int', 'int']
++    'findobjects-done': ['int', 'int'],
++
++    // msgid, req_id, dirnme, requests
++    'batch-start': ['int', 'int', 'int', 'char *'],
++
++    // msgid
++    'batch-done': ['int']
+ };
+ var PROVIDER;
+ 
+diff --git a/lib/schema/manta.js b/lib/schema/manta.js
+index 1a3816a..90e0d66 100644
+--- a/lib/schema/manta.js
++++ b/lib/schema/manta.js
+@@ -5,37 +5,43 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var path = require('path');
+ 
++// return the dirname of the key, if dirname === '.' this means there was
++// no dir, then just return the key as is
++function dirnameOrKey(key) {
++    /* JSSTYLED */
++    var ROOT_RE = /^\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/stor$/;
++    var tkey = ROOT_RE.test(key) ? key : path.dirname(key);
++    if (tkey === '.') {
++        return key;
++    } else {
++        return tkey;
++    }
++}
+ 
+ ///--- Exports
+ 
+ module.exports = {
+-    // return the dirname of the key, if dirname === '.' this means there was
+-    // no dir, then just return the key as is
+     manta: function manta(key) {
+-        /* JSSTYLED */
+-        var ROOT_RE = /^\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/stor$/;
+-        var tkey = ROOT_RE.test(key) ? key : path.dirname(key);
+-        if (tkey === '.') {
+-            return key;
+-        } else {
+-            return tkey;
++        return (dirnameOrKey(key));
++    },
++    manta_uploads: function manta_uploads(key) {
++        var split = key.split(':', 2);
++        if (split.length < 2) {
++            return (key);
+         }
++        // A path can contain colons, so we want to make sure we only exclude
++        // what's before the first colon (namely, the upload ID).
++        var objectPath = key.substring(key.indexOf(':') + 1);
++        return (dirnameOrKey(objectPath));
+     },
+     // same as the manta bucket, used for unit tests so they don't stomp all
+     // over the actual manta bucket
+     testmanta: function testmanta(key) {
+-        /* JSSTYLED */
+-        var ROOT_RE = /^\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\/stor$/;
+-        var tkey = ROOT_RE.test(key) ? key : path.dirname(key);
+-        if (tkey === '.') {
+-            return key;
+-        } else {
+-            return tkey;
+-        }
++        return (dirnameOrKey(key));
+     }
+ };
+diff --git a/lib/server.js b/lib/server.js
+index 7975cf5..caf87f3 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -18,6 +18,7 @@ var vasync = require('vasync');
+ var verror = require('verror');
+ 
+ var dtrace = require('./dtrace');
++var schema = require('./schema');
+ var ring = require('./ring');
+ require('./errors');
+ 
+@@ -860,25 +861,129 @@ function updateObjects(options) {
+     return _updateObjects;
+ }
+ 
+-// we don't support batch operations
++/*
++ * We only want to support batching for a very specific use-case for now:
++ * specifically, the commit step of Manta multipart uploads. To do so,
++ * we require very specific parameters for the batch request.
++ *
++ * In particular, the batch must only contain two 'put' requests, with identical
++ * keys of the form '<id>:<path>', with one request destined for the 'manta'
++ * bucket, and the other for the 'manta_uploads' bucket.
++ */
++function isMantaMultipartUploadRequest(requests) {
++    if (requests.length !== 2) {
++        return (false);
++    }
++
++    if (requests[0].key !== requests[1].key) {
++        return (false);
++    }
++
++    var split = requests[0].key.split(':');
++    if (split.length !== 2) {
++        return (false);
++    }
++
++    var op1 = requests[0].operation;
++    var op2 = requests[1].operation;
++
++    if (op1 !== 'put' || op2 !== 'put') {
++        return (false);
++    }
++
++    var bucket1 = requests[0].bucket;
++    var bucket2 = requests[1].bucket;
++
++    return ((bucket1 === 'manta' && bucket2 === 'manta_uploads') ||
++            (bucket1 === 'manta_uploads' && bucket2 === 'manta'));
++}
++
++
++/*
++ * Performs the batch functionality for multipart upload.
++ *
++ * First, we select the correct shard by extracting the object path
++ * from the keys, which are of the form '<id>:<object path>' and passing
++ * this to getNode. Once we have the correct node, we then overwrite the
++ * key for the object record with its correct key, instead of the one that
++ * came in with the request. Finally, we batch the request, which will
++ * insert a finalizing record and object record atomically on the shard.
++ */
++function multipartUploadFinalize(options, requests, opts, res) {
++    var id = opts.req_id || uuid.v1();
++    var log = options.log.child({
++        req_id: id
++    });
++
++    log.debug({
++        requests: requests,
++        opts: opts
++    }, 'batch: entered');
++
++
++    var dirname = schema.transformKey('manta_uploads', requests[0].key);
++    dtrace['batch-start'].fire(function () {
++        return ([res.msgid, id, dirname, requests]);
++    });
++
++    options.ring.getNode('manta', dirname, function (err, node) {
++        if (err) {
++            res.end(err);
++            return (undefined);
++        }
++        if (node.data && node.data === READ_ONLY) {
++            log.debug({
++                bucket: 'manta',
++                dirname: dirname,
++                opts: opts,
++                node: node
++            }, 'batch: failed vnode is read only');
++            return res.end(new ReadOnlyError());
++        }
++        var pnode = node.pnode;
++        var client = options.clients.map[pnode];
++
++        // Ensure keys are set properly for each request.
++        debugger;
++        requests.forEach(function (r) {
++            if (r.bucket === 'manta') {
++                r.key = r.key.split(':')[1];
++            } else {
++                assert.ok(r.bucket === 'manta_uploads');
++            }
++        });
++        client.batch(requests, opts, function (_err, meta) {
++            log.debug({
++                err: _err,
++                meta: meta
++            }, 'batch: returned');
++
++            dtrace['batch-done'].fire(function () {
++                return ([res.msgid]);
++            });
++            res.end(_err ? _err : meta);
++        });
++    });
++}
++
++/*
++ * Batching is generally not supported, with the exception of batching
++ * a multipart upload commit request from Manta.
++ */
+ function batch(options) {
+     assert.object(options, 'options');
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+     function _batch(requests, opts, res) {
+-        var id = opts.req_id || uuid.v1();
+-        var log = options.log.child({
+-            req_id: id
+-        });
+-
+-        log.debug({
+-            requests: requests,
+-            opts: opts
+-        }, 'batch: entered');
+-
+-        res.end(new Error('Operation not supported'));
++        if (!isMantaMultipartUploadRequest(requests)) {
++            res.end(new Error('Operation not supported'));
++            return (undefined);
++        } else {
++            return (multipartUploadFinalize(options, requests, opts, res));
++        }
+     }
+ 
+     return _batch;
++
+ }

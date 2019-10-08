@@ -1,0 +1,373 @@
+commit dac42cf58b4c9812eb5d5c0fba09a40d4773d2a9 (refs/changes/95/1395/8)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2017-02-22T16:05:48-08:00 (2 years, 7 months ago)
+    
+    DOCKER-893 Improve docker pull reliability
+
+diff --git a/docs/index.md b/docs/index.md
+index 20a969c..c3dc4a8 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -652,6 +652,7 @@ Error codes that can be returned from IMGAPI endpoints.
+ | OperatorOnly | 403 | Operator-only endpoint called by a non-operator. |
+ | ImageUuidAlreadyExists | 409 | Attempt to import an image with a conflicting UUID |
+ | Upload | 400 | There was a problem with the upload. |
++| Download | 400 | There was a problem with the download. |
+ | StorageIsDown | 503 | Storage system is down. |
+ | StorageUnsupported | 503 | The storage type for the image file is unsupported. |
+ | RemoteSourceError | 503 | Error contacting the remote source. |
+@@ -660,9 +661,11 @@ Error codes that can be returned from IMGAPI endpoints.
+ | NotImageOwner | 422 | The caller is not the owner of this image. |
+ | NotMantaPathOwner | 422 | The caller is not the owner of this Manta path. |
+ | OriginDoesNotExist | 422 | No image exists with the UUID given in the "origin" field for image creation or import. |
++| OriginIsNotActive | 422 | An origin image of the given image exists, but is not active. |
+ | InsufficientServerVersion | 422 | Image creation is not supported for this VM because the host server version is not of a recent enough version. |
+ | ImageHasDependentImages | 422 | An error raised when attempting to delete an image which has dependent incremental images (images whose "origin" is this image). |
+ | NotAvailable | 501 | Functionality is not available. |
++| NotImplemented | 400 | Attempt to use a feature that is not yet implemented |
+ | InternalError | 500 | Internal Server Error |
+ | ResourceNotFound | 404 | Not Found |
+ | InvalidHeader | 400 | An invalid header was given in the request. |
+diff --git a/lib/errors.js b/lib/errors.js
+index 9dc06d1..2dd54b1 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -524,6 +524,40 @@ function parseErrorFromStorage(err, message) {
+     }
+ }
+ 
++// Handle docker registry client errors and convert these errors into IMGAPI
++// errors. Note that err could be a docker registry client error, a node.js
++// http/connection error or a restify error. Due to this we use the 'name'
++// and/or 'code' attributes of the error to check what type of error it is and
++// convert it into the error instance we want.
++function wrapErrorFromDrc(err) {
++    if (!err) {
++        return err;
++    }
++    if (err.name === 'BadDigestError') {
++        // Docker registry client digest error.
++        return new ValidationFailedError(err,
++            (err.message || err.toString()),
++            [ {field: 'digest', code: 'Invalid'} ]);
++    } else if (err.name === 'ConnectTimeoutError') {
++        // Restify connection timeout.
++        return new RemoteSourceError(err, err.message);
++    } else if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET' ||
++        err.code === 'ENOTFOUND')
++    {
++        // Node.js connection error.
++        return new RemoteSourceError(err, err.message);
++    } else if (err.name === 'DownloadError') {
++        // Docker registry client download error.
++        return new DownloadError(err, err.message);
++    } else if (err.name === 'UnauthorizedError') {
++        // Docker registry client unauthorized error.
++        return new restify.UnauthorizedError(err, err.message);
++    } else {
++        // Unexpected error - wrap it into an internal error.
++        return new restify.InternalError(err, err.message);
++    }
++}
++
+ 
+ samples.InternalError = new restify.InternalError('boom');
+ 
+@@ -566,6 +600,9 @@ module.exports = {
+     // Helper function to parse errors that come from manta
+     parseErrorFromStorage: parseErrorFromStorage,
+ 
++    // Helper function to wrap errors that come from docker registry client.
++    wrapErrorFromDrc: wrapErrorFromDrc,
++
+     samples: samples
+ };
+ 
+diff --git a/lib/images.js b/lib/images.js
+index 03ced87..934c58f 100644
+--- a/lib/images.js
++++ b/lib/images.js
+@@ -74,6 +74,15 @@ var IMGAPI_251_MIN_PLATFORM = {
+     '6.5': '20120614T001014Z'
+ };
+ 
++/*
++ * DOCKER-893: Maintain an in-memory image cache (just the image/layer metadata)
++ * for the docker layers that have been downloaded, but not yet registered with
++ * an image. This is used when a docker image download fails, we keep all the
++ * successfully downloaded layers from that image in this cache. If the image is
++ * attempted to be downloaded again, this cache is checked to avoid
++ * re-downloading those layers.
++ */
++var DOCKER_IMAGE_CACHE = {};
+ 
+ 
+ //---- Image model
+@@ -2433,6 +2442,7 @@ function _dockerDownloadAndImportImage(opts, callback) {
+         return callback(infoErr);
+     }
+     var active = false;
++    var addImageFileAttempts = 0;
+     var unactivated = false;
+     var fileSize = -1; // The same value used in Docker-docker for "don't know".
+     var manifest;
+@@ -2460,6 +2470,20 @@ function _dockerDownloadAndImportImage(opts, callback) {
+             return callback(gErr);
+         }
+ 
++        // Check if this image layer has already been downloaded before.
++        if (DOCKER_IMAGE_CACHE.hasOwnProperty(imgId)) {
++            var cachedItem = DOCKER_IMAGE_CACHE[imgId];
++            ctx.fileInfoFromImgId[imgId] = cachedItem.fileInfo;
++            ctx.imageFromImgId[imgId] = cachedItem.image;
++            ctx.alreadyExistsFromImgId[imgId] = true;
++
++            log.debug({imgId: imgId, uuid: uuid},
++                'dockerDownloadAndImportImage: image layer already cached');
++
++            callback();
++            return;
++        }
++
+         log.debug({uuid: uuid, repo: rat.canonicalName, imgId: imgId},
+             'AdminImportDockerImage: start import');
+ 
+@@ -2517,7 +2541,7 @@ function _dockerDownloadAndImportImage(opts, callback) {
+             imgId: imgId
+         }, function (err, imgJson_, getRes) {
+             imgJson = imgJson_;
+-            next(err);
++            next(errors.wrapErrorFromDrc(err));
+         });
+     }
+ 
+@@ -2623,16 +2647,72 @@ function _dockerDownloadAndImportImage(opts, callback) {
+             }
+         })(function (err, stream) {
+             if (err) {
+-                next(err);
++                next(errors.wrapErrorFromDrc(err));
+                 return;
+             }
+ 
++            assert.object(stream.connection, 'stream.connection');
++
++            var DOCKER_READ_STREAM_TIMEOUT = 5 * 1000;
++            var MAX_IMAGE_FILE_DOWNLOAD_ATTEMPTS = 5;
++
+             var lastUpdate = 0;
+             var updateEvery = 512 * 1024;
+             var startTs = Math.floor(new Date().getTime() / 1000);
++            var streamTimeoutHandler;
+ 
+             var compression = 'none';
+ 
++            // Setup a timeout listener and handle connection timeout.
++            stream.connection.setTimeout(DOCKER_READ_STREAM_TIMEOUT);
++            streamTimeoutHandler = function onDockerStreamTimeout() {
++                log.info({imgId: imgId, size: size, fileSize: fileSize},
++                    'dockerDownloadAndImportImage: '
++                    + 'createBlobReadStream connection timed out');
++                ctx.resMessage({
++                    type: 'progress',
++                    payload: {
++                        id: imgId.substr(0, 12),
++                        status: 'Connection timed out',
++                        progressDetail: {
++                            current: size,
++                            total: fileSize,
++                            start: startTs
++                        }
++                    }
++                });
++                // Note that by destroying the stream this will result in a
++                // call to finish() with an error, as the drc
++                // createBlobReadStream handler has an 'end' handler that
++                // validates the size and digest of downloaded data and
++                // emits an error event when all the data wasn't downloaded.
++                stream.destroy();
++            };
++            stream.connection.on('timeout', streamTimeoutHandler);
++
++            // Retry the download if there are attempts left.
++            function retryAddImageFile(rErr) {
++                addImageFileAttempts += 1;
++                if (addImageFileAttempts >= MAX_IMAGE_FILE_DOWNLOAD_ATTEMPTS) {
++                    log.info({imgId: imgId, fileSize: fileSize},
++                        'dockerDownloadAndImportImage: download failed after '
++                        + '%d attempts', addImageFileAttempts);
++                    next(rErr);
++                    return;
++                }
++                // Give a short respite and then go again.
++                setTimeout(function () {
++                    if (ctx.downloadsCanceled) {
++                        next(new errors.DownloadError('Download canceled'));
++                        return;
++                    }
++                    log.info({imgId: imgId, fileSize: fileSize,
++                        addImageFileAttempts: addImageFileAttempts},
++                        'dockerDownloadAndImportImage: retrying blob download');
++                    addImageFile(null, next);
++                }, 1000);
++            }
++
+             if (stream.headers['content-length'] !== undefined) {
+                 fileSize = Number(stream.headers['content-length']);
+             }
+@@ -2641,7 +2721,19 @@ function _dockerDownloadAndImportImage(opts, callback) {
+             var stor;  // the storage class
+             var sha1;
+             function finish_(fErr, tmpFilename, filename) {
++                // Remove connection timeout handler.
++                stream.connection.removeListener('timeout',
++                    streamTimeoutHandler);
++                streamTimeoutHandler = null;
++
+                 if (fErr) {
++                    if (fErr.name === 'DownloadError') {
++                        retryAddImageFile(fErr);
++                        return;
++                    }
++                    log.info({imgId: imgId, err: err},
++                        'dockerDownloadAndImportImage: ' +
++                        'not retrying on this error');
+                     return next(fErr);
+                 } else if (ctx.downloadsCanceled) {
+                     return next(new errors.DownloadError('Download canceled'));
+@@ -2651,9 +2743,11 @@ function _dockerDownloadAndImportImage(opts, callback) {
+                         'maximum allowed file size, %s',
+                         size, MAX_IMAGE_SIZE_STR)));
+                 } else if (fileSize >= 0 && size !== fileSize) {
+-                    return next(new errors.DownloadError(format(
++                    // Retry - as there was an issue downloading all the bits.
++                    retryAddImageFile(new errors.DownloadError(format(
+                         'Download error: "Content-Length" header, %s, does ' +
+                         'not match downloaded size, %d', fileSize, size)));
++                    return;
+                 }
+ 
+                 sha1 = shasum.digest('hex');
+@@ -2674,6 +2768,8 @@ function _dockerDownloadAndImportImage(opts, callback) {
+                     filename: filename
+                 };
+ 
++                log.info({imgId: imgId, fileSize: fileSize},
++                    'dockerDownloadAndImportImage: Download successful');
+                 return next();
+             }
+             var finish = once(finish_);
+@@ -2726,7 +2822,7 @@ function _dockerDownloadAndImportImage(opts, callback) {
+             });
+ 
+             stream.on('error', function (streamErr) {
+-                finish(streamErr);
++                finish(errors.wrapErrorFromDrc(streamErr));
+             });
+ 
+             stor = app.chooseStor(newImage);
+@@ -2921,7 +3017,7 @@ function _dockerV1Pull(ctx, cb) {
+                 imgId: ctx.imgId
+             }, function (err, ancestry) {
+                 if (err) {
+-                    return next(err);
++                    return next(errors.wrapErrorFromDrc(err));
+                 }
+                 // Want to import oldest in ancestry first.
+                 reverseAncestry = ancestry.reverse();
+@@ -3019,6 +3115,7 @@ function _dockerV2Pull(ctx, cb) {
+     assert.object(ctx.regClientV2, 'ctx.regClientV2');
+     assert.func(cb, 'cb');
+ 
++    var cacheDownloadedLayers = false;
+     var req = ctx.req;
+     var log = req.log;
+     var resMessage = ctx.resMessage;
+@@ -3075,6 +3172,8 @@ function _dockerV2Pull(ctx, cb) {
+         function importImagesPart1(_, next) {
+             var pullQueueError;
+             ctx.downloadsCanceled = false;
++            cacheDownloadedLayers = true;
++
+             var pullQueue = vasync.queue(function (imgInfo, nextImg) {
+                 _dockerDownloadAndImportImage({
+                     imgId: imgInfo.imgJson.id,
+@@ -3109,6 +3208,7 @@ function _dockerV2Pull(ctx, cb) {
+          *   db consistency.
+          */
+         function importImagesPart2(_, next) {
++            cacheDownloadedLayers = false;
+             vasync.forEachPipeline({
+                 inputs: reverseAncestry,
+                 func: function (imgInfo, nextImg) {
+@@ -3137,7 +3237,21 @@ function _dockerV2Pull(ctx, cb) {
+ 
+             next();
+         }
+-    ]}, cb);
++    ]}, function (err) {
++        if (cacheDownloadedLayers) {
++            // There was a failure downloading one or more image layers - keep
++            // the downloaded image metadata in memory, so we can avoid
++            // downloading it again next time.
++            Object.keys(ctx.fileInfoFromImgId).forEach(function (id) {
++                DOCKER_IMAGE_CACHE[id] = {
++                    fileInfo: ctx.fileInfoFromImgId[id],
++                    image: ctx.imageFromImgId[id]
++                };
++            });
++        }
++
++        cb(err);
++    });
+ }
+ 
+ 
+@@ -3353,7 +3467,7 @@ function apiAdminImportDockerImage(req, res, callback) {
+             var client = drc.createClientV2(ctx.regClientOpts);
+             client.supportsV2(function (err, supportsV2) {
+                 if (err) {
+-                    next(err);
++                    next(errors.wrapErrorFromDrc(err));
+                 } else {
+                     log.info({indexName: rat.index.name,
+                         supportsV2: supportsV2}, 'regSupportsV2');
+@@ -3390,7 +3504,7 @@ function apiAdminImportDockerImage(req, res, callback) {
+                         ctx.errV2 = err; // Save it for possible use below.
+                         next();
+                     } else {
+-                        next(err);
++                        next(errors.wrapErrorFromDrc(err));
+                     }
+                 } else {
+                     log.debug({ref: ref, manifest: man},
+@@ -3437,9 +3551,9 @@ function apiAdminImportDockerImage(req, res, callback) {
+                     client.close();
+                     if (ctx.errV2) {
+                         log.debug({err: err}, 'v1GetImgId error');
+-                        next(ctx.errV2);
++                        next(errors.wrapErrorFromDrc(ctx.errV2));
+                     } else {
+-                        next(err);
++                        next(errors.wrapErrorFromDrc(err));
+                     }
+                 } else {
+                     ctx.regClientV1 = client;
+@@ -3489,7 +3603,7 @@ function apiAdminImportDockerImage(req, res, callback) {
+                         ctx.isPrivate = false;
+                     }
+                     noAuthClient.close();
+-                    next(err);
++                    next(errors.wrapErrorFromDrc(err));
+                 });
+ 
+             } else {
+@@ -3520,7 +3634,7 @@ function apiAdminImportDockerImage(req, res, callback) {
+                         ctx.isPrivate = false;
+                     }
+                     noAuthClient.close();
+-                    next(err);
++                    next(errors.wrapErrorFromDrc(err));
+                 });
+             }
+         },

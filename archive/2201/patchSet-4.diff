@@ -1,0 +1,3834 @@
+commit d03d3817447498188a3d4c4d25c0317edc7d6f95 (refs/changes/01/2201/4)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2017-07-19T22:47:47-07:00 (2 years, 3 months ago)
+    
+    DOCKER-1034 support docker volume ls -f dangling=true
+
+diff --git a/lib/endpoints/volume-reservations.js b/lib/endpoints/volume-reservations.js
+new file mode 100644
+index 0000000..1e135c0
+--- /dev/null
++++ b/lib/endpoints/volume-reservations.js
+@@ -0,0 +1,672 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * Volume reservations are different than volume references. They represent an
++ * *intention* for a VM that is being provisioned by a VM provisioning workflow
++ * job to use a given volume.
++ *
++ * When a volume is reserved by a VM being provisioned, an implict reference
++ * is still added from the VM being provisioned to the volumes it requires, but
++ * these references are tied to the reservation's lifecycle and can be removed
++ * if the reservation is removed as the result of a failed provision. As a
++ * result, a volume cannot be deleted even if the only VM that is referencing it
++ * hasn't been provisioned yet, since it's considered to be in use.
++ *
++ * When a VM that requires volumes is provisioned, it first creates a
++ * reservation for all the volumes that it requires.
++ *
++ * When a VM is provisioned successfully, an explicit reference is added from
++ * that VM to all of the volumes it requires, and all the reservations for this
++ * VM are removed.
++ *
++ * When a VM fails to provision, its volumes reservations and the associated
++ * implicit references are cleaned up asynchronously by volapi-updater.
++ *
++ * The state of volumes reservations is maintained by the volapi-updater
++ * service, which cleans up reservations (and sometimes the references they
++ * created) depending on the state of the VM or the provisioning workflow job
++ * that made the reservation.
++ *
++ * The raison-d'etre of reservations is that a VM can fail to provision without
++ * ever creating a VM object in VMAPI or a VM on any CN. Thus, relying on
++ * VMAPI's changefeed events or polling VMAPI is not sufficient to determine
++ * that reservations and their associated implicit references need to be cleaned
++ * up. Storing reservations allow to keep track of them in that case.
++ *
++ * All of these APIs are internal and not meant to be exposed via any external
++ * service such as CloudAPI. Some of them, like the ListReservations endpoint,
++ * are even present only to provide a way to observe the system and used for
++ * debugging purposes.
++ *
++ * A volume reservation is a separate type of object that exists in VOLAPI
++ * alongside volumes which has the following properties:
++ *
++ * - uuid -- the unique identifier of the reservation
++ * - volume_name -- the name of the volume being reserved (unique per
++ *   owner_uuid)
++ * - owner_uuid -- the owner of the VM making the reservation
++ * - vm_uuid -- the unique identifier of the VM making the reservation
++ * - job_uuid -- the unique identifier of the provisioning job that is
++ *   provisioning the VM making the reservation
++ * - create_timestamp -- the date and time at which the reservation was made
++ */
++
++var assert = require('assert-plus');
++var restify = require('restify');
++var vasync = require('vasync');
++
++var errors = require('../errors');
++var renderingMiddlewares = require('../middlewares/rendering');
++var reservationModels = require('../models/volume-reservations');
++var validationUtils = require('../validation/utils');
++var volumesMiddlewares = require('../middlewares/volumes');
++var volumesModel = require('../models/volumes');
++var volumesValidation = require('../validation/volumes');
++var uuidValidation = require('../validation/uuid');
++
++var CONFIG;
++var APPLICATION_STATE;
++
++function validateAddVolumeReservation(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var validationErr;
++    var validationErrs = [];
++    var VALID_PARAM_NAMES =
++        ['job_uuid', 'owner_uuid', 'volume_name', 'vm_uuid'];
++    var MANDATORY_PARAM_NAMES = VALID_PARAM_NAMES.slice();
++
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
++
++    validationErrs = validationErrs.concat(mandatoryParamsErrs);
++    validationErrs = validationErrs.concat(invalidParamsErrs);
++
++    if (req.params.owner_uuid !== undefined) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.owner_uuid, 'owner');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.volume_name !== undefined) {
++        validationErr =
++            volumesValidation.validateVolumeName(req.params.volume_name,
++                'volume_name');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.vm_uuid !== undefined) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.vm_uuid, 'VM');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.job_uuid !== undefined) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.job_uuid, 'job');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (validationErrs.length > 0) {
++        next(new errors.ValidationError(validationErrs));
++        return;
++    } else {
++        next();
++        return;
++    }
++}
++
++function addVolumeReservation(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var context = {};
++
++    var ownerUuid = req.params.owner_uuid;
++    var vmUuid = req.params.vm_uuid;
++    var volumeName = req.params.volume_name;
++
++    req.log.debug({
++        params: req.params
++    }, 'start AddVolumeReservation');
++
++    vasync.pipeline({arg: context, funcs: [
++        /*
++         * We consider that the volume reservation to be added for a given
++         * volume and VM supersedes any previous reservation. So we load those
++         * previous reservations first so that we can remove them once the new
++         * one is added.
++         */
++        function getPreviousVolumeReservations(ctx, done) {
++            req.log.debug({
++                volumeName: volumeName,
++                vmUuid: vmUuid
++            }, 'Getting existing volume reservations');
++
++            reservationModels.listVolumeReservations({
++                volumeName: volumeName,
++                vmUuid: vmUuid,
++                ownerUuid: ownerUuid
++            }, function onGetVolRes(getVolResErr, volRes) {
++                if (getVolResErr) {
++                    req.log.error({
++                        err: getVolResErr,
++                        volRes: volRes
++                    }, 'Error when getting existing volume reservations');
++                } else {
++                    req.log.debug({
++                        err: getVolResErr,
++                        volRes: volRes
++                    }, 'Got existing volume reservations');
++                }
++
++                ctx.previousVolRes = volRes;
++                done(getVolResErr);
++            });
++        },
++        function createReservation(ctx, done) {
++            var reservation = {
++                owner_uuid: req.params.owner_uuid,
++                volume_name: req.params.volume_name,
++                vm_uuid: req.params.vm_uuid,
++                job_uuid: req.params.job_uuid
++            };
++
++            req.log.debug({
++                reservation: reservation
++            }, 'Creating new volume reservation');
++
++            reservationModels.createVolumeReservation(reservation,
++                function onResCreated(resCreationErr, resUuid) {
++                    if (resCreationErr) {
++                        req.log.error({
++                            err: resCreationErr,
++                            resUuid: resUuid
++                        }, 'Error when creating volume reservation');
++                    } else {
++                        req.log.debug({
++                            err: resCreationErr,
++                            resUuid: resUuid
++                        }, 'Created volume reservation');
++                    }
++
++                    ctx.resUuid = resUuid;
++                    done(resCreationErr);
++                });
++        },
++        function deletePreviousVolumeReservations(ctx, done) {
++            /*
++             * Attempt to cleanup volume reservations for the same volume and
++             * VM, because they are superseded by any one that is more recent.
++             */
++            req.log.debug({
++                previousRes: ctx.previousVolRes
++            }, 'Deleting previous volume reservations');
++
++            reservationModels.deleteVolumeReservations(ctx.previousVolRes,
++                function onDelReservations(delResErr) {
++                    if (delResErr) {
++                        req.log.error({
++                            err: delResErr
++                        }, 'Failed to delete previous reservations');
++                    } else {
++                        req.log.debug('Previous reservations deleted ' +
++                            'successfully');
++                    }
++
++                    /*
++                     * Ignore errors during reservation deletion on purpose, as
++                     * this does not prevent the reference between from the VM
++                     * to the volume to be registered. The worse case is that
++                     * the previous volume reservations are not deleted, and
++                     * thus the volume can't be deleted without using the
++                     * "force" flag until the stale reservations process reaps
++                     * them.
++                     */
++                    done();
++                });
++        },
++        function loadVolume(ctx, done) {
++            req.log.debug({
++                volumeName: volumeName,
++                ownerUuid: ownerUuid
++            }, 'Loading volume');
++
++            volumesModel.listVolumes({
++                name: volumeName,
++                owner_uuid: ownerUuid,
++                state: 'ready'
++            }, function onVolumesLoaded(loadVolErr, volumeObjects) {
++                var err;
++                var volumeObject;
++
++                assert.optionalArrayOfObject(volumeObjects, 'volumeObjects');
++                if (volumeObjects !== undefined) {
++                    assert.ok(volumeObjects.length <= 1);
++
++                    if (volumeObjects.length > 0) {
++                        volumeObject = volumeObjects[0];
++                    }
++                }
++
++                if (volumeObject !== undefined) {
++                    ctx.volumeObject = volumeObject;
++                }
++
++                /*
++                 * If the volume couldn't be found, that's fine, we'll just
++                 * add the reference corresponding to the reservation when
++                 * that volume gets created.
++                 */
++                if (loadVolErr &&
++                    loadVolErr.name !== 'ObjectNotFoundError') {
++                    req.log.error({
++                        err: loadVolErr,
++                        volumeName: volumeName,
++                        ownerUuid: ownerUuid
++                    }, 'Error when loading volume');
++
++                    err = loadVolErr;
++                }
++
++                done(err);
++            });
++        },
++        function addReference(ctx, done) {
++            var volumeUuid;
++
++            if (ctx.volumeObject === undefined) {
++                /*
++                 * If the volume for which we're doing a reservation does not
++                 * exist, then we'll not add the corresponding reference now.
++                 * Instead, we'll add the references that correspond to the
++                 * existing reservations when the volume is created.
++                 */
++                req.log.debug({
++                    vmUuid: vmUuid,
++                    volumeName: volumeName,
++                    ownerUuid: ownerUuid
++                }, 'Volume does not exist, not adding actual reference');
++
++                done();
++                return;
++            }
++
++            volumeUuid = ctx.volumeObject.value.uuid;
++
++            req.log.debug({
++                vmUuid: vmUuid,
++                volumeUuid: volumeUuid
++            }, 'Adding actual volume reference');
++
++            /*
++             * A reservation is not a reference in itself, but while it is
++             * active we want it to act as a reference so that a "reserved"
++             * volume cannot be deleted.
++             */
++            volumesModel.addReference(vmUuid, volumeUuid,
++                function onRefAdded(addRefErr) {
++                    if (!addRefErr) {
++                        req.log.debug({
++                            vmUuid: vmUuid,
++                            volumeUuid: volumeUuid
++                        }, 'Reference added successfully');
++
++                        ctx.refAdded = true;
++                    } else {
++                        req.log.error({
++                            err: addRefErr,
++                            vmUuid: vmUuid,
++                            volumeUuid: volumeUuid
++                        }, 'Failed to add volume reference');
++                    }
++
++                    done(addRefErr);
++                });
++        },
++        function loadRes(ctx, done) {
++            assert.uuid(ctx.resUuid, 'ctx.resUuid');
++            reservationModels.getVolumeReservation(ctx.resUuid,
++                function onGetRes(getResErr, volRes) {
++                    if (volRes !== undefined) {
++                        ctx.volRes = volRes.value;
++                    }
++
++                    done(getResErr);
++                });
++        }
++    ]}, function onAllDone(addVolResErr) {
++        if (addVolResErr) {
++            cleanupReservationAndRef(function onCleanupDone(cleanupErr) {
++                if (cleanupErr) {
++                    req.log.error({
++                        cleanupErr: cleanupErr,
++                        addVolResErr: addVolResErr
++                    }, 'Error when cleaning up after reservation error');
++                }
++                next(addVolResErr);
++            });
++        } else {
++            req.responseReservation = context.volRes;
++            next();
++        }
++    });
++
++    function cleanupReservationAndRef(callback) {
++        assert.func(callback, 'callback');
++
++        vasync.parallel({funcs: [
++            function deleteRes(done) {
++                if (context.resUuid !== undefined) {
++                    reservationModels.deleteVolumeReservation(context.resUuid,
++                        done);
++                } else {
++                    done();
++                }
++            },
++            function deleteRef(done) {
++                if (context.refAdded === true) {
++                    volumesModel.deleteReference(req.params.vm_uuid,
++                        req.params.volume_uuid, done);
++                } else {
++                    done();
++                }
++            }
++        ]}, callback);
++    }
++}
++
++function validateRemoveVolumeReservation(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var validationErr;
++    var validationErrs = [];
++    var VALID_PARAM_NAMES = ['uuid', 'owner_uuid'];
++    var MANDATORY_PARAM_NAMES = VALID_PARAM_NAMES.slice();
++
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
++
++    validationErrs = validationErrs.concat(mandatoryParamsErrs);
++    validationErrs = validationErrs.concat(invalidParamsErrs);
++
++    if (req.params.uuid) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.uuid, 'uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.owner_uuid) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.owner_uuid, 'owner');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (validationErrs.length > 0) {
++        next(new errors.ValidationError(validationErrs));
++        return;
++    } else {
++        next();
++        return;
++    }
++}
++
++function removeVolumeReservation(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var context = {};
++    var err;
++    var expectedVolResOwnerUuid = req.params.owner_uuid;
++    var volResUuid = req.params.uuid;
++
++    vasync.pipeline({arg: context, funcs: [
++        function checkExists(ctx, done) {
++            reservationModels.getVolumeReservation(volResUuid,
++                function onVolResLoaded(getVolResErr, volResObject) {
++                    if (getVolResErr === undefined) {
++                        if (volResObject === undefined) {
++                            err = new Error('No volume reservation with uuid ' +
++                                volResUuid);
++                        } else {
++                            ctx.volumeReservationObject = volResObject;
++                        }
++                    } else {
++                        req.log.error({err: err},
++                            'Error when loading volume reservation object ' +
++                                'from moray');
++
++                        if (getVolResErr.name === 'ObjectNotFoundError') {
++                            err =
++                                new errors.VolumeReservationFoundError(
++                                    volResUuid);
++                        }
++                    }
++
++                    next(err);
++                });
++        },
++        function checkOwner(ctx, done) {
++            assert.object(ctx.volumeReservationObject,
++                'ctx.volumeReservationObject');
++
++            var checkOwnerErr;
++            var volResOwnerUuid = ctx.volumeReservation.value.owner_uuid;
++
++            if (volResOwnerUuid !== expectedVolResOwnerUuid) {
++                checkOwnerErr = new Error('owner_uuid: '  +
++                    expectedVolResOwnerUuid + ' does not match owner_uuid ' +
++                    'for volume reservation ' + volResUuid + ' (' +
++                    ctx.volumeReservation.value.owner_uuid + ')');
++            }
++
++            done(checkOwnerErr);
++        },
++        function remove(ctx, done) {
++            reservationModels.deleteVolumeReservation(req.params.uuid,
++                function onResCreated(resDelErr) {
++                    done(resDelErr);
++                });
++        }
++    ]}, next);
++}
++
++function formatVolumeReservationValue(volumeReservationValue) {
++    assert.object(volumeReservationValue, 'volumeReservationValue');
++
++    volumeReservationValue.create_timestamp =
++        new Date(volumeReservationValue.create_timestamp).toISOString();
++    return volumeReservationValue;
++}
++
++function renderVolumeReservation(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    assert.object(req.responseReservation, 'req.responseReservation');
++
++    req.renderedResponse =
++        formatVolumeReservationValue(req.responseReservation);
++
++    next();
++}
++
++function validateListVolumeReservations(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var validationErr;
++    var validationErrs = [];
++    var VALID_PARAM_NAMES =
++        ['owner_uuid', 'volume_name', 'vm_uuid', 'job_uuid'];
++    var MANDATORY_PARAM_NAMES = [];
++
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
++
++    validationErrs = validationErrs.concat(mandatoryParamsErrs);
++    validationErrs = validationErrs.concat(invalidParamsErrs);
++
++    if (req.params.owner_uuid) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.owner_uuid, 'owner_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.volume_name) {
++        validationErr =
++            volumesValidation.validateVolumeName(req.params.volume_name,
++                'volume_name');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.vm_uuid) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.vm_uuid, 'vm_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.job_uuid) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.job_uuid, 'job_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (validationErrs.length > 0) {
++        next(new errors.ValidationError(validationErrs));
++        return;
++    } else {
++        next();
++        return;
++    }
++}
++
++function listVolumeReservations(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(req.params, 'req.params');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    reservationModels.listVolumeReservations({
++        ownerUuid: req.params.owner_uuid,
++        volumeName: req.params.volume_name,
++        jobUuid: req.params.job_uuid,
++        vmUuid: req.params.vm_uuid
++    }, function onListReservations(listResErr, reservations) {
++        req.responseReservations =
++            reservations.map(function getResObjectValue(resObject) {
++                return resObject.value;
++            });
++
++        next(listResErr);
++    });
++}
++
++function formatVolumeReservationsValues(volumeReservationValues) {
++    assert.arrayOfObject(volumeReservationValues, 'volumeReservationValues');
++    return volumeReservationValues.map(formatVolumeReservationValue);
++}
++
++function renderVolumeReservations(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    assert.object(req.responseReservations, 'req.responseReservations');
++
++    req.renderedResponse =
++        formatVolumeReservationsValues(req.responseReservations);
++
++    next();
++}
++
++function mount(config, server, applicationState) {
++    assert.object(config, 'config');
++    assert.object(server, 'server');
++    assert.object(applicationState, 'applicationState');
++
++    CONFIG = config;
++    APPLICATION_STATE = applicationState;
++
++    server.post({
++        path: '/volumereservations',
++        name: 'AddVolumeReservation',
++        version: '1.0.0'
++    }, restify.bodyParser(),
++        validateAddVolumeReservation, addVolumeReservation,
++        renderVolumeReservation,
++        renderingMiddlewares.makeSendResponseHandler({
++            statusCode: 201
++        }));
++
++    server.del({
++        path: '/volumereservations/:uuid',
++        name: 'RemoveVolumeReservation',
++        version: '1.0.0'
++    }, restify.queryParser(),
++        validateRemoveVolumeReservation, volumesMiddlewares.loadVolumeObject,
++        removeVolumeReservation, renderVolumeReservation,
++        renderingMiddlewares.makeSendResponseHandler({
++            statusCode: 204
++        }));
++
++    server.get({
++        path: '/volumereservations',
++        name: 'ListVolumeReservations',
++        version: '1.0.0'
++    }, restify.queryParser(),
++        validateListVolumeReservations, listVolumeReservations,
++        renderVolumeReservations,
++        renderingMiddlewares.makeSendResponseHandler({
++            statusCode: 200
++        }));
++}
++
++module.exports = {
++    mount: mount
++};
+\ No newline at end of file
+diff --git a/lib/endpoints/volumes.js b/lib/endpoints/volumes.js
+index b45f676..2c3636a 100644
+--- a/lib/endpoints/volumes.js
++++ b/lib/endpoints/volumes.js
+@@ -20,10 +20,15 @@ var vasync = require('vasync');
+ var errors = require('../errors');
+ var networksValidation = require('../validation/networks');
+ var predicateValidation = require('../validation/predicate');
++var renderingMiddlewares = require('../middlewares/rendering');
++var reservationModels = require('../models/volume-reservations');
+ var units = require('../units');
++var validationUtils = require('../validation/utils');
++var volumesMiddlewares = require('../middlewares/volumes');
+ var volumesModel = require('../models/volumes');
+ var volumeUtils = require('../volumes');
+ var volumesValidation = require('../validation/volumes');
++var uuidValidation = require('../validation/uuid');
+ 
+ var CONFIG;
+ var APPLICATION_STATE;
+@@ -304,25 +309,41 @@ function generateVolumeName(volumeParams) {
+     return (newName);
+ }
+ 
+-function createVolume(req, res, next) {
++function validateCreateVolume(req, res, next) {
+     assert.object(req, 'req');
+     assert.object(req.params, 'req.params');
+     assert.object(res, 'res');
+     assert.func(next, 'next');
+ 
+     var networkValidationErrs;
+-    var ownerUuid = req.params.owner_uuid;
+     var validationErr;
+     var validationErrs = [];
+-    var vmapiClient = req._vmapiClient;
+-    var volumeName = req.params.name;
+-    var volumeUuid = libuuid.create();
++    var VALID_PARAM_NAMES = ['uuid', 'owner_uuid', 'size', 'name', 'type',
++        'networks'];
++    var MANDATORY_PARAM_NAMES = ['owner_uuid', 'type', 'networks'];
++
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
+ 
+-    validationErr = volumesValidation.validateOwnerUuid(req.params.owner_uuid);
++    validationErrs = validationErrs.concat(mandatoryParamsErrs);
++    validationErrs = validationErrs.concat(invalidParamsErrs);
++
++    validationErr = uuidValidation.validateUuid(req.params.owner_uuid,
++        'owner_uuid');
+     if (validationErr !== undefined) {
+         validationErrs.push(validationErr);
+     }
+ 
++    if (req.params.uuid !== undefined) {
++        validationErr = uuidValidation.validateUuid(req.params.uuid, 'uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
+     if (req.params.size !== undefined) {
+         validationErr = volumesValidation.validateVolumeSize(req.params.size);
+         if (validationErr !== undefined) {
+@@ -330,7 +351,7 @@ function createVolume(req, res, next) {
+         }
+     }
+ 
+-    validationErr = volumesValidation.validateVolumeName(volumeName,
++    validationErr = volumesValidation.validateVolumeName(req.params.name,
+         {allowEmpty: true});
+     if (validationErr !== undefined) {
+         validationErrs.push(validationErr);
+@@ -358,6 +379,25 @@ function createVolume(req, res, next) {
+     if (validationErrs.length > 0) {
+         next(new errors.ValidationError(validationErrs));
+         return;
++    } else {
++        next();
++        return;
++    }
++}
++
++function createVolume(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(req.params, 'req.params');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var ownerUuid = req.params.owner_uuid;
++    var vmapiClient = req._vmapiClient;
++    var volumeName = req.params.name;
++    var volumeUuid = req.params.uuid;
++
++    if (volumeUuid === undefined) {
++        volumeUuid = libuuid.create();
+     }
+ 
+     req.log.debug({params: req.params}, 'createVolume');
+@@ -445,8 +485,48 @@ function createVolume(req, res, next) {
+                 done(err);
+             });
+         },
++        function loadVolumeReservations(ctx, done) {
++            reservationModels.listVolumeReservations({
++                volumeName: volumeName,
++                ownerUuid: ownerUuid
++            }, function onVolRes(getVolResErr, volReservations) {
++                req.log.debug({
++                    err: getVolResErr,
++                    reservations: volReservations
++                }, 'Got volume reservations');
++
++                ctx.volReservations = volReservations;
++                done(getVolResErr);
++            });
++        },
+         function createVolumeModel(ctx, done) {
+             assert.object(ctx.ticket, 'ctx.ticket');
++            assert.optionalArrayOfObject(ctx.volReservations,
++                'ctx.volReservations');
++
++            /*
++             * If there are reservations for this volume, it means they were
++             * made by provisioning VMs that require this volume before the
++             * volume was created, so it's now time to add these VMs as actual
++             * references.
++             * We don't cleanup the reservations yet, because it is possible
++             * that, after the reservations were made, the job failed and no VM
++             * was actually created both in VMAPI or on a CN, and thus we can't
++             * rely on VMAPI's changefeed's notifications to cleanup references
++             * for failed VMs. Instead, we'll keep monitoring the workflow job
++             * associated to these reservations, and clean them up (as well as
++             * the associated references) if the workflow fails.
++             */
++            if (ctx.volReservations !== undefined &&
++                ctx.volReservations.length > 0) {
++                volumeParams.refs =
++                    ctx.volReservations.map(function getVmUuid(volResObject) {
++                        assert.object(volResObject, 'volResObject');
++                        assert.object(volResObject.value, 'volResObject.value');
++
++                        return volResObject.value.vm_uuid;
++                    });
++            }
+ 
+             req.log.debug({volumeParams: volumeParams},
+                 'Creating volume model');
+@@ -672,15 +752,17 @@ function validateGetVolume(req, res, next) {
+     var VALID_PARAM_NAMES = ['owner_uuid', 'uuid'];
+     var MANDATORY_PARAM_NAMES = ['uuid'];
+ 
+-    var mandatoryParamsErrs = checkMandatoryParamsPresence(req.params,
+-        MANDATORY_PARAM_NAMES);
+-    var invalidParamsErrs = checkInvalidParams(req.params, VALID_PARAM_NAMES);
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
+ 
+     validationErrs = validationErrs.concat(mandatoryParamsErrs);
+     validationErrs = validationErrs.concat(invalidParamsErrs);
+ 
+     if (req.params.uuid) {
+-        validationErr = volumesValidation.validateVolumeUuid(req.params.uuid);
++        validationErr = uuidValidation.validateUuid(req.params.uuid, 'uuid');
+         if (validationErr !== undefined) {
+             validationErrs.push(validationErr);
+         }
+@@ -688,7 +770,7 @@ function validateGetVolume(req, res, next) {
+ 
+     if (req.params.owner_uuid) {
+         validationErr =
+-            volumesValidation.validateOwnerUuid(req.params.owner_uuid);
++            uuidValidation.validateUuid(req.params.owner_uuid, 'owner_uuid');
+         if (validationErr !== undefined) {
+             validationErrs.push(validationErr);
+         }
+@@ -729,6 +811,7 @@ function validateListVolumes(req, res, next) {
+     var ownerUuidValidationErr;
+     var predFields;
+     var predicateValidationErr;
++    var refsValidationErr;
+     var sizeValidationErr;
+     var stateValidationErr;
+     var validationErr;
+@@ -736,12 +819,14 @@ function validateListVolumes(req, res, next) {
+         'name',
+         'owner_uuid',
+         'predicate',
++        'refs',
+         'size',
+         'state',
+         'type'
+     ];
+ 
+-    invalidParamsErrs = checkInvalidParams(req.params, VALID_PARAM_NAMES);
++    invalidParamsErrs = validationUtils.checkInvalidParams(req.params,
++        VALID_PARAM_NAMES);
+     errs = errs.concat(invalidParamsErrs);
+ 
+     if (req.query.predicate) {
+@@ -799,15 +884,23 @@ function validateListVolumes(req, res, next) {
+     }
+ 
+     if (req.query.owner_uuid !== undefined && req.query.owner_uuid !== null) {
+-        ownerUuidValidationErr = volumesValidation
+-            .validateOwnerUuid(req.query.owner_uuid);
++        ownerUuidValidationErr =
++            uuidValidation.validateUuid(req.query.owner_uuid, 'owner_uuid');
+         if (ownerUuidValidationErr) {
+             errs.push(ownerUuidValidationErr);
+         }
+     }
+ 
++    if (req.params.refs !== undefined && req.params.ref !== null) {
++        refsValidationErr =
++            uuidValidation.validateUuid(req.params.refs, 'refs');
++        if (refsValidationErr !== undefined) {
++            errs.push(refsValidationErr);
++        }
++    }
++
+     if (errs.length > 0) {
+-        validationErr = next(new errors.ValidationError(errs));
++        validationErr = new errors.ValidationError(errs);
+     }
+ 
+     next(validationErr);
+@@ -929,54 +1022,65 @@ function renderVolumeSizes(req, res, next) {
+     next();
+ }
+ 
+-function _getVolumeReferences(volumeObject, options, callback) {
+-    assert.object(volumeObject, 'volumeObject');
+-    assert.object(options, 'options');
+-    assert.object(options.vmapiClient, 'options.vmapiClient');
+-    assert.func(callback, 'callback');
++function getVolumeReferences(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(req.loadedVolumeObject, 'req.loadedVolumeObject');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
+ 
+-    var vmapiClient = options.vmapiClient;
+-    var predicate = {
+-        and: [
+-            { and: [
+-                { ne: ['state', 'destroyed'] },
+-                { ne: ['state', 'failed'] }
+-            ] },
+-            { eq: ['required_nfs_volumes', volumeObject.value.name] }
+-        ]
+-    };
++    var volumeObject = req.loadedVolumeObject;
++    req.volumeReferences = volumeObject.value.refs;
++}
++
++function validateDeleteVolume(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
+ 
+-    vmapiClient.listVms({
+-        predicate: JSON.stringify(predicate)
+-    }, function vmsListed(err, vms) {
+-        var references;
++    var validationErr;
++    var validationErrs = [];
++    var VALID_PARAM_NAMES = ['owner_uuid', 'uuid', 'force'];
++    var MANDATORY_PARAM_NAMES = ['uuid'];
+ 
+-        assert.optionalArrayOfObject(vms, 'vms');
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
+ 
+-        if (vms) {
+-            references = vms.map(function getVmURL(vm) {
+-                assert.object(vm, 'vm');
+-                return vm.uuid;
+-            });
++    validationErrs = validationErrs.concat(mandatoryParamsErrs);
++    validationErrs = validationErrs.concat(invalidParamsErrs);
++
++    if (req.params.uuid !== undefined) {
++        validationErr = uuidValidation.validateUuid(req.params.uuid, 'uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
+         }
++    }
+ 
+-        callback(err, references);
+-    });
+-}
++    if (req.params.owner_uuid !== undefined) {
++        validationErr =
++            uuidValidation.validateUuid(req.query.owner_uuid, 'owner_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
+ 
+-function getVolumeReferences(req, res, next) {
+-    assert.object(req, 'req');
+-    assert.object(req.loadedVolumeObject, 'req.loadedVolumeObject');
+-    assert.object(res, 'res');
+-    assert.func(next, 'next');
++    if (req.params.force !== undefined) {
++        validationErr =
++            volumesValidation.validateBooleanAsString(req.query.force, 'force');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
+ 
+-    var volumeObject = req.loadedVolumeObject;
+-    _getVolumeReferences(volumeObject, {
+-        vmapiClient: req._vmapiClient
+-    }, function volumeRefsListed(err, volumeRefs) {
+-        req.volumeReferences = volumeRefs;
+-        next(err);
+-    });
++    if (validationErrs.length > 0) {
++        next(new errors.ValidationError(validationErrs));
++        return;
++    } else {
++        next();
++        return;
++    }
+ }
+ 
+ function deleteVolume(req, res, next) {
+@@ -985,11 +1089,10 @@ function deleteVolume(req, res, next) {
+     assert.object(res, 'res');
+     assert.func(next, 'next');
+ 
+-    var volumeUuid = req.params.uuid;
+-    var ownerUuid = req.query.owner_uuid;
++    var ownerUuid = req.params.owner_uuid;
+     var context = {};
+ 
+-    req.log.debug({uuid: volumeUuid}, 'Start deleting volume');
++    req.log.debug({params: req.params}, 'Start deleting volume');
+ 
+     vasync.pipeline({
+         funcs: [
+@@ -1026,6 +1129,15 @@ function deleteVolume(req, res, next) {
+                 });
+             },
+             function checkVolumeUnused(ctx, done) {
++                if (req.params.force === 'true') {
++                    req.log.debug({
++                        params: req.params
++                    }, 'force set to "true" in request\'s params, skipping ' +
++                        'in-use check');
++                    done();
++                    return;
++                }
++
+                 req.log.debug({volumeObject: req.loadedVolumeObject},
+                     'Check volume is not currently required by any VM');
+ 
+@@ -1033,27 +1145,12 @@ function deleteVolume(req, res, next) {
+                 var volumeObject = req.loadedVolumeObject;
+                 var volumeName = volumeObject.value.name;
+ 
+-                _getVolumeReferences(volumeObject, {
+-                        vmapiClient: req._vmapiClient
+-                    },
+-                    function referencesListed(listRefsErr, references) {
+-                        assert.optionalArrayOfString(references, 'references');
+-
+-                        if (listRefsErr) {
+-                            req.log.error({error: listRefsErr},
+-                                'Error when listing volume references');
+-                            done(listRefsErr);
+-                        } else {
+-                            req.log.debug({references: references},
+-                                'references found');
+-
+-                            if (references && references.length > 0) {
+-                                err = new errors.VolumeInUseError(volumeName);
+-                            }
++                if (volumeObject.value.refs &&
++                    volumeObject.value.refs.length > 0) {
++                    err = new errors.VolumeInUseError(volumeName);
++                }
+ 
+-                            done(err);
+-                        }
+-                    });
++                done(err);
+             },
+             function getStorageVm(ctx, done) {
+                 var volume = req.loadedVolumeObject.value;
+@@ -1182,89 +1279,6 @@ function deleteVolume(req, res, next) {
+     });
+ }
+ 
+-function loadVolumeObject(req, res, next) {
+-    assert.object(req, 'req');
+-    assert.object(req.params, 'req.params');
+-    assert.uuid(req.params.uuid, 'req.params.uuid');
+-    assert.optionalUuid(req.params.owner_uuid, 'req.params.owner_uuid');
+-    assert.object(res, 'res');
+-    assert.func(next, 'next');
+-
+-    var volumeUuid = req.params.uuid;
+-    var ownerUuid = req.params.owner_uuid;
+-
+-    req.log.debug({uuid: volumeUuid}, 'Loading volume');
+-
+-    volumesModel.loadVolume(volumeUuid,
+-        function onVolumesLoaded(err, volumeObject) {
+-            if (!err) {
+-                if (!volumeObject) {
+-                    err = new Error('No volume with uuid ' + volumeUuid
+-                        + ' could be found');
+-                } else {
+-                    if (ownerUuid !== undefined &&
+-                        volumeObject.value.owner_uuid !== ownerUuid) {
+-                        err = new Error('owner_uuid: '  + ownerUuid
+-                            + ' does not match owner_uuid for volume '
+-                            + volumeUuid + ' ('
+-                            + volumeObject.value.owner_uuid + ')');
+-                    } else {
+-                        req.loadedVolumeObject = volumeObject;
+-                    }
+-                }
+-            } else {
+-                req.log.error({err: err},
+-                    'Error when loading volume object from moray');
+-
+-                if (err.name === 'ObjectNotFoundError') {
+-                    err = new errors.VolumeNotFoundError(volumeUuid);
+-                }
+-            }
+-
+-            next(err);
+-        });
+-}
+-
+-function checkMandatoryParamsPresence(params, mandatoryParamNames) {
+-    assert.object(params, 'params');
+-    assert.arrayOfString(mandatoryParamNames, 'mandatoryParamNames');
+-
+-    var errs = [];
+-    var mandatoryParamIndex;
+-    var mandatoryParamName;
+-
+-    for (mandatoryParamIndex = 0; mandatoryParamIndex <
+-        mandatoryParamNames.length; ++mandatoryParamIndex) {
+-        mandatoryParamName = mandatoryParamNames[mandatoryParamIndex];
+-        if (!params.hasOwnProperty(mandatoryParamName)) {
+-            errs.push(new Error('missing mandatory parameter: ' +
+-                mandatoryParamName));
+-        }
+-    }
+-
+-    return errs;
+-}
+-
+-function checkInvalidParams(params, validParamNames) {
+-    assert.object(params, 'params');
+-    assert.arrayOfString(validParamNames, 'validParamNames');
+-
+-    var errs = [];
+-    var paramName;
+-
+-    for (paramName in params) {
+-        if (!params.hasOwnProperty(paramName)) {
+-            continue;
+-        }
+-
+-        if (validParamNames.indexOf(paramName) === -1) {
+-            errs.push(new Error('invalid parameter: ' + paramName));
+-        }
+-    }
+-
+-    return errs;
+-}
+-
+ function validateUpdateVolume(req, res, next) {
+     assert.object(req, 'req');
+     assert.object(res, 'res');
+@@ -1275,15 +1289,17 @@ function validateUpdateVolume(req, res, next) {
+     var VALID_PARAM_NAMES = ['name', 'owner_uuid', 'uuid'];
+     var MANDATORY_PARAM_NAMES = ['uuid'];
+ 
+-    var mandatoryParamsErrs = checkMandatoryParamsPresence(req.params,
+-        MANDATORY_PARAM_NAMES);
+-    var invalidParamsErrs = checkInvalidParams(req.params, VALID_PARAM_NAMES);
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
+ 
+     validationErrs = validationErrs.concat(mandatoryParamsErrs);
+     validationErrs = validationErrs.concat(invalidParamsErrs);
+ 
+     if (req.params.uuid) {
+-        validationErr = volumesValidation.validateVolumeUuid(req.params.uuid);
++        validationErr = uuidValidation.validateUuid(req.params.uuid, 'uuid');
+         if (validationErr !== undefined) {
+             validationErrs.push(validationErr);
+         }
+@@ -1291,7 +1307,7 @@ function validateUpdateVolume(req, res, next) {
+ 
+     if (req.params.owner_uuid) {
+         validationErr =
+-            volumesValidation.validateOwnerUuid(req.params.owner_uuid);
++            uuidValidation.validateUuid(req.params.owner_uuid, 'owner_uuid');
+         if (validationErr !== undefined) {
+             validationErrs.push(validationErr);
+         }
+@@ -1419,31 +1435,19 @@ function updateVolume(req, res, next) {
+                 'Check volume is not currently required by any VM');
+ 
+             var err;
++            var volumeName;
+             var volumeObject = req.loadedVolumeObject;
+-            var volumeName = volumeObject.value.name;
+-
+-            _getVolumeReferences(volumeObject, {
+-                    vmapiClient: req._vmapiClient
+-                },
+-                function referencesListed(listRefsErr, references) {
+-                    assert.optionalArrayOfString(references, 'references');
+-
+-                    if (listRefsErr) {
+-                        req.log.error({error: listRefsErr},
+-                            'Error when listing volume references');
+-                        done(listRefsErr);
+-                    } else {
+-                        req.log.debug({references: references},
+-                            'references found');
+ 
+-                        if (references && references.length > 0) {
+-                            err = new errors.VolumeInUseError(volumeName);
+-                        }
++            assert.object(volumeObject.value, 'volumeObject.value');
++            volumeName = volumeObject.value.name;
+ 
+-                        done(err);
+-                    }
+-                });
+-            },
++            if (volumeObject.value.refs &&
++                volumeObject.value.refs.length > 0) {
++                err = new errors.VolumeInUseError(volumeName);
++            }
++
++            done(err);
++        },
+         function changeVolume(ctx, done) {
+             var volumeObject = req.loadedVolumeObject;
+ 
+@@ -1520,31 +1524,224 @@ function renderVolumeReferences(req, res, next) {
+     next();
+ }
+ 
+-function makeSendResponseHandler(options) {
+-    assert.object(options, 'options');
++function checkNfsServerImgImported(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    if (APPLICATION_STATE.nfsServerImageImported !== true) {
++        next(new Error('nfsserver image not yet imported'));
++    } else {
++        next();
++    }
++}
++
++function validateAddVolumeReference(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var validationErr;
++    var validationErrs = [];
++    var VALID_PARAM_NAMES = ['uuid', 'owner_uuid', 'vm_uuid'];
++    var MANDATORY_PARAM_NAMES = ['uuid', 'owner_uuid', 'vm_uuid'];
++
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
++
++    validationErrs = validationErrs.concat(mandatoryParamsErrs);
++    validationErrs = validationErrs.concat(invalidParamsErrs);
+ 
+-    var statusCode = options.statusCode || 200;
++    if (req.params.uuid !== undefined) {
++        validationErr = uuidValidation.validateUuid(req.params.uuid, 'uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.owner_uuid !== undefined) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.owner_uuid, 'owner_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
+ 
+-    return function sendResponseHandler(req, res, next) {
+-        assert.optionalObject(req.renderedResponse, 'req.renderedResponse');
++    if (req.params.vm_uuid !== undefined) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.vm_uuid, 'vm_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
+ 
+-        res.send(statusCode, req.renderedResponse);
++    if (validationErrs.length > 0) {
++        next(new errors.ValidationError(validationErrs));
++        return;
++    } else {
+         next();
+-    };
++        return;
++    }
+ }
+ 
+-function checkNfsServerImgImported(req, res, next) {
++function addVolumeReference(req, res, next) {
+     assert.object(req, 'req');
++    assert.object(req.loadedVolumeObject, 'req.loadedVolumeObject');
+     assert.object(res, 'res');
+     assert.func(next, 'next');
+ 
+-    if (APPLICATION_STATE.nfsServerImageImported !== true) {
+-        next(new Error('nfsserver image not yet imported'));
++    var context = {};
++    var vmUuid = req.params.vm_uuid;
++    var volumeName = req.loadedVolumeObject.value.name;
++    var volumeUuid = req.loadedVolumeObject.value.uuid;
++
++    vasync.pipeline({arg: context, funcs: [
++        /*
++         * Add actual reference first so that we don't end up deleting a
++         * reservation and _not_ adding a reference, which could result in the
++         * VM not referencing the volume in any way in some cases.
++         */
++        function addReference(ctx, done) {
++            volumesModel.addReference(vmUuid, volumeUuid, done);
++        },
++        function loadVolReservation(ctx, done) {
++            reservationModels.listVolumeReservations({
++                volumeName: volumeName,
++                vmUuid: vmUuid
++            }, function onListRes(listResErr, volReservations) {
++                req.log.debug({
++                    err: listResErr,
++                    volReservations: volReservations
++                }, 'Found volume reservations');
++
++                ctx.volumeReservations = volReservations;
++                done(listResErr);
++            });
++        },
++        function delVolumeReservations(ctx, done) {
++            var volumeReservations = ctx.volumeReservations;
++            if (volumeReservations && volumeReservations.length > 0) {
++                req.log.debug({
++                    volumeReservations: volumeReservations
++                }, 'Deleting volume reservations');
++
++                reservationModels.deleteVolumeReservations(volumeReservations,
++                    function onDelRes(delResErr) {
++                        req.log.error({
++                            err: delResErr
++                        }, 'Error when deleting volume reservations');
++
++                        /*
++                         * Ignore errors during reservation deletion on purpose,
++                         * as this does not prevent the reference between from
++                         * the VM to the volume to be registered. The worse case
++                         * is that the volume reservation is not deleted, and
++                         * thus the volume can't be deleted without using the
++                         * "force" flag until the stale reservations process
++                         * reaps it.
++                         */
++                        done();
++                    });
++            } else {
++                req.log.debug('No volume reservation found, nothing to delete');
++                done();
++            }
++        },
++        function loadVolume(ctx, done) {
++            volumesModel.loadVolume(volumeUuid,
++                function onVolLoaded(loadVolErr, volumeObject) {
++                    ctx.volumeObject = volumeObject;
++                    done(loadVolErr);
++                });
++        }
++    ]}, function addRefDone(err) {
++        req.responseVolume = context.volumeObject.value;
++        next(err);
++    });
++}
++
++function validateRemoveVolumeReference(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var validationErr;
++    var validationErrs = [];
++    var VALID_PARAM_NAMES = ['uuid', 'owner_uuid', 'vm_uuid'];
++    var MANDATORY_PARAM_NAMES = ['uuid', 'owner_uuid', 'vm_uuid'];
++
++    var mandatoryParamsErrs =
++        validationUtils.checkMandatoryParamsPresence(req.params,
++            MANDATORY_PARAM_NAMES);
++    var invalidParamsErrs =
++        validationUtils.checkInvalidParams(req.params, VALID_PARAM_NAMES);
++
++    validationErrs = validationErrs.concat(mandatoryParamsErrs);
++    validationErrs = validationErrs.concat(invalidParamsErrs);
++
++    if (req.params.uuid) {
++        validationErr = uuidValidation.validateUuid(req.params.uuid, 'uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.owner_uuid) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.owner_uuid, 'owner_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (req.params.vm_uuid) {
++        validationErr =
++            uuidValidation.validateUuid(req.params.vm_uuid, 'vm_uuid');
++        if (validationErr !== undefined) {
++            validationErrs.push(validationErr);
++        }
++    }
++
++    if (validationErrs.length > 0) {
++        next(new errors.ValidationError(validationErrs));
++        return;
+     } else {
+         next();
++        return;
+     }
+ }
+ 
++function removeVolumeReference(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var context = {};
++    var vmUuid = req.params.vm_uuid;
++    var volumeUuid = req.params.uuid;
++
++    vasync.pipeline({arg: context, funcs: [
++        function delReference(ctx, done) {
++            volumesModel.removeReference(vmUuid, volumeUuid, done);
++        },
++        function loadVolume(ctx, done) {
++            volumesModel.loadVolume(volumeUuid,
++                function onVolLoaded(loadVolErr, volumeObject) {
++                    ctx.volumeObject = volumeObject;
++                    done(loadVolErr);
++                });
++        }
++    ]}, function delRefDone(err) {
++        req.responseVolume = context.volumeObject.value;
++        next(err);
++    });
++}
++
++
++
+ function mount(config, server, applicationState) {
+     assert.object(config, 'config');
+     assert.object(server, 'server');
+@@ -1558,9 +1755,9 @@ function mount(config, server, applicationState) {
+         name: 'CreateVolume',
+         version: '1.0.0'
+     }, checkNfsServerImgImported,
+-        restify.bodyParser(),
++        restify.bodyParser(), validateCreateVolume,
+         createVolume, renderVolume,
+-        makeSendResponseHandler({
++        renderingMiddlewares.makeSendResponseHandler({
+             statusCode: 201
+         }));
+ 
+@@ -1569,7 +1766,7 @@ function mount(config, server, applicationState) {
+         name: 'ListVolumes',
+         version: '1.0.0'
+     }, restify.queryParser(), validateListVolumes, listVolumes, renderVolumes,
+-        makeSendResponseHandler({
++        renderingMiddlewares.makeSendResponseHandler({
+             statusCode: 200
+         }));
+ 
+@@ -1579,7 +1776,7 @@ function mount(config, server, applicationState) {
+         version: '1.0.0'
+     }, restify.queryParser(), validateListVolumeSizes, listVolumeSizes,
+         renderVolumeSizes,
+-        makeSendResponseHandler({
++        renderingMiddlewares.makeSendResponseHandler({
+             statusCode: 200
+         }));
+ 
+@@ -1587,9 +1784,10 @@ function mount(config, server, applicationState) {
+          path: '/volumes/:uuid',
+          name: 'GetVolume',
+          version: '1.0.0'
+-     }, restify.queryParser(), validateGetVolume, loadVolumeObject, getVolume,
++     }, restify.queryParser(), validateGetVolume,
++        volumesMiddlewares.loadVolumeObject, getVolume,
+         renderVolume,
+-        makeSendResponseHandler({
++        renderingMiddlewares.makeSendResponseHandler({
+             statusCode: 200
+         }));
+ 
+@@ -1597,7 +1795,8 @@ function mount(config, server, applicationState) {
+         path: '/volumes/:uuid',
+         name: 'DeleteVolume',
+         version: '1.0.0'
+-    }, restify.queryParser(), loadVolumeObject, deleteVolume,
++    }, restify.queryParser(), volumesMiddlewares.loadVolumeObject,
++        validateDeleteVolume, deleteVolume,
+         function renderDeletedVolume(req, res, next) {
+             /*
+              * It seems we need to explicitly send an empty response for some
+@@ -1607,7 +1806,7 @@ function mount(config, server, applicationState) {
+             req.renderedResponse = {};
+             next();
+         },
+-        makeSendResponseHandler({
++        renderingMiddlewares.makeSendResponseHandler({
+             statusCode: 204
+         }));
+ 
+@@ -1615,8 +1814,9 @@ function mount(config, server, applicationState) {
+          path: '/volumes/:uuid/references',
+          name: 'GetVolumeReferences',
+          version: '1.0.0'
+-     }, restify.queryParser(), loadVolumeObject, getVolumeReferences,
+-        renderVolumeReferences, makeSendResponseHandler({
++     }, restify.queryParser(), volumesMiddlewares.loadVolumeObject,
++        getVolumeReferences, renderVolumeReferences,
++        renderingMiddlewares.makeSendResponseHandler({
+             statusCode: 200
+         }));
+ 
+@@ -1624,7 +1824,8 @@ function mount(config, server, applicationState) {
+         path: '/volumes/:uuid',
+         name: 'UpdateVolume',
+         version: '1.0.0'
+-    }, restify.bodyParser(), validateUpdateVolume, loadVolumeObject,
++    }, restify.bodyParser(), validateUpdateVolume,
++        volumesMiddlewares.loadVolumeObject,
+         /*
+          * We purposedly do _not_ render the volume, as we would need to either:
+          *
+@@ -1639,7 +1840,55 @@ function mount(config, server, applicationState) {
+          * clients can send a GetVolume request if/when they want to get the
+          * representation of the modified volume.
+          */
+-        updateVolume, makeSendResponseHandler({
++        updateVolume, renderingMiddlewares.makeSendResponseHandler({
++            statusCode: 204
++        }));
++
++    server.post({
++        path: '/volumes/:uuid/addreference',
++        name: 'AddVolumeReference',
++        version: '1.0.0'
++    }, restify.bodyParser(), validateAddVolumeReference,
++        volumesMiddlewares.loadVolumeObject,
++        /*
++         * We purposedly do _not_ render the volume, as we would need to either:
++         *
++         * 1. render the original volume, which is not useful when we try to
++         * update (change) it.
++         *
++         * 2. render the result of the update, which would require to load the
++         * volume object from moray, adding more latency to the request's
++         * response.
++         *
++         * Instead, we reply with a 204 HTTP status code (no content) and
++         * clients can send a GetVolume request if/when they want to get the
++         * representation of the modified volume.
++         */
++        addVolumeReference, renderingMiddlewares.makeSendResponseHandler({
++            statusCode: 204
++        }));
++
++    server.post({
++        path: '/volumes/:uuid/removereference',
++        name: 'RemoveVolumeReference',
++        version: '1.0.0'
++    }, restify.bodyParser(), validateRemoveVolumeReference,
++        volumesMiddlewares.loadVolumeObject,
++        /*
++         * We purposely do _not_ render the volume, as we would need to either:
++         *
++         * 1. render the original volume, which is not useful when we try to
++         * update (change) it.
++         *
++         * 2. render the result of the update, which would require to load the
++         * volume object from moray, adding more latency to the request's
++         * response.
++         *
++         * Instead, we reply with a 204 HTTP status code (no content) and
++         * clients can send a GetVolume request if/when they want to get the
++         * representation of the modified volume.
++         */
++        removeVolumeReference, renderingMiddlewares.makeSendResponseHandler({
+             statusCode: 204
+         }));
+ }
+diff --git a/lib/errors.js b/lib/errors.js
+index f5f678f..4a88e1d 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -23,6 +23,18 @@ function VolumeNotFoundError(volumeUuid) {
+ }
+ util.inherits(VolumeNotFoundError, restify.RestError);
+ 
++function VolumeReservationNotFoundError(volumeResUuid) {
++    restify.RestError.call(this, {
++        restCode: 'VolumeReservationNotFound',
++        statusCode: 404,
++        message: 'Volume reservation with uuid ' + volumeResUuid + ' could ' +
++            'not be found',
++        constructorOpt: VolumeReservationNotFoundError
++    });
++    this.name = 'VolumeReservationNotFoundError';
++}
++util.inherits(VolumeReservationNotFoundError, restify.RestError);
++
+ function VolumeAlreadyExistsError(volumeName) {
+     restify.RestError.call(this, {
+         restCode: 'VolumeAlreadyExists',
+diff --git a/lib/middlewares/rendering.js b/lib/middlewares/rendering.js
+new file mode 100644
+index 0000000..a79b453
+--- /dev/null
++++ b/lib/middlewares/rendering.js
+@@ -0,0 +1,28 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++function makeSendResponseHandler(options) {
++    assert.object(options, 'options');
++
++    var statusCode = options.statusCode || 200;
++
++    return function sendResponseHandler(req, res, next) {
++        assert.optionalObject(req.renderedResponse, 'req.renderedResponse');
++
++        res.send(statusCode, req.renderedResponse);
++        next();
++    };
++}
++
++module.exports = {
++    makeSendResponseHandler: makeSendResponseHandler
++};
+\ No newline at end of file
+diff --git a/lib/middlewares/volumes.js b/lib/middlewares/volumes.js
+new file mode 100644
+index 0000000..48dfc8b
+--- /dev/null
++++ b/lib/middlewares/volumes.js
+@@ -0,0 +1,63 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++var errors = require('../errors');
++var volumesModel = require('../models/volumes');
++
++function loadVolumeObject(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(req.params, 'req.params');
++    assert.uuid(req.params.uuid, 'req.params.uuid');
++    assert.optionalUuid(req.params.owner_uuid, 'req.params.owner_uuid');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var volumeUuid = req.params.uuid;
++    var ownerUuid = req.params.owner_uuid;
++
++    req.log.debug({uuid: volumeUuid}, 'Loading volume');
++
++    volumesModel.loadVolume(volumeUuid,
++        function onVolumesLoaded(err, volumeObject) {
++            if (!err) {
++                if (!volumeObject) {
++                    err = new Error('No volume with uuid ' + volumeUuid
++                        + ' could be found');
++                } else {
++                    assert.object(volumeObject.value, 'volumeObject.value');
++
++                    if (ownerUuid !== undefined &&
++                        volumeObject.value.owner_uuid !== ownerUuid) {
++                        err = new Error('owner_uuid: '  + ownerUuid
++                            + ' does not match owner_uuid for volume '
++                            + volumeUuid + ' ('
++                            + volumeObject.value.owner_uuid + ')');
++                    } else {
++                        req.loadedVolumeObject = volumeObject;
++                    }
++                }
++            } else {
++                req.log.error({err: err},
++                    'Error when loading volume object from moray');
++
++                if (err.name === 'ObjectNotFoundError') {
++                    err = new errors.VolumeNotFoundError(volumeUuid);
++                }
++            }
++
++            next(err);
++        });
++}
++
++module.exports = {
++    loadVolumeObject: loadVolumeObject
++};
+\ No newline at end of file
+diff --git a/lib/models/index.js b/lib/models/index.js
+index 85e0b42..dc61301 100644
+--- a/lib/models/index.js
++++ b/lib/models/index.js
+@@ -5,13 +5,14 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+ var vasync = require('vasync');
+ 
+ var volumesModel = require('./volumes');
++var volumeReservationsModel = require('./volume-reservations');
+ 
+ function init(config, options, callback) {
+     assert.object(config, 'config');
+@@ -25,10 +26,13 @@ function init(config, options, callback) {
+     vasync.parallel({funcs: [
+         function initVolumesModel(done) {
+             return volumesModel.init(config, options, done);
++        },
++        function initVolumeReservationsModel(done) {
++            return volumeReservationsModel.init(config, options, done);
+         }
+     ]}, function modelsInitDone(err) {
+         if (err) {
+-            log.err({err: err}, 'Error when initializing models');
++            log.error({err: err}, 'Error when initializing models');
+         } else {
+             log.info('Models initialized successfully');
+         }
+diff --git a/lib/models/volume-reservations.js b/lib/models/volume-reservations.js
+new file mode 100644
+index 0000000..480508d
+--- /dev/null
++++ b/lib/models/volume-reservations.js
+@@ -0,0 +1,226 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var krill = require('krill');
++var libuuid = require('libuuid');
++var VError = require('verror');
++
++var log;
++var morayClient;
++
++var VOLUMES_RESERVATIONS_BUCKET_NAME = 'volapi_volumes_reservations';
++var VOLUMES_RESERVATIONS_BUCKET_CONFIG = {
++    index: {
++        create_timestamp: { type: 'number' },
++        job_uuid: { type: 'string' },
++        owner_uuid: { type: 'string' },
++        uuid: { type: 'string', unique: true},
++        vm_uuid: { type: 'string' },
++        volume_name: { type: 'string' }
++    }
++};
++
++function createVolumeReservation(reservationParams, callback) {
++    assert.object(reservationParams, 'reservationParams');
++    assert.uuid(reservationParams.job_uuid, 'reservationParams.job_uuid');
++    assert.uuid(reservationParams.owner_uuid, 'reservationParams.owner_uuid');
++    assert.string(reservationParams.volume_name,
++        'reservationParams.volume_name');
++    assert.uuid(reservationParams.vm_uuid, 'reservationParams.vm_uuid');
++    assert.func(callback, 'callback');
++
++    log.debug({reservationParams: reservationParams},
++        'Create volume reservation');
++
++    var uuid = libuuid.create();
++
++    var jobUuid = reservationParams.job_uuid;
++    var volumeName = reservationParams.volume_name;
++    var ownerUuid = reservationParams.owner_uuid;
++    var vmUuid = reservationParams.vm_uuid;
++
++    var reservationObject = {
++        create_timestamp: (new Date()).getTime(),
++        job_uuid: jobUuid,
++        owner_uuid: ownerUuid,
++        uuid: uuid,
++        vm_uuid: vmUuid,
++        volume_name: volumeName
++    };
++
++    log.debug({reservationObject: reservationObject},
++        'Creating volume reservation object in moray');
++
++    morayClient.putObject(VOLUMES_RESERVATIONS_BUCKET_NAME, uuid,
++        reservationObject, {
++        etag: null
++    }, function onPutObjectDone(err) {
++        return callback(err, uuid);
++    });
++}
++
++function getVolumeReservation(reservationUuid, callback) {
++    assert.uuid(reservationUuid, 'reservationUuid');
++    assert.func(callback, 'callback');
++
++    log.debug({reservationUuid: reservationUuid}, 'Get volume reservation');
++
++    morayClient.getObject(VOLUMES_RESERVATIONS_BUCKET_NAME, reservationUuid,
++        callback);
++}
++
++function deleteVolumeReservation(reservationUuid, callback) {
++    assert.uuid(reservationUuid, 'reservationUuid');
++    assert.func(callback, 'callback');
++
++    log.debug({reservationUuid: reservationUuid}, 'Delete volume reservation');
++
++    morayClient.deleteObject(VOLUMES_RESERVATIONS_BUCKET_NAME, reservationUuid,
++        callback);
++}
++
++function makeBatchDelOpFromVolRes(volResObject) {
++    assert.object(volResObject, 'volResObject');
++
++    return {
++        bucket: VOLUMES_RESERVATIONS_BUCKET_NAME,
++        etag: volResObject._etag,
++        key: volResObject.value.uuid,
++        operation: 'delete'
++    };
++}
++
++function deleteVolumeReservations(volumeReservations, callback) {
++    assert.arrayOfObject(volumeReservations, 'volumeReservations');
++    assert.func(callback, 'callback');
++
++    var delBatch = volumeReservations.map(makeBatchDelOpFromVolRes);
++    if (delBatch && delBatch.length > 0) {
++        morayClient.batch(delBatch, callback);
++    } else {
++        callback();
++    }
++}
++
++function searchVolumeReservations(filter, callback) {
++    assert.string(filter, 'filter');
++    assert.func(callback, 'callback');
++
++    var req = morayClient.findObjects(VOLUMES_RESERVATIONS_BUCKET_NAME, filter);
++    var reservationsFound = [];
++
++    req.on('error', function onFindErr(findErr) {
++        callback(findErr);
++    });
++
++    req.on('record', function onRecord(reservationObj) {
++        reservationsFound.push(reservationObj);
++    });
++
++    req.on('end', function onEnd() {
++        callback(null, reservationsFound);
++    });
++}
++
++function listVolumeReservations(params, callback) {
++    if (typeof (params) === 'function') {
++        callback = params;
++        params = {};
++    }
++
++    assert.object(params, 'params');
++    assert.optionalString(params.volumeName, 'params.volumeName');
++    assert.optionalUuid(params.vmUuid, 'params.vmUuid');
++    assert.optionalUuid(params.ownerUuid, 'params.ownerUuid');
++    assert.optionalUuid(params.jobUuid, 'params.jobUuid');
++    assert.func(callback, 'callback');
++
++    log.debug({params: params}, 'ListVolumeReservations');
++
++    var jobUuid = params.jobUuid;
++    var ldapFilter;
++    var ownerUuid = params.ownerUuid;
++    var predicate;
++    var predicateComponents = [];
++    var vmUuid = params.vmUuid;
++    var volumeName = params.volumeName;
++
++    if (volumeName !== undefined) {
++        predicateComponents.push({eq: ['volume_name', volumeName]});
++    }
++
++    if (vmUuid !== undefined) {
++        predicateComponents.push({eq: ['vm_uuid', vmUuid]});
++    }
++
++    if (ownerUuid !== undefined) {
++        predicateComponents.push({eq: ['owner_uuid', ownerUuid]});
++    }
++
++    if (jobUuid !== undefined) {
++        predicateComponents.push({eq: ['job_uuid', jobUuid]});
++    }
++
++    log.debug({
++        predicateComponents: predicateComponents
++    }, 'Built predicate components');
++
++    if (predicateComponents.length === 0) {
++        predicate = krill.createPredicate({eq: ['uuid', '*']});
++    } else if (predicateComponents.length === 1) {
++        predicate = krill.createPredicate(predicateComponents[0]);
++    } else {
++        predicate = krill.createPredicate({
++            and: predicateComponents
++        });
++    }
++
++    ldapFilter = predicate.toLDAPFilterString();
++    log.debug({filter: ldapFilter}, 'Generated LDAP filter');
++
++    searchVolumeReservations(ldapFilter, callback);
++}
++
++function init(config, options, callback) {
++    assert.object(config, 'config');
++    assert.object(options, 'options');
++    assert.object(options.log, 'options.log');
++    assert.object(options.morayClient, 'options.morayClient');
++    assert.func(callback, 'callback');
++
++    morayClient = options.morayClient;
++    log = options.log;
++
++    log.info('Initializing volumes reservations model...');
++
++    morayClient.setupBucket({
++        name: VOLUMES_RESERVATIONS_BUCKET_NAME,
++        config: VOLUMES_RESERVATIONS_BUCKET_CONFIG
++    }, function volumeModelInitialized(err) {
++        if (err) {
++            log.error({err: err},
++                'Error when initializing volumes reservations model');
++        } else {
++            log.info('Volumes reservations model initialized successfully');
++        }
++
++        return callback(err);
++    });
++}
++
++module.exports = {
++    init: init,
++    createVolumeReservation: createVolumeReservation,
++    getVolumeReservation: getVolumeReservation,
++    deleteVolumeReservation: deleteVolumeReservation,
++    deleteVolumeReservations: deleteVolumeReservations,
++    listVolumeReservations: listVolumeReservations
++};
+\ No newline at end of file
+diff --git a/lib/models/volumes.js b/lib/models/volumes.js
+index 9e1a35f..63b9c59 100644
+--- a/lib/models/volumes.js
++++ b/lib/models/volumes.js
+@@ -29,7 +29,14 @@ var VOLUMES_BUCKET_CONFIG = {
+         create_timestamp: { type: 'number' },
+         type: {type: 'string'},
+         size: {type: 'number'},
+-        state: {type: 'string'}
++        state: {type: 'string'},
++        /*
++         * "references" is a reserved Postgresql keyword, and so using the name
++         * "references" here would cause errors when adding the corresponding
++         * table column in Postgres as part of the moray bucket initialization
++         * process.
++         */
++        refs: {type: '[string]'}
+     }
+ };
+ 
+@@ -59,6 +66,10 @@ function createVolume(volumeParams, callback) {
+         state: state
+     };
+ 
++    if (volumeParams.refs !== undefined) {
++        volumeObject.refs = volumeParams.refs;
++    }
++
+     if (volumeParams.networks !== undefined) {
+         volumeObject.networks = volumeParams.networks;
+     }
+@@ -147,17 +158,28 @@ function _buildSearchFilter(params) {
+ 
+     var filters = [];
+     var paramName;
+-    var predicateLdapFilter;
++    var predicateLdapFilterObject;
++    var predicateLdapFilterString;
+     var searchFilter;
+     var SELECT_ALL_FILTER = '(uuid=*)';
+ 
+     if (params.predicate && !params.predicate.trivial()) {
+-        predicateLdapFilter =
+-            ldapFilter.parse(params.predicate.toLDAPFilterString());
++        predicateLdapFilterString = params.predicate.toLDAPFilterString();
++        assert.string(predicateLdapFilterString, 'predicateLdapFilterString');
++        log.debug({
++            filterString: predicateLdapFilterString
++        }, 'filter string before subs');
++
++        predicateLdapFilterString =
++            predicateLdapFilterString.replace('(dangling=true)', '(!(refs=*))');
++        predicateLdapFilterString =
++            predicateLdapFilterString.replace('(dangling=false)', '(refs=*)');
++
++        predicateLdapFilterObject = ldapFilter.parse(predicateLdapFilterString);
+     }
+ 
+-    if (predicateLdapFilter) {
+-        filters.push(predicateLdapFilter);
++    if (predicateLdapFilterObject) {
++        filters.push(predicateLdapFilterObject);
+     }
+ 
+     for (paramName in params) {
+@@ -204,10 +226,32 @@ function _buildSearchFilter(params) {
+     return searchFilter.toString();
+ }
+ 
++function listVolumesByFilter(filter, callback) {
++    assert.string(filter, 'filter');
++    assert.func(callback, 'callback');
++
++    var volumesFound = [];
++
++    var req = morayClient.findObjects(VOLUMES_BUCKET_NAME, filter);
++
++    req.once('error', function onSearchVolumeError(err) {
++        callback(err);
++    });
++
++    req.on('record', function onVolumeFound(volumeObj) {
++        volumesFound.push(volumeObj);
++    });
++
++    req.on('end', function onSearchVolumeEnd() {
++        callback(null, volumesFound);
++    });
++}
++
+ function listVolumes(params, callback) {
+     assert.object(params, 'params');
+     assert.optionalString(params.name, 'params.name');
+     assert.optionalString(params.owner_uuid, 'params.owner_uuid');
++    assert.optionalString(params.state, 'params.state');
+     assert.optionalObject(params.predicate, 'params.predicate');
+     assert.func(callback, 'callback');
+ 
+@@ -314,6 +358,93 @@ function deleteVolumeWithRetry(volumeUuid, callback) {
+     doDeleteVolume();
+ }
+ 
++function addReference(fromVmUuid, toVolumeUuid, callback) {
++    assert.uuid(fromVmUuid, 'fromVmUuid');
++    assert.uuid(toVolumeUuid, 'toVolumeUuid');
++    assert.func(callback, 'callback');
++
++    var context = {};
++
++    vasync.pipeline({arg: context, funcs: [
++        function doLoadVolume(ctx, next) {
++            loadVolume(toVolumeUuid, function onVolLoaded(loadErr, volume) {
++                if (volume) {
++                    ctx.volumeObject = volume;
++                }
++
++                next(loadErr);
++            });
++        },
++        function addRef(ctx, next) {
++            assert.object(ctx.volumeObject, 'ctx.volumeObject');
++            assert.object(ctx.volumeObject.value, 'ctx.volumeObject.value');
++
++            var volumeObject = ctx.volumeObject;
++            if (volumeObject.value.refs) {
++                if (volumeObject.value.refs.indexOf(fromVmUuid) === -1) {
++                    volumeObject.value.refs.push(fromVmUuid);
++                }
++            } else {
++                volumeObject.value.refs = [fromVmUuid];
++            }
++
++            next();
++        },
++        function doUpdateVolume(ctx, next) {
++            assert.object(ctx.volumeObject, 'ctx.volumeObject');
++
++            updateVolumeWithRetry(toVolumeUuid, ctx.volumeObject, next);
++        }
++    ]}, callback);
++}
++
++function removeReference(fromVmUuid, toVolumeUuid, callback) {
++    assert.uuid(fromVmUuid, 'fromVmUuid');
++    assert.uuid(toVolumeUuid, 'toVolumeUuid');
++    assert.func(callback, 'callback');
++
++    var context = {};
++
++    vasync.pipeline({arg: context, funcs: [
++        function doLoadVolume(ctx, next) {
++            loadVolume(toVolumeUuid, function onVolLoaded(loadErr, volume) {
++                if (volume) {
++                    ctx.volumeObject = volume;
++                }
++
++                next(loadErr);
++            });
++        },
++        function removeRef(ctx, next) {
++            assert.object(ctx.volumeObject, 'ctx.volumeObject');
++            assert.object(ctx.volumeObject.value, 'ctx.volumeObject.value');
++
++            var idx = -1;
++
++            var volumeObject = ctx.volumeObject;
++            if (volumeObject.value.refs) {
++                idx = volumeObject.value.refs.indexOf(fromVmUuid);
++            }
++
++            if (idx !== -1) {
++                volumeObject.value.refs.splice(idx, 1);
++            }
++
++            if (volumeObject.value.refs &&
++                volumeObject.value.refs.length === 0) {
++                delete volumeObject.value.refs;
++            }
++
++            next();
++        },
++        function doUpdateVolume(ctx, next) {
++            assert.object(ctx.volumeObject, 'ctx.volumeObject');
++
++            updateVolumeWithRetry(toVolumeUuid, ctx.volumeObject, next);
++        }
++    ]}, callback);
++}
++
+ function init(config, options, callback) {
+     assert.object(config, 'config');
+     assert.object(options, 'options');
+@@ -347,6 +478,9 @@ module.exports = {
+     updateVolumeWithRetry: updateVolumeWithRetry,
+     loadVolume: loadVolume,
+     listVolumes: listVolumes,
++    listVolumesByFilter: listVolumesByFilter,
+     deleteVolume: deleteVolume,
+-    deleteVolumeWithRetry: deleteVolumeWithRetry
++    deleteVolumeWithRetry: deleteVolumeWithRetry,
++    addReference: addReference,
++    removeReference: removeReference
+ };
+diff --git a/lib/moray.js b/lib/moray.js
+index edab386..b49a01e 100644
+--- a/lib/moray.js
++++ b/lib/moray.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var util = require('util');
+@@ -72,6 +72,10 @@ Moray.prototype.ping = function ping(callback) {
+     return this.connection.ping({ log: this.log }, callback);
+ };
+ 
++Moray.prototype.batch = function batch(data, callback) {
++    return this.connection.batch(data, callback);
++};
++
+ /*
+  * Gets a bucket
+  */
+diff --git a/lib/uuid.js b/lib/uuid.js
+new file mode 100644
+index 0000000..b1ce23f
+--- /dev/null
++++ b/lib/uuid.js
+@@ -0,0 +1,19 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
++
++function validUuid(uuid) {
++    return typeof (uuid) === 'string' && uuid !== '' && uuid.match(UUID_RE);
++}
++
++module.exports = {
++    validUuid: validUuid
++};
+\ No newline at end of file
+diff --git a/lib/validation/predicate.js b/lib/validation/predicate.js
+index 3b67739..dd9d248 100644
+--- a/lib/validation/predicate.js
++++ b/lib/validation/predicate.js
+@@ -16,6 +16,7 @@ var volumes = require('../volumes');
+ var volumesValidation = require('./volumes');
+ 
+ var VOLUME_PREDICATE_TYPES = {
++    dangling: 'boolean',
+     name: 'string',
+     network: 'string',
+     size: 'number',
+@@ -34,6 +35,7 @@ function validatePredicate(predicateString) {
+     var predicateFieldsAndValues;
+     var predicateField;
+     var VALIDATION_FUNCS = {
++        dangling: volumesValidation.validateDanglingPredicate,
+         name: volumesValidation.validateVolumeName,
+         network: volumesValidation.validateVolumeNetwork,
+         size: volumesValidation.validateVolumeSize,
+diff --git a/lib/validation/utils.js b/lib/validation/utils.js
+new file mode 100644
+index 0000000..1726a16
+--- /dev/null
++++ b/lib/validation/utils.js
+@@ -0,0 +1,56 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++function checkMandatoryParamsPresence(params, mandatoryParamNames) {
++    assert.object(params, 'params');
++    assert.arrayOfString(mandatoryParamNames, 'mandatoryParamNames');
++
++    var errs = [];
++    var mandatoryParamIndex;
++    var mandatoryParamName;
++
++    for (mandatoryParamIndex = 0; mandatoryParamIndex <
++        mandatoryParamNames.length; ++mandatoryParamIndex) {
++        mandatoryParamName = mandatoryParamNames[mandatoryParamIndex];
++        if (!params.hasOwnProperty(mandatoryParamName)) {
++            errs.push(new Error('missing mandatory parameter: ' +
++                mandatoryParamName));
++        }
++    }
++
++    return errs;
++}
++
++function checkInvalidParams(params, validParamNames) {
++    assert.object(params, 'params');
++    assert.arrayOfString(validParamNames, 'validParamNames');
++
++    var errs = [];
++    var paramName;
++
++    for (paramName in params) {
++        if (!params.hasOwnProperty(paramName)) {
++            continue;
++        }
++
++        if (validParamNames.indexOf(paramName) === -1) {
++            errs.push(new Error('invalid parameter: ' + paramName));
++        }
++    }
++
++    return errs;
++}
++
++module.exports = {
++    checkMandatoryParamsPresence: checkMandatoryParamsPresence,
++    checkInvalidParams: checkInvalidParams
++};
+\ No newline at end of file
+diff --git a/lib/validation/uuid.js b/lib/validation/uuid.js
+new file mode 100644
+index 0000000..6b83c0a
+--- /dev/null
++++ b/lib/validation/uuid.js
+@@ -0,0 +1,30 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++var mod_uuid = require('../uuid');
++
++function validateUuid(uuid, paramName) {
++    assert.string(paramName, 'paramName');
++
++    var err;
++    var validUuid = mod_uuid.validUuid(uuid);
++
++    if (!validUuid) {
++        err = new Error(uuid + ' is not a valid ' + paramName + ' UUID');
++    }
++
++    return err;
++}
++
++module.exports = {
++    validateUuid: validateUuid
++};
+\ No newline at end of file
+diff --git a/lib/validation/volumes.js b/lib/validation/volumes.js
+index 007aae7..a77c3c3 100644
+--- a/lib/validation/volumes.js
++++ b/lib/validation/volumes.js
+@@ -8,31 +8,46 @@
+  * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
++var assert = require('assert-plus');
+ var volumes = require('../volumes');
++var mod_uuid = require('../uuid.js');
+ 
+ var VALID_VOLUME_NAME_CHARS_REGEXP = /^[a-zA-Z0-9_\.\-]+$/;
+ var VALID_VOLUME_NAME_REGEXP = /^[a-zA-Z0-9][a-zA-Z0-9_\.\-]+$/;
+ var VALID_VOLUME_SIZE_REGEXP = /^[1-9][0-9]*$/;
+-var UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+ 
+-function validUuid(uuid) {
+-    return typeof (uuid) === 'string' && uuid !== '' && uuid.match(UUID_RE);
++function validateBoolean(value, paramName) {
++    assert.string(paramName, 'paramName');
++
++    var err;
++    var validBoolean = typeof (value) === 'boolean';
++
++    if (!validBoolean) {
++        err = new Error(value + ' is not a valid boolean value for ' +
++            paramName + '.');
++    }
++
++    return err;
+ }
+ 
+-function validateOwnerUuid(ownerUuid) {
+-     var err;
+-     var validOwnerUuid = validUuid(ownerUuid);
++function validateBooleanAsString(value, paramName) {
++    assert.string(paramName, 'paramName');
+ 
+-     if (!validOwnerUuid) {
+-         err = new Error(ownerUuid + ' is not a valid volume owner UUID');
+-     }
++    var err;
++    var validBooleanAsString = typeof (value) === 'string' &&
++        (value === 'true' || value === 'false');
+ 
+-     return err;
++    if (!validBooleanAsString) {
++        err = new Error(value + ' is not a valid boolean string value for ' +
++            paramName + '.');
++    }
++
++    return err;
+ }
+ 
+ function validateVolumeNetwork(volumeNetworkUuid) {
+     var err;
+-    var validNetworkUuid = validUuid(volumeNetworkUuid);
++    var validNetworkUuid = mod_uuid.validUuid(volumeNetworkUuid);
+ 
+      if (!validNetworkUuid) {
+          err = new Error(volumeNetworkUuid + ' is not a valid volume ' +
+@@ -145,19 +160,19 @@ function validateVolumeState(state) {
+     return err;
+ }
+ 
+-function validateVolumeUuid(volumeUuid) {
++function validateDanglingPredicate(dangling) {
+     var err;
+-    var validVolumeUuid = validUuid(volumeUuid);
++    var validDanglingPredicate = typeof (dangling) === 'boolean';
+ 
+-    if (!validVolumeUuid) {
+-        err = new Error(volumeUuid + ' is not a valid volume UUID');
++    if (!validDanglingPredicate) {
++        err = new Error('Dangling predicate: "' + dangling + '" is not a ' +
++            'valid dangling predicate. must be either true or false');
+     }
+ 
+     return err;
+ }
+ 
+ module.exports = {
+-    validateOwnerUuid: validateOwnerUuid,
+     validateVolumeName: validateVolumeName,
+     validateVolumeNameSearchParam: validateVolumeNameSearchParam,
+     validateVolumeNetwork: validateVolumeNetwork,
+@@ -165,5 +180,7 @@ module.exports = {
+     validateVolumeSizeSearchParam: validateVolumeSizeSearchParam,
+     validateVolumeState: validateVolumeState,
+     validateVolumeType: validateVolumeType,
+-    validateVolumeUuid: validateVolumeUuid
++    validateDanglingPredicate: validateDanglingPredicate,
++    validateBoolean: validateBoolean,
++    validateBooleanAsString: validateBooleanAsString
+ };
+diff --git a/lib/volapi.js b/lib/volapi.js
+index b0f5582..e67abb9 100644
+--- a/lib/volapi.js
++++ b/lib/volapi.js
+@@ -28,6 +28,7 @@ var models = require('./models');
+ var Moray = require('./moray');
+ 
+ var pingRoutes = require('./endpoints/ping');
++var volumeResRoutes = require('./endpoints/volume-reservations');
+ var volumeRoutes = require('./endpoints/volumes');
+ 
+ var request_seq_id = 0;
+@@ -98,20 +99,16 @@ function setRoutes(config, server, applicationState, callback) {
+     assert.object(applicationState, 'applicationState');
+     assert.func(callback, 'callback');
+ 
++    volumeResRoutes.mount(config, server, applicationState);
+     volumeRoutes.mount(config, server, applicationState);
+     pingRoutes.mount(config, server);
+ 
+     callback();
+ }
+ 
+-function setupRestifyServer(context, callback) {
+-    assert.object(context, 'context');
+-    assert.object(context.log, 'context.log');
+-    assert.object(context.config, 'context.log');
+-    assert.func(callback, 'callback');
+-
+-    var log = context.log;
+-    var config = context.config;
++function setupRestifyServer(config, log) {
++    assert.object(log, 'log');
++    assert.object(config, 'log');
+ 
+     var server = restify.createServer({
+         name: 'VOLAPI',
+@@ -179,9 +176,7 @@ function setupRestifyServer(context, callback) {
+         res.send(new restify.InternalError('Internal Server Error'));
+     });
+ 
+-    context.server = server;
+-
+-    callback();
++    return server;
+ }
+ 
+ function importImage(imgapiClient, imageUuid, log, callback) {
+@@ -237,7 +232,7 @@ function init(config, log, callback) {
+     assert.func(callback, 'callback');
+ 
+     var morayClient;
+-    var ctx = {
++    var context = {
+         log: log,
+         config: config
+     };
+@@ -255,21 +250,46 @@ function init(config, log, callback) {
+             applicationState.nfsServerImageImported = true;
+         });
+ 
+-    vasync.pipeline({funcs: [
+-        function connectToMoray(context, next) {
++    vasync.pipeline({arg: context, funcs: [
++        function connectToMoray(ctx, next) {
+             morayClient = new Moray(config.moray);
+             morayClient.connect();
+             morayClient.on('connect', next);
+         },
+-        function initModels(context, next) {
+-            models.init(config, {
+-                morayClient: morayClient,
+-                log: log
+-            }, next);
++        function initModels(ctx, next) {
++            var modelsInitBackoff = backoff.exponential({
++                initialDelay: 100,
++                maxDelay: 10000
++            });
++
++            modelsInitBackoff.on('ready', function onBackoff(number, delay) {
++                models.init(config, {
++                    morayClient: morayClient,
++                    log: log
++                }, function onModelsInitialized(modelsInitErr) {
++                    if (modelsInitErr) {
++                        ctx.log.error({
++                            err: modelsInitErr
++                        }, 'Error when initializing models, backing off');
++                        modelsInitBackoff.backoff();
++                    } else {
++                        ctx.log.info('Models initialized successfully');
++                        modelsInitBackoff.reset();
++                        next();
++                    }
++                });
++            });
++
++            modelsInitBackoff.backoff();
++        },
++        function setupHttpServer(ctx, next) {
++            ctx.server = setupRestifyServer(ctx.config, ctx.log);
++            next();
+         },
+-        setupRestifyServer,
+-        function setupMiddlewares(context, next) {
+-            return setCommonMiddlewares(config, context.server, {
++        function setupMiddlewares(ctx, next) {
++            assert.object(ctx.server, 'ctx.server');
++
++            return setCommonMiddlewares(config, ctx.server, {
+                 cnapiClient: new CnapiClient(config.cnapi),
+                 imgapiClient: imgapiClient,
+                 morayClient: morayClient,
+@@ -278,13 +298,12 @@ function init(config, log, callback) {
+                 vmapiClient: new VmapiClient(config.vmapi)
+             }, next);
+         },
+-        function setupRoutes(context, next) {
+-            return setRoutes(config, context.server, applicationState, next);
++        function setupRoutes(ctx, next) {
++            assert.object(ctx.server, 'ctx.server');
++            return setRoutes(config, ctx.server, applicationState, next);
+         }
+-    ],
+-    arg: ctx
+-    }, function initDone(err) {
+-        return callback(err, ctx.server);
++    ]}, function initDone(err) {
++        return callback(err, context.server);
+     });
+ }
+ 
+diff --git a/package.json b/package.json
+index 587aaf6..7130981 100644
+--- a/package.json
++++ b/package.json
+@@ -24,7 +24,8 @@
+     "sdc-clients": "git+https://github.com/joyent/node-sdc-clients.git#tritonnfs",
+     "trace-event": "^1.3.0",
+     "vasync": "^1.6.4",
+-    "verror": "1.8.1"
++    "verror": "1.10.0",
++    "wf-client": "0.2.1"
+   },
+   "devDependencies": {
+     "tape": "^4.5.1"
+diff --git a/sapi_manifests/volapi/template b/sapi_manifests/volapi/template
+index a76e8b7..4509959 100644
+--- a/sapi_manifests/volapi/template
++++ b/sapi_manifests/volapi/template
+@@ -7,10 +7,6 @@
+         "port": 80
+     },
+     "wfapi": {
+-        "forceMd5Check": true,
+-        "workflows": [
+-            "provision-volume-vm"
+-        ],
+         "url": "http://{{{WORKFLOW_SERVICE}}}"
+     },
+     "cnapi": {
+diff --git a/volapi-updater.js b/volapi-updater.js
+index 42e98fd..1eeead6 100644
+--- a/volapi-updater.js
++++ b/volapi-updater.js
+@@ -10,16 +10,31 @@
+ 
+ /*
+  * Introduction
+- * ------------
++ * ============
++ *
++ * volapi-updater runs as part of a separate SMF service. It performs two tasks:
++ *
++ * 1. It watches for changes in state for NFS shared volumes' storage VMs, and
++ *    update these volumes' properties (state, NFS remote path, etc.) according
++ *    to their storage VM's changes. For instance, when a NFS shared volume is
++ *    created, its state is 'creating'. As part of the volume creation process,
++ *    a storage VM is also created. Once that storage VM changes state to
++ *    'running', volapi-updater updates the corresponding volume to be in state
++ *    'ready'
++ *
++ * 2. It keeps volume references consistent. For instance, when a VM that
++ *    requires a NFS volume gets destroyed, volapi-updater notices the VM
++ *    changes its state to 'destroyed' and removes that VM from the "refs"
++ *    property of all volumes that that VM was requiring. It also removes all
++ *    the volume reservations associated to that VM.
++ *
+  *
+- * volapi-updater runs as part of a separate SMF service. Its role is to watch
+- * for changes in state for NFS shared volumes' storage VMs, and update these
+- * volumes' state according to their storage VM's state changes.
++ * Those two responsiblities are considered as two different logical processes,
++ * even though they are performed by the same program, and they share a lot of
++ * code.
+  *
+- * For instance, when a NFS shared volume is created, its state is 'creating'.
+- * As part of the volume creation process, a storage VM is also created. Once
+- * that storage VM changes state to 'running', volapi-updater updates the
+- * corresponding volume to be in state 'ready'
++ * Watching volumes' storage VMs
++ * =============================
+  *
+  * Changefeed usage
+  * ----------------
+@@ -115,24 +130,101 @@
+  * volume objects, such as when a volume's name is updated. In this case, an
+  * etag conflict error would result in volapi-updater reloading the volume, and
+  * retrying to update its state.
++ *
++ * Keeping volume references consistent
++ * ====================================
++ *
++ * Keeping volume references consistent involves two separate processes:
++ *
++ * 1. Processing all entries from the volumes reservations bucket and updating
++ *    the volumes reserved and the reservations themselves depending on the
++ *    state of the VM that made the reservation.
++ *
++ * 2. Processing VM changefeed events to update references and reservations when
++ *    a VM referencing a volume changes state.
++ *
++ * Using the volumes reservations bucket
++ * -------------------------------------
++ *
++ * When provisioning a VM that requires a NFS volume (via e.g a "docker run -v
++ * volume-name:/mountpoint" command), a volume reservation is created that
++ * associates the volumes that are required and the provisioning VM. Creating a
++ * volume reservation implicitly creates a reference from the provisioning VM to
++ * the volume when the volume is created, and before the VM is provisioned.
++ *
++ * This serves different purposes:
++ *
++ * 1. It allows VMs that are provisioning to hold a reference to their required
++ *    volumes. Thus, a user cannot delete these volumes even when the VM is not
++ *    provisioned. Instead they get a "volume in use" error.
++ *
++ * 2. It allows volapi-updater to check for VMs that failed to update their
++ *    references and clear their reservations via AddReference requests, or
++ *    failed to provision and somehow didn't get their state and/or their
++ *    provisioning workflow's state updated. volapi-updater is able to
++ *    determine, depending on the state of the provisioning workflow, the state
++ *    of the VM, and the time at which the provisioning workflow was created
++ *    whether it's safe to keep/remove the implicit references and clear the
++ *    reservations that were created.
++ *
++ * Processing changefeed events
++ * ----------------------------
++ *
++ * In addition to going through the volumes reservations table periodically,
++ * volapi-updater also uses VMAPI changefeed events to keep the references and
++ * volumes reservations consistent with the state of VMs that require volumes.
++ *
++ * When a VM changes its state, volapi-updater gets a changefeed event. For
++ * instance, if the state of that VM is "active" (running or stopped), then
++ * volapi-updater makes sure that, if it requires NFS volumes, the volume
++ * objects that represent the volumes it requires have that VM's uuid in their
++ * "refs" property.
++ *
++ * When volapi-updater processes a changefeed event and is confident that it can
++ * update volume references accordingly, it also clears all volume reservations
++ * associated with the VM for which it received a changefeed event, since the
++ * purpose of volumes reservations is really to hold a reference to a volume
++ * until the state of the VM that reserved it is known.
++ *
++ * Known issues
++ * ------------
++ *
++ * It is possible for a VM to transition from a state === 'failed' to a state
++ * that is considered active. In this case, what would happen is that
++ * volapi-updater could get two events, one for when the state changes to
++ * 'failed', and another one when the VM transition to an active state.
++ *
++ * When processing the event corresponding to the VM transitioning to the state
++ * 'failed', volapi-updater would remove the VM's uuid from the "refs" property
++ * of all volumes that were previously referenced by it. At that point, the
++ * owner of the volumes referenced by the VM would be able to delete all these
++ * volumes, even though the VM would actually be running on the CN, and would
++ * later come back to an active state.
++ *
++ * This is currently considered to be an acceptable limitation.
+  */
+ 
+ var execFile = require('child_process').execFile;
+ var mod_assert = require('assert-plus');
++var mod_backoff = require('backoff');
+ var mod_bunyan = require('bunyan');
+ var mod_changefeed = require('changefeed');
++var mod_jsprim = require('jsprim');
+ var mod_restify = require('restify');
+ var mod_vasync = require('vasync');
+ var mod_VError = require('verror');
+ var path = require('path');
+ var VmapiClient = require('sdc-clients').VMAPI;
++var WfClient = require('wf-client');
+ 
+ var configLoader = require('./lib/config-loader');
+ var mod_volumeUtils = require('./lib/volumes.js');
++var models = require('./lib/models');
++var reservationModels = require('./lib/models/volume-reservations.js');
+ var volumeModels = require('./lib/models/volumes.js');
+ var Moray = require('./lib/moray.js');
+ 
+-function VmsUpdater(options) {
++function VolumesUpdater(options) {
+     this._changefeedListener = null;
+ 
+     mod_assert.object(options, 'options');
+@@ -170,7 +262,7 @@ function getInstanceUuid(callback) {
+         });
+ }
+ 
+-VmsUpdater.prototype.init = function init(callback) {
++VolumesUpdater.prototype.init = function init(callback) {
+     mod_assert.func(callback, 'callback');
+ 
+     var self = this;
+@@ -364,11 +456,9 @@ function updateVolumeFromVmChangeEvent(vmChangeEvent, log, vmapiClient,
+     mod_assert.object(vmapiClient, 'vmapiClient');
+     mod_assert.func(callback, 'callback');
+ 
+-    mod_assert.object(vmChangeEvent, 'vmChangeEvent');
+-
+     log.debug({
+-        event: vmChangeEvent
+-    }, 'Processing change event');
++        vmChangeEvent: vmChangeEvent
++    }, 'Updating volume from VM changefeed event');
+ 
+     var vmUuid = vmChangeEvent.changedResourceId;
+     mod_assert.uuid(vmUuid, 'vmUuid');
+@@ -424,13 +514,7 @@ function updateVolumeFromVmChangeEvent(vmChangeEvent, log, vmapiClient,
+         function updateVolume(ctx, next) {
+             mod_assert.optionalObject(ctx.volume, 'ctx.volume');
+ 
+-            if (ctx.volume === undefined) {
+-                next();
+-                return;
+-            }
+-
+-            mod_assert.optionalObject(ctx.storageVm, 'ctx.storageVm');
+-            if (ctx.storageVm === undefined) {
++            if (ctx.volume === undefined || ctx.storageVm === undefined) {
+                 next();
+                 return;
+             }
+@@ -452,7 +536,7 @@ function updateVolumeFromVmChangeEvent(vmChangeEvent, log, vmapiClient,
+                     } else {
+                         log.info({
+                             storageVm: ctx.storageVm,
+-                            volume: ctx.volume
++                            volume: ctx.storageVm
+                         }, 'Successfully updated volume with storage ' +
+                                 'vm');
+                     }
+@@ -469,14 +553,11 @@ function updateAllVolumesFromVmApi(vmapiClient, log, callback) {
+     mod_assert.object(log, 'log');
+     mod_assert.func(callback, 'callback');
+ 
+-    log.info('Updating all volumes from VMAPI...');
+-
+     vmapiClient.listVms({
+         'tag.smartdc_role': mod_volumeUtils.NFS_SHARED_VOLUME_SMARTDC_ROLE
+     }, function onGetAllVolumesVms(getVmsErr, volumeVms) {
+         if (getVmsErr) {
+-            log.error({error: getVmsErr},
+-                'Error when fetching VMs during bootstrap');
++            log.error({error: getVmsErr}, 'Error when fetching VMs');
+             callback(getVmsErr);
+             return;
+         } else {
+@@ -485,86 +566,637 @@ function updateAllVolumesFromVmApi(vmapiClient, log, callback) {
+                     updateVolumeFromVm(vm, log, done);
+                 },
+                 inputs: volumeVms
+-            }, callback);
++            }, function onVolsUpdated(volsUpdateErr) {
++                if (volsUpdateErr) {
++                    log.error({
++                        err: volsUpdateErr
++                    }, 'Error when updating volumes');
++                } else {
++                    log.info('All volumes updated successfully');
++                }
++
++                callback(volsUpdateErr);
++            });
+             return;
+         }
+     });
+ }
+ 
+-VmsUpdater.prototype.start = function start() {
++/*
++ * Get the list of VMs that are currently referencing or reserving a volume.
++ */
++function getAllPotentialRefVms(options, callback) {
++    mod_assert.object(options, 'options');
++    mod_assert.object(options.log, 'options.log');
++    mod_assert.func(callback, 'callback');
++
++    var vmUuidsMap = {};
++
++    mod_vasync.parallel({funcs: [
++        function loadVolumeReservations(done) {
++            reservationModels.listVolumeReservations(onListVolsRes);
++
++            function onListVolsRes(listErr, reservations) {
++                if (!listErr && reservations) {
++                    reservations.forEach(function setReservation(res) {
++                        vmUuidsMap[res.value.vm_uuid] = true;
++                    });
++                }
++
++                done(listErr);
++            }
++        },
++        function loadVolumesRefs(done) {
++            volumeModels.listVolumesByFilter('(refs=*)',
++                function onListVolumes(listErr, volumeObjects) {
++                    if (listErr) {
++                        done(listErr);
++                        return;
++                    }
++
++                    mod_assert.optionalArrayOfObject(volumeObjects,
++                        'volumeObjects');
++
++                    if (!volumeObjects || volumeObjects.length === 0) {
++                        done();
++                        return;
++                    }
++
++                    volumeObjects.forEach(function processVolumeObj(volumeObj) {
++                        var volumeRefs = volumeObj.value.refs;
++                        mod_assert.optionalArrayOfUuid(volumeRefs,
++                            'volumeRefs');
++
++                        if (!volumeRefs || volumeRefs.length === 0) {
++                            return;
++                        }
++
++                        volumeRefs.forEach(function setVolRef(vmUuidRef) {
++                            vmUuidsMap[vmUuidRef] = true;
++                        });
++                    });
++
++                    done();
++                });
++        }
++    ]}, function onResAndRefsLoaded(loadErr) {
++        var refVms = Object.keys(vmUuidsMap);
++
++        if (loadErr) {
++            callback(loadErr);
++            return;
++        }
++
++        callback(null, refVms);
++    });
++}
++
++function updateAllVolumesRefs(options, callback) {
++    mod_assert.object(options, 'options');
++    mod_assert.object(options.vmapiClient, 'options.vmapiClient');
++    mod_assert.object(options.log, 'options.log');
++    mod_assert.func(callback, 'callback');
++
++    var context = {};
++    var log = options.log;
++
++    mod_vasync.pipeline({arg:context, funcs: [
++        function getPotentialRefVms(ctx, next) {
++            log.info('Getting all VMs that are referencing volumes');
++
++            getAllPotentialRefVms({
++                log: options.log
++            }, function onGetRefVms(getErr, refVms) {
++                if (getErr) {
++                    log.error({
++                        err: getErr
++                    }, 'Error when getting all VMs that are referencing ' +
++                        'volumes');
++                } else {
++                    log.info({
++                        vms: refVms
++                    }, 'Got all VMs that are referencing volumes');
++                }
++
++                ctx.refVms = refVms;
++                next(getErr);
++            });
++        },
++        function updateVolumesRefsAndResFromVms(ctx, next) {
++            var updateRefsQueue;
++
++            mod_assert.optionalArrayOfUuid(ctx.refVms, 'ctx.refVms');
++
++            log.info({
++                vms: ctx.refVms
++            }, 'Updating references for referencing VMs');
++
++            if (ctx.refVms && ctx.refVms.length > 0) {
++                updateRefsQueue = mod_vasync.queue(updateRefsForVm, 10);
++
++                updateRefsQueue.on('end', function onUpdateRefsQueueEnd() {
++                    log.info({
++                        vms: ctx.refVms
++                    }, 'Done updating references for referencing VMs');
++                    next();
++                });
++
++                ctx.refVms.forEach(function pushToUpdateRefsQueue(vmUuid) {
++                    updateRefsQueue.push(vmUuid);
++                });
++
++                updateRefsQueue.close();
++            } else {
++                log.info('No reference to update');
++                next();
++            }
++
++            function updateRefsForVm(vmUuid, done) {
++                mod_assert.uuid(vmUuid, 'vmUuid');
++
++                updateReferencesAndReservationsForVm(vmUuid, {
++                    log: options.log,
++                    vmapiClient: options.vmapiClient
++                }, done);
++            }
++        }
++    ]}, callback);
++}
++
++VolumesUpdater.prototype.start = function start() {
+     mod_assert.object(this._changefeedListener, 'this._changefeedListener');
+ 
+     var self = this;
+ 
+     self._changefeedListener.register();
+ 
+-    self._changefeedListener.on('bootstrap',
+-        function _updateAllVolumesFromVmApi() {
+-            updateAllVolumesFromVmApi(self._vmapiClient, self._log,
+-                function onAllVolumesUpdated(err) {
+-                    if (err) {
+-                        self._log.error({error: err}, 'Error when updating ' +
+-                            'volumes on bootstrap, retrying...');
+-                        setTimeout(_updateAllVolumesFromVmApi, 2000);
++    self._changefeedListener.on('bootstrap', function onBootstrap() {
++        mod_vasync.parallel({funcs: [
++            function updateVolumes(done) {
++                self._log.info('Updating all volumes from VMAPI');
++                updateAllVolumesFromVmApi(self._vmapiClient, self._log,
++                    function onUpdateVolsDone(volsUpdateErr) {
++                        if (volsUpdateErr) {
++                            self._log.error({error: volsUpdateErr},
++                                    'Error when updating all volumes from ' +
++                                        'VMAPI');
++                        } else {
++                            self._log.info('All volumes updated from VMAPI ' +
++                                'successfully');
++                        }
++
++                        done(volsUpdateErr);
++                    });
++            },
++            function updateVolumesRefsAndRes(done) {
++                self._log.info('Updating all volumes references and ' +
++                    'reservations');
++                updateAllVolumesRefs({
++                    vmapiClient: self._vmapiClient,
++                    log: self._log
++                }, function onUpdateVolRefsAndResDone(updateErr) {
++                    if (updateErr) {
++                        self._log.error({error: updateErr},
++                            'Error when updating all volumes references and ' +
++                                'reservations');
+                     } else {
+-                        self._log.info('All volumes updated successfully on ' +
+-                            'bootstrap');
+-                        self._startProcessingChangefeedEvents();
++                        self._log.info('Updated all volumes references and ' +
++                                'reservations successfully');
+                     }
++
++                    done(updateErr);
+                 });
++            }
++        ]}, function onBootstrapDone(bootstrapErr) {
++            if (bootstrapErr) {
++                self._log.error({err: bootstrapErr},
++                    'Error when updating volumes on bootstrap, retrying...');
++                setTimeout(onBootstrap, 2000);
++            } else {
++                self._log.info('All volumes updated successfully on bootstrap');
++                self._startProcessingChangefeedEvents();
++            }
+         });
++    });
+ };
+ 
+-VmsUpdater.prototype._processVmChangeEvent =
+-    function _processVmChangeEvent(vmChangeEvent, callback) {
+-        var self = this;
++function updateReferencesAndReservationsForVm(vmUuid, options, callback) {
++    mod_assert.uuid(vmUuid, 'vmUuid');
++    mod_assert.object(options, 'options');
++    mod_assert.object(options.log, 'options.log');
++    mod_assert.object(options.vmapiClient, 'options.vmapiClient');
++    mod_assert.optionalBool(options.considerProvisioningVmFailed,
++        'opts.considerProvisioningVmFailed');
++    mod_assert.func(callback, 'callback');
+ 
+-        self._log.info({vmChangeEvent: vmChangeEvent},
+-            'Process VM change event...');
++    var considerProvisioningVmFailed = options.considerProvisioningVmFailed;
++    var context = {};
++    var log = options.log;
++    var RETRY_DELAY = 1000;
++    var MAX_NB_TRIES = 5;
++    var nbTries = 0;
++    var vmapiClient = options.vmapiClient;
++
++    function doUpdate() {
++        ++nbTries;
++
++        mod_vasync.pipeline({arg: context, funcs: [
++            function getVm(ctx, next) {
++                var STATES_REQUIRE_REFS_ADD = ['running', 'stopped'];
++                var STATES_REQUIRE_REFS_DEL = ['failed', 'destroyed'];
++
++                if (considerProvisioningVmFailed === true) {
++                    STATES_REQUIRE_REFS_DEL.push('provisioning');
++                }
+ 
+-        updateVolumeFromVmChangeEvent(vmChangeEvent, self._log,
+-            self._vmapiClient, function onVmChangeEventHandled(err) {
+-                if (err) {
+-                    self._log.error({
+-                        error: err,
+-                        event: vmChangeEvent
+-                    }, 'Error when processing changefeed event');
+-                } else {
+-                    self._log.debug({
+-                        event: vmChangeEvent
+-                    }, 'Changefeed event processed successfully');
++                log.debug({vm_uuid: vmUuid}, 'Getting VM');
++
++                vmapiClient.getVm({
++                    uuid: vmUuid
++                }, function onGetVm(getVmErr, vm) {
++                    if (getVmErr) {
++                        log.error({err: getVmErr}, 'Error when getting VM');
++                        next(getVmErr);
++                        return;
++                    }
++
++                    log.info({vm: vm}, 'Got VM');
++
++                    mod_assert.optionalObject(vm, 'vm');
++                    if (vm) {
++                        if (STATES_REQUIRE_REFS_ADD.indexOf(vm.state) !== -1) {
++                            ctx.shouldAddReferences = true;
++                        } else if (STATES_REQUIRE_REFS_DEL.indexOf(vm.state)
++                            !== -1) {
++                            ctx.shouldDeleteReferences = true;
++                        }
++
++                        ctx.vm = vm;
++                    } else {
++                        ctx.shouldDeleteReferences = true;
++                    }
++
++                    next(getVmErr);
++                });
++            },
++            function loadVolumesRefedByAbsentVm(ctx, next) {
++                var listVolumesParams;
++
++                if (ctx.shouldAddReferences !== true &&
++                    ctx.shouldDeleteReferences !== true) {
++                    log.info({
++                        vmUuid: vmUuid
++                    }, 'No reference to add or delete, no need to load ' +
++                        'volumes refed by absent VM');
++                    next();
++                    return;
+                 }
+ 
+-                callback(err);
+-            });
++                /*
++                 * When the VM for which we update its volume references and
++                 * reservations does not exist, we can't load the volumes that
++                 * it might have referenced if and when it existed. Moreover,
++                 * since VMAPI doesn't delete VMs, the VM can only be absent
++                 * from VMAPI when we're updating references and reservations as
++                 * a result of a workflow failing or being in the state
++                 * "executing" for too long, and that somehow the VM object was
++                 * not created in VMAPI. So we're in either of two cases:
++                 *
++                 * 1. The VM actually exists on a CN, and will eventually show
++                 *    up in VMAPI because vm-agent will PUT it. References may
++                 *    have already been added to some volumes from the
++                 *    provisioning workflow. Deleting those references means
++                 *    that those volumes could be deleted even though they
++                 *    should not be, but it's a compromise that we're willing to
++                 *    accept.
++                 *
++                 * 2. The VM does not exist on a CN, and thus will never show up
++                 *    in VMAPI. In this case, it's safe to delete any
++                 *    reference left for this VM.
++                 *
++                 * In both cases, it is fine to delete any reservation.
++                 */
++                if (ctx.vm !== undefined) {
++                    next();
++                    return;
++                }
++
++                listVolumesParams = {
++                    refs: ctx.vm.uuid
++                };
++
++                log.info({
++                    params: listVolumesParams
++                }, 'Loading volumes referenced by non-existing VM');
++
++                volumeModels.listVolumes(listVolumesParams,
++                    function onListVols(listVolsErr, volumeObjects) {
++                        if (listVolsErr) {
++                            log.error({
++                                err: listVolsErr
++                            }, 'Error when loading volumes referenced by ' +
++                                'non-existing VM');
++                        } else {
++                            log.info({
++                                volumeObjects: volumeObjects
++                            }, 'Loaded volumes referenced by non-existing VM');
++                        }
++
++                        ctx.volumesToProcess = volumeObjects;
++
++                        next(listVolsErr);
++                    });
++            },
++            function loadVolumesRefedByExistentVm(ctx, next) {
++                var requiredVolumes = [];
++                var volumeOwnerUuid;
++
++                if (ctx.shouldAddReferences !== true &&
++                    ctx.shouldDeleteReferences !== true) {
++                    log.info({
++                        vmUuid: vmUuid
++                    }, 'No reference to add or delete, no need to load ' +
++                        'volumes refed by existent VM');
++                    next();
++                    return;
++                }
++
++                if (ctx.vm === undefined ||
++                    ctx.vm.required_nfs_volumes === undefined) {
++                    next();
++                    return;
++                }
++
++                volumeOwnerUuid = ctx.vm.owner_uuid;
++
++                log.info({
++                    volumes: ctx.vm.required_nfs_volumes,
++                    vm: ctx.vm
++                }, 'Loading volumes required by VM');
++
++                mod_vasync.forEachParallel({
++                    func: function loadRequiredVolume(volumeName, done) {
++                        mod_assert.string(volumeName, 'volumeName');
++
++                        log.info({
++                            name: volumeName,
++                            ownerUuid: volumeOwnerUuid
++                        }, 'Listing volumes');
++
++                        volumeModels.listVolumes({
++                            name: volumeName,
++                            owner_uuid: volumeOwnerUuid,
++                            state: 'ready'
++                        }, function onVolumesLoaded(volListErr, volumeObjects) {
++                            mod_assert.optionalArrayOfObject(volumeObjects,
++                                'volumeObjects');
++
++                            if (volListErr) {
++                                log.error({err: volListErr},
++                                    'Error when listing volumes required by ' +
++                                        'VM');
++                                done(volListErr);
++                                return;
++                            }
++
++                            log.info({volumeObjects: volumeObjects},
++                                'Found volumes required by VM');
++
++                            if (volumeObjects === undefined ||
++                                volumeObjects.length === 0) {
++                                done();
++                                return;
++
++                            }
++
++                            if (volumeObjects.length > 1) {
++                                done(new Error('Found more than one volume ' +
++                                    'with name: ' + volumeName + ' and ' +
++                                    'owner_uuid: ' + volumeOwnerUuid));
++                                return;
++                            }
++
++                            requiredVolumes.push(volumeObjects[0]);
++
++                            done();
++                        });
++                    },
++                    inputs: ctx.vm.required_nfs_volumes
++                }, function onRequiredVolsLoaded(loadErr) {
++                    ctx.volumesToProcess = requiredVolumes;
++                    next(loadErr);
++                });
++            },
++            function generateRefChanges(ctx, next) {
++                mod_assert.optionalArrayOfObject(ctx.volumesToProcess,
++                    'ctx.volumesToProcess');
++
++                if (ctx.shouldAddReferences !== true &&
++                    ctx.shouldDeleteReferences !== true) {
++                    log.info({
++                        vmUuid: vmUuid
++                    }, 'No reference to add or delete, no need to generate ' +
++                        'refs changes');
++                    next();
++                    return;
++                }
++
++                if (!ctx.volumesToProcess) {
++                    next();
++                    return;
++                }
++
++                var volumesToProcess = ctx.volumesToProcess;
++                var volumeObjectsToUpdate = [];
++
++                volumesToProcess.forEach(function checkVolumeHasRef(volumeObj) {
++                    var refIndex = -1;
++                    var volumeRefs;
++                    var volumeValue = volumeObj.value;
++
++                    mod_assert.optionalArrayOfUuid(volumeValue.refs,
++                        'volumeValue.refs');
++                    volumeRefs = volumeValue.refs;
++
++                    if (ctx.shouldAddReferences) {
++                        if (volumeRefs === undefined || volumeRefs === null ||
++                            volumeRefs.indexOf(vmUuid) === -1) {
++                            volumeRefs.push(vmUuid);
++                            volumeObjectsToUpdate.push(volumeObj);
++                        }
++                    } else if (ctx.shouldDeleteReferences) {
++                        if (volumeRefs) {
++                            refIndex = volumeRefs.indexOf(vmUuid);
++                            if (refIndex !== -1) {
++                                volumeRefs.splice(refIndex, 1);
++
++                                if (volumeRefs.length === 0) {
++                                    delete volumeValue.refs;
++                                }
++
++                                volumeObjectsToUpdate.push(volumeObj);
++                            }
++                        }
++                    }
++                });
++
++                ctx.volumeObjectsToUpdate = volumeObjectsToUpdate;
++                next();
++            },
++            function updateRefs(ctx, next) {
++                mod_assert.optionalArrayOfObject(ctx.volumeObjectsToUpdate,
++                    'ctx.volumeObjectsToUpdate');
++
++                if (ctx.shouldAddReferences !== true &&
++                    ctx.shouldDeleteReferences !== true) {
++                    log.info({
++                        vmUuid: vmUuid
++                    }, 'No reference to add or delete, no need to update refs');
++                    next();
++                    return;
++                }
++
++                if (!ctx.volumeObjectsToUpdate) {
++                    next();
++                    return;
++                }
++
++                mod_vasync.forEachParallel({
++                    func: function updateVolume(volumeObj, done) {
++                        volumeModels.updateVolumeWithRetry(volumeObj.value.uuid,
++                            volumeObj, function onVolUpdated(volUpdateErr) {
++                                if (volUpdateErr &&
++                                    volUpdateErr.name === 'EtagConflictError') {
++                                    ctx.needRetry = true;
++                                }
++
++                                done(volUpdateErr);
++                            });
++                    },
++                    inputs: ctx.volumeObjectsToUpdate
++                }, next);
++            },
++            /*
++             * Reservations are cleaned up only if updating references was
++             * successful. Otherwise, we might lose some data about provisioning
++             * jobs that would still need to be monitored to determine if we
++             * need to retry updating references later.
++             */
++            function cleanupRes(ctx, next) {
++                if (ctx.shouldAddReferences !== true &&
++                    ctx.shouldDeleteReferences !== true) {
++                    log.info({
++                        vmUuid: vmUuid
++                    }, 'No reference to add or delete, no need to cleanup ' +
++                        'reservations');
++                    next();
++                    return;
++                }
++
++                reservationModels.listVolumeReservations({
++                    vmUuid: vmUuid
++                }, function onReservationsListed(listResErr, reservations) {
++                    if (listResErr) {
++                        next(listResErr);
++                        return;
++                    }
++
++                    mod_assert.arrayOfObject(reservations, 'reservations');
++                    if (reservations.length > 0) {
++                        reservationModels.deleteVolumeReservations(reservations,
++                            next);
++                    } else {
++                        next();
++                    }
++                });
++            }
++        ]}, function onUpdateDone(updateErr) {
++            if (context.needRetry === true) {
++                if (nbTries >= MAX_NB_TRIES) {
++                    callback(new Error('Reached max number of tries'));
++                    return;
++                }
++
++                setTimeout(doUpdate, RETRY_DELAY);
++                return;
++            }
++
++            callback(updateErr);
++        });
++    }
++
++    doUpdate();
++}
++
++VolumesUpdater.prototype._processVmChangeEvent =
++    function _processVmChangeEvent(vmChangeEvent, callback) {
++        var self = this;
++
++        var log = self._log;
++        var vmUuid = vmChangeEvent.changedResourceId;
++        mod_assert.uuid(vmUuid, 'vmUuid');
++
++        log.info({vmChangeEvent: vmChangeEvent},
++            'Processing VM change event...');
++
++        mod_vasync.parallel({funcs: [
++            function updateVolume(done) {
++                updateVolumeFromVmChangeEvent(vmChangeEvent, self._log,
++                    self._vmapiClient,
++                    function onVolumeUpdate(updateVolErr) {
++                        if (updateVolErr) {
++                            log.error({
++                                error: updateVolErr,
++                                changeEvent: vmChangeEvent
++                            }, 'Error when updating volume from VM change ' +
++                                'event');
++                        } else {
++                            log.debug({
++                                changeEvent: vmChangeEvent
++                            }, 'Volume updated successfully');
++                        }
++
++                        done(updateVolErr);
++                    });
++            },
++            function updateReferencesAndReservations(done) {
++                updateReferencesAndReservationsForVm(vmUuid, {
++                    log: self._log,
++                    vmapiClient: self._vmapiClient
++                }, done);
++            }
++        ]}, callback);
+ };
+ 
+-VmsUpdater.prototype._startProcessingChangefeedEvents =
++VolumesUpdater.prototype._startProcessingChangefeedEvents =
+     function _startProcessingChangefeedEvents() {
+         var self = this;
+ 
+         self._changefeedListener.on('data',
+             function processVmChangeEvent(vmChangeEvent) {
++                self._log.info({
++                    vmChangeEvent: vmChangeEvent
++                }, 'Got data event from changefeed');
+                 self._vmChangeEventsQueue.push(vmChangeEvent);
+             });
+     };
+ 
+-function startVmsUpdater(config, log) {
++function startVolumesUpdater(config, log) {
+     mod_assert.object(config, 'config');
+     mod_assert.object(log, 'log');
+ 
+     var vmapiClient = new VmapiClient(config.vmapi);
+-    var vmsUpdater = new VmsUpdater({
++    var volumesUpdater = new VolumesUpdater({
+         log: log,
+         vmapiClient: vmapiClient,
+         changefeedPublisherUrl: config.vmapi.url
+     });
+ 
+-    vmsUpdater.init(function onVmsUpdateInitDone(initUpdaterErr) {
++    volumesUpdater.init(function onVolsUpdaterInitDone(initUpdaterErr) {
+         if (initUpdaterErr) {
+             log.error({error: initUpdaterErr},
+-                'An error was encountered when initializing the VMs updater, ' +
+-                    'exiting');
++                'An error was encountered when initializing the volumes ' +
++                    'updater, exiting');
+             /*
+              * Set process.exitCode instead of calling process.exit() to avoid
+              * some output from not being written on some versions of node. See
+@@ -572,12 +1204,240 @@ function startVmsUpdater(config, log) {
+              */
+             process.exitCode = 1;
+         } else {
+-            log.info('VMS updater initialized successfully');
+-            vmsUpdater.start();
++            log.info('Volumes updater initialized successfully');
++            volumesUpdater.start();
++        }
++    });
++}
++
++/*
++ * This function checks the status of a job that made a volume reservation, and
++ * determines whether it is likely that volume objects may need to be updated.
++ */
++function checkReservationJob(volumeReservationValue, options, callback) {
++    mod_assert.object(volumeReservationValue, 'volumeReservationValue');
++    mod_assert.uuid(volumeReservationValue.job_uuid,
++        'volumeReservationValue.job_uuid');
++    mod_assert.object(options, 'options');
++    mod_assert.object(options.log, 'options.log');
++    mod_assert.object(options.wfApiClient, 'options.wfApiClient');
++    mod_assert.object(options.vmapiClient, 'options.vmapiClient');
++    mod_assert.func(callback, 'callback');
++
++    var context = {};
++    var log = options.log;
++    var reservingVmUuid = volumeReservationValue.vm_uuid;
++    var vmapiClient = options.vmapiClient;
++    var wfApiClient = options.wfApiClient;
++
++    log.info({
++        volumeReservation: volumeReservationValue
++    }, 'Starting to check volume reservation');
++
++    mod_vasync.pipeline({arg: context, funcs: [
++        function getJob(ctx, next) {
++            var jobUuid = volumeReservationValue.job_uuid;
++
++            log.info({jobUuid: jobUuid}, 'Fetching job');
++
++            wfApiClient.getJob(jobUuid, function onGetJob(getJobErr, job) {
++                var jobCreationTimeMs;
++                var TWO_HOURS_IN_MS = 1000 * 60 * 60 * 2;
++
++                if (getJobErr || job === undefined || job === null) {
++                    log.error({err: getJobErr}, 'Could not get job info');
++
++                    next(new mod_VError.VError(getJobErr,
++                        'Could not get job info when checking ' +
++                            'reservation job'));
++                    return;
++                }
++
++                log.info({job: job}, 'Fetched job successfully');
++
++                if (job.execution === 'executing') {
++                    if (job.created_at !== null && job.created_at !==
++                        undefined) {
++                        jobCreationTimeMs =
++                            new Date(job.created_at).getTime();
++                        /*
++                         * Wall-clock times comparison is not safe, but this
++                         * is the best we can do in Triton as far as I know.
++                         * We could do a variety of time consistency checks
++                         * (checking the GetJob's response header, etc.),
++                         * but it seems currently that the implementation
++                         * complexity would outweigh the benefits.
++                         */
++                        if (Date.now() - jobCreationTimeMs <
++                            TWO_HOURS_IN_MS) {
++                            /*
++                             * If we consider the workflow job hasn't timed
++                             * out, and it is still executing, then there's
++                             * nothing to do here.
++                             */
++                            next();
++                            return;
++                        } else {
++                            ctx.considerProvisioningVmFailed = true;
++                        }
++                    }
++                }
++
++                /*
++                 * If the VM provisioning job suceeded, we assume it
++                 * resulted in the add_volumes_references task of VMAPI's
++                 * provisioning workflow adding the relevant references and
++                 * cleaning up the relevant reservations, since failing that
++                 *  task would make the job as "failed".
++                 */
++                if (job.execution === 'succeeded') {
++                    next();
++                    return;
++                }
++
++                /*
++                 * For any other use case, such as a job with execution
++                 * status === 'failed', or a job that has had execution
++                 * status === 'running' for too long, we need to cleanup
++                 * references and reservations that are now potentially
++                 * obsolete.
++                 */
++                ctx.refreshVmReferencesAndReservations = true;
++
++                next();
++            });
++        },
++        function refreshVmReferencesAndReservations(ctx, next) {
++            if (ctx.refreshVmReferencesAndReservations !== true) {
++                next();
++                return;
++            }
++
++            updateReferencesAndReservationsForVm(reservingVmUuid, {
++                log: log,
++                vmapiClient: vmapiClient,
++                considerProvisioningVmFailed: ctx.considerProvisioningVmFailed
++            }, next);
++        }
++    ]}, function onCheckDone(checkErr) {
++        var err;
++
++        if (checkErr) {
++            log.error({
++                err: checkErr,
++                volumeReservation: volumeReservationValue
++            }, 'Error when checking volume reservation');
++
++            err = new mod_VError.VError(checkErr,
++                'Could not check reservation job');
++        } else {
++            log.info({
++                volumeReservation: volumeReservationValue
++            }, 'Checked volume reservation successfully');
+         }
++
++        callback(err);
+     });
+ }
+ 
++/*
++ * List all reservations from the volumes reservations moray bucket, and check
++ * them one by one to determine if some volumes need to be updated.
++ */
++function pollJobs(options, callback) {
++    mod_assert.object(options, 'options');
++    mod_assert.object(options.log, 'options.log');
++    mod_assert.object(options.vmapiClient, 'options.vmapiClient');
++    mod_assert.object(options.wfApiClient, 'options.wfApiClient');
++
++    /*
++     * We use a concurrency of 4 so that we can still process multiple
++     * reservations in parallel, but we don't want to slam any of the services
++     * used in case of a high volume of reservations.
++     */
++    var CHECK_RESERVATION_JOBS_CONCURRENCY = 4;
++    var checkResJobsQueue;
++    var log = options.log;
++    var vmapiClient = options.vmapiClient;
++    var wfApiClient = options.wfApiClient;
++
++    checkResJobsQueue = mod_vasync.queue(checkReservation,
++        CHECK_RESERVATION_JOBS_CONCURRENCY);
++
++    checkResJobsQueue.on('end', callback);
++
++    function onResListed(listResErr, res) {
++        if (listResErr) {
++            log.error({
++                err: listResErr
++            }, 'Error when listing volume reservations');
++
++            callback(new mod_VError.VError(listResErr, 'Could not check jobs'));
++            return;
++        }
++
++        log.info({
++            reservations: res
++        }, 'reservations listed successfully');
++
++        res.forEach(function pushToQueue(reservationObject) {
++            checkResJobsQueue.push(reservationObject.value);
++        });
++
++        checkResJobsQueue.close();
++    }
++
++    function checkReservation(volReservationValue, done) {
++        mod_assert.object(volReservationValue, 'volReservationValue');
++        mod_assert.func(done, 'done');
++
++        checkReservationJob(volReservationValue, {
++            log: log,
++            wfApiClient: wfApiClient,
++            vmapiClient: vmapiClient
++        }, done);
++    }
++
++    reservationModels.listVolumeReservations(onResListed);
++}
++
++function startJobsWatcher(config, log) {
++    mod_assert.object(config, 'config');
++    mod_assert.object(log, 'log');
++
++    var CHECK_RESERVATION_JOBS_INTERVAL = 60 * 1000; // 1 minute
++    var vmapiClient = new VmapiClient(config.vmapi);
++    var wfApiClient;
++    var wfApiConfig = mod_jsprim.deepCopy(config.wfapi);
++
++    /*
++     * the workflow client seems to _require_ a path property in the config
++     * object, so we provide a dummy one. VOLAPI itself does not have any
++     * workflow defined in this directory.
++     */
++    wfApiConfig.path = './foo';
++    wfApiConfig.log = log;
++    wfApiClient = new WfClient(wfApiConfig);
++
++    function processJobs() {
++        log.info('Starting to poll jobs');
++
++        pollJobs({
++            log: log,
++            vmapiClient: vmapiClient,
++            wfApiClient: wfApiClient
++        }, function onJobsProcessed(jobsErr) {
++            log.info({err: jobsErr}, 'Done polling jobs');
++
++            setTimeout(function checkVolReservationsJobs() {
++                processJobs();
++            }, CHECK_RESERVATION_JOBS_INTERVAL);
++        });
++    }
++
++    processJobs();
++}
++
+ function main() {
+     var config = configLoader.loadConfigSync();
+     var log = new mod_bunyan.createLogger({
+@@ -594,13 +1454,46 @@ function main() {
+             morayClient.on('connect', next);
+         },
+         function initModels(arg, next) {
+-            volumeModels.init(config, {
+-                morayClient: morayClient,
+-                log: log
+-            }, next);
++            var modelsInitBackoff = mod_backoff.exponential({
++                initialDelay: 100,
++                maxDelay: 10000
++            });
++
++            modelsInitBackoff.on('ready', function onBackoff(number, delay) {
++                models.init(config, {
++                    morayClient: morayClient,
++                    log: log
++                }, function onModelsInitialized(modelsInitErr) {
++                    if (modelsInitErr) {
++                        log.error({
++                            err: modelsInitErr
++                        }, 'Error when initializing models, backing off');
++                        modelsInitBackoff.backoff();
++                    } else {
++                        log.info('Models initialized successfully');
++                        modelsInitBackoff.reset();
++                        next();
++                    }
++                });
++            });
++
++            modelsInitBackoff.backoff();
+         }
+     ]}, function allDependenciesInitialized(err) {
+-        startVmsUpdater(config, log);
++        /*
++         * The "Volumes updater" is an async process that listens to VMAPI's
++         * changefeed events and update volume objects accordingly.
++         */
++        startVolumesUpdater(config, log);
++        /*
++         * The "jobs watcher" is an async process that polls the volumes
++         * reservations moray bucket periodically and updates volumes
++         * accordingly. Volumes reservations are created by VM provisioning
++         * jobs, and that process primarily checks the state of these jobs to
++         * determine what the appropriate action is, hence the name "jobs
++         * watcher".
++         */
++        startJobsWatcher(config, log);
+     });
+ }
+ 

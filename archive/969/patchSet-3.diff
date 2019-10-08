@@ -1,0 +1,230 @@
+commit 7b0af8d7953dbe0222685c94c791b98703a5638c (refs/changes/69/969/3)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-12-01T01:38:30+00:00 (2 years, 10 months ago)
+    
+    joyent/node-cueball#50 cueball appears to be flapping with only one connection
+    Reviewed by: David Pacheco <dap@joyent.com>
+
+diff --git a/README.md b/README.md
+index 059e582..5ac364a 100644
+--- a/README.md
++++ b/README.md
+@@ -649,7 +649,9 @@ Parameters
+    - `log` -- optional Object, a `bunyan`-style logger to use
+    - `target` -- optional Number, target number of connections to be made
+                  available in the entire set
+-   - `maximum` -- optional Number, maximum number of connections per host
++   - `maximum` -- optional Number, maximum number of sockets opened by the set.
++                  Note that this number may temporarily be exceeded by 1 socket
++                  to allow the set to re-balance.
+ 
+ ### Event `'added'`
+ 
+diff --git a/lib/connection-fsm.js b/lib/connection-fsm.js
+index e15d01f..025725c 100644
+--- a/lib/connection-fsm.js
++++ b/lib/connection-fsm.js
+@@ -426,14 +426,35 @@ ConnectionFSM.prototype.state_idle = function (S) {
+ 		self.cf_pool._incrCounter('error-during-idle');
+ 	});
+ 	S.on(this.cf_conn, 'close', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		S.gotoState('error');
+-		self.cf_pool._incrCounter('close-during-idle');
++		/*
++		 * If we receive 'close' while idle with our closeAfter flag
++		 * set, we were going to be removed anyway. Just go to closed.
++		 * Going to error would give us a chance to learn about a dead
++		 * backend, but a clean 'close' with no 'error' is probably
++		 * not dead.
++		 *
++		 * This is particularly important with ConnectionSets, where
++		 * this is the normal path that's taken for the Set's consumer
++		 * to notify it that this connection has drained and closed.
++		 */
++		if (self.cf_closeAfter === true) {
++			S.gotoState('closed');
++		} else {
++			self.cf_lastError =
++			    new mod_errors.ConnectionClosedError(self);
++			S.gotoState('error');
++			self.cf_pool._incrCounter('close-during-idle');
++		}
+ 	});
+ 	S.on(this.cf_conn, 'end', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		S.gotoState('error');
+-		self.cf_pool._incrCounter('end-during-idle');
++		if (self.cf_closeAfter === true) {
++			S.gotoState('closed');
++		} else {
++			self.cf_lastError = new
++			    mod_errors.ConnectionClosedError(self);
++			S.gotoState('error');
++			self.cf_pool._incrCounter('end-during-idle');
++		}
+ 	});
+ 	S.on(this, 'closeAsserted', function () {
+ 		S.gotoState('closed');
+diff --git a/lib/set.js b/lib/set.js
+index 734581a..daf6366 100644
+--- a/lib/set.js
++++ b/lib/set.js
+@@ -284,10 +284,11 @@ CueBallConnectionSet.prototype.state_stopping = function (S) {
+ 		if (cks.length === 0 && !fsm.isInState('idle')) {
+ 			fsm.close();
+ 		} else {
++			fsm.closeAfterRelease();
+ 			cks.forEach(function (ck) {
+ 				var conn = self.cs_connections[ck];
+ 				delete (self.cs_connections[ck]);
+-				self.emit('removed', ck, conn);
++				self.assertEmit('removed', ck, conn);
+ 			});
+ 		}
+ 	}
+@@ -377,20 +378,24 @@ CueBallConnectionSet.prototype._rebalance = function () {
+ 		    total);
+ 	}
+ 	plan.remove.forEach(function (fsm) {
++		/*
++		 * Never deliberately remove our last connection. We should wait
++		 * for another connection to be up and running first and then
++		 * remove this one.
++		 */
++		if (total <= 1)
++			return;
++
+ 		var k = fsm.cf_backend.key;
+ 		/*
+-		 * Find any advertised connections from this FSM, and emit
+-		 * 'removed' so our consumer will close them.
++		 * Find any advertised connections from this FSM, and (after
++		 * setting the closeAfterRelease flag to avoid them retrying),
++		 * emit 'removed' so our consumer will close them.
+ 		 */
+ 		var cks = Object.keys(self.cs_connections).filter(
+ 		    function (ck) {
+ 			return (ck.indexOf(k + '.') === 0);
+ 		});
+-		cks.forEach(function (ck) {
+-			var conn = self.cs_connections[ck];
+-			delete (self.cs_connections[ck]);
+-			self.emit('removed', ck, conn);
+-		});
+ 		/*
+ 		 * We can close the FSM immediately if we aren't advertising
+ 		 * any connections for it, and we aren't waiting on our consumer
+@@ -410,11 +415,18 @@ CueBallConnectionSet.prototype._rebalance = function () {
+ 			} else {
+ 				fsm.closeAfterRelease();
+ 			}
++		} else {
++			fsm.closeAfterRelease();
+ 		}
++		cks.forEach(function (ck) {
++			var conn = self.cs_connections[ck];
++			delete (self.cs_connections[ck]);
++			self.assertEmit('removed', ck, conn);
++		});
+ 	});
+ 	plan.add.forEach(function (k) {
+-		/* Make sure we *never* exceed our socket limit. */
+-		if (++total > self.cs_max)
++		/* Make sure we never exceed our socket limit. */
++		if (++total > (self.cs_max + 1))
+ 			return;
+ 		self.addConnection(k);
+ 	});
+diff --git a/test/cset.test.js b/test/cset.test.js
+index a8c2ee6..b1fdc28 100644
+--- a/test/cset.test.js
++++ b/test/cset.test.js
+@@ -193,6 +193,87 @@ mod_tape.test('cset with two backends', function (t) {
+ 	});
+ });
+ 
++mod_tape.test('cset swapping', function (t) {
++	connections = [];
++	var inset = [];
++	resolver = new DummyResolver();
++
++	var cset = new mod_cset.ConnectionSet({
++		log: log,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery,
++		target: 1,
++		maximum: 1,
++		resolver: resolver
++	});
++
++	cset.on('stateChanged', function (st) {
++		if (st === 'stopped')
++			t.end();
++	});
++
++	cset.on('added', function (key, conn) {
++		inset.push(conn);
++	});
++
++	cset.on('removed', function (key, conn) {
++		t.ok(!conn.dead);
++		conn.seen = true;
++		conn.destroy();
++		var idx = inset.indexOf(conn);
++		if (idx !== -1)
++			inset.splice(idx, 1);
++	});
++
++	resolver.emit('added', 'b1', {});
++
++	setImmediate(function () {
++		t.equal(connections.length, 1);
++		summarize();
++		t.deepEqual(counts, { 'b1': 1 });
++		index.b1[0].connect();
++
++		setTimeout(function () {
++			t.equal(connections.length, 1);
++			summarize();
++			t.deepEqual(counts, { 'b1': 1 });
++			t.equal(inset.length, 1);
++
++			var conn = index.b1[0];
++
++			resolver.emit('added', 'b0', {});
++			cset.cs_keys.sort();
++			t.strictEqual(cset.cs_keys[0], 'b0');
++
++			t.ok(!conn.dead);
++			t.ok(!conn.seen);
++
++			setTimeout(function () {
++				t.equal(connections.length, 2);
++				t.equal(inset.length, 1);
++				summarize();
++				t.deepEqual(counts, { 'b1': 1, 'b0': 1 });
++				t.ok(!conn.dead);
++				t.ok(!conn.seen);
++				index.b0[0].connect();
++
++				setTimeout(function () {
++					t.equal(connections.length, 1);
++					t.equal(inset.length, 1);
++					t.strictEqual(inset[0], index.b0[0]);
++					summarize();
++					t.deepEqual(counts, { 'b0': 1 });
++					t.ok(conn.dead);
++					cset.stop();
++					resolver.stop();
++				}, 1000);
++			}, 500);
++		}, 500);
++	});
++});
++
+ mod_tape.test('removing a backend', function (t) {
+ 	connections = [];
+ 	resolver = new DummyResolver();

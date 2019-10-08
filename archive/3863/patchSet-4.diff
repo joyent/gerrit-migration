@@ -1,0 +1,1303 @@
+commit b32be5fb9d64810d2aa74627afc3b69d086efb2f (refs/changes/63/3863/4)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2018-05-28T16:56:55-07:00 (1 year, 4 months ago)
+    
+    TRITON-52 x-DC image copy
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 20db701..3a46a88 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,5 +1,13 @@
+ # IMGAPI changelog
+ 
++## 4.4.0
++
++- TRITON-52 x-DC image copy. This adds a new apiImportImageFromDc endpoint, 
++  which will allow a user to copy an image between datacenters in the same
++  cloud. As an optimization, images that use the same Manta storage will be
++  able to take advantage of snap linking, instead of directly copying the
++  file bits, which greatly speeds up the image copying process.
++
+ ## 4.3.0
+ 
+ - TRITON-178 Add support for image creation with bhyve brand (requires platform
+diff --git a/docs/index.md b/docs/index.md
+index d2f2bd9..ccb2938 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -626,7 +626,7 @@ and relevant for images in an IMGAPI server that uses [channels](#channels).
+ | [DeleteImageIcon](#DeleteImageIcon)               | DELETE /images/:uuid/icon                                  | Remove the image icon.                                                        |
+ | [CreateImageFromVm](#CreateImageFromVm)           | POST /images?action=create-from-vm                         | Create a new (activated) image from an existing VM.                           |
+ | [ExportImage](#ExportImage)                       | POST /images/:uuid?action=export                           | Exports an image to the specified Manta path.                                 |
+-| [CopyRemoteImage](#CopyRemoteImage)               | POST /images/$uuid?action=copy-remote&dc=us-west-1         | **NYI (IMGAPI-278)** Copy one's own image from another DC in the same cloud.  |
++| [ImportFromDatacenter](#ImportFromDatacenter)     | POST /images/$uuid?action=import-from-datacenter&datacenter=us-west-1  | Copy one's own image from another datacenter in the same cloud.  |
+ | [AdminImportRemoteImage](#AdminImportRemoteImage) | POST /images/$uuid?action=import-remote&source=$imgapi-url | Import an image from another IMGAPI                                           |
+ | [AdminImportImage](#AdminImportImage)             | POST /images/$uuid?action=import                           | Only for operators to import an image and maintain `uuid` and `published_at`. |
+ | [AdminGetState](#AdminGetState)                   | GET /state                                                 | Dump internal server state (for dev/debugging)                                |
+@@ -1899,6 +1899,55 @@ CLI tool:
+     $ cat data.json | sdc-imgadm update f9bbbc9f-d281-be42-9651-72c6be875874
+ 
+ 
++## ImportFromDatacenter (POST /images?action=import-from-datacenter&datacenter=)
++
++Import an image and all origin images (preserving the image `uuid` and
++`published_at` fields) from the provided datacenter `datacenter`.
++
++An end user cannot import an operator image from another datacenter (i.e. an
++image that is owned by admin).
++
++All usage of IMGAPI on behalf of end users is required to use `account=UUID`.
++
++### Query String Inputs
++
++| Field            | Type    | Required? | Notes |
++| ---------------- | ------- | --------- | ----- |
++| account          | UUID    | Yes       | The account UUID on behalf of whom this request is being made. If given and if relevant, authorization will be done for this account. It is expected that all calls originating from a user (e.g. from cloudapi) will provide this parameter. |
++| datacenter       | String  | Yes       | The datacenter name that holds the source image. |
++
++### Returns
++
++A Job object. The location of the workflow API where the status of the job can
++be polled is available in the workflow-api header of the response.
++
++### Errors
++
++See [Errors](#errors) section above.
++
++### Example
++
++Raw API tool (against an SDC's IMGAPI). This queues the copying of an existing
++Image in another datacenter to be copied into this datacenter:
++
++    $ sdc-imgapi '/images/859eb57c-d969-4962-8a87-3e5980e237ee?action=import-from-datacenter&datacenter=us-west-1' \
++        -X POST --data-binary '{}'
++    HTTP/1.1 200 OK
++    Content-Type: application/json
++    Content-Length: 236
++    Date: Tue, 08 Jan 2018 20:04:01 GMT
++    Server: IMGAPI/1.0.0
++    workflow-api: http://workflow.coal.joyent.us
++    x-request-id: ed5f60d6-a66d-4ff5-9991-935a36636c8b
++    x-response-time: 236
++    x-server-name: 616a4e4b-7bdd-4d6b-87cb-7a4458dc08b0
++    Connection: keep-alive
++
++    {
++      "image_uuid": "859eb57c-d969-4962-8a87-3e5980e237ee",
++      "job_uuid": "ddc2ec53-2dd8-4b0d-a992-0a7cafda6e8d"
++    }
++
+ 
+ ## AdminImportImage (POST /images/:uuid?action=import)
+ 
+diff --git a/lib/images.js b/lib/images.js
+index 4ded88d..6a22ce0 100644
+--- a/lib/images.js
++++ b/lib/images.js
+@@ -782,7 +782,10 @@ function createImportImageJob(req, uuid, source, skipOwnerCheck, log, cb) {
+                 return next(null, juuid);
+             });
+         }
+-    ], cb);
++    ], function _createImportImageJobWaterfallCb(err, jobUuid) {
++        client.close();
++        cb(err, jobUuid);
++    });
+ };
+ 
+ 
+@@ -1594,6 +1597,17 @@ function apiListImages(req, res, next) {
+ function apiGetImage(req, res, next) {
+     var serialized = req._image.serialize(req._app.mode, req.getVersion(),
+         req.inclAdminFields);
++
++    // TRITON-52 Include the manta file path.
++    if (req.inclAdminFields && req._image.files.length > 0 &&
++            req._image.files[0].stor === 'manta') {
++        var stor = req._app.getStor('manta');
++        if (stor) {
++            serialized.files[0].path = stor._storPathFromImageUuid(
++                req._image.uuid, 'file0');
++        }
++    }
++
+     resSetEtag(req, res, serialized);
+     res.send(serialized);
+     next();
+@@ -2201,6 +2215,7 @@ function apiAdminImportImageFromSource(req, res, cb) {
+                 if (err) {
+                     log.error(err, 'failed to get manifest for image %s',
+                         uuid);
++                    client.close();
+                     return next(new errors.RemoteSourceError(format('Unable ' +
+                         'to get manifest for image %s. Error from remote: %s',
+                         uuid, err.message || err.code)));
+@@ -2208,6 +2223,7 @@ function apiAdminImportImageFromSource(req, res, cb) {
+                 manifest = manifest_;
+                 assert.ok(manifest.uuid, 'no uuid on image manifest: ' +
+                     JSON.stringify(manifest));
++                client.close();
+                 next();
+             });
+         },
+@@ -2371,6 +2387,214 @@ function apiAdminImportRemoteImage(req, res, callback) {
+ }
+ 
+ 
++/**
++ * Allow a user (or admin) to import an image that resides in another
++ * datacenter within the same cloud (e.g. an image that resides in a
++ * different JPC region, such as importing from us-west-1 into us-sw-1).
++ *
++ * This creates and returns a workflow 'import-remote-image' job.
++ */
++function apiImportImageFromDatacenter(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(req.log, 'req.log');
++    assert.object(req.params, 'req.params');
++    assert.object(req.query, 'req.query');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    if (req.query.action !== 'import-from-datacenter') {
++        return next();
++    }
++
++    var account = req.query.account;
++    var app = req._app;
++    var client;
++    var datacenter = req.query.datacenter;
++    var errs;
++    var log = req.log;
++    var source;
++    var uuid = req.params.uuid;
++
++    if (!UUID_RE.test(uuid)) {
++        errs = [ { field: 'uuid', code: 'Invalid' } ];
++        next(new errors.ValidationFailedError(
++            format('invalid image "uuid" (not a UUID): %s', uuid), errs));
++        return;
++    }
++
++    if (account && !UUID_RE.test(account)) {
++        errs = [ { field: 'account', code: 'Invalid' } ];
++        next(new errors.ValidationFailedError(
++            format('invalid image "account" (not a UUID): %s', account), errs));
++        return;
++    }
++
++    if (datacenter === undefined) {
++        errs = [ { field: 'datacenter', code: 'MissingParameter' } ];
++        next(new errors.ValidationFailedError('missing datacenter parameter',
++            errs));
++        return;
++    }
++
++    if (!app.config.imgapiUrlFromDatacenter ||
++            !app.config.imgapiUrlFromDatacenter.hasOwnProperty(datacenter)) {
++        errs = [ { field: 'datacenter', code: 'Invalid' } ];
++        next(new errors.ValidationFailedError('unknown datacenter: ' +
++            datacenter, errs));
++        return;
++    }
++
++    source = app.config.imgapiUrlFromDatacenter[datacenter];
++    assert.string(source, 'source');
++
++    vasync.pipeline({ arg: {}, funcs: [
++        function checkImageExistsInRemoteDc(ctx, cb) {
++            log.debug({uuid: uuid},
++                'ImportDcImage: ensure image exists in remote DC');
++            client = new sdcClients.IMGAPI(utils.commonHttpClientOpts({
++                url: source,
++                log: log
++            }, req));
++            client.getImage(uuid, account, function (err, img) {
++                if (err) {
++                    // TODO: Should we wrap this error?
++                    cb(err);
++                    return;
++                }
++
++                // A user cannot import an admin image.
++                if (account && account !== app.config.adminUuid &&
++                        (img.owner === constants.UNSET_OWNER_UUID ||
++                        img.owner === app.config.adminUuid)) {
++                    cb(new errors.UnauthorizedError(
++                        'Cannot import an admin image.'));
++                    return;
++                }
++
++                ctx.image = img;
++                cb();
++            });
++        },
++
++        function checkIfImageExistsLocally(_, cb) {
++            log.debug({uuid: uuid},
++                'ImportDcImage: check if image already exists locally');
++            Image.get(app, uuid, log, function (err, img) {
++                if (!err) {
++                    assert.object(img, 'img');
++                    cb(new errors.ImageUuidAlreadyExistsError(uuid));
++                    return;
++                } else if (err.restCode !== 'ResourceNotFound') {
++                    cb(err);
++                    return;
++                }
++                cb();
++            });
++        },
++
++        // Find and validate each of the origin images:
++        // 1. must be activated or disabled (disabled means cannot provision)
++        // 2. must be owned by the given user (or admin, see 3)
++        // 3. admin owned images must already exist locally - as they cannot
++        //    be copied between DCs (unless the request is made by admin)
++        function lookupOriginImages(ctx, cb) {
++            // The images to clone, starting from the base.
++            if (!ctx.image.origin) {
++                cb();
++                return;
++            }
++
++            var maxOriginCount = 100;
++            var originImages = [];
++
++            function validateOneOriginImage(currentOrigin, subnext) {
++                client.getImage(currentOrigin, account,
++                        function _originGetImageCb(err, img) {
++                    if (err) {
++                        subnext(err);
++                        return;
++                    }
++                    // Note that we allow disabled origin images, as that just
++                    // means that the origin image is not provisionable.
++                    if (img.state === 'unactivated') {
++                        subnext(new errors.OriginIsNotActiveError(
++                            currentOrigin));
++                        return;
++                    }
++
++                    // Stop when an admin image is found - must check that the
++                    // same admin image exists in the local DC.
++                    if (img.owner === constants.UNSET_OWNER_UUID ||
++                            img.owner === app.config.adminUuid) {
++                        log.debug({uuid: uuid}, 'ImportDcImage: check admin ' +
++                            'origin image exists locally');
++                        Image.get(app, currentOrigin, log,
++                                function (err2) {
++                            if (err2) {
++                                if (err2.restCode === 'ResourceNotFound') {
++                                    subnext(new errors.ResourceNotFoundError(
++                                        format(
++                                            'Unable to import - admin origin ' +
++                                            'image %s does not exist in this ' +
++                                            'datacenter.'
++                                        )));
++                                    return;
++                                }
++                                subnext(err2);
++                                return;
++                            }
++                            subnext();
++                        });
++                        return;
++                    }
++
++                    originImages.push(img);
++                    // Follow the origin chain.
++                    if (img.origin) {
++                        if (originImages.length >= maxOriginCount) {
++                            subnext(new errors.InternalError(format(
++                                'Origin chain too long, exceeds %d images',
++                                maxOriginCount)));
++                            return;
++                        }
++                        validateOneOriginImage(img.origin, subnext);
++                        return;
++                    }
++                    subnext();
++                });
++            }
++
++            validateOneOriginImage(ctx.image.origin, cb);
++        },
++
++        function doImportFromDc(_, cb) {
++            var skipOwnerCheck = false;
++            log.debug({datacenter: datacenter, uuid: uuid, source: source},
++                'ImportDcImage: start import');
++            Image.createImportImageJob(req, uuid, source, skipOwnerCheck, log,
++                    function _createImportImageJobCb(err, jobUuid) {
++                if (err) {
++                        cb(err);
++                        return;
++                }
++
++                // Allow clients to know where is wfapi located
++                res.header('workflow-api', app.config.wfapi.url);
++                    log.warn('_importFromDcPipelineCb jobUuid: %s', jobUuid);
++                res.send({ image_uuid: uuid, job_uuid: jobUuid });
++                    cb(false);
++            });
++        }
++
++    ]}, function _importFromDcPipelineCb(err) {
++        if (client) {
++            client.close();
++        }
++        next(err || false);
++    });
++}
++
++
+ function apiAdminImportDockerImage(req, res, next) {
+     if (req.query.action !== 'import-docker-image') {
+         return next();
+@@ -2579,18 +2803,65 @@ function apiAddImageFileFromSource(req, res, next) {
+         url: req.query.source,
+         log: req.log
+     }, req));
++
++    // Next handler that closes the IMGAPI client before running callback.
++    // TODO: Maybe better to move these calls into a vasync chain.
++    var _next = next;
++    function closeClientAndCallNext(err) {
++        client.close();
++        _next(err);
++    }
++    next = closeClientAndCallNext;
++
+     // Get the image so we can get the manifest files details
+-    client.getImage(uuid, addImageFileFromSource);
++    client.getImage(uuid, {inclAdminFields: true},
++        addImageFileFromSharedMantaSource);
+ 
+-    function addImageFileFromSource(err, manifest) {
++    // TRITON-52 Check if the given IMGAPI source uses the same manta storage,
++    // if yes then the manta file can be snaplinked rather than bit-copied.
++    function addImageFileFromSharedMantaSource(err, manifest) {
+         if (err) {
+-            req.log.error(err, 'failed to get manifest for image %s',
++            req.log.error(err, 'apiAddImageFile: failed to get image %s',
+                 uuid);
+-            return next(new errors.RemoteSourceError(format('Unable ' +
++            next(new errors.RemoteSourceError(format('Unable ' +
+                 'to get manifest for image %s. Error from remote: %s',
+                 uuid, err.message || err.code)));
++            return;
++        }
++
++        var config = req._app.config;
++
++        if (manifest.files[0].path && config.imgapiUrlFromDatacenter &&
++                Object.keys(config.imgapiUrlFromDatacenter).some(
++                    function _urlSome(datacenter) {
++                        return config.imgapiUrlFromDatacenter[datacenter] ===
++                            req.query.source;
++                    }
++                )) {
++            var stor = req._app.getStor('manta');
++            if (!stor) {
++                addImageFileFromImgapiSource(manifest);
++                return;
++            }
++
++            // The image file can be manta snaplinked.
++            // Passing some vars onto `finishMoveImageFile`.
++            req.file = objCopy(manifest.files[0]);
++            req.file.stor = stor.type;
++            req.storage = stor.type;
++
++            assert.string(req.file.path, 'req.file.path');
++            req.mantaSnaplinkPath = req.file.path;
++            // Remove file.path - we don't want that saved in the metadata.
++            delete req.file.path;
++
++            next();
++            return;
+         }
++        addImageFileFromImgapiSource(manifest);
++    }
+ 
++    function addImageFileFromImgapiSource(manifest) {
+         var compression = manifest.files[0].compression;
+         var sha1Param = manifest.files[0].sha1;
+         var contentLength = manifest.files[0].size;
+@@ -2698,32 +2969,59 @@ function apiAddImageFileFromSource(req, res, next) {
+  * into its final (non-tmp) place.
+  */
+ function finishMoveImageFile(req, res, next) {
+-    req.log.debug({image: req._image}, 'MoveImageFile: start');
++    assert.object(req, 'req');
++    assert.object(req.file, 'req.file');
++    assert.object(req._image, 'req._image');
++    assert.string(req.storage, 'req.storage');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    req.log.debug({uuid: req._image.uuid}, 'FinishMoveImageFile: start');
+ 
+     if (req._image.activated) {
+         return next(new errors.ImageAlreadyActivatedError(req._image.uuid));
+     }
+ 
+-    var stor = req._app.getStor(req.storage);
+-    stor.moveImageFile(req._image, req.tmpFilename, req.filename,
+-      function (mErr) {
+-        if (mErr) {
+-            return next(mErr);
++    vasync.pipeline({ funcs: [
++        function moveImageFile(_, cb) {
++            var stor = req._app.getStor(req.storage);
++            assert.object(stor, 'stor');
++            if (req.mantaSnaplinkPath) {
++                req.log.debug({uuid: req._image.uuid,
++                     mantaSnaplinkPath: req.mantaSnaplinkPath},
++                    'Snaplinking from existing manta file');
++                stor.snapLinkImageFileFromPath(req._image,
++                    req.mantaSnaplinkPath, cb);
++            } else {
++                assert.string(req.filename, 'req.filename');
++                assert.string(req.tmpFilename, 'req.tmpFilename');
++                stor.moveImageFile(req._image, req.tmpFilename, req.filename,
++                    cb);
++            }
++        },
++        function addImageFileDetails(_, cb) {
++            req._image.addFile(req._app, req.file, req.log, function (err) {
++                if (err) {
++                    req.log.error(err, 'error adding file info to Image');
++                    cb(new errors.InternalError(err, 'could not save image'));
++                    return;
++                }
++                cb();
++            });
+         }
+ 
+-        req._image.addFile(req._app, req.file, req.log, function (err2) {
+-            if (err2) {
+-                req.log.error(err2, 'error adding file info to Image');
+-                return next(new errors.InternalError(err2,
+-                    'could not save image'));
+-            }
++    ]}, function _onFinishMoveImageFileCb(err) {
++        if (err) {
++            next(err);
++            return;
++        }
+ 
+-            var serialized = req._image.serialize(req._app.mode,
+-                    req.getVersion());
+-            resSetEtag(req, res, serialized);
+-            res.send(serialized);
+-            next();
+-        });
++        req.log.debug({uuid: req._image.uuid}, 'FinishMoveImageFile: success');
++
++        var serialized = req._image.serialize(req._app.mode, req.getVersion());
++        resSetEtag(req, res, serialized);
++        res.send(serialized);
++        next();
+     });
+ }
+ 
+@@ -4102,6 +4400,7 @@ function mountApi(server, reqAuth, reqPassiveAuth) {
+         apiAdminImportRemoteImage, // before `reqGetImage` b/c shouldn't be one
+         apiAdminImportImage,       // before `reqGetImage` b/c shouldn't be one
+         apiAdminImportImageFromSource,
++        apiImportImageFromDatacenter,
+         reqGetImage,               // add `req._image`, ensure access
+         apiAdminChangeImageStor,
+         reqEnsureAccountIsImageOwner,
+diff --git a/lib/storage.js b/lib/storage.js
+index db83ddf..c0e2679 100644
+--- a/lib/storage.js
++++ b/lib/storage.js
+@@ -663,6 +663,26 @@ function (image, toPath, callback) {
+     this.client.ln(fromPath, toPath, callback);
+ };
+ 
++MantaStorage.prototype.snapLinkImageFileFromPath =
++function (image, fromPath, callback) {
++    assert.object(image, 'image');
++    assert.string(image.uuid, 'image.uuid');
++    assert.string(fromPath, 'fromPath');
++    assert.func(callback, 'callback');
++
++    var self = this;
++    var toPath = this._storPathFromImageUuid(image.uuid, 'file0');
++    var toDir = path.dirname(toPath);
++
++    self.client.mkdirp(toDir, function _snapLinkMkdirpCb(err) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        self.client.ln(fromPath, toPath, callback);
++    });
++};
++
+ MantaStorage.prototype.createImageFileReadStream =
+         function (image, filename, opts, callback) {
+     assert.object(image, 'image');
+diff --git a/package.json b/package.json
+index ebd267e..139cadd 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "imgapi",
+   "description": "Image API to manage images for SDC 7",
+-  "version": "4.3.0",
++  "version": "4.4.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+diff --git a/sapi_manifests/imgapi/template b/sapi_manifests/imgapi/template
+index ef9a862..1149f11 100644
+--- a/sapi_manifests/imgapi/template
++++ b/sapi_manifests/imgapi/template
+@@ -48,6 +48,9 @@
+ {{/IMGAPI_MANTA_URL}}
+         "local"
+     ],
++{{#IMGAPI_URL_FROM_DATACENTER}}
++    "imgapiUrlFromDatacenter": {{{IMGAPI_URL_FROM_DATACENTER}}},
++{{/IMGAPI_URL_FROM_DATACENTER}}
+     "wfapi": {
+         "forceMd5Check": true,
+         "workflows": ["create-from-vm", "import-remote-image"],
+diff --git a/test/data/xdc/15963d90-61d7-4664-87a6-f56b16492d5a.file0 b/test/data/xdc/15963d90-61d7-4664-87a6-f56b16492d5a.file0
+new file mode 100644
+index 0000000..e8ce8fd
+Binary files /dev/null and b/test/data/xdc/15963d90-61d7-4664-87a6-f56b16492d5a.file0 differ
+diff --git a/test/data/xdc/15963d90-61d7-4664-87a6-f56b16492d5a.manifest b/test/data/xdc/15963d90-61d7-4664-87a6-f56b16492d5a.manifest
+new file mode 100644
+index 0000000..bdcca0c
+--- /dev/null
++++ b/test/data/xdc/15963d90-61d7-4664-87a6-f56b16492d5a.manifest
+@@ -0,0 +1,34 @@
++{
++  "v": 2,
++  "uuid": "15963d90-61d7-4664-87a6-f56b16492d5a",
++  "owner": "86055c40-2547-11e2-8a6b-4bb37edc84ba",
++  "name": "inc-level-3",
++  "version": "1.0.0",
++  "description": "Vader incremental image generated from inc-level-2 image",
++  "state": "active",
++  "disabled": false,
++  "public": false,
++  "published_at": "2018-03-06T21:16:12.134Z",
++  "type": "zone-dataset",
++  "os": "smartos",
++  "files": [
++    {
++      "sha1": "f6217f583a64e1b39cea7a8700b96cbb2375bb23",
++      "size": 65,
++      "compression": "bzip2",
++      "stor": "local"
++    }
++  ],
++  "requirements": {
++    "min_platform": {
++      "7.0": "20170608T172457Z"
++    },
++    "networks": [
++      {
++        "name": "net0",
++        "description": "public"
++      }
++    ]
++  },
++  "origin": "900cffef-55e3-4e7d-b7ec-ccf439a159e3"
++}
+diff --git a/test/data/xdc/649d6948-4f1d-11e8-8249-1b9928638559.file0 b/test/data/xdc/649d6948-4f1d-11e8-8249-1b9928638559.file0
+new file mode 100644
+index 0000000..e8ce8fd
+Binary files /dev/null and b/test/data/xdc/649d6948-4f1d-11e8-8249-1b9928638559.file0 differ
+diff --git a/test/data/xdc/649d6948-4f1d-11e8-8249-1b9928638559.manifest b/test/data/xdc/649d6948-4f1d-11e8-8249-1b9928638559.manifest
+new file mode 100644
+index 0000000..21ffcdb
+--- /dev/null
++++ b/test/data/xdc/649d6948-4f1d-11e8-8249-1b9928638559.manifest
+@@ -0,0 +1,34 @@
++{
++  "v": 2,
++  "uuid": "649d6948-4f1d-11e8-8249-1b9928638559",
++  "owner": "86055c40-2547-11e2-8a6b-4bb37edc84ba",
++  "name": "inc-level-4",
++  "version": "1.0.0",
++  "description": "Vader incremental image generated from inc-level-3 image",
++  "state": "active",
++  "disabled": false,
++  "public": false,
++  "published_at": "2018-03-15T16:59:40.102Z",
++  "type": "zone-dataset",
++  "os": "smartos",
++  "files": [
++    {
++      "sha1": "f6217f583a64e1b39cea7a8700b96cbb2375bb23",
++      "size": 65,
++      "compression": "bzip2",
++      "stor": "local"
++    }
++  ],
++  "requirements": {
++    "min_platform": {
++      "7.0": "20170608T172457Z"
++    },
++    "networks": [
++      {
++        "name": "net0",
++        "description": "public"
++      }
++    ]
++  },
++  "origin": "15963d90-61d7-4664-87a6-f56b16492d5a"
++}
+diff --git a/test/data/xdc/7a1b1967-6ecf-1e4c-8f09-f49094cc36ad.file0 b/test/data/xdc/7a1b1967-6ecf-1e4c-8f09-f49094cc36ad.file0
+new file mode 100644
+index 0000000..e8ce8fd
+Binary files /dev/null and b/test/data/xdc/7a1b1967-6ecf-1e4c-8f09-f49094cc36ad.file0 differ
+diff --git a/test/data/xdc/7a1b1967-6ecf-1e4c-8f09-f49094cc36ad.manifest b/test/data/xdc/7a1b1967-6ecf-1e4c-8f09-f49094cc36ad.manifest
+new file mode 100644
+index 0000000..608eb32
+--- /dev/null
++++ b/test/data/xdc/7a1b1967-6ecf-1e4c-8f09-f49094cc36ad.manifest
+@@ -0,0 +1,22 @@
++{
++  "v": 2,
++  "uuid": "7a1b1967-6ecf-1e4c-8f09-f49094cc36ad",
++  "owner": "ba28f844-8cb4-f141-882d-46d6251e6a9f",
++  "name": "public-operator-image-1",
++  "version": "0.0.1",
++  "description": "Operator image - used for 'import admin image' test",
++  "state": "active",
++  "disabled": false,
++  "public": true,
++  "published_at": "2012-11-02T22:46:45.992Z",
++  "os": "smartos",
++  "type": "zone-dataset",
++  "files": [
++    {
++      "sha1": "f6217f583a64e1b39cea7a8700b96cbb2375bb23",
++      "size": 65,
++      "compression": "bzip2",
++      "stor": "local"
++    }
++  ]
++}
+diff --git a/test/data/xdc/900cffef-55e3-4e7d-b7ec-ccf439a159e3.file0 b/test/data/xdc/900cffef-55e3-4e7d-b7ec-ccf439a159e3.file0
+new file mode 100644
+index 0000000..e8ce8fd
+Binary files /dev/null and b/test/data/xdc/900cffef-55e3-4e7d-b7ec-ccf439a159e3.file0 differ
+diff --git a/test/data/xdc/900cffef-55e3-4e7d-b7ec-ccf439a159e3.manifest b/test/data/xdc/900cffef-55e3-4e7d-b7ec-ccf439a159e3.manifest
+new file mode 100644
+index 0000000..7756894
+--- /dev/null
++++ b/test/data/xdc/900cffef-55e3-4e7d-b7ec-ccf439a159e3.manifest
+@@ -0,0 +1,34 @@
++{
++  "v": 2,
++  "uuid": "900cffef-55e3-4e7d-b7ec-ccf439a159e3",
++  "owner": "86055c40-2547-11e2-8a6b-4bb37edc84ba",
++  "name": "inc-level-2",
++  "version": "1.0.0",
++  "description": "Vader incremental image generated from base inc-level-1 image",
++  "state": "active",
++  "disabled": false,
++  "public": false,
++  "published_at": "2018-03-06T21:12:15.436Z",
++  "type": "zone-dataset",
++  "os": "smartos",
++  "files": [
++    {
++      "sha1": "f6217f583a64e1b39cea7a8700b96cbb2375bb23",
++      "size": 65,
++      "compression": "bzip2",
++      "stor": "local"
++    }
++  ],
++  "requirements": {
++    "min_platform": {
++      "7.0": "20170608T172457Z"
++    },
++    "networks": [
++      {
++        "name": "net0",
++        "description": "public"
++      }
++    ]
++  },
++  "origin": "a224da79-1806-4e66-b949-d481c7ca8cee"
++}
+diff --git a/test/data/xdc/9f819499-8298-9842-8cc5-1c2838196ab4.file0 b/test/data/xdc/9f819499-8298-9842-8cc5-1c2838196ab4.file0
+new file mode 100644
+index 0000000..e8ce8fd
+Binary files /dev/null and b/test/data/xdc/9f819499-8298-9842-8cc5-1c2838196ab4.file0 differ
+diff --git a/test/data/xdc/9f819499-8298-9842-8cc5-1c2838196ab4.manifest b/test/data/xdc/9f819499-8298-9842-8cc5-1c2838196ab4.manifest
+new file mode 100644
+index 0000000..efc647c
+--- /dev/null
++++ b/test/data/xdc/9f819499-8298-9842-8cc5-1c2838196ab4.manifest
+@@ -0,0 +1,22 @@
++{
++  "v": 2,
++  "uuid": "9f819499-8298-9842-8cc5-1c2838196ab4",
++  "owner": "86055c40-2547-11e2-8a6b-4bb37edc84ba",
++  "name": "i-am-your-father",
++  "version": "0.0.1",
++  "description": "Vader base image - used for 'image already exists' test",
++  "state": "active",
++  "disabled": false,
++  "public": false,
++  "published_at": "2012-11-02T22:46:45.992Z",
++  "os": "smartos",
++  "type": "zone-dataset",
++  "files": [
++    {
++      "sha1": "f6217f583a64e1b39cea7a8700b96cbb2375bb23",
++      "size": 65,
++      "compression": "bzip2",
++      "stor": "local"
++    }
++  ]
++}
+diff --git a/test/data/xdc/a224da79-1806-4e66-b949-d481c7ca8cee.file0 b/test/data/xdc/a224da79-1806-4e66-b949-d481c7ca8cee.file0
+new file mode 100644
+index 0000000..e8ce8fd
+Binary files /dev/null and b/test/data/xdc/a224da79-1806-4e66-b949-d481c7ca8cee.file0 differ
+diff --git a/test/data/xdc/a224da79-1806-4e66-b949-d481c7ca8cee.manifest b/test/data/xdc/a224da79-1806-4e66-b949-d481c7ca8cee.manifest
+new file mode 100644
+index 0000000..e88dccb
+--- /dev/null
++++ b/test/data/xdc/a224da79-1806-4e66-b949-d481c7ca8cee.manifest
+@@ -0,0 +1,37 @@
++{
++  "v": 2,
++  "uuid": "a224da79-1806-4e66-b949-d481c7ca8cee",
++  "owner": "ba28f844-8cb4-f141-882d-46d6251e6a9f",
++  "name": "inc-level-1",
++  "version": "1.0.0",
++  "description": "Base operator owned public image",
++  "state": "active",
++  "disabled": false,
++  "public": true,
++  "published_at": "2018-01-04T11:35:37Z",
++  "type": "zone-dataset",
++  "os": "smartos",
++  "files": [
++    {
++      "sha1": "f6217f583a64e1b39cea7a8700b96cbb2375bb23",
++      "size": 65,
++      "compression": "bzip2",
++      "stor": "local"
++    }
++  ],
++  "requirements": {
++    "min_platform": {
++      "7.0": "20141030T081701Z"
++    },
++    "networks": [
++      {
++        "name": "net0",
++        "description": "public"
++      }
++    ]
++  },
++  "tags": {
++    "role": "os",
++    "group": "minimal-64-lts"
++  }
++}
+diff --git a/test/data/xdc/f3078f0c-a53b-4140-b7af-fbb6308a8e35.file0 b/test/data/xdc/f3078f0c-a53b-4140-b7af-fbb6308a8e35.file0
+new file mode 100644
+index 0000000..e8ce8fd
+Binary files /dev/null and b/test/data/xdc/f3078f0c-a53b-4140-b7af-fbb6308a8e35.file0 differ
+diff --git a/test/data/xdc/f3078f0c-a53b-4140-b7af-fbb6308a8e35.manifest b/test/data/xdc/f3078f0c-a53b-4140-b7af-fbb6308a8e35.manifest
+new file mode 100644
+index 0000000..260f00d
+--- /dev/null
++++ b/test/data/xdc/f3078f0c-a53b-4140-b7af-fbb6308a8e35.manifest
+@@ -0,0 +1,22 @@
++{
++  "v": 2,
++  "uuid": "f3078f0c-a53b-4140-b7af-fbb6308a8e35",
++  "owner": "86055c40-2547-11e2-8a6b-4bb37edc84ba",
++  "name": "Private vader image",
++  "version": "0.0.1",
++  "description": "Vader base image - used for 'import image' test",
++  "state": "active",
++  "disabled": false,
++  "public": false,
++  "published_at": "2012-11-02T22:46:45.992Z",
++  "os": "smartos",
++  "type": "zone-dataset",
++  "files": [
++    {
++      "sha1": "f6217f583a64e1b39cea7a8700b96cbb2375bb23",
++      "size": 65,
++      "compression": "bzip2",
++      "stor": "local"
++    }
++  ]
++}
+diff --git a/test/images-xdc.dc-test.js b/test/images-xdc.dc-test.js
+new file mode 100644
+index 0000000..29a8e72
+--- /dev/null
++++ b/test/images-xdc.dc-test.js
+@@ -0,0 +1,264 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * Test cross-DC image copying.
++ */
++
++var path = require('path');
++
++var sdcClients = require('sdc-clients');
++var uuid = require('uuid');
++var vasync = require('vasync');
++
++var mockImgapi = require('./mock/imgapi');
++
++/* Globals */
++
++var ACCOUNT_ADMIN = 'ba28f844-8cb4-f141-882d-46d6251e6a9f';
++var ACCOUNT_VADER = '86055c40-2547-11e2-8a6b-4bb37edc84ba';
++
++/* Public image in remote DC which must be owned by admin */
++var ADMIN_IMAGE = '7a1b1967-6ecf-1e4c-8f09-f49094cc36ad';
++
++/* Existing private image that must exist in both DCs */
++var EXISTING_IMAGE = '9f819499-8298-9842-8cc5-1c2838196ab4';
++
++/* Private image in the remote DC, owned by Vader */
++var PRIVATE_IMAGE = 'f3078f0c-a53b-4140-b7af-fbb6308a8e35';
++
++/* Private incremental image in the remote DC, owned by Vader. */
++var PRIVATE_INC_IMAGE = '649d6948-4f1d-11e8-8249-1b9928638559';
++
++/* Origin chain for PRIVATE_INC_IMAGE, the first one is the base image. */
++var PRIVATE_INC_IMAGE_ORIGIN_CHAIN = [
++    'a224da79-1806-4e66-b949-d481c7ca8cee', /* base - public and admin owned */
++    '900cffef-55e3-4e7d-b7ec-ccf439a159e3', /* vader owned inc image */
++    '15963d90-61d7-4664-87a6-f56b16492d5a', /* vader owned inc image */
++    PRIVATE_INC_IMAGE                       /* vader owned inc image */
++];
++
++var TEST_DC_NAME = 'TestDc';
++var TEST_IMGAPI_URL = 'http://localhost:8082';
++
++var imgapi;
++var mockServer;
++
++/* Helpers */
++
++function deleteOneImage(imageUuid, t, callback) {
++    imgapi.deleteImage(imageUuid, ACCOUNT_VADER,
++            function _delIncrementalImgCb(err) {
++        // Allow a 404 error.
++        if (!err || err.statusCode !== 404) {
++            t.ok(!err, 'should be no error deleting image');
++        }
++        callback();
++    });
++}
++
++function deleteIncrementalImages(t, callback) {
++    vasync.forEachPipeline({
++        inputs: PRIVATE_INC_IMAGE_ORIGIN_CHAIN.slice(1).reverse(),
++        func: function deleteLayerN(imageUuid, next) {
++            deleteOneImage(imageUuid, t, next);
++        }
++    }, callback);
++}
++
++/* Tests */
++
++exports['x-DC'] = {
++
++    setup: function _testModuleSetup(t) {
++        var imgapiUrl = process.env.IMGAPI_URL || TEST_IMGAPI_URL;
++        imgapi = new sdcClients.IMGAPI({
++            url: imgapiUrl,
++            agent: false
++        });
++        t.ok(imgapi, 'setup imgapi client');
++
++        var mockOpts = {
++            adminAccount: ACCOUNT_ADMIN,
++            imagesDir: path.join(__dirname, 'data/xdc')
++        };
++        mockImgapi.setupServer(mockOpts, function (err, server) {
++            if (err) {
++                t.done(err);
++                return;
++            }
++            mockServer = server;
++            t.ok(mockServer, 'setup imock server');
++            t.done();
++        });
++    },
++
++    'invalid account test': function (t) {
++        var unknownAccount = uuid.v4();
++        imgapi.importImageFromDatacenterAndWait(PRIVATE_IMAGE,
++                unknownAccount, {datacenter: TEST_DC_NAME},
++                function _invalidAccountCb(err) {
++            t.ok(err, 'expected import image to return an error');
++            if (err) {
++                t.equal(err.statusCode, 404, 'err.statusCode should be 404');
++                t.ok(err.body, 'err.body');
++                if (err.body) {
++                    t.equal(err.body.code, 'NotFoundError',
++                        'err.body should be a NotFoundError error');
++                }
++            }
++            t.done();
++        });
++    },
++
++    'unknown DC test': function (t) {
++        imgapi.importImageFromDatacenter(EXISTING_IMAGE, ACCOUNT_VADER,
++                {datacenter: 'unknown'}, function _unknownDcCb(err) {
++            t.ok(err, 'expected import to have an error');
++            if (err) {
++                t.equal(err.statusCode, 422, 'err.statusCode should be 422');
++                t.ok(err.body, 'err.body');
++                if (err.body) {
++                    t.equal(err.body.code, 'ValidationFailed',
++                        'err.body should be a ValidationFailed error');
++                }
++            }
++            t.done();
++        });
++    },
++
++    'image already exists': function (t) {
++        imgapi.importImageFromDatacenter(EXISTING_IMAGE, ACCOUNT_VADER,
++                {datacenter: TEST_DC_NAME},
++                function _alreadyExistsCb(err) {
++            t.ok(err, 'expected import to have an error');
++            if (err) {
++                t.equal(err.statusCode, 409, 'err.statusCode should be 409');
++                t.ok(err.body, 'err.body');
++                if (err.body) {
++                    t.equal(err.body.code, 'ImageUuidAlreadyExists',
++                        'err.body should be a ImageUuidAlreadyExists error');
++                }
++            }
++            t.done();
++        });
++    },
++
++    'user cannot import an admin image': function (t) {
++        imgapi.importImageFromDatacenter(ADMIN_IMAGE, ACCOUNT_VADER,
++                {datacenter: TEST_DC_NAME},
++                function _importAdminCb(err) {
++            t.ok(err, 'expected import to have an error');
++            if (err) {
++                t.equal(err.statusCode, 401, 'err.statusCode should be 401');
++                t.ok(err.body, 'err.body');
++                if (err.body) {
++                    t.equal(err.body.code, 'UnauthorizedError',
++                        'err.body should be a UnauthorizedError error');
++                }
++            }
++            t.done();
++        });
++    },
++
++    /**
++     * Import a private (owned by vader) single layer image.
++     *
++     * Result: This should import one new image.
++     */
++    'import image': function (t) {
++        imgapi.importImageFromDatacenterAndWait(PRIVATE_IMAGE, ACCOUNT_VADER,
++                {datacenter: TEST_DC_NAME},
++                function _importIncCb(err, img) {
++            t.ok(!err, 'import should not fail');
++            t.ok(img, 'img');
++            imgapi.getImage(PRIVATE_IMAGE, ACCOUNT_VADER,
++                    function _incImportImageCb(err2, img2) {
++                t.ok(!err2, 'getImage for imported image should not fail');
++                t.ok(img2, 'img2');
++                t.done();
++            });
++        });
++    },
++
++    /**
++     * Import a private (owned by vader) multi-layer image, with the base image
++     * layer being owned by the admin (i.e. operator image).
++     *
++     * Result: This should import three new images (2 intermediate layers).
++     */
++    'import incremental image': function (t) {
++        imgapi.importImageFromDatacenterAndWait(PRIVATE_INC_IMAGE,
++                ACCOUNT_VADER,
++                {datacenter: TEST_DC_NAME},
++                function _importIncCb(err, img) {
++            t.ok(!err, 'import incremental image should not fail');
++            t.ok(img, 'img');
++            imgapi.getImage(PRIVATE_INC_IMAGE, ACCOUNT_VADER,
++                    function _incImportImageCb(err2, img2) {
++                t.ok(!err2, 'getImage for imported inc image should not fail');
++                t.ok(img2, 'img2');
++                t.done();
++            });
++        });
++    },
++
++    'delete incremental image layers': function (t) {
++        deleteIncrementalImages(t, t.done.bind(t));
++    },
++
++    /**
++     * Import a private (owned by vader) multi-layer image one layer at a time.
++     * This is meant to test importing an image when a number of images in the
++     * origin chain have already been imported.
++     *
++     * Result: This should import three new images.
++     */
++    'import incremental image in steps': function (t) {
++        vasync.forEachPipeline({
++            inputs: PRIVATE_INC_IMAGE_ORIGIN_CHAIN.slice(1),
++            func: function importLayerN(imageUuid, next) {
++                imgapi.importImageFromDatacenterAndWait(imageUuid,
++                        ACCOUNT_VADER,
++                        {datacenter: TEST_DC_NAME},
++                        function _importIncNCb(err, img) {
++                    t.ok(!err, 'import layer-n image should not fail');
++                    t.ok(img, 'img');
++                    imgapi.getImage(imageUuid, ACCOUNT_VADER,
++                            function _importLayerNImageCb(err2, img2) {
++                        t.ok(!err2,
++                            'getImage for layer-n image should not fail');
++                        t.ok(img2, 'img2');
++                        next(err || err2);
++                    });
++                });
++            }
++        }, t.done.bind(t));
++    },
++
++    teardown: function _testModuleTeardown(t) {
++        vasync.pipeline({funcs: [
++            function deletePrivateImage(_, next) {
++                deleteOneImage(PRIVATE_IMAGE, t, next);
++            },
++            function deleteIncImages(_, next) {
++                deleteIncrementalImages(t, next);
++            }
++        ]}, function _teardownPipelineCb() {
++            imgapi.close();
++
++            if (mockServer) {
++                mockServer.close();
++            }
++
++            t.done();
++        });
++    }
++};
+diff --git a/test/mock/imgapi.js b/test/mock/imgapi.js
+new file mode 100644
+index 0000000..470bcc3
+--- /dev/null
++++ b/test/mock/imgapi.js
+@@ -0,0 +1,180 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * Mock IMGAPI server.
++ */
++
++var fs = require('fs');
++var path = require('path');
++var util = require('util');
++
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
++var restify = require('restify');
++
++var DEFAULT_PORT = 8082;
++var format = util.format;
++var images = {};
++var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
++
++
++function loadImage(server, uuid) {
++    if (images.hasOwnProperty(uuid)) {
++        return true;
++    }
++
++    var mpath = path.join(server.imagesDir, uuid + '.manifest');
++    if (!fs.existsSync(mpath)) {
++        return false;
++    }
++
++    var image = JSON.parse(fs.readFileSync(mpath));
++    assert.equal(uuid, image.uuid);
++
++    if (server.mapAdminAccount && image.owner === server.mapAdminAccount) {
++        image.owner = server.adminAccount;
++    }
++
++    images[uuid] = image;
++
++    return true;
++}
++
++function reqImg(req, res, next) {
++    var uuid = req.params.uuid;
++
++    if (!UUID_RE.test(uuid) || !loadImage(this, uuid)) {
++        var message = req.url + ' does not exist';
++        next(new restify.errors.NotFoundError(format('%s', message)));
++        return;
++    }
++
++    req.img = images[uuid];
++    next();
++}
++
++function checkImgAccess(req, res, next) {
++    assert.object(req.img, 'req.img');
++
++    var account = req.query.account;
++
++    if (account) {
++        var m = req.img;
++        if (m.owner === this.adminAccount && m.public) {
++            // Public admin (operator) images are always accessible.
++            next();
++            return;
++        }
++        if (m.owner !== account && (!m.acl || m.acl.indexOf(account) === -1)) {
++            var message = req.url + ' does not exist';
++            next(new restify.errors.NotFoundError(format('%s', message)));
++            return;
++        }
++    }
++
++    next();
++}
++
++function mockGetImage(req, res, next) {
++    res.send(req.img);
++    next();
++}
++
++function mockGetImageFile(req, res, next) {
++    var fpath = path.join(this.imagesDir, req.img.uuid + '.file0');
++    var stream = fs.createReadStream(fpath);
++    stream.on('end', function () {
++        next();
++    });
++    stream.pipe(res);
++}
++
++function setupServer(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.optionalString(opts.adminAccount, 'opts.adminAccount');
++    assert.optionalString(opts.imagesDir, 'opts.imagesDir');
++    assert.optionalObject(opts.log, 'opts.log');
++    assert.optionalNumber(opts.port, 'opts.port');
++    assert.func(callback, 'callback');
++
++    var log = opts.log;
++    if (!log) {
++        log = bunyan.createLogger({name: 'mock-imgapi', level: 'warn'});
++    }
++    var port = opts.port || DEFAULT_PORT;
++    var server;
++
++    server = restify.createServer({
++        name: 'mock-imgapi',
++        handleUncaughtExceptions: true,
++        log: log
++    });
++
++    if (process.env.UFDS_ADMIN_UUID) {
++        server.adminAccount = process.env.UFDS_ADMIN_UUID;
++        server.mapAdminAccount = opts.adminAccount;
++    } else {
++        server.adminAccount = opts.adminAccount;
++    }
++
++    server.imagesDir = opts.imagesDir || '/var/tmp/images';
++
++    // server.use(restify.requestLogger());
++    server.use(restify.queryParser({
++        mapParams: false,
++        allowDots: false,
++        plainObjects: false
++    }));
++
++    server.on('uncaughtException', function (req, res, route, err) {
++        console.log('Mock Server Error:', err.message);
++        log.error(err, 'uncaughtException');
++        res.send(new restify.errors.InternalServerError(err.message));
++    });
++
++    server.on('after', function (req, res, route, err) {
++        restify.auditLogger({
++            log: log.child(
++                {
++                    route: route && route.name,
++                    action: req.query.action
++                },
++                true),
++            body: true
++        })(req, res, route, err);
++    });
++
++    server.get(
++        {path: '/images/:uuid', name: 'GetImage'},
++        reqImg,
++        checkImgAccess,
++        mockGetImage);
++    server.get(
++        {path: '/images/:uuid/file', name: 'GetImageFile'},
++        reqImg,
++        checkImgAccess,
++        mockGetImageFile);
++
++    server.listen(port, '127.0.0.1', function (err) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        log.info('Mock Image API listening on <http://localhost:%d>.', port);
++        callback(null, server);
++    });
++}
++
++
++module.exports = {
++    setupServer: setupServer
++};

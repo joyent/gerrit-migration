@@ -1,0 +1,247 @@
+commit 17e374dd4e200f2a3bc662bd0cde9d6826c092b9 (refs/changes/57/3957/2)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2018-05-16T17:47:17+00:00 (1 year, 5 months ago)
+    
+    TRITON-386 Deleting a NIC during a VMAPI "destroy" workflow races with net-agent
+    Reviewed by: Marsell Kukuljevic <marsell@joyent.com>
+    Approved by: Marsell Kukuljevic <marsell@joyent.com>
+
+diff --git a/lib/endpoints/nics.js b/lib/endpoints/nics.js
+index 2552d66..fa4d0b6 100644
+--- a/lib/endpoints/nics.js
++++ b/lib/endpoints/nics.js
+@@ -16,9 +16,10 @@
+ 
+ var assert = require('assert-plus');
+ var mod_nic = require('../models/nic');
+-var reqToOpts = require('../util/common').reqToOpts;
+ var restify = require('restify');
++var util_common = require('../util/common');
+ 
++var reqToOpts = util_common.reqToOpts;
+ 
+ 
+ /*
+@@ -148,11 +149,18 @@ function postNic(req, res, next) {
+ function deleteNic(req, res, next) {
+     assert.object(req._nic, 'req._nic');
+ 
+-    mod_nic.del(reqToOpts(req, {
++    var opts = reqToOpts(req, {
+         existingNic: req._nic
+-    }), function (err) {
++    });
++
++    mod_nic.del(opts, function (err) {
+         req.log.debug({ err: err }, 'deleteNic: cb entry');
+         if (err) {
++            if (opts.isConditionalRequest) {
++                next(util_common.translateEtagError(err));
++                return;
++            }
++
+             next(err);
+             return;
+         }
+diff --git a/lib/models/nic/del.js b/lib/models/nic/del.js
+index 128bace..301218a 100644
+--- a/lib/models/nic/del.js
++++ b/lib/models/nic/del.js
+@@ -56,9 +56,9 @@ function listVnetCns(opts, cb) {
+ }
+ 
+ function addNicToBatch(opts, cb) {
+-    opts.batch = opts.existingNic.delBatch({ log: opts.log,
+-        vnetCns: opts.vnetCns });
+-    return cb();
++    opts.batch = opts.existingNic.delBatch(opts);
++
++    cb();
+ }
+ 
+ function delIPs(opts, callback) {
+diff --git a/lib/models/nic/obj.js b/lib/models/nic/obj.js
+index 6755e61..248fc51 100644
+--- a/lib/models/nic/obj.js
++++ b/lib/models/nic/obj.js
+@@ -324,21 +324,25 @@ Nic.prototype.batch = function nicBatch(opts) {
+ 
+ 
+ /**
+- * Returns a moray batch that deletes this nic from all moray tables
++ * Returns a Moray batch that deletes this NIC from all Moray tables.
++ *
++ * If this was the primary NIC of a VM, then net-agent will take care of
++ * setting the "primary" flag for the new primary NIC.
+  */
+ Nic.prototype.delBatch = function nicDelBatch(opts) {
+     var batch = [
+         {
+             bucket: BUCKET.name,
+             key: this.mac.toLong().toString(),
+-            operation: 'delete',
+-            options: {
+-                etag: this.etag
+-            }
++            operation: 'delete'
+         }
+     ];
+ 
+-    // XXX: what to do if this was the primary nic?
++    if (opts.isConditionalRequest) {
++        batch[0].options = {
++            etag: this.etag
++        };
++    }
+ 
+     if (this.isUnderlay()) {
+         // This is an underlay vnic - remove it from the portolan underlay table
+diff --git a/lib/util/common.js b/lib/util/common.js
+index 2ab22e5..beb2d35 100644
+--- a/lib/util/common.js
++++ b/lib/util/common.js
+@@ -16,8 +16,15 @@
+ 
+ var errors = require('./errors');
+ var mod_jsprim = require('jsprim');
++var restify = require('restify');
++var VError = require('verror');
+ 
++// --- Globals
+ 
++var IF_MATCH_FAIL = 'if-match \'%s\' didn\'t match etag \'%s\'';
++
++
++// --- Exports
+ 
+ /**
+  * Turn a value into an array, unless it is one already.
+@@ -61,10 +68,15 @@ function repeat(repeatCb, afterCb) {
+  * model functions
+  */
+ function reqToOpts(req, extra) {
++    var conditional = (
++        req.headers['if-match'] !== undefined ||
++        req.headers['if-none-match'] !== undefined);
++
+     return mod_jsprim.mergeObjects({
+         app: req.app,
+         log: req.log,
+-        params: req.params
++        params: req.params,
++        isConditionalRequest: conditional
+     }, extra);
+ }
+ 
+@@ -110,11 +122,23 @@ function getEtag(etags, bucket, key) {
+ }
+ 
+ 
++function translateEtagError(err) {
++    var ece = VError.findCauseByName(err, 'EtagConflictError');
++    if (ece !== null) {
++        return new restify.errors.PreconditionFailedError(IF_MATCH_FAIL,
++            ece.context.expected, ece.context.actual);
++    }
++
++    return err;
++}
++
++
+ module.exports = {
+     arrayify: arrayify,
+     getEtag: getEtag,
+     repeat: repeat,
+     requireParams: requireParams,
+     reqToOpts: reqToOpts,
++    translateEtagError: translateEtagError,
+     translateParams: translateParams
+ };
+diff --git a/test/unit/nics.test.js b/test/unit/nics.test.js
+index 720d13d..fbf2b59 100644
+--- a/test/unit/nics.test.js
++++ b/test/unit/nics.test.js
+@@ -2891,6 +2891,83 @@ test('Delete nic - IP ownership changed underneath', function (t) {
+ });
+ 
+ 
++test('Delete NIC - EtagConflictError on Moray delete', function (t) {
++    var mac = '02:04:06:08:10:12';
++    var params = {
++        belongs_to_type: 'zone',
++        belongs_to_uuid: mod_uuid.v4(),
++        owner_uuid: mod_uuid.v4()
++    };
++    var nic;
++    var etag;
++
++    t.test('create nic', function (t2) {
++        NAPI.createNic(mac, params, function (err, obj, _, res) {
++            if (h.ifErr(t2, err, 'create new nic')) {
++                t2.end();
++                return;
++            }
++
++            nic = obj;
++            etag = res.headers['etag'];
++
++            t2.end();
++        });
++    });
++
++    t.test('delete nic encounts EtagConflictError', function (t2) {
++        var fakeErr = new Error('Already exists');
++        fakeErr.name = 'EtagConflictError';
++        fakeErr.context = {
++            bucket: models.nic.bucket().name,
++            key: mod_mac.parse(mac).toLong(),
++            expected: etag,
++            actual: 'foo'
++        };
++
++        MORAY.setMockErrors({ batch: [ fakeErr ] });
++
++        mod_nic.del(t2, {
++            mac: nic.mac,
++            etag: etag,
++            expCode: 412,
++            expErr: {
++                code: 'PreconditionFailed',
++                message: fmt('if-match \'%s\' didn\'t match etag \'foo\'', etag)
++            }
++        }, function (_) {
++            // Make sure we actually hit all of the errors:
++            t2.deepEqual(MORAY.getMockErrors(), {
++                batch: [ ]
++            }, 'no more batch errors left');
++
++            // Reset moray errors
++            MORAY.setMockErrors({ });
++
++            t2.end();
++        });
++    });
++
++    t.test('delete nic', function (t2) {
++        mod_nic.del(t2, {
++            mac: nic.mac,
++            etag: etag
++        });
++    });
++
++    t.test('confirm nic deleted', function (t2) {
++        mod_nic.get(t2, {
++            mac: nic.mac,
++            expCode: 404,
++            expErr: {
++                code: 'ResourceNotFound',
++                message: 'nic not found'
++            }
++        });
++    });
++});
++
++
+ test('NAPI-407: Concurrent deletes should fail with 404s', function (t) {
+     var params = {
+         belongs_to_type: 'zone',

@@ -1,0 +1,193 @@
+commit b9e79e969712e67b9ed3c9f8d6ea90c605aa4ee8 (refs/changes/59/4559/1)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2018-07-23T19:01:17-04:00 (1 year, 3 months ago)
+    
+    TRITON-628 vm-agent should have vmadm.events retry logic
+
+diff --git a/lib/watchers/vmadm-events-watcher.js b/lib/watchers/vmadm-events-watcher.js
+index 63d3456..c2bb82a 100644
+--- a/lib/watchers/vmadm-events-watcher.js
++++ b/lib/watchers/vmadm-events-watcher.js
+@@ -5,12 +5,15 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+ var vmadm = require('vmadm');
+ 
++// Time to wait before restarting `vmadm.events` if it has an error.
++var RESTART_TIMEOUT = 1000;
++
+ function noop() {}
+ 
+ function VmadmEventsWatcher(opts) {
+@@ -22,6 +25,8 @@ function VmadmEventsWatcher(opts) {
+ 
+     self.log = opts.log.child({watcher: 'vmadm-events-watcher'});
+     self.updateVm = opts.updateVm;
++    self.vms = null;
++    self.restarted = false;
+ }
+ 
+ VmadmEventsWatcher.prototype.start = function start(_cb) {
+@@ -29,6 +34,7 @@ VmadmEventsWatcher.prototype.start = function start(_cb) {
+ 
+     var opts;
+     var cb = _cb || noop;
++    var watcher;
+ 
+     assert.func(cb, 'cb');
+     assert(!self.stopWatcher, 'watcher already created');
+@@ -46,13 +52,16 @@ VmadmEventsWatcher.prototype.start = function start(_cb) {
+         switch (ev.type) {
+             case 'create':
+                 assert.object(ev.vm, 'ev.vm');
++                self.vms[ev.zonename] = ev.vm;
+                 self.updateVm(ev.zonename, 'create', ev.vm);
+                 break;
+             case 'modify':
+                 assert.object(ev.vm, 'ev.vm');
++                self.vms[ev.zonename] = ev.vm;
+                 self.updateVm(ev.zonename, 'modify', ev.vm);
+                 break;
+             case 'delete':
++                delete self.vms[ev.zonename];
+                 self.updateVm(ev.zonename, 'delete', {});
+                 break;
+             default:
+@@ -62,6 +71,10 @@ VmadmEventsWatcher.prototype.start = function start(_cb) {
+     }
+ 
+     function ready(err, obj) {
++        /*
++         * This error is only encountered in the case where `vmadm.events` is
++         * not supported.
++         */
+         if (err) {
+             cb(err);
+             return;
+@@ -70,12 +83,30 @@ VmadmEventsWatcher.prototype.start = function start(_cb) {
+         assert.object(obj, 'obj');
+         assert.func(obj.stop, 'obj.stop');
+         assert.object(obj.ev, 'obj.ev');
++        assert.object(obj.ev.vms, 'obj.ev.vms');
+ 
+         self.stopWatcher = obj.stop;
++
++        if (self.restarted) {
++            assert.object(self.vms, 'self.vms');
++            self._sendMissedUpdates(self.vms, obj.ev.vms);
++        }
++
++        self.vms = obj.ev.vms;
++
+         cb(null, obj.ev);
+     }
+ 
+-    vmadm.events(opts, handler, ready);
++    watcher = vmadm.events(opts, handler, ready);
++
++    watcher.once('error', function vmadmEventsOnceError(err) {
++        self.log.error(err, 'vmadm.events error - restarting watcher');
++        self.stop();
++        setTimeout(function vmadmEventsRestart() {
++            self.restarted = true;
++            self.start();
++        }, RESTART_TIMEOUT);
++    });
+ };
+ 
+ VmadmEventsWatcher.prototype.stop = function stop() {
+@@ -87,6 +118,75 @@ VmadmEventsWatcher.prototype.stop = function stop() {
+     }
+ };
+ 
++/*
++ * Figure out all the VMs that have been modified since the last
++ * time `vmadm.events` ran and send the proper update - this
++ * ensures no events are missed.
++ *
++ * The basic idea here is to calculate the difference between VMs known before
++ * `vmadm.events` stopped and VMs known now that it is running again (vminfod
++ * sends a full update when the stream is created).  Any VM UUID known now that
++ * wasn't known before is considered a `create`, any VM UUID not known now that
++ * was known before is considered a 'delete', and any VM known then and now is
++ * considered a 'modify' if the objects are different.
++ */
++VmadmEventsWatcher.prototype._sendMissedUpdates = // eslint-disable-line
++function _sendMissedUpdates(oldVms, newVms) {
++    var self = this;
++
++    var oldVmUUIDs = Object.keys(oldVms);
++    var newVmUUIDs = Object.keys(newVms);
++
++    var createdVms = newVmUUIDs.filter(function findDeletedVms(i) {
++        return oldVmUUIDs.indexOf(i) < 0;
++    });
++    var modifiedVms = newVmUUIDs.filter(function findModifiedVms(i) {
++        return oldVmUUIDs.indexOf(i) >= 0;
++    });
++    var deletedVms = oldVmUUIDs.filter(function findCreatedVms(i) {
++        return newVmUUIDs.indexOf(i) < 0;
++    });
++
++    self.log.debug({
++        createdVms: createdVms,
++        modifiedVms: modifiedVms,
++        deletedVms: deletedVms
++    }, 'sending vmadm.events update after restart');
++
++    createdVms.forEach(function addCreatedVm(uuid) {
++        var vm = newVms[uuid];
++
++        assert.object(vm, 'vm');
++        self.updateVm(uuid, 'create', vm);
++    });
++
++    modifiedVms.forEach(function updateModifiedVm(uuid) {
++        var oldVm = oldVms[uuid];
++        var newVm = newVms[uuid];
++        var modified;
++
++        assert.object(oldVm, 'oldVm');
++        assert.object(newVm, 'newVm');
++
++        try {
++            assert.deepEqual(oldVm, newVm);
++            modified = false;
++        } catch (e) {
++            modified = true;
++        }
++
++        if (modified) {
++            self.updateVm(uuid, 'modify', newVm);
++        } else {
++            self.log.debug('skipping unmodified vm %s', uuid);
++        }
++    });
++
++    deletedVms.forEach(function removeDeletedVm(uuid) {
++        self.updateVm(uuid, 'delete', {});
++    });
++};
++
+ VmadmEventsWatcher.FIELDS = [];
+ 
+ module.exports = VmadmEventsWatcher;
+diff --git a/package.json b/package.json
+index 913aaef..c60ac42 100644
+--- a/package.json
++++ b/package.json
+@@ -17,7 +17,7 @@
+         "restify-clients": "1.1.1",
+         "tape": "4.2.2",
+         "vasync": "1.6.3",
+-        "vmadm": "1.0.0"
++        "vmadm": "1.1.0"
+     },
+     "sdcDependencies": {
+         "config-agent": ">=1.3.0"

@@ -1,0 +1,157 @@
+commit 4eaf8c6ce9e971d6c4487256feef1e63f0d59a73 (refs/changes/98/2898/7)
+Author: Tim Kordas <tim.kordas@joyent.com>
+Date:   2017-11-17T13:53:54-08:00 (1 year, 11 months ago)
+    
+    MORAY-452 client should use a priority-queue to assign connection.
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 5f3d068..a85463d 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -2,6 +2,10 @@
+ 
+ ## v3.4.1
+ 
++* [MORAY-452](http://smartos.org/bugview/MORAY-452) client should use priority-queue to assign connection.
++
++## v3.4.1
++
+ * [MORAY-422](http://smartos.org/bugview/MORAY-422) node-moray could smooth over connection shuffling
+ 
+ ## v.3.4.0
+diff --git a/lib/pool.js b/lib/pool.js
+index 8f22847..88873f5 100644
+--- a/lib/pool.js
++++ b/lib/pool.js
+@@ -67,6 +67,7 @@
+ 
+ var assert = require('assert-plus');
+ var jsprim = require('jsprim');
++var upq = require('updatablepriorityqueue');
+ var VError = require('verror');
+ 
+ /*
+@@ -157,6 +158,10 @@ function MorayConnectionPool(args) {
+     this.mcp_conns = {};    /* all connections, by key */
+     this.mcp_avail = {};    /* keys for conns cueball considers in-service */
+ 
++    /* priority queue of available connections */
++    this.mcp_pq = new upq(function (o) { return (o.k); },
++                          function (o) { return (o.v); });
++
+     /* Fallback connection information.  See above. */
+     this.mcp_fallback_enable = true;    /* fallback behavior enabled */
+     this.mcp_conn_fallback = null;      /* fallback connection itself */
+@@ -186,19 +191,39 @@ function MorayConnectionPool(args) {
+  * The caller must invoke connRelease() when the request is finished.
+  */
+ MorayConnectionPool.prototype.connAlloc = function () {
+-    var availkeys, key, mconn, aconn, staletime, staletimems;
++    var entry, availkeys, key, mconn, aconn, staletime, staletimems;
+ 
+     /*
+-     * There are more sophisticated ways to pick a connection (e.g., store
+-     * connections in a priority queue by number of outstanding requests).  But
+-     * our expectation is that Moray servers are pretty uniform, Moray requests
+-     * are pretty uniform in their cost on the server, and so a random
+-     * distribution is likely to be reasonable.
++     * Our release and drain functionality often requires access by key, so
++     * maintaining a pure priority-queue is a little bit complex. We use
++     * an "availability" hash along with a priority-queue. The availability
++     * hash is authoritative (ie the priority queue may have entries which
++     * are no longer available, so we have to check).
++     *
++     * Randomly picking Moray servers works when their response times are
++     * all uniform; but small differences in response times, (especially
++     * with bursty workloads) can end up assigning too much work to the
++     * slowest server(s). In cases where the server performance is partly
++     * dictated by the amount of work, we end up with a positive feedback
++     * loop where the slowest servers acquire a mounting backlog while the
++     * least-loaded stay lightly loaded.
++     *
++     * Get the next entry from our priority-queue, check that it is still
++     * a valid entry.
+      */
+     availkeys = Object.keys(this.mcp_avail);
+     if (availkeys.length > 0) {
+-        key = jsprim.randElt(availkeys);
+-        mconn = this.mcp_conns[key];
++        // Get the lowest-connection-count entry, and sanity check for validity.
++        while ((entry = this.mcp_pq.poll()) !== undefined) {
++            /*
++             * We got an entry from our queue, is it legal to use ?
++             * NOTE: if it wasn't valid, it has now been removed.
++             */
++            if (this.mcp_avail.hasOwnProperty(entry.k))
++                break;
++        }
++
++        mconn = this.mcp_conns[entry.k];
+         assert.strictEqual(mconn.mc_state, MC_S_AVAIL);
+     } else {
+         mconn = this.mcp_conn_fallback;
+@@ -232,6 +257,9 @@ MorayConnectionPool.prototype.connAlloc = function () {
+     assert.ok(mconn instanceof MorayConnection);
+     assert.ok(mconn.mc_nreqs >= 0);
+     mconn.mc_nreqs++;
++    // Update our priority queue.
++    entry.v = mconn.mc_nreqs;
++    this.mcp_pq.add(entry);
+     aconn = new MorayConnectionAllocation(mconn);
+     mconn.mc_log.trace('allocated connection');
+     this.mcp_nalloc_ok++;
+@@ -259,12 +287,16 @@ MorayConnectionPool.prototype.connRelease = function (aconn) {
+     key = mconn.mc_key;
+     if (mconn.mc_state == MC_S_AVAIL) {
+         assert.ok(this.mcp_avail.hasOwnProperty(key));
++        // Update our priority-queue
++        this.mcp_pq.updateElement(key, {'k': key, 'v': mconn.mc_nreqs});
+     } else {
+         assert.ok(!this.mcp_avail.hasOwnProperty(key));
+         assert.ok(mconn.mc_state == MC_S_DRAIN ||
+             mconn.mc_state == MC_S_FALLBACK);
+         if (mconn.mc_state == MC_S_DRAIN && mconn.mc_nreqs === 0) {
+             this.connDelete(key);
++            // remove from the priority-queue, if present
++            this.mcp_pq.deleteElement(key);
+         }
+     }
+ };
+@@ -286,6 +318,8 @@ MorayConnectionPool.prototype.connAdd = function connAdd(key, conn, hdl) {
+     assert.strictEqual(mconn.mc_state, MC_S_AVAIL);
+     this.mcp_conns[key] = mconn;
+     this.mcp_avail[key] = true;
++    // Also add to our min-priority-queue with tip-top priority (0).
++    this.mcp_pq.add({ 'k': key, 'v': 0});
+     mconn.mc_log.info('new connection');
+ 
+     this.connFallbackRemove({ 'reason': 'new connection' });
+@@ -313,6 +347,7 @@ MorayConnectionPool.prototype.connRetire = function (key) {
+      * Remove the connection from service for new requests.
+      */
+     delete (this.mcp_avail[key]);
++    this.mcp_pq.deleteElement(key); // remove from the priority-queue, if present
+ 
+     assert.bool(mconn.mc_conn.destroyed);
+     if (!jsprim.isEmpty(this.mcp_avail) || !this.mcp_fallback_enable ||
+diff --git a/package.json b/package.json
+index a310842..b51feaa 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+     "name": "moray",
+     "description": "Moray client library",
+-    "version": "3.4.1",
++    "version": "3.4.2",
+     "author": "Joyent (joyent.com)",
+     "keywords": [ "moray" ],
+     "main": "./lib/index.js",
+@@ -21,6 +21,7 @@
+         "jsprim": "^1.3.0",
+         "posix-getopt": "^1.0.0",
+         "progbar": "0.1.0",
++        "updatablepriorityqueue": "0.1.3",
+         "vasync": "^1.6.4",
+         "verror": "^1.9.0"
+     },

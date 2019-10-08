@@ -1,0 +1,440 @@
+commit b498daead59fe7f8b115b38f08a8cec12447dae8 (refs/changes/33/4933/4)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2018-10-15T12:24:47-04:00 (12 months ago)
+    
+    OS-7289 vminfod doesn't update JSON files (tags, metadata, etc.) from ZFS rollback
+
+diff --git a/src/vm/node_modules/vminfod/vminfod.js b/src/vm/node_modules/vminfod/vminfod.js
+index bbd6cb2a..8ea92244 100644
+--- a/src/vm/node_modules/vminfod/vminfod.js
++++ b/src/vm/node_modules/vminfod/vminfod.js
+@@ -1130,6 +1130,36 @@ Vminfod.prototype.stopVmWatchers = function stopVmWatchers(zonename, callback) {
+     }
+ };
+ 
++/*
++ * Stop and start all watchers for a specific zone
++ */
++Vminfod.prototype.restartVmWatchers =
++    function restartVmWatchers(zonename, callback) {
++
++    var self = this;
++
++    assert.string(zonename, 'zonename');
++    assert.func(callback, 'callback');
++
++    vasync.pipeline({funcs: [
++        function restartVmWatchersStopWatchers(_, cb) {
++            self.stopVmWatchers(zonename, function stopWatchersDone(err) {
++                /*
++                 * If we fail here it's not a big deal since we will restart the
++                 * watchers below.
++                 */
++                if (err) {
++                    self.log.warn(err, 'restartVmWatchers stopWatchers error');
++                }
++                cb();
++            });
++        },
++        function restartVmWatchersStartWatchers(_, cb) {
++            self.startVmWatchers(zonename, cb);
++        }
++    ]}, callback);
++};
++
+ /*
+  * Return a JSON serialized string for a given vm.  This will return
+  * a cached object, or generate the contents and cache the result.
+@@ -2050,92 +2080,18 @@ Vminfod.prototype.handleFsEvent = function handleFsEvent(obj) {
+     } else if ((matches = obj.pathname.match(metadata_re))) {
+         zonename = matches[1];
+ 
+-        self.event_queue.enqueue({
+-            description: 'handle metadata fs update - ' + meta,
+-            timeout: QUEUE_TASK_TIMEOUT,
+-            func: function handleMetadataEventTask(extras, callback) {
+-                // short-circuit if this vmobj doesn't exist
+-                if (!self.vmobjs.hasOwnProperty(zonename)) {
+-                    extras.log.debug('vmobj doesn\'t exist for %s',
+-                        zonename);
+-                    callback();
+-                    return;
+-                }
++        self.enqueueMetadataFileUpdate(zonename, meta);
+ 
+-                self.cloneVmDatasets(zonename);
+-                vm_datasets = self.vmDatasets(zonename);
+-
+-                // clear the missing pieces and refresh
+-                contexts = [
+-                    'last_modified',
+-                    'json_objects'
+-                ];
+-
+-                self.invalidateZoneDataCache(zonename, vm_datasets, contexts);
+-                self.refreshVmobj(zonename, vm_datasets, callback);
+-            }
+-        });
+     // zone lastexited file
+     } else if ((matches = obj.pathname.match(lastexit_re))) {
+         zonename = matches[1];
+ 
+-        self.event_queue.enqueue({
+-            description: 'handle lastexit fs change - ' + meta,
+-            timeout: QUEUE_TASK_TIMEOUT,
+-            func: function handleLastExitEventTask(extras, callback) {
+-                // short-circuit if this vmobj doesn't exist
+-                if (!self.vmobjs.hasOwnProperty(zonename)) {
+-                    self.log.debug('vmobj doesn\'t exist for ' + zonename);
+-                    callback();
+-                    return;
+-                }
+-
+-                self.cloneVmDatasets(zonename);
+-                vm_datasets = self.vmDatasets(zonename);
+-
+-                // clear the missing pieces and refresh
+-                contexts = [
+-                    'last_modified',
+-                    'last_exited'
+-                ];
+-
+-                self.invalidateZoneDataCache(zonename, vm_datasets, contexts);
+-                self.refreshVmobj(zonename, vm_datasets, callback);
+-            }
+-        });
++        self.enqueueLastexitFileUpdate(zonename, meta);
+ 
+     // sysinfo
+     } else if (obj.pathname === SYSINFO_FILE) {
+-        self.event_queue.enqueue({
+-            description: 'handle sysinfo fs change - ' + meta,
+-            timeout: QUEUE_TASK_TIMEOUT,
+-            func: function handleSysinfoEventTask(extras, callback) {
+-                vasync.forEachParallel({
+-                    inputs: self.vmDatasets(),
+-                    func: function getZoneData(data, cb) {
+-                        if (data.hasOwnProperty('sysinfo')) {
+-                            delete data.sysinfo;
+-                        }
+-
+-                        var opts = {
+-                            log: extras.log,
+-                            cache: data,
+-                            keepalive: true
+-                        };
+-                        vmload.getZoneData(null, opts,
+-                            function getZoneDataDone(err, cache) {
+-
+-                            if (err) {
+-                                extras.log.error('failed to refresh '
+-                                    + 'sysinfo, failed to getZoneData');
+-                            }
++        self.enqueueSysinfoFileUpdate(meta);
+ 
+-                            cb();
+-                        });
+-                    }
+-                }, callback);
+-            }
+-        });
+     } else {
+         self.log.warn('unhandled event for file: %s', obj.pathname);
+     }
+@@ -2216,7 +2172,6 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+     case 'snapshot':
+         action = 'fetchAndCopy';
+         break;
+-    case 'clone swap': // rollback
+     case 'set':
+     case 'hold':
+     case 'release':
+@@ -2224,6 +2179,39 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+     case 'finish receiving':
+         action = 'fetchExpireAndCopy';
+         break;
++    case 'clone swap': // rollback
++        action = 'fetchExpireAndCopy';
++        if (uuid) {
++            self.log.debug('zfs rollback seen for %s on %s', uuid, dsname);
++
++            /*
++             * In the event of a ZFS rollback for a zones' dataset (or one of
++             * its child datasets), the procedure is fairly involved.  Because
++             * files may be modified or deleted as a result of the rollback
++             * operation, we enqueue the following tasks:
++             *
++             * 1. the ZFS event below to fetchExpireAndCopy
++             *
++             * (and after the call to setImmediate)
++             *
++             * 2. restart the VM's FS watches
++             * 3. check the metadata files (json files in config/ for the zone)
++             * 4. check the last exited file (lastexited)
++             */
++            setImmediate(function zfsRollbackRestartFsWatchers() {
++                self.event_queue.enqueue({
++                    description: util.format('zone %s restart watchers', uuid),
++                    timeout: QUEUE_TASK_TIMEOUT,
++                    func: function zfsRollbackRestartWatcher(extras, callback) {
++                        self.restartVmWatchers(uuid, callback);
++                    }
++                });
++
++                self.enqueueMetadataFileUpdate(uuid, 'rollback');
++                self.enqueueLastexitFileUpdate(uuid, 'rollback');
++            });
++        }
++        break;
+     case 'destroy':
+         action = 'expire';
+         break;
+@@ -2235,6 +2223,7 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+         self.log.fatal('unknown action: %s', obj.action);
+         return;
+     }
++    assert.string(action, 'action');
+     description = util.format('dsname: %s action: %s', obj.dsname, action);
+ 
+     function expire() {
+@@ -2332,7 +2321,7 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+                 });
+                 return;
+             case 'fetchExpireAndCopy':
+-                fetch(datasetObj, function fetchExpireAndDone(err, cache) {
++                fetch(datasetObj, function fetchExpireAndCopyDone(err, cache) {
+                     if (err) {
+                         finish();
+                         return;
+@@ -2367,6 +2356,125 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+     });
+ };
+ 
++/*
++ * Enqueue a task to update a single zones metadata file
++ */
++Vminfod.prototype.enqueueMetadataFileUpdate =
++    function enqueueMetadataFileUpdate(zonename, meta) {
++
++    var self = this;
++
++    assert.string(zonename, 'zonename');
++    assert.string(meta, 'meta');
++
++    self.event_queue.enqueue({
++        description: util.format('handle metadata fs update for %s - %s',
++            zonename, meta),
++        timeout: QUEUE_TASK_TIMEOUT,
++        func: function handleMetadataEventTask(extras, callback) {
++            // short-circuit if this vmobj doesn't exist
++            if (!self.vmobjs.hasOwnProperty(zonename)) {
++                extras.log.debug('vmobj doesn\'t exist for %s',
++                    zonename);
++                callback();
++                return;
++            }
++
++            self.cloneVmDatasets(zonename);
++            var vm_datasets = self.vmDatasets(zonename);
++
++            // clear the missing pieces and refresh
++            var contexts = [
++                'last_modified',
++                'json_objects'
++            ];
++
++            self.invalidateZoneDataCache(zonename, vm_datasets, contexts);
++            self.refreshVmobj(zonename, vm_datasets, callback);
++        }
++    });
++};
++
++/*
++ * Enqueue a task to update a single zones lastexit file
++ */
++Vminfod.prototype.enqueueLastexitFileUpdate =
++    function enqueueLastexitFileUpdate(zonename, meta) {
++
++    var self = this;
++
++    assert.string(zonename, 'zonename');
++    assert.string(meta, 'meta');
++
++    self.event_queue.enqueue({
++        description: util.format('handle lastexit fs change for %s - %s',
++            zonename, meta),
++        timeout: QUEUE_TASK_TIMEOUT,
++        func: function handleLastExitEventTask(extras, callback) {
++            // short-circuit if this vmobj doesn't exist
++            if (!self.vmobjs.hasOwnProperty(zonename)) {
++                self.log.debug('vmobj doesn\'t exist for ' + zonename);
++                callback();
++                return;
++            }
++
++            self.cloneVmDatasets(zonename);
++            var vm_datasets = self.vmDatasets(zonename);
++
++            // clear the missing pieces and refresh
++            var contexts = [
++                'last_modified',
++                'last_exited'
++            ];
++
++            self.invalidateZoneDataCache(zonename, vm_datasets, contexts);
++            self.refreshVmobj(zonename, vm_datasets, callback);
++        }
++    });
++};
++
++/*
++ * Enqueue a task to the sysinfo file
++ */
++Vminfod.prototype.enqueueSysinfoFileUpdate =
++    function enqueueSysinfoFileUpdate(meta) {
++
++    var self = this;
++
++    assert.string(meta, 'meta');
++
++    self.event_queue.enqueue({
++        description: util.format('handle sysinfo fs change - %s', meta),
++        timeout: QUEUE_TASK_TIMEOUT,
++        func: function handleSysinfoEventTask(extras, callback) {
++            vasync.forEachParallel({
++                inputs: self.vmDatasets(),
++                func: function getZoneData(data, cb) {
++                    if (data.hasOwnProperty('sysinfo')) {
++                        delete data.sysinfo;
++                    }
++
++                    var opts = {
++                        log: extras.log,
++                        cache: data,
++                        keepalive: true
++                    };
++                    vmload.getZoneData(null, opts,
++                        function getZoneDataDone(err, cache) {
++
++                        if (err) {
++                            extras.log.error('failed to refresh '
++                                + 'sysinfo, failed to getZoneData');
++                        }
++
++                        cb();
++                    });
++                }
++            }, callback);
++        }
++    });
++};
++
+ /*
+  * Extract a (the first) UUID from a string
+  */
+diff --git a/src/vm/tests/test-snapshots.js b/src/vm/tests/test-snapshots.js
+index 9c8cc58f..e432942b 100644
+--- a/src/vm/tests/test-snapshots.js
++++ b/src/vm/tests/test-snapshots.js
+@@ -85,8 +85,8 @@ test('create joyent-minimal VM with delegated dataset', function (t) {
+         } else {
+             t.ok(true, 'VM created with uuid ' + obj.uuid);
+             VM.load(obj.uuid, function (e, o) {
+-                common.ifError(t, err, 'loading VM after create');
+-                if (!err) {
++                common.ifError(t, e, 'loading VM after create');
++                if (!e) {
+                     t.ok(o.snapshots.length === 0, 'no snapshots after create');
+                     t.ok(o.hasOwnProperty('zfs_filesystem'),
+                         'has zfs_filesystem');
+@@ -1145,6 +1145,90 @@ test('rollback to garbage snapshot, try mdata-get again', function (t) {
+     });
+ });
+ 
++test('modify tags and rollback', function (t) {
++    t.ok(vmobj, 'have vmobj');
++
++    if (!vmobj) {
++        t.end();
++        return;
++    }
++
++    var firstTags = {
++        foo: 1
++    };
++    var secondTags = {
++        foo: 2
++    };
++
++    vasync.pipeline({funcs: [
++        // Set the initial tags
++        function (_, cb) {
++            VM.update(vmobj.uuid, {set_tags: firstTags}, function (err) {
++                common.ifError(t, err, 'VM.update first tags');
++                cb(err);
++            });
++        },
++
++        // Ensure the first set worked
++        function (_, cb) {
++            VM.load(vmobj.uuid, function (err, o) {
++                common.ifError(t, err, 'loading VM after update first tags');
++                t.deepEqual(o.tags, firstTags, 'first tags are correct');
++                cb(err);
++            });
++        },
++
++        // Create a snapshot
++        function (_, cb) {
++            VM.create_snapshot(vmobj.uuid, 'initial-tags-snap', {},
++                function (err) {
++
++                common.ifError(t, err, 'VM.create_snapshot initial-tags-snap');
++                cb(err);
++            });
++        },
++
++        // Set the second set of tags
++        function (_, cb) {
++            VM.update(vmobj.uuid, {set_tags: secondTags}, function (err) {
++                common.ifError(t, err, 'VM.update second tags');
++                cb(err);
++            });
++        },
++
++        // Ensure the second tags set worked
++        function (_, cb) {
++            VM.load(vmobj.uuid, function (err, o) {
++                common.ifError(t, err, 'loading VM after update second tags');
++                t.deepEqual(o.tags, secondTags, 'second tags are correct');
++                cb(err);
++            });
++        },
++
++        // Rollback the VM
++        function (_, cb) {
++            VM.rollback_snapshot(vmobj.uuid, 'initial-tags-snap', {},
++                function (err) {
++
++                common.ifError(t, err, 'VM.rollback initial-tags-snap');
++                cb(err);
++            });
++        },
++
++        // Ensure the tags have now reverted to the first set
++        function (_, cb) {
++            VM.load(vmobj.uuid, function (err, o) {
++                common.ifError(t, err, 'loading VM after rollback');
++                t.deepEqual(o.tags, firstTags, 'rollback tags are correct');
++                cb(err);
++            });
++        }
++    ]}, function (err) {
++        common.ifError(t, err, 'test modify tags and rollback');
++        t.end();
++    });
++});
++
+ test('delete VM with garbage snapshot', function (t) {
+     t.ok(vmobj, 'have vmobj');
+ 

@@ -1,0 +1,1095 @@
+commit 81d83dc015004ffc71da484ae319ff23f20b656d (refs/changes/22/2322/7)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2018-02-08T08:49:09-08:00 (1 year, 8 months ago)
+    
+    DOCKER-524 Implement docker push
+    Reviewed by: Trent Mick <trentm@gmail.com>
+    Approved by: Trent Mick <trentm@gmail.com>
+
+diff --git a/lib/backends/sdc/images.js b/lib/backends/sdc/images.js
+index 77be77c..55c694f 100644
+--- a/lib/backends/sdc/images.js
++++ b/lib/backends/sdc/images.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2017, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -413,7 +413,7 @@ function listImages(opts, callback) {
+         });
+ 
+ 
+-        function pushImage(img, repoTags) {
++        function _addImage(img, repoTags) {
+             assert.optionalArrayOfString(repoTags, 'repoTags');
+ 
+             // reminder: img.config is the image config, img.container_config
+@@ -444,7 +444,7 @@ function listImages(opts, callback) {
+             // Intermediate layers don't have tags.
+             var serialized = img.serialize();
+             if (!serialized.head) {
+-                pushImage(serialized);
++                _addImage(serialized);
+                 cb();
+                 return;
+             }
+@@ -459,9 +459,9 @@ function listImages(opts, callback) {
+                     var repoTags = imgTags.map(function (it) {
+                         return it.repo + ':' + it.tag;
+                     });
+-                    pushImage(serialized, repoTags);
++                    _addImage(serialized, repoTags);
+                 } else {
+-                    pushImage(serialized);
++                    _addImage(serialized);
+                 }
+                 cb();
+             });
+@@ -2710,6 +2710,186 @@ function pullImage(opts, callback) {
+ }
+ 
+ 
++/**
++ * Push `opts.image` to the docker registry.
++ *
++ * @param opts {Object} Contains image and optional tag information.
++ * @param callback {Function} with signature fn(err).
++ */
++function pushImage(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.image, 'opts.image');
++    assert.object(opts.rat, 'opts.rat');
++    assert.string(opts.repoAndTag, 'opts.repoAndTag');
++    assert.object(opts.req, 'opts.req');
++    assert.object(opts.res, 'opts.res');
++    assert.func(callback, 'callback');
++
++    var jobUuid;
++    var log = opts.req.log;
++    var repoAndTag = opts.repoAndTag;
++    var req = opts.req;
++    var req_id = req.getId();
++
++    /*
++     * Handle a push error. This is a chunked transfer so we can't return
++     * a restify error because headers have already been sent when the
++     * downloads have started. "docker/pkg/jsonmessage/jsonmessage.go" defines
++     * an error message format.
++     *
++     * In general we can't assume much about the `err` object, e.g. if it
++     * is an early failure. However, we try to gracefully handle some
++     * well structured cases.
++     *
++     * 1. In some cases the `err.code` is set to a meaningful error code.
++     *    This comes via the `JOB.chain_results[-1].error.name`, set by
++     *    push-image.js error handling.
++     *
++     * 2. If there is an error in the Docker Registry v2 API, then `err.message`
++     *    equals a JSON string per:
++     *        https://docs.docker.com/registry/spec/api/#errors
++     */
++    function errorAndEnd(err, job) {
++        assert.object(err, 'err');
++
++        var imgName = opts.rat.localName;
++        if (opts.rat.digest) {
++            imgName += '@' + opts.rat.digest;
++        } else if (opts.rat.tag) {
++            imgName += ':' + opts.rat.tag;
++        }
++        opts.req.log.info({err: err, imgName: imgName,
++            jobUuid: job && job.uuid}, 'imagePush job error');
++
++        /*
++         * `recognized: false` is log.info'd below to indicated `docker push`
++         * errors that are ones that we are *not* handling specially and
++         * falling back to "Error pushing image: Internal error". I.e. the
++         * point is to get back to those and improve the user experience.
++         */
++        var recognized = true;
++
++        var errmsg;
++        if (err.code === 'RemoteSourceError') {
++            /* BEGIN JSSTYLED */
++            /*
++             * Docker-docker:
++             *  $ docker push nope.example.com/nope
++             *  The push refers to a repository [nope.example.com/nope]
++             *  Get https://nope.example.com/v1/_ping: dial tcp: lookup nope.example.com on 10.0.2.3:53: no such host
++             *
++             * Triton-docker:
++             *  $ docker --tls push nope.example.com/nope
++             *  The push refers to a repository [nope.example.com/nope]
++             *  Error: getaddrinfo ENOTFOUND nope.example.com nope.example.com:443 (16e6b24e-7555-4621-a9f2-9d245c854233)
++             *
++             * err={ [Error: getaddrinfo ENOTFOUND] code: 'ENOTFOUND' }
++             */
++            /* END JSSTYLED */
++            errmsg = format('(%s) %s host not found',
++                err.code, opts.rat.index.name);
++        } else if (err.code === 'ConnectTimeoutError') {
++            errmsg = format('Timeout connecting to host %s',
++                opts.rat.index.name);
++        } else if (err.code === 'UnauthorizedError') {
++            errmsg = 'Unauthorized: authentication required';
++        } else {
++            errmsg = err.message || String(err);
++        }
++
++        opts.req.log.info({err: err, imgName: imgName,
++            jobUuid: job && job.uuid, recognized: recognized, errmsg: errmsg},
++            'pushImage error');
++
++        /*
++         * Note: docker/pkg/jsonmessage/jsonmessage.go describes an optional
++         * 'errorDetail.code' field, though I don't know specific usage of
++         * this in Docker-'docker push'.
++         */
++        var payload = {
++            errorDetail: {
++                message: format('Error: %s (%s)', errmsg, req_id)
++            }
++        };
++
++        opts.res.write(JSON.stringify(payload));
++        opts.res.end();
++    }
++
++    vasync.pipeline({arg: {}, funcs: [
++        _createPushJob,
++        _waitForPushJob
++    ]}, callback);
++
++    function _createPushJob(ctx, next) {
++        var jobOpts = {
++            account_uuid: req.account.uuid,
++            headers: { 'x-request-id': req_id },
++            image: opts.image,
++            regAuth: req.headers['x-registry-auth'],
++            repoAndTag: repoAndTag,
++            req_id: req_id
++        };
++
++        req.wfapi.createPushImageJob(jobOpts, function (err, juuid) {
++            if (err) {
++                errorAndEnd(err);
++                next();
++                return;
++            }
++
++            jobUuid = juuid;
++
++            // Create an in-progress push operation so the wfapi job can report
++            // progress back to us
++            req.app.sockets.setSocket('job', req_id, {
++                socket: opts.res
++            });
++
++            next();
++        });
++    }
++
++    function _waitForPushJob(_, next) {
++        common.waitForJob(req.wfapi, jobUuid, function (err, job) {
++            log.trace('push job finished, err: %s', err);
++            if (err) {
++                errorAndEnd(err, job);
++            }
++
++            next();
++        });
++    }
++}
++
++
++/**
++ * Return the Tags for the given repo name.
++ *
++ * Accepted repo name examples:
++ *   busybox
++ *   toddw/mybusybox
++ *   my.registry.com:5000/ns/myname
++ *
++ * @param opts {Object} Contains repo name.
++ * @param callback {Function} with signature fn(err, imgTags).
++ */
++function tagsFromRepoName(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.repo, 'opts.repo');
++    assert.object(opts.req, 'opts.req');
++    assert.optionalString(opts.tag, 'opts.tag');
++
++    var req = opts.req;
++    var filter = [ { repo: opts.repo, owner_uuid: req.account.uuid } ];
++    if (opts.tag) {
++        filter[0].tag = opts.tag;
++    }
++
++    ImageTagV2.list(req.app, req.log, filter, callback);
++}
++
++
+ /**
+  * Create new (unactivated) docker image in imgapi and return it through the
+  * callback.
+@@ -2839,7 +3019,9 @@ module.exports = {
+     listImages: listImages,
+     inspectImage: inspectImage,
+     pullImage: pullImage,
++    pushImage: pushImage,
+     imgFromConfigDigest: imgFromConfigDigest,
+     imgFromName: imgFromName,
+-    tagImage: tagImage
++    tagImage: tagImage,
++    tagsFromRepoName: tagsFromRepoName
+ };
+diff --git a/lib/backends/sdc/index.js b/lib/backends/sdc/index.js
+index 9e5fd7d..51da662 100644
+--- a/lib/backends/sdc/index.js
++++ b/lib/backends/sdc/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -72,7 +72,10 @@ SdcBackend.prototype.getScratchImage = images.getScratchImage;
+ SdcBackend.prototype.listImages = images.listImages;
+ SdcBackend.prototype.inspectImage = images.inspectImage;
+ SdcBackend.prototype.pullImage = images.pullImage;
++SdcBackend.prototype.pushImage = images.pushImage;
++SdcBackend.prototype.imgFromConfigDigest = images.imgFromConfigDigest;
+ SdcBackend.prototype.imgFromName = images.imgFromName;
++SdcBackend.prototype.tagsFromRepoName = images.tagsFromRepoName;
+ SdcBackend.prototype.tagImage = images.tagImage;
+ 
+ // build.js
+diff --git a/lib/common.js b/lib/common.js
+index e4daf07..0a99a1f 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2017, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+@@ -248,25 +248,6 @@ function formatProgress(args) {
+ }
+ 
+ 
+-/**
+- * Writes a JSON progress object to an HTTP response object. Docker
+- * expects a progressDetail object even if it's empty
+- */
+-function writeProgress(res, progress) {
+-    if (!progress.progressDetail) {
+-        progress.progressDetail = {};
+-    }
+-    res.write(JSON.stringify(formatProgress(progress)));
+-}
+-
+-/**
+- * Writes a JSON status object to an HTTP response object
+- */
+-function writeStatus(res, progress) {
+-    res.write(JSON.stringify(formatProgress(progress)));
+-}
+-
+-
+ /*
+  * Wait for a job to complete. Callback with an error if the job fails
+  * (execution of 'failed' or 'canceled'). The returned error attempts to
+@@ -867,8 +848,6 @@ module.exports = {
+     generateDockerId: generateDockerId,
+     formatProgress: formatProgress,
+     waitForJob: waitForJob,
+-    writeProgress: writeProgress,
+-    writeStatus: writeStatus,
+     LABELTAG_PREFIX: LABELTAG_PREFIX,
+     LOG_DRIVERS: LOG_DRIVERS
+ };
+diff --git a/lib/endpoints/admin/index.js b/lib/endpoints/admin/index.js
+index 1caf18d..34d87fc 100644
+--- a/lib/endpoints/admin/index.js
++++ b/lib/endpoints/admin/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ 
+diff --git a/lib/endpoints/images.js b/lib/endpoints/images.js
+index bef797b..d49e6bb 100644
+--- a/lib/endpoints/images.js
++++ b/lib/endpoints/images.js
+@@ -5,9 +5,10 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++var assert = require('assert-plus');
+ var drc = require('docker-registry-client');
+ var format = require('util').format;
+ var fs = require('fs');
+@@ -15,8 +16,6 @@ var restify = require('restify');
+ var vasync = require('vasync');
+ 
+ var common = require('../common');
+-var writeProgress = common.writeProgress;
+-var writeStatus = common.writeStatus;
+ var errors = require('../errors');
+ 
+ 
+@@ -177,9 +176,62 @@ function imageHistory(req, res, next) {
+ 
+ /**
+  * POST /images/:name/push
++ *
++ * Push image (or multiple multiple images in the same repo) to the registry.
++ *
++ * Note: req.images and req.imageTags get populated by the reqImagesAndTags()
++ * handler.
+  */
+ function imagePush(req, res, next) {
+-    return next(new errors.NotImplementedError('image push'));
++    assert.arrayOfObject(req.images, 'req.images');
++    assert.arrayOfObject(req.imageTags, 'req.imageTags');
++
++    try {
++        var rat = drc.parseRepoAndTag(req.params.name);
++    } catch (e) {
++        next(new errors.DockerError(e, e.message));
++        return;
++    }
++
++    // At this point, all messages will be passed back to client using a JSON
++    // stream.
++    res.status(200);
++    res.header('Content-Type', 'application/json');
++
++    var msgPayload = {
++        status: format('The push refers to a repository [%s]',
++            rat.canonicalName)
++    };
++    res.write(JSON.stringify(msgPayload) + '\r\n');
++
++    var idx = 0;
++
++    vasync.forEachPipeline({
++        inputs: req.images,
++        func: function _pushOneImage(img, cb) {
++            rat.tag = req.imageTags[idx].tag;
++            idx += 1;
++
++            var repoAndTag = rat.canonicalName + ':' + rat.tag;
++            req.log.debug({rat:rat, repoAndTag: repoAndTag}, 'imagePush');
++
++            req.backend.pushImage({
++                image: img,
++                rat: rat,
++                repoAndTag: repoAndTag,
++                req: req,
++                res: res
++            }, cb);
++        }
++    }, function _vasyncPipelinePushCb(err) {
++        if (err) {
++            req.log.error({err: err}, 'backend.pushImage failed');
++            // Note that err will have already been sent back to the client
++            // in the req.backend.pushImage method.
++        }
++        res.end();
++        next();
++    });
+ }
+ 
+ 
+@@ -347,6 +399,55 @@ function register(config, http, before) {
+         });
+     }
+ 
++    function reqImagesAndTags(req, res, next) {
++        req.backend.tagsFromRepoName({
++            req: req,
++            repo: req.params.name,
++            tag: req.query.tag
++        }, function (err, imgTags) {
++            if (err) {
++                next(err);
++                return;
++            }
++            if (imgTags.length === 0) {
++                next(new errors.ResourceNotFoundError(format(
++                    'An image does not exist locally with the tag: %s',
++                    req.params.name)));
++                return;
++            }
++
++            // Lookup all the matching Image objects.
++            var images = [];
++
++            vasync.forEachPipeline({
++                inputs: imgTags,
++                func: _getImageFromImgTag
++            }, function (getErr) {
++                req.images = images;
++                req.imageTags = imgTags;
++                next(getErr);
++            });
++
++            function _getImageFromImgTag(imgTag, cb) {
++                var getDigestOpts = {
++                    account: req.account,
++                    app: req.app,
++                    config_digest: imgTag.config_digest,
++                    log: req.log
++                };
++                req.backend.imgFromConfigDigest(getDigestOpts,
++                        function _imgFromConfigDigestCb(err2, img) {
++                    if (err2) {
++                        cb(err2);
++                        return;
++                    }
++                    images.push(img);
++                    cb();
++                });
++            }
++        });
++    }
++
+     http.get({ path: /^(\/v[^\/]+)?\/images\/json$/, name: 'ImageList' },
+         before, restify.queryParser({mapParams: false}), imageList);
+ 
+@@ -372,7 +473,8 @@ function register(config, http, before) {
+     // Match '/:apiversion/images/:name/push' where ':name' can include '/'.
+     http.post(
+         { path: /^(\/v[^\/]+)?\/images\/(.*?)\/push$/, name: 'ImagePush' },
+-        reqParamsName, before, imagePush);
++        reqParamsName, before, restify.queryParser({mapParams: false}),
++        reqImagesAndTags, imagePush);
+ 
+     // Match '/:apiversion/images/:name/tag' where ':name' can include '/'.
+     http.post(
+diff --git a/lib/wfapi/index.js b/lib/wfapi/index.js
+index c8a7767..795bcce 100644
+--- a/lib/wfapi/index.js
++++ b/lib/wfapi/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -17,6 +17,7 @@ var format = require('util').format;
+ var assert = require('assert-plus');
+ var WfClient = require('wf-client');
+ var async = require('async');
++var jsprim = require('jsprim');
+ 
+ 
+ // Workflows
+@@ -173,6 +174,40 @@ Wfapi.prototype.createPullImageV2Job = function (options, cb) {
+ };
+ 
+ 
++/*
++ * Queues a push-image job.
++ *
++ * @param options {Object} Required.
++ * @param cb {Function} `function (err, jobUuid)`
++ */
++Wfapi.prototype.createPushImageJob = function (options, cb) {
++    var self = this;
++    assert.object(options, 'options');
++    assert.string(options.account_uuid, 'opts.account_uuid');
++    assert.object(options.image, 'options.image');
++    assert.optionalString(options.regAuth, 'opts.regAuth');
++    assert.string(options.repoAndTag, 'options.repoAndTag');
++    assert.string(options.req_id, 'options.req_id');
++
++    // Combine the push opts and the workflow opts.
++    var params = jsprim.mergeObjects(options, {
++        target: format('/push-image-%s', options.repoAndTag),
++        task: 'push-image'
++    });
++
++    var jobOpts = { headers: { 'x-request-id': options.req_id } };
++
++    self.client.createJob(params.task, params, jobOpts, function (err, job) {
++        if (err) {
++            return cb(err);
++        }
++        params.job_uuid = job.uuid;
++        self.log.debug(params, 'Push image => job params');
++        return cb(null, job.uuid);
++    });
++};
++
++
+ /*
+  * Retrieves a job from WFAPI.
+  */
+diff --git a/lib/wfapi/workflows/push-image.js b/lib/wfapi/workflows/push-image.js
+new file mode 100644
+index 0000000..5f38830
+--- /dev/null
++++ b/lib/wfapi/workflows/push-image.js
+@@ -0,0 +1,121 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2018, Joyent, Inc.
++ */
++
++
++// This is not really needed, but javascriptlint will complain otherwise:
++var restify = require('restify');
++var sdcClients = require('sdc-clients');
++var vasync = require('vasync');
++
++var LineStream;
++var urlModule;
++var imgapiUrl;
++var dockerUrl;
++
++var VERSION = '1.0.0';
++
++function pushImageLayers(job, cb) {
++    var queue = vasync.queue(processMessage, 5);
++    var queueError;
++
++    // For now assume dockerUrl is the URL to the DOCKER_HOST. In this case
++    // we parse the URL to obtain the location of the admin host
++    var parsedUrl = urlModule.parse(dockerUrl);
++    var dockerAdminiUrl = parsedUrl.protocol + '//' + parsedUrl.hostname;
++    var dockerAdmin = restify.createJsonClient({
++        url: dockerAdminiUrl,
++        headers: { 'x-request-id': job.params.req_id }
++    });
++    var imgapi = new sdcClients.IMGAPI({url: imgapiUrl});
++
++    function processMessage(data, next) {
++        if (data.type == 'error') {
++            /*
++             * Currently WFAPI will add `err.message` and `err.name` to the
++             * chain_results. We'll slip our error *code* in using `err.name`.
++             */
++            queueError = new Error(data.error.message);
++            if (data.error.code) {
++                queueError.name = data.error.code;
++            }
++            next();
++        } else {
++            dockerAdmin.post('/admin/progress', data, next);
++        }
++    }
++
++    imgapi.adminPushDockerImage(job.params, function (err, res) {
++        if (err) {
++            job.log.info('adminImportDockerImage error %s', err);
++            cb(err);
++            return;
++        }
++
++        var lstream = new LineStream({ encoding: 'utf8' });
++
++        lstream.on('error', function (lerr) {
++            job.log.info('LineStream threw an error %s', lerr);
++            cb(lerr);
++        });
++
++        lstream.on('readable', function _onReadable() {
++            var line = lstream.read();
++            while (line !== null) {
++                queue.push(JSON.parse(line));
++                line = lstream.read();
++            }
++        });
++
++        res.on('end', function onEnd() {
++            job.log.trace('pushImageLayers res.end received');
++            queue.close();
++
++            // Wait for queue to finish before ending the task
++            queue.on('end', function () {
++                job.log.trace('pushImageLayers queue.end received');
++                if (queueError) {
++                    cb(queueError);
++                } else {
++                    cb(null, 'pushImageLayers completed');
++                }
++            });
++        });
++
++        res.pipe(lstream);
++    });
++}
++
++var workflow = module.exports = {
++    name: 'push-image-' + VERSION,
++    version: VERSION,
++    chain: [ {
++        name: 'push_image_layers',
++        timeout: 3600,
++        retry: 1,
++        body: pushImageLayers,
++        modules: {
++            assert: 'assert-plus',
++            LineStream: 'lstream',
++            restify: 'restify',
++            sdcClients: 'sdc-clients',
++            urlModule: 'url',
++            vasync: 'vasync'
++        }
++    }],
++    timeout: 3620,
++    onerror: [ {
++        name: 'On error',
++        modules: {},
++        body: function (job, cb) {
++            job.log.warn('Error handling job %s', job.params.req_id);
++            return cb('Error executing job');
++        }
++    }]
++};
+diff --git a/package.json b/package.json
+index f46eb58..aa11a3b 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "sdc-docker",
+-  "version": "0.4.12",
++  "version": "0.5.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+@@ -38,6 +38,7 @@
+     "deep-equal": "~0.2.0",
+     "difflet": "0.2.6",
+     "manta": "3.1.2",
++    "mkdirp": "0.5.1",
+     "rewire": "2.5.2",
+     "semver": "5.1.0",
+     "tar-stream": "1.3.1",
+diff --git a/sapi_manifests/docker/template b/sapi_manifests/docker/template
+index 53ad9d9..815a502 100644
+--- a/sapi_manifests/docker/template
++++ b/sapi_manifests/docker/template
+@@ -59,7 +59,7 @@
+     {{/CNS_SERVICE}}
+     "wfapi": {
+         "forceMd5Check": true,
+-        "workflows": ["pull-image-v2"],
++        "workflows": ["pull-image-v2", "push-image"],
+         "url": "http://workflow.{{{datacenter_name}}}.{{{dns_domain}}}"
+     },
+ {{#experimental_docker_nfs_shared_volumes}}
+diff --git a/test/integration/cli-push.test.js b/test/integration/cli-push.test.js
+new file mode 100644
+index 0000000..980e6e3
+--- /dev/null
++++ b/test/integration/cli-push.test.js
+@@ -0,0 +1,297 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * Integration tests for `docker push` using the docker cli.
++ */
++
++var tarstream = require('tar-stream');
++var test = require('tape');
++var vasync = require('vasync');
++
++var cli = require('../lib/cli');
++var h = require('./helpers');
++
++// -- Globals
++
++var STATE = {
++    log: require('../lib/log')
++};
++
++var ALICE;
++var DOCKER_ALICE; // Regular JSON restify client.
++var DOCKER_ALICE_HTTP; // For sending non-JSON payload
++var TEST_IMAGE = 'busybox';
++var TP = 'cli: push: ';  // Test prefix.
++
++// -- Helpers
++
++function createTarStream(fileAndContents) {
++    var pack = tarstream.pack();
++
++    Object.keys(fileAndContents).forEach(function (name) {
++        pack.entry({ name: name }, fileAndContents[name]);
++    });
++
++    pack.finalize();
++
++    return pack;
++}
++
++// -- Tests
++
++test(TP + 'setup', function (tt) {
++
++    tt.test('DockerEnv: alice init', function (t) {
++        cli.init(t, function (err, result) {
++            // Note: err and t.end() are both checked/called in cli.init.
++            if (!err) {
++                ALICE = result.user;
++                DOCKER_ALICE = result.client;
++            }
++        });
++    });
++
++    tt.test('docker client http init', function (t) {
++        h.createDockerRemoteClient({user: ALICE, clientType: 'http'},
++            function (err, client) {
++                t.ifError(err, 'docker client http init is successful');
++                DOCKER_ALICE_HTTP = client;
++                t.end();
++            }
++        );
++    });
++
++    // Ensure the test image is around.
++    tt.test(TP + 'pull ' + TEST_IMAGE + ' image', function (t) {
++        h.ensureImage({
++            name: TEST_IMAGE,
++            user: ALICE
++        }, function (err) {
++            t.error(err, 'should be no error pulling ' + TEST_IMAGE);
++            t.end();
++        });
++    });
++});
++
++
++test(TP + 'unathorized tag and push', function (tt) {
++    var tagName = 'joyentunsupported/privatetest';
++
++    tt.test(TP + 'tag ' + TEST_IMAGE + ' as ' + tagName, function (t) {
++        cli.docker('tag ' + TEST_IMAGE + ' ' + tagName, {}, onComplete);
++        function onComplete(err, stdout, stderr) {
++            t.ifErr(err, 'Tagging ' + TEST_IMAGE + ' as ' + tagName);
++            t.end();
++        }
++    });
++
++    tt.test(TP + tagName, function (t) {
++        cli.docker('push ' + tagName, {}, onComplete);
++        function onComplete(err, stdout, stderr) {
++            t.ifErr(!err, 'Pushing ' + tagName);
++            // We expect an error in stdout.
++            var expectedErr = 'authentication required';
++            var authFailure = stderr.indexOf(expectedErr) >= 0;
++            if (!authFailure) {
++                t.fail('Expected authorization failure, got ' + stderr);
++            }
++            t.end();
++        }
++    });
++
++    // Cleanup the tagged image.
++
++    tt.test('delete tagged image', function (t) {
++        DOCKER_ALICE.del('/images/' + encodeURIComponent(tagName),
++            function (err) {
++                t.ifErr(err, 'deleting ' + tagName);
++                t.end();
++            }
++        );
++    });
++});
++
++test(TP + 'tag and push', function (tt) {
++    var repo = 'joyentunsupported/test_push';
++    var tagName = repo + ':tagpush';
++    var tagName2 = repo + ':tagpush2';
++
++    tt.test(TP + 'tag ' + TEST_IMAGE + ' as ' + tagName, function (t) {
++        cli.docker('tag ' + TEST_IMAGE + ' ' + tagName, {}, onComplete);
++        function onComplete(err, stdout, stderr) {
++            t.ifErr(err, 'Tagging ' + TEST_IMAGE + ' as ' + tagName);
++            t.end();
++        }
++    });
++
++    tt.test(TP + tagName, function (t) {
++        if (!process.env.DOCKER_TEST_CONFIG_FILE) {
++            t.skip(TP + tagName);
++            t.end();
++            return;
++        }
++        cli.docker('push ' + tagName, {}, onComplete);
++        function onComplete(err, stdout, stderr) {
++            t.ifErr(err, 'Pushing ' + tagName);
++            // We expect a tag and digest in stdout.
++            var msg = 'tagpush: digest: sha256:';
++            var pushOkay = stdout.indexOf(msg) >= 0;
++            if (!pushOkay) {
++                t.fail('Expected successful push, got ' + stdout);
++            }
++            // Make sure we don't see tagpush2 being pushed.
++            msg = 'tagpush2: digest: sha256:';
++            if (stdout.indexOf(msg) !== -1) {
++                t.fail('Should not see tagpush2 in stdout: ' + stdout);
++            }
++            t.end();
++        }
++    });
++
++    tt.test(TP + 'tag ' + TEST_IMAGE + ' as ' + tagName2, function (t) {
++        cli.docker('tag ' + TEST_IMAGE + ' ' + tagName2, {}, onComplete);
++        function onComplete(err, stdout, stderr) {
++            t.ifErr(err, 'Tagging ' + TEST_IMAGE + ' as ' + tagName2);
++            t.end();
++        }
++    });
++
++    // Test pushing the repo name - this should push all tags for the given
++    // repo.
++    tt.test(TP + repo, function (t) {
++        if (!process.env.DOCKER_TEST_CONFIG_FILE) {
++            t.skip(TP + repo);
++            t.end();
++            return;
++        }
++        cli.docker('push ' + repo, {}, onComplete);
++        function onComplete(err, stdout, stderr) {
++            t.ifErr(err, 'Pushing ' + repo);
++            // We expect a tag and digest (for each tag) in stdout.
++            ['tagpush', 'tagpush2'].forEach(function (tag) {
++                var msg = tag + ': digest: sha256:';
++                var pushOkay = stdout.indexOf(msg) >= 0;
++                if (!pushOkay) {
++                    t.fail('Expected successful push, got ' + stdout);
++                }
++            });
++            t.end();
++        }
++    });
++
++    // Cleanup tagged images.
++
++    tt.test('delete tagged image', function (t) {
++        DOCKER_ALICE.del('/images/' + encodeURIComponent(tagName),
++            function (err) {
++                t.ifErr(err, 'deleting ' + tagName);
++                DOCKER_ALICE.del('/images/' + encodeURIComponent(tagName2),
++                    function (err2) {
++                        t.ifErr(err2, 'deleting ' + tagName2);
++                        t.end();
++                    }
++                );
++            }
++        );
++    });
++});
++
++
++test(TP + 'build and push', function (tt) {
++    tt.test('docker build image', function (t) {
++        var dockerImageId = null;
++        var tarStream;
++        var repo = 'joyentunsupported/test_push';
++        var tagName = repo + ':buildpush';
++
++        vasync.waterfall([
++
++            function createTar(next) {
++                var fileAndContents = {
++                    'Dockerfile': 'FROM scratch\n'
++                                + 'LABEL sdcdockertest_push=yes\n'
++                                + 'ADD dummy.txt /\n',
++                    'dummy.txt': 'Some contents\n'
++                };
++                tarStream = createTarStream(fileAndContents);
++                next();
++            },
++
++            function buildContainer(next) {
++                h.buildDockerContainer({
++                    dockerClient: DOCKER_ALICE_HTTP,
++                    params: {
++                        rm: 'true',  // Remove container after it's built.
++                        t: tagName
++                    },
++                    test: t,
++                    tarball: tarStream
++                }, onbuild);
++
++                function onbuild(err, result) {
++                    t.ifError(err, 'built successfully');
++                    next(err, result);
++                }
++            },
++
++            function checkResults(result, next) {
++                if (!result || !result.body) {
++                    next(new Error('build generated no output!?'));
++                    return;
++                }
++
++                var output = result.body;
++                var hasSuccess = output.indexOf('Successfully built') >= 0;
++                t.ok(hasSuccess, 'output should contain: Successfully built');
++
++                if (!hasSuccess) {
++                    next(new Error('Build failed: ' + output));
++                    return;
++                }
++
++                var reg = new RegExp('Successfully built (\\w+)');
++                dockerImageId = output.match(reg)[1];
++                next();
++            },
++
++            function pushImage(next) {
++                if (!process.env.DOCKER_TEST_CONFIG_FILE) {
++                    t.skip(TP + tagName);
++                    next();
++                    return;
++                }
++                cli.docker('push ' + tagName, {}, onComplete);
++                function onComplete(err, stdout) {
++                    t.ifErr(err, 'Pushing ' + tagName);
++                    // We expect an error in stdout.
++                    var msg = 'buildpush: digest: sha256:';
++                    var pushOkay = stdout.indexOf(msg) >= 0;
++                    if (!pushOkay) {
++                        next(new Error(
++                            'Expected successful push, got ' + stdout));
++                        return;
++                    }
++                    next();
++                }
++            },
++
++            function removeBuiltImage(next) {
++                t.ok(dockerImageId, 'got the built docker image id');
++                DOCKER_ALICE.del('/images/' + dockerImageId, next);
++            }
++
++        ], function allDone(err) {
++            t.ifErr(err);
++            t.end();
++        });
++
++    });
++});
+diff --git a/test/integration/helpers.js b/test/integration/helpers.js
+index 55f1a0a..8536f23 100644
+--- a/test/integration/helpers.js
++++ b/test/integration/helpers.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -17,6 +17,7 @@ var drc = require('docker-registry-client');
+ var exec = require('child_process').exec;
+ var fmt = require('util').format;
+ var fs = require('fs');
++var mkdirp = require('mkdirp');
+ var moray = require('moray');
+ var os = require('os');
+ var path = require('path');
+@@ -487,7 +488,8 @@ function stepClientZone(state_, cb) {
+             });
+         },
+         // Create the client zone if necessary.
+-        _stepCreateClientZone
++        _stepCreateClientZone,
++        _stepCopyClientZoneDockerConfig
+     ]}, cb);
+ }
+ 
+@@ -618,6 +620,26 @@ function _stepCreateClientZone(state_, cb) {
+     ]}, cb);
+ }
+ 
++function _stepCopyClientZoneDockerConfig(state, cb) {
++    var gzConfigPath = process.env.DOCKER_TEST_CONFIG_FILE;
++    if (!gzConfigPath) {
++        cb();
++        return;
++    }
++    p('# Copying docker config file (%s) into client zone',
++        gzConfigPath);
++    var zoneConfigPath = fmt('/zones/%s/root/root/.docker/config.json',
++        state.clientZone.uuid);
++
++    mkdirp(path.dirname(zoneConfigPath), function (err) {
++        if (err) {
++            cb(err);
++            return;
++        }
++        fs.writeFileSync(zoneConfigPath, fs.readFileSync(gzConfigPath));
++        cb();
++    });
++}
+ 
+ 
+ /*
+diff --git a/test/runtest.common b/test/runtest.common
+index 86e9f73..735e7bd 100644
+--- a/test/runtest.common
++++ b/test/runtest.common
+@@ -6,7 +6,7 @@
+ #
+ 
+ #
+-# Copyright 2017, Joyent, Inc.
++# Copyright 2018, Joyent, Inc.
+ #
+ 
+ #
+@@ -155,6 +155,9 @@ fi
+ echo "# Test config:"
+ echo "#  DOCKER_ADMIN_URL=${DOCKER_ADMIN_URL}"
+ echo "#  DOCKER_AVAILABLE_CLI_VERSIONS=${DOCKER_AVAILABLE_CLI_VERSIONS}"
++if [[ -n "$DOCKER_TEST_CONFIG_FILE" ]]; then
++    echo "#  DOCKER_TEST_CONFIG_FILE=${DOCKER_TEST_CONFIG_FILE}"
++fi
+ echo "#  DOCKER_CLI_VERSIONS=${DOCKER_CLI_VERSIONS}"
+ echo "#  COMPOSE_AVAILABLE_CLI_VERSIONS=${COMPOSE_AVAILABLE_CLI_VERSIONS}"
+ echo "#  COMPOSE_CLI_VERSIONS=${COMPOSE_CLI_VERSIONS}"

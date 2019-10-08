@@ -1,0 +1,1615 @@
+commit 3b9d3477953d04bff01e2e4739aac058b6f1928b (refs/changes/92/4692/4)
+Author: Josh Wilsdon <josh@wilsdon.ca>
+Date:   2018-08-15T16:18:59-07:00 (1 year, 2 months ago)
+    
+    TRITON-697 net-agent should support dummy backend compatible with mockcloud
+
+diff --git a/dummy/net-agent.js b/dummy/net-agent.js
+new file mode 100755
+index 0000000..798566e
+--- /dev/null
++++ b/dummy/net-agent.js
+@@ -0,0 +1,266 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018 Joyent, Inc.
++ */
++
++/*
++ * net-agent.js
++ */
++
++'use strict';
++
++var assert = require('assert-plus');
++var child_process = require('child_process');
++var bunyan = require('bunyan');
++var bunyanSerializers = require('sdc-bunyan-serializers');
++var fs = require('fs');
++var path = require('path');
++var uuidv4 = require('uuid/v4');
++var vasync = require('vasync');
++
++var logLevel = (process.env.LOG_LEVEL || 'debug');
++var logger = bunyan.createLogger({
++    name: 'net-agent',
++    level: logLevel,
++    serializers: bunyanSerializers
++});
++
++var DummyVmadm = require('./vmadm');
++var NetAgent = require('../lib');
++
++
++// This will blow up if something goes wrong. That's what we want.
++var MOCKCLOUD_ROOT = process.env.MOCKCLOUD_ROOT ||
++    child_process.execSync('/usr/sbin/mdata-get mockcloudRoot',
++    {encoding: 'utf8'}).trim();
++var SERVER_ROOT = MOCKCLOUD_ROOT + '/servers';
++
++
++function mdataGet(key, callback) {
++    assert.string(key, 'key');
++    assert.func(callback, 'callback');
++
++    child_process.execFile('/usr/sbin/mdata-get', [
++        key
++    ], function _onMdata(err, stdout, stderr) {
++        assert.ifError(err, 'mdata-get should always work');
++
++        callback(null, stdout.trim());
++    });
++}
++
++function loadSysinfo(server_uuid, callback) {
++    var filename = SERVER_ROOT + '/' + server_uuid + '/sysinfo.json';
++
++    fs.readFile(filename, function onData(err, data) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        callback(null, JSON.parse(data.toString()));
++    });
++}
++
++// TODO: should use common method in backends to get rackaware admin IP.
++// For now, just copied this from cn-agent.
++function findZoneAdminIp(ctx, callback) {
++    mdataGet('sdc:nics', function _onMdata(err, nicsData) {
++        var idx;
++        var nic;
++        var nics = JSON.parse(nicsData.toString());
++
++        for (idx = 0; idx < nics.length; idx++) {
++            nic = nics[idx];
++            if (nic.nic_tag === 'admin') {
++                ctx.bindIP = nic.ip;
++                break;
++            }
++        }
++
++        assert.string(ctx.bindIP, 'ctx.bindIP');
++
++        callback();
++    });
++}
++
++function findUfdsAdminUuid(ctx, callback) {
++    mdataGet('ufdsAdmin', function _onMdata(err, data) {
++
++        ctx.ufdsAdminUuid = data.toString();
++        assert.uuid(ctx.ufdsAdminUuid, 'ctx.ufdsAdminUuid');
++
++        callback();
++    });
++}
++
++function findDnsDomain(ctx, callback) {
++    mdataGet('dnsDomain', function _onMdata(err, data) {
++
++        ctx.dnsDomain = data.toString();
++        assert.string(ctx.dnsDomain, 'ctx.dnsDomain');
++
++        callback();
++    });
++}
++
++function findDatacenterName(ctx, callback) {
++    mdataGet('sdc:datacenter_name', function _onMdata(err, data) {
++
++        ctx.datacenterName = data.toString();
++        assert.string(ctx.datacenterName, 'ctx.datacenterName');
++
++        callback();
++    });
++}
++
++function getNetAgentInstanceId(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++
++    var instance_root = path.join(
++        SERVER_ROOT,
++        opts.serverUuid,
++        'agent_instances');
++    var net_agent_instance_file = path.join(instance_root, 'net-agent');
++
++    fs.mkdir(instance_root, function _onMkdir(err) {
++        // check for EEXIST, then ignore err
++        if (err && err.code !== 'EEXIST') {
++            callback(err);
++            return;
++        }
++
++        fs.readFile(net_agent_instance_file, function onData(err, data) {
++            var instanceUuid;
++
++            if (err) {
++                if (err.code !== 'ENOENT') {
++                    callback(err);
++                    return;
++                }
++
++                instanceUuid = uuidv4();
++                fs.writeFile(net_agent_instance_file, instanceUuid,
++                    function _onWrite(err) {
++
++                    assert.ifError(err);
++
++                    callback(null, instanceUuid);
++                });
++                return;
++            }
++
++            instanceUuid = data.toString();
++            callback(null, instanceUuid);
++        });
++    });
++}
++
++function runServer(opts, callback) {
++    var config = {};
++    var ctx = opts.ctx;
++    var fullDNS = ctx.datacenterName + '.' + ctx.dnsDomain;
++
++    // First we need to build a config for this net-agent
++
++    loadSysinfo(opts.serverUuid, function _onSysinfo(err, sysinfo) {
++        assert.ifError(err);
++
++        config.admin_uuid = ctx.ufdsAdminUuid;
++        config.bindip = ctx.bindIP;
++        config.cn_uuid = opts.serverUuid;
++        config.cueballAgent = {
++            resolvers: [ 'binder.' + fullDNS ],
++            initialDomains: [ 'napi.' + fullDNS ],
++            spares: 3,
++            maximum: 10,
++            recovery: {
++                'default': {
++                    timeout: 2000,
++                    maxTimeout: 8000,
++                    retries: 3,
++                    delay: 0,
++                    maxDelay: 1000
++                }
++            }
++        };
++        config.datacenterName = ctx.datacenterName;
++        config.dnsDomain = ctx.dnsDomain;
++        config.log = opts.log;
++        config.napi = {
++            url: 'http://napi.' + fullDNS
++        };
++        config.no_rabbit = true;
++        config.sysinfo = sysinfo;
++
++        // Create a new vmadm just for this server
++        config.vmadm = new DummyVmadm({
++            log: opts.log,
++            serverRoot: SERVER_ROOT,
++            sysinfo: sysinfo,
++            uuid: opts.serverUuid
++        });
++
++        getNetAgentInstanceId({
++            serverUuid: opts.serverUuid
++        }, function _onInstanceId(err, instanceUuid) {
++            var netagent;
++
++            assert.ifError(err);
++            config.agent_uuid = instanceUuid;
++
++            netagent = new NetAgent(config);
++            netagent.start();
++
++            callback();
++        });
++    });
++}
++
++function main() {
++    fs.readdir(SERVER_ROOT, function _onReadDir(err, dirs) {
++        var state = {};
++
++        if (err) {
++            console.error('FATAL: %s', err.message);
++            process.exit(2);
++            return;
++        }
++
++        vasync.pipeline({
++            arg: state,
++            funcs: [
++                findDatacenterName,
++                findDnsDomain,
++                findUfdsAdminUuid,
++                findZoneAdminIp
++            ]
++        }, function pipelineComplete(pipelineErr) {
++            assert.ifError(pipelineErr);
++
++            vasync.forEachPipeline({
++                func: function _runServer(serverUuid, cb) {
++                    assert.uuid(serverUuid, 'serverUuid');
++                    runServer({
++                        ctx: state,
++                        log: logger,
++                        serverUuid: serverUuid
++                    }, cb);
++                },
++                inputs: dirs
++            }, function _forEachPipelineComplete(forEachPipelineErr) {
++                console.error('startup sequence complete');
++            });
++        });
++    });
++}
++
++
++// kick things off
++main();
+diff --git a/dummy/vmadm.js b/dummy/vmadm.js
+new file mode 100644
+index 0000000..03fd3b6
+--- /dev/null
++++ b/dummy/vmadm.js
+@@ -0,0 +1,973 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * A dummy version of node-vmadm using json files on the local file system
++ */
++
++var cp = require('child_process');
++var fs = require('fs');
++var path = require('path');
++var spawn = cp.spawn;
++var stream = require('stream');
++var util = require('util');
++
++var assert = require('assert-plus');
++var vasync = require('vasync');
++var uuidv4 = require('uuid/v4');
++
++
++function addSystemProperties(arg, callback) {
++    // we know we loaded sysinfo if we got here
++    assert.object(arg, 'arg');
++    assert.object(arg.sysinfo, 'arg.sysinfo');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    assert.uuid(arg.sysinfo.UUID, 'arg.sysinfo.UUID');
++    arg.vmobj.server_uuid = arg.sysinfo.UUID;
++
++    assert.string(arg.sysinfo['Datacenter Name'],
++        'arg.sysinfo[\'Datacenter Name\']');
++    arg.vmobj.datacenter_name = arg.sysinfo['Datacenter Name'];
++
++    assert.string(arg.sysinfo['Live Image'], 'arg.sysinfo[\'Live Image\']');
++    arg.vmobj.platform_buildstamp = arg.sysinfo['Live Image'];
++
++    // zpool?
++
++    callback();
++}
++
++function addInstanceExecutionInfo(arg, callback) {
++    var last_modified;
++
++    // XXX we just make stuff up for now
++    assert.object(arg, 'arg');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    if (arg.vmobj.state === undefined) {
++        arg.vmobj.state = 'running';
++    }
++
++    if (arg.vmobj.state === 'running') {
++        last_modified = (new Date(arg.vmobj.last_modified)).getTime();
++        arg.vmobj.pid = Math.floor(last_modified / 1000) % 100000;
++        if (arg.vmobj.boot_timestamp === undefined) {
++            arg.vmobj.boot_timestamp = arg.vmobj.last_modified;
++        }
++    } else if (arg.vmobj.state === 'stopped') {
++        arg.vmobj.exit_status = 0;
++        if (arg.vmobj.exit_timestamp === undefined) {
++            arg.vmobj.exit_timestamp = arg.vmobj.last_modified;
++        }
++    }
++
++    callback();
++}
++
++function addHardcodedProperties(arg, callback) {
++    // these make no sense here, so we hardcode them to something for compat
++    assert.object(arg, 'arg');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    assert.uuid(arg.vmobj.uuid, 'arg.vmobj.uuid');
++    arg.vmobj.zonename = arg.vmobj.uuid;
++
++    assert.string(arg.vmobj.state, 'arg.vmobj.state');
++    arg.vmobj.zone_state = arg.vmobj.state;
++
++    assert.optionalNumber(arg.vmobj.pid, 'arg.vmobj.pid');
++    if (arg.vmobj.pid !== undefined) {
++        arg.vmobj.zoneid = arg.vmobj.pid;
++    }
++
++    callback();
++}
++
++function loadTimestamp(arg, callback) {
++    assert.object(arg, 'arg');
++    assert.string(arg.file, 'arg.file');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    fs.stat(arg.file, function _onStat(err, stats) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        arg.vmobj.last_modified = stats.mtime.toISOString();
++
++        callback();
++    });
++}
++
++function loadVm(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.serverRoot, 'serverRoot');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++    assert.uuid(opts.uuid, 'opts.uuid');
++
++    var filename =
++        path.join(opts.serverRoot, opts.serverUuid, 'vms', opts.uuid + '.json');
++    var vmobj;
++
++    fs.readFile(filename, function _onRead(err, data) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        // XXX will throw on bad data
++        vmobj = JSON.parse(data.toString());
++
++        vasync.pipeline({
++            arg: {
++                file: filename,
++                vmobj: vmobj,
++                serverRoot: opts.serverRoot,
++                serverUuid: opts.serverUuid
++            },
++            funcs: [
++                loadTimestamp,
++                addInstanceExecutionInfo,
++                addSystemProperties,
++                addHardcodedProperties
++            ]
++        }, function _afterPipeline(pipelineErr) {
++            callback(pipelineErr, vmobj);
++        });
++    });
++}
++
++function loadVms(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.serverRoot, 'opts.serverRoot');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++    assert.uuid(opts.sysinfo.UUID, 'opts.sysinfo.UUID');
++
++    var vmdir;
++
++    vmdir = path.join(opts.serverRoot, opts.sysinfo.UUID, 'vms');
++
++    fs.readdir(vmdir, function _onReadDir(err, files) {
++        var filename;
++        var idx;
++        var matches;
++        var toLoad = [];
++
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        for (idx = 0; idx < files.length; idx++) {
++            filename = files[idx];
++
++            /* jsl:ignore (assignment in if()) */
++            if (matches = filename.match(/^([a-f0-9\-]*).json$/)) {
++                toLoad.push(matches[1]);
++            } else {
++                console.error('XXX WARNING: IGNORING: ' + filename);
++            }
++            /* jsl:end */
++        }
++
++        vasync.forEachParallel({
++            func: function _loadVm(uuid, cb) {
++                loadVm({
++                    serverRoot: opts.serverRoot,
++                    sysinfo: opts.sysinfo,
++                    uuid: uuid
++                }, cb);
++            },
++            inputs: toLoad
++        }, function _afterLoading(loadErr, results) {
++            callback(loadErr, results.successes);
++        });
++    });
++}
++
++
++// TODO: param strings
++function DummyVmadm(opts) {
++    assert.object(opts);
++    assert.object(opts.log, 'opts.log');
++    assert.string(opts.serverRoot, 'opts.serverRoot');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++    assert.uuid(opts.uuid, 'opts.uuid');
++
++    var self = this;
++
++    self.log = opts.log;
++    self.serverRoot = opts.serverRoot;
++    self.serverUuid = opts.uuid;
++    self.sysinfo = opts.sysinfo;
++}
++
++
++/**
++ * Check whether a VM exists or not.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} The VM uuid.
++ *      - include_dni {Boolean} If true, return VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err, exists)`
++ *      - err is set on unhandled error
++ *      - otherwise; exists will be true or false
++ */
++
++DummyVmadm.prototype.exists = function vmExists(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var self = this;
++
++    self.load(opts, {fields: ['uuid']}, function _onLoad(err, vm) {
++        if (err) {
++            if (err.restCode === 'VmNotFound') {
++                callback(null, false);
++                return;
++            }
++            callback(err);
++            return;
++        }
++
++        if (vm.do_not_inventory && !opts.include_dni) {
++            /*
++             * VM is marked do_not_inventory. And we don't have include_dni
++             * option set indicating we want to include those, so we treat the
++             * same as not existing.
++             */
++            self.log.trace(err, 'vmadm.exists(): ' + opts.uuid +
++                ' has do_not_inventory');
++            callback(null, false);
++            return;
++        }
++
++        callback(null, true);
++        return;
++    });
++};
++
++
++/**
++ * Call `vmadm get UUID`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} The VM uuid.
++ * @param vmopts {Object} Optional vm options
++ *      - fields {Array} Return only the keys give in `fields` array
++ *      - include_dni {Boolean} If true, return VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++DummyVmadm.prototype.load = function vmLoad(opts, vmopts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var self = this;
++
++    if (!callback) {
++        callback = vmopts;
++    }
++
++    self.log.trace({
++        req_id: opts.req_id,
++        serverUuid: self.serverUuid,
++        uuid: opts.uuid
++    }, 'loading VM');
++
++    loadVm({
++        serverRoot: self.serverRoot,
++        serverUuid: self.serverUuid,
++        sysinfo: self.sysinfo,
++        uuid: opts.uuid
++    }, function _onVmLoad(err, vm) {
++        var notFoundErr;
++
++        if (err && err.code === 'ENOENT') {
++            notFoundErr = new Error('vmadm load ' + opts.uuid +
++                ' failed: No such zone');
++            notFoundErr.restCode = 'VmNotFound';
++            callback(notFoundErr);
++            return;
++        } else if (err) {
++            callback(err);
++            return;
++        }
++
++        if (vm.do_not_inventory && !opts.include_dni) {
++            // Unless the caller is specifically asking for VMs that are
++            // do_not_inventory, we treat them the same a VMs that don't exist.
++            notFoundErr = new Error('vmadm load ' + opts.uuid +
++                ' failed: No such zone');
++            notFoundErr.restCode = 'VmNotFound';
++            callback(notFoundErr);
++            return;
++        }
++
++        if (opts.fields) {
++            Object.keys(vm).forEach(function _removeUnwantedFields(field) {
++                if (opts.fields.indexOf(field) === -1) {
++                    // not a field we want
++                    delete vm[field];
++                }
++            });
++        }
++
++        callback(null, vm);
++        return;
++    });
++};
++
++
++/**
++ * Call `vmadm create`.
++ *
++ * @param opts {Object} Options
++ * @param callback {Function} `function (err, info)`
++ */
++
++DummyVmadm.prototype.create = function vmCreate(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++
++    var self = this;
++    var payload = opts;
++    var req_id = opts.req_id;
++
++    delete payload.log;
++    delete payload.req_id;
++    delete payload.sysinfo;
++    delete payload.vmadmLogger;
++
++    self.log.trace({
++        req_id: req_id,
++        payload: payload
++    }, 'creating VM');
++
++    assert.optionalUuid(payload.uuid, 'payload.uuid');
++    if (!payload.hasOwnProperty('uuid')) {
++        payload.uuid = uuidv4();
++    }
++
++    payload.state = 'running';
++    payload.autoboot = true;
++    payload.create_timestamp = (new Date()).toISOString();
++
++    // TODO:
++    //
++    //   strip out properties we don't care about, validate ones we do.
++    //   convert disks to final versions
++    //   fill in other fields that happen in real vmadm
++    //
++
++    writeVm(payload, {
++        log: self.log,
++        serverRoot: self.serverRoot,
++        serverUuid: self.serverUuid
++    }, function _onWrite(err) {
++        callback(err, {'uuid': payload.uuid});
++    });
++};
++
++
++/**
++ * Call `vmadm delete <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to delete
++ *      - include_dni {Boolean} If true, delete VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++DummyVmadm.prototype.delete = function vmDelete(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var self = this;
++    var filename;
++    var vmdir;
++
++    vmdir = path.join(self.serverRoot, self.serverUuid, 'vms');
++
++    self.log.trace({
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'deleting VM');
++
++    assert.uuid(opts.uuid, 'opts.uuid');
++    filename = path.join(vmdir, opts.uuid + '.json');
++
++    vasync.pipeline({
++        funcs: [
++            // TODO: stop the instance, do any other cleanup
++            function _unlinkFile(_, cb) {
++                fs.unlink(filename, function _onUnlink(err) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++
++                    cb();
++                });
++            }
++        ]
++    }, function _onDeleted(err) {
++        self.log.info({err: err, uuid: opts.uuid}, 'delete VM');
++        callback(err);
++    });
++};
++
++
++/**
++ * Call `vmadm update`.
++ *
++ * @param opts {Object} VMADM update payload
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, update VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++DummyVmadm.prototype.update = function vmUpdate(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var log = opts.log;
++    var payload = opts;
++    var req_id = opts.req_id;
++
++    delete payload.log;
++    delete payload.req_id;
++    delete payload.vmadmLogger;
++
++    log.trace({
++        payload: payload,
++        req_id: req_id,
++        uuid: opts.uuid
++    }, 'updating VM');
++
++    // TODO: this should actually update
++
++    callback();
++};
++
++
++function writeVm(vmobj, opts, callback) {
++    assert.object(vmobj);
++    assert.object(opts);
++    assert.func(callback);
++
++    // TODO: asserts
++
++    var fd;
++    var filename;
++    var finalFilename;
++    var vmdir;
++
++    vmdir = path.join(opts.serverRoot, opts.serverUuid, 'vms');
++    filename = path.join(vmdir, vmobj.uuid + '.json');
++
++    if (opts.atomicReplace) {
++        finalFilename = filename;
++        filename = filename + '.' + process.pid;
++    }
++
++    vasync.pipeline({
++        funcs: [
++            function _openFile(_, cb) {
++                fs.open(filename, 'wx', function _onOpen(err, openedFd) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++
++                    fd = openedFd;
++                    cb();
++                });
++            }, function _writeThenCloseFile(_, cb) {
++                var buf = new Buffer(JSON.stringify(vmobj, null, 2));
++
++                fs.write(fd, buf, 0, buf.length, null, function _onWrite(err) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++                    fs.close(fd, function _onWritten() {
++                        cb();
++                    });
++                });
++            }, function _atomicReplace(_, cb) {
++                if (!opts.atomicReplace) {
++                    cb();
++                    return;
++                }
++
++                fs.rename(filename, finalFilename, cb);
++            }
++        ]
++    }, function _onWroteVm(err) {
++        opts.log.info({err: err, uuid: vmobj.uuid}, 'wrote VM');
++        callback(err);
++    });
++}
++
++
++/**
++ * Call `vmadm reboot <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to reboot
++ *      - force {Boolean} Whether to force the reboot.
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, reboot VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++DummyVmadm.prototype.reboot = function vmReboot(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var args = [];
++
++    if (opts.force) {
++        args.push('-F');
++    }
++
++    opts.log.trace({
++        args: args,
++        force: Boolean(opts.force),
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'rebooting VM');
++
++    // TODO: this should actually reboot
++
++    callback();
++};
++
++
++/**
++ * Call `vmadm lookup -j`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} The VM uuid.
++ *      - log {Logger object}
++ * @param vmopts {Object} Optional vm options
++ *      - fields {Array} Return only the keys give in `fields` array
++ *      - include_dni {Boolean} If true, return VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err, vms)`
++ */
++
++DummyVmadm.prototype.lookup = function vmLookup(search, opts, callback) {
++    assert.object(search, 'search');
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var self = this;
++
++    opts.log.error({
++        req_id: opts.req_id,
++        search: search
++    }, 'lookup VMs');
++
++
++    // XXX can't we also specify fields in opts?
++
++    loadVms({
++        serverRoot: self.serverRoot,
++        sysinfo: self.sysinfo
++    }, function _onLoadVms(err, loadedVms) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        if (JSON.stringify(search) === '{}') {
++            // no search, just return all VMs
++            callback(null, loadedVms);
++            return;
++        }
++
++        assert.ok(false, 'Don\'t yet know how to handle search: ' +
++            JSON.stringify(search));
++    });
++};
++
++
++/**
++ * Call `vmadm start <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to start
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, start VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++DummyVmadm.prototype.start = function vmStart(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var self = this;
++
++    opts.log.trace({
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'start VM');
++
++
++    // TODO: this should actually do the start
++
++    loadVm({
++        serverRoot: self.serverRoot,
++        sysinfo: self.sysinfo,
++        uuid: opts.uuid
++    }, function _onLoad(err, vmobj) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        vmobj.autoboot = true;
++        vmobj.state = 'running';
++
++        writeVm(vmobj, {
++            atomicReplace: true,
++            log: opts.log
++        }, function _onWrite(writeErr) {
++            callback(writeErr);
++        });
++    });
++};
++
++
++/**
++ * Call `vmadm stop <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to stop
++ *      - force {Boolean} Whether to force the stop
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, stop VMs that have do_not_inventory
++ *        set. default: false.
++ *      - timeout {Number} If set, timeout in seconds between sending SIGTERM
++ *        and SIGKILL when stopping docker containers.
++ * @param callback {Function} `function (err)`
++ */
++
++DummyVmadm.prototype.stop = function vmStop(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.optionalNumber(opts.timeout, 'opts.timeout');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var self = this;
++
++    opts.log.trace({
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'stop VM');
++
++    // TODO: this should actually do the stop
++
++    loadVm({
++        serverRoot: self.serverRoot,
++        sysinfo: self.sysinfo,
++        uuid: opts.uuid
++    }, function _onLoad(err, vmobj) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        vmobj.autoboot = false;
++        vmobj.state = 'stopped';
++
++        writeVm(vmobj, {
++            atomicReplace: true,
++            log: opts.log
++        }, function _onWrite(writeErr) {
++            callback(err);
++        });
++    });
++};
++
++
++DummyVmadm.prototype._deleteAllWatchers = function _deleteAllWatchers() {
++    var self = this;
++    var filename;
++    var idx;
++    var keys;
++
++    keys = Object.keys(self.fileWatches);
++    for (idx = 0; idx < keys.length; idx++) {
++        filename = keys[idx];
++
++        self.log.trace({filename: filename}, 'deleting file watch');
++        self.fileWatches[filename].close();
++        delete self.fileWatches[filename];
++    }
++};
++
++// wrap handler in a closure so we can keep the filename
++function wrapHandler(filename, handler) {
++    var fn = filename.slice(0);
++
++    return (function _onFileEvent(evt) {
++        handler(evt, fn);
++    });
++}
++
++function zoneFromFilename(filename) {
++    var matches;
++
++    /* jsl:ignore (assignment in if()) */
++    if (matches = filename.match(/^(.*)\.json$/)) {
++        assert.uuid(matches[1], 'zonename');
++        return (matches[1]);
++    }
++    /* jsl:end */
++
++    return undefined;
++}
++
++DummyVmadm.prototype._dispatchEvent =
++function _dispatchEvent(evtName, zonename, opts, handler) {
++    var self = this;
++
++    assert.string(evtName, 'evtName');
++    assert.uuid(zonename, 'zonename');
++    assert.object(opts, 'opts');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++    assert.func(handler, 'handler');
++
++    if (self.loadingVms[zonename]) {
++        self.log.trace({zonename: zonename}, 'dispatchEvent skipping zone'
++            + ' which is already being loaded');
++        return;
++    }
++    self.loadingVms[zonename] = (new Date()).getTime();
++
++    loadVm({
++        serverRoot: self.serverRoot,
++        sysinfo: self.sysinfo,
++        uuid: zonename
++    }, function _onVmLoad(err, vmobj) {
++        delete self.loadingVms[zonename];
++
++        if (err && err.code === 'ENOENT') {
++            if (evtName === 'delete') {
++                handler({
++                    type: 'delete',
++                    vm: {},
++                    zonename: zonename
++                });
++            } else {
++                self.log.error({evtname: evtName, zonename: zonename},
++                    'VM unexpectedly disappeared while loading after event');
++            }
++            return;
++        }
++
++       if (err) {
++            self.log.error({err: err, zonename: zonename}, 'error loading VM');
++            return;
++        }
++
++        handler({
++            type: evtName,
++            vm: vmobj,
++            zonename: zonename
++        });
++    });
++};
++
++// This implementation detail is now exposed as of TRITON-571 so we have to do
++// this even though it makes no sense.
++function VmadmCLIEventStream(opts) {
++}
++util.inherits(VmadmCLIEventStream, stream.Transform);
++
++DummyVmadm.prototype.events = function vmEvents(opts, handler, callback) {
++    var self = this;
++
++    var vmdir = path.join(self.serverRoot, self.serverUuid, 'vms');
++
++    self.fileWatches = {};
++    self.loadingVms = {};
++
++    // load initial set of files so we know when things change
++    fs.readdir(vmdir, function _onReadDir(err, files) {
++        var filename;
++        var idx;
++        var modifyHandler;
++
++        // XXX what to do on error
++
++        self.instanceFiles = files;
++
++        for (idx = 0; idx < files.length; idx++) {
++            filename = files[idx];
++
++            if (!zoneFromFilename(filename)) {
++                self.log.warn({filename: filename}, 'events: ignoring non-vm');
++                continue;
++            }
++
++            // need to make a closure with a copy of the filename since
++            // node doesn't give it to us w/ the event.
++            modifyHandler = wrapHandler(filename, function _onModify(evt, fn) {
++                fs.exists(path.join(vmdir, fn), function _onExists(exists) {
++                    if (exists) {
++                        self._dispatchEvent('modify', zoneFromFilename(fn),
++                            {sysinfo: opts.sysinfo}, handler);
++                    } else {
++                        self.log.warn({filename: fn}, 'ignoring modify event '
++                            + 'for deleted file');
++                    }
++                });
++            });
++
++            self.fileWatches[filename] =
++                fs.watch(path.join(vmdir, filename), {}, modifyHandler);
++        }
++    });
++
++    self.fileWatches[vmdir] =
++    fs.watch(vmdir, {}, function _onDirEvent(evt) {
++        fs.readdir(vmdir, function _onRead(err, files) {
++            var filename;
++            var idx;
++            var modifyHandler;
++
++            // XXX what to do on error
++
++            // XXX this is a pretty inefficient way to generate the
++            // added/deleted
++
++            for (idx = 0; idx < files.length; idx++) {
++                filename = files[idx];
++
++                if (!zoneFromFilename(filename)) {
++                    self.log.warn({filename: filename}, 'ignoring non-vm');
++                    continue;
++                }
++
++                if (self.instanceFiles.indexOf(filename) === -1) {
++                    // didn't exist before, exists now: added
++                    assert.equal(self.fileWatches[filename], undefined,
++                        'file should not already have a watcher');
++
++                    // need to make a closure with a copy of the filename since
++                    // node doesn't give it to us w/ the event.
++                    modifyHandler = wrapHandler(filename,
++                        function _onModify(_, fn) {
++
++                        fs.exists(path.join(vmdir, fn),
++                            function _onExists(exists) {
++
++                            if (exists) {
++                                self._dispatchEvent('modify',
++                                    zoneFromFilename(fn),
++                                    {sysinfo: opts.sysinfo}, handler);
++                            } else {
++                                self.log.warn({filename: fn}, 'ignoring modify'
++                                    + ' event for deleted file');
++                            }
++                        });
++                    });
++
++                    self.fileWatches[filename] =
++                        fs.watch(path.join(vmdir, filename), {},
++                            modifyHandler);
++
++                    self._dispatchEvent('create', zoneFromFilename(filename),
++                        {sysinfo: opts.sysinfo}, handler);
++                }
++            }
++
++            for (idx = 0; idx < self.instanceFiles.length; idx++) {
++                filename = self.instanceFiles[idx];
++                if (files.indexOf(filename) === -1) {
++                    // existed before, doesn't exist now: deleted
++                    if (self.fileWatches[filename]) {
++                        self.fileWatches[filename].close();
++                        delete self.fileWatches[filename];
++                    }
++
++                    self._dispatchEvent('delete', zoneFromFilename(filename),
++                        {sysinfo: opts.sysinfo}, handler);
++                }
++            }
++
++            // replace with new list
++            self.instanceFiles = files;
++        });
++    });
++
++    // We do this with setImmediate because the node-vmadm callers depend on
++    // getting the return value and using it before the callback runs.
++    setImmediate(function _eventuallyCallCallback() {
++        loadVms({
++            serverRoot: self.serverRoot,
++            sysinfo: self.sysinfo
++        }, function _onLoadVms(err, loadedVms) {
++            var idx;
++            var vms = {};
++
++            if (!err) {
++                for (idx = 0; idx < loadedVms.length; idx++) {
++                    vms[loadedVms[idx].uuid] = loadedVms[idx];
++                }
++            }
++
++            callback(null, {
++                ev: {
++                    date: (new Date()).toISOString(),
++                    type: 'ready',
++                    vms: vms
++                },
++                stop: function _stop() {
++                    self._deleteAllWatchers();
++                }
++            });
++        });
++    });
++
++    return new VmadmCLIEventStream();
++};
++
++module.exports = DummyVmadm;
+diff --git a/lib/event-source.js b/lib/event-source.js
+index 6d28f81..bd98018 100644
+--- a/lib/event-source.js
++++ b/lib/event-source.js
+@@ -11,13 +11,15 @@
+ 'use strict';
+ 
+ var assert = require('assert-plus');
+-var vmadm = require('vmadm');
+ 
+ function determineEventSource(opts, cb) {
+     var vmadmEventsOpts;
+ 
+     assert.object(opts, 'opts');
+     assert.object(opts.log, 'opts.log');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++    assert.ok(['object', 'function']
++        .indexOf(typeof(opts.vmadm)) !== -1, 'opts.vmadm');
+     assert.func(cb, 'cb');
+ 
+     /*
+@@ -26,10 +28,11 @@ function determineEventSource(opts, cb) {
+      */
+     vmadmEventsOpts = {
+         log: opts.log,
+-        name: 'VM Agent determineEventSource'
++        name: 'VM Agent determineEventSource',
++        sysinfo: opts.sysinfo
+     };
+ 
+-    var vs = vmadm.events(vmadmEventsOpts,
++    var vs = opts.vmadm.events(vmadmEventsOpts,
+         function vmadmEventsHandler() {
+             /*
+              * We don't care about any events seen here - we are only
+diff --git a/lib/inst-fsm.js b/lib/inst-fsm.js
+index f6e487f..0805567 100644
+--- a/lib/inst-fsm.js
++++ b/lib/inst-fsm.js
+@@ -14,7 +14,6 @@ var assert = require('assert-plus');
+ var mod_jsprim = require('jsprim');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+-var vmadm = require('vmadm');
+ 
+ // --- Globals
+ 
+@@ -49,6 +48,8 @@ function InstanceFSM(opts) {
+     assert.uuid(opts.uuid, 'opts.uuid');
+     assert.object(opts.app, 'opts.app');
+     assert.object(opts.vm, 'opts.vm');
++    assert.ok(['object', 'function']
++        .indexOf(typeof(opts.vmadm)) !== -1, 'opts.vmadm');
+ 
+     this.uuid = opts.uuid;
+     this.app = opts.app;
+@@ -63,6 +64,7 @@ function InstanceFSM(opts) {
+ 
+     this.nics = {};
+     this.vm = null;
++    this.vmadm = opts.vmadm;
+ 
+     this._update(opts.vm);
+ 
+@@ -192,7 +194,7 @@ InstanceFSM.prototype.state_update.vm = function (S) {
+ 
+     payload.log = self.log;
+ 
+-    vmadm.update(payload, S.callback(afterUpdate));
++    self.vmadm.update(payload, S.callback(afterUpdate));
+ };
+ 
+ 
+@@ -304,7 +306,7 @@ InstanceFSM.prototype.addNIC = function (mac, nic, callback) {
+ 
+     nic.mac = mac;
+ 
+-    vmadm.update({
++    self.vmadm.update({
+         uuid: self.uuid,
+         add_nics: [ nic ],
+         log: self.log
+@@ -322,7 +324,7 @@ InstanceFSM.prototype.updateNIC = function (mac, update, callback) {
+ 
+     update.mac = mac;
+ 
+-    vmadm.update({
++    self.vmadm.update({
+         uuid: self.uuid,
+         update_nics: [ update ],
+         log: self.log
+@@ -337,7 +339,7 @@ InstanceFSM.prototype.removeNIC = function (mac, callback) {
+ 
+     self.log.info('Removing NIC %s on VM %s', mac, self.uuid);
+ 
+-    vmadm.update({
++    self.vmadm.update({
+         uuid: self.uuid,
+         remove_nics: [ mac ],
+         log: self.log
+diff --git a/lib/net-agent.js b/lib/net-agent.js
+index c50c023..5c19647 100644
+--- a/lib/net-agent.js
++++ b/lib/net-agent.js
+@@ -80,6 +80,7 @@ var mod_jsprim = require('jsprim');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+ var VError = require('verror');
++var vmadm = require('vmadm');
+ 
+ var AggrFSM = require('./aggr-fsm');
+ var NetworkFSM = require('./net-fsm');
+@@ -112,13 +113,18 @@ function NetAgent(options) {
+     assert.object(options.napi, 'options.napi');
+     assert.string(options.napi.url, 'options.napi.url');
+     assert.object(options.cueballAgent, 'options.cueballAgent');
++    assert.ok(['object', 'function']
++        .indexOf(typeof(options.vmadm)) !== -1, 'options.vmadm');
++    assert.object(options.sysinfo, 'options.sysinfo');
+ 
+     this.options = options;
+     this.log = options.log;
+     this.cn_uuid = options.cn_uuid;
+     this.agent_uuid = options.agent_uuid;
+     this.admin_uuid = options.admin_uuid;
++    this.sysinfo = options.sysinfo;
+     this.version = getNetAgentVersion();
++    this.vmadm = options.vmadm || vmadm;
+ 
+     var userAgent = mod_util.format(
+         'net-agent/%s (node/%s) server/%s',
+@@ -235,7 +241,8 @@ NetAgent.prototype.watchNic = function (mac) {
+     if (!mod_jsprim.hasKey(this.nics, mac)) {
+         this.nics[mac] = new NicFSM({
+             app: this,
+-            mac: mac
++            mac: mac,
++            vmadm: this.vmadm
+         });
+     }
+ 
+@@ -253,7 +260,8 @@ NetAgent.prototype.watchAggr = function (name) {
+     if (!mod_jsprim.hasKey(this.aggrs, name)) {
+         this.aggrs[name] = new AggrFSM({
+             app: this,
+-            name: name
++            name: name,
++            vmadm: this.vmadm
+         });
+     }
+ 
+@@ -284,8 +292,11 @@ NetAgent.prototype.state_init = function (S) {
+ NetAgent.prototype.state_init.determineEventSource = function (S) {
+     var self = this;
+ 
+-    determineEventSource({log: self.log},
+-        function determinedEventSource(err, eventSource) {
++    determineEventSource({
++        log: self.log,
++        sysinfo: self.sysinfo,
++        vmadm: self.vmadm
++    }, function determinedEventSource(err, eventSource) {
+ 
+         if (err) {
+             self.log.error(err, 'error determining event source');
+@@ -308,12 +319,14 @@ NetAgent.prototype.state_init.startWatcher = function (S) {
+     switch (this.eventSource) {
+     case 'default':
+         this.watcher = new WatcherFSM({
+-            app: this
++            app: this,
++            vmadm: this.vmadm
+         });
+         break;
+     case 'vmadm-events':
+         this.watcher = new VmadmWatcherFSM({
+-            app: this
++            app: this,
++            vmadm: this.vmadm
+         });
+         break;
+     default:
+diff --git a/lib/server-fsm.js b/lib/server-fsm.js
+index 92793cb..4214ec8 100644
+--- a/lib/server-fsm.js
++++ b/lib/server-fsm.js
+@@ -28,12 +28,38 @@ function isAdminLike(tag) {
+     return ADMIN_TAG_RE.test(tag.toUpperCase());
+ }
+ 
++function loadSysinfo(callback) {
++    mod_forkexec.forkExecWait({
++        argv: [ '/usr/bin/sysinfo' ],
++        includeStderr: true,
++        timeout: 0
++    }, function (err, info) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        var sysinfo;
++
++        try {
++            sysinfo = JSON.parse(info.stdout.trim());
++        } catch (e) {
++            callback(e);
++            return;
++        }
++
++        callback(null, sysinfo);
++    });
++}
++
++
+ // --- Exports
+ 
+ function ServerFSM(opts) {
+     assert.object(opts, 'opts');
+     assert.uuid(opts.uuid, 'opts.uuid');
+     assert.object(opts.app, 'opts.app');
++    assert.optionalFunc(opts.loadSysinfo, 'opts.loadSysinfo');
+ 
+     this.uuid = opts.uuid;
+     this.app = opts.app;
+@@ -46,6 +72,12 @@ function ServerFSM(opts) {
+     this.aggrs = {};
+     this.nictags = {};
+ 
++    /*
++     * Allow caller to pass in a function for loading sysinfo. Otherwise we'll
++     * default to calling /usr/bin/sysinfo.
++     */
++    this.loadSysinfo = opts.loadSysinfo || loadSysinfo;
++
+     mod_mooremachine.FSM.call(this, 'init');
+ }
+ mod_util.inherits(ServerFSM, mod_mooremachine.FSM);
+@@ -76,25 +108,12 @@ ServerFSM.prototype.state_refresh = function (S) {
+         });
+     }
+ 
+-    mod_forkexec.forkExecWait({
+-        argv: [ '/usr/bin/sysinfo' ],
+-        includeStderr: true,
+-        timeout: 0
+-    }, function (err, info) {
++    self.loadSysinfo(function _onSysinfo(err, sysinfo) {
+         if (err) {
+             retry(err);
+             return;
+         }
+ 
+-        var sysinfo;
+-
+-        try {
+-            sysinfo = JSON.parse(info.stdout.trim());
+-        } catch (e) {
+-            retry(e);
+-            return;
+-        }
+-
+         self._update(sysinfo);
+ 
+         S.gotoState('waiting');
+diff --git a/lib/vmadm-watcher-fsm.js b/lib/vmadm-watcher-fsm.js
+index d844945..a2690a0 100644
+--- a/lib/vmadm-watcher-fsm.js
++++ b/lib/vmadm-watcher-fsm.js
+@@ -13,7 +13,6 @@
+ var assert = require('assert-plus');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+-var vmadm = require('vmadm');
+ 
+ var WATCHED_FIELDS = [
+     'resolvers',
+@@ -33,6 +32,8 @@ function VmadmEventsFSM(opts) {
+ 
+     assert.object(opts, 'opts');
+     assert.object(opts.log, 'opts.log');
++    assert.ok(['object', 'function']
++        .indexOf(typeof(opts.vmadm)) !== -1, 'opts.vmadm');
+ 
+     self.log = opts.log.child({
+         component: 'vmadm-events'
+@@ -41,6 +42,7 @@ function VmadmEventsFSM(opts) {
+     self.ignore = {};
+     self.emitter = null;
+     self.stopWatcher = null;
++    self.vmadm = opts.vmadm;
+ 
+     mod_mooremachine.FSM.call(self, 'init');
+ }
+@@ -165,7 +167,7 @@ VmadmEventsFSM.prototype.state_init = function (S) {
+         S.gotoState('running');
+     }
+ 
+-    self.emitter = vmadm.events(opts, handler, ready);
++    self.emitter = self.vmadm.events(opts, handler, ready);
+ 
+     S.on(self.emitter, 'error', function (err) {
+         self.log.error(err, 'vmadm events error');
+@@ -237,6 +239,7 @@ function VmadmWatcherFSM(opts) {
+     self.log = opts.app.log.child({
+         component: 'vmadm-watcher'
+     }, true);
++    self.vmadm = opts.vmadm;
+ 
+     mod_mooremachine.FSM.call(self, 'init');
+ }
+@@ -253,7 +256,7 @@ VmadmWatcherFSM.prototype.state_init = function (S) {
+ VmadmWatcherFSM.prototype.state_running = function (S) {
+     var self = this;
+ 
+-    self.vmadmevents = new VmadmEventsFSM({log: self.log});
++    self.vmadmevents = new VmadmEventsFSM({log: self.log, vmadm: self.vmadm});
+ 
+     S.on(self.vmadmevents, 'vms-update', function (vms) {
+         self.app.updateVMs(vms);
+diff --git a/lib/watcher-fsm.js b/lib/watcher-fsm.js
+index ba3137a..8e4e42b 100644
+--- a/lib/watcher-fsm.js
++++ b/lib/watcher-fsm.js
+@@ -16,7 +16,6 @@ var mod_fs = require('fs');
+ var mod_jsprim = require('jsprim');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+-var vmadm = require('vmadm');
+ 
+ var LineStream = require('lstream');
+ 
+@@ -74,6 +73,8 @@ function currentMillis() {
+ function ZoneEventFSM(opts) {
+     assert.object(opts, 'opts');
+     assert.object(opts.log, 'opts.log');
++    assert.ok(['object', 'function']
++        .indexOf(typeof(opts.vmadm)) !== -1, 'opts.vmadm');
+ 
+     this.log = opts.log.child({
+         component: 'zoneevent'
+@@ -82,6 +83,7 @@ function ZoneEventFSM(opts) {
+     this.proc = null;
+     this.stdout = null;
+     this.stderr = null;
++    this.vmadm = opts.vmadm;
+ 
+     mod_mooremachine.FSM.call(this, 'init');
+ }
+@@ -264,7 +266,7 @@ WatcherFSM.prototype.state_refresh = function (S) {
+         S.gotoState('waiting');
+     }
+ 
+-    vmadm.lookup({}, {
++    self.vmadm.lookup({}, {
+         log: self.log,
+         include_dni: false,
+         fields: FIELDS

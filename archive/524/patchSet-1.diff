@@ -1,0 +1,1002 @@
+commit c098972602d514500ecf0f010f48468fefc20d54 (refs/changes/24/524/1)
+Author: Marsell Kukuljevic <marsell@joyent.com>
+Date:   2016-09-24T01:57:41+12:00 (3 years ago)
+    
+    DAPI-325 - Allow dapi to load VM data from external services.
+
+diff --git a/.gitignore b/.gitignore
+index 8154208..9ebdc1d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,3 +7,4 @@ config.json
+ *.sublime-project
+ *.sublime-workspace
+ /tmp
++*.swp
+diff --git a/bin/sim.js b/bin/sim.js
+index af0c472..56d4d84 100644
+--- a/bin/sim.js
++++ b/bin/sim.js
+@@ -37,30 +37,36 @@ var ALLOC_CHAIN = [
+ 	        'hard-filter-running',
+ 	        'hard-filter-invalid-servers',
+ 	        'hard-filter-volumes-from',
+-	        'calculate-ticketed-vms',
+ 	        'hard-filter-reserved',
+ 	        'hard-filter-headnode',
+-//	        'hard-filter-vm-count',
+-	        'hard-filter-capness',
+ 	        'hard-filter-vlans',
+ 	        'hard-filter-platform-versions',
+ 	        'hard-filter-traits',
+-	        'hard-filter-sick-servers',
+ 	        'override-overprovisioning',
+-	        'calculate-server-unreserved',
+ 	        'hard-filter-overprovision-ratios',
++		'load-server-vms',
++	        'calculate-ticketed-vms',
++	        'hard-filter-capness',
++//	        'hard-filter-vm-count',
++	        'hard-filter-sick-servers',
++	        'calculate-server-unreserved',
+ 	        'hard-filter-min-ram',
+ 	        'hard-filter-min-cpu',
+ //	        'hard-filter-min-disk',
++		'hard-filter-locality-hints',
++		'hard-filter-owners-servers',
+ 	       ['or', 'hard-filter-reservoir',
+ 	              'identity'],
+ 	       ['or', 'hard-filter-large-servers',
+ 	              'identity'],
+-	       'soft-filter-locality-hints',
+-	       'sort-min-ram',
+-	       'sort-min-owner',
+-	       'sort-random',
+-	       'pick-weighted-random'];
++		'soft-filter-locality-hints',
++		'score-unreserved-ram',
++		'score-unreserved-disk',
++		'score-num-owner-zones',
++		'score-current-platform',
++		'score-next-reboot',
++		'score-uniform-random'];
++
+ 
+ var ALLOC_DEFAULTS = {
+ 	server_spread: SERVER_SPREAD,
+diff --git a/docs/index.md b/docs/index.md
+index 3007ddb..d7af07d 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -436,6 +436,7 @@ aware that you'll need to add the custom file back after any DAPI zone upgrade.
+ | hard-filter-vm-count            | Removes CNs with more than 223 (default) VMs                |
+ | hard-filter-volumes-from        | Removes CNs which do not contain VMs listed in docker:volumesfrom metadata, if provided |
+ | identity                        | Returns the same servers it received                        |
++| load-server-vms                 | Populates all server.vms with VM information if sys.getServerVms was passed to allocator constructor |
+ | override-overprovisioning       | Substitutes package and server overprovision data for own defaults   |
+ | soft-filter-locality-hints      | Tries to place VM near or far from other given VMs, with non-strict placement |
+ | score-current-platform          | Make CNs running more recent platforms more likely to be selected |
+diff --git a/lib/algorithms/hard-filter-volumes-from.js b/lib/algorithms/hard-filter-volumes-from.js
+index 6e6bef9..c7b7421 100644
+--- a/lib/algorithms/hard-filter-volumes-from.js
++++ b/lib/algorithms/hard-filter-volumes-from.js
+@@ -11,10 +11,15 @@
+ /*
+  * When volumes-from is set, filters out all servers except the one that has the
+  * volumes.
++ *
++ * If sys.getVm is set, the plugin loads VMs while checking if they apply to any
++ * of the servers. If sys.getVm is not set, the plugin assumes the servers.vms
++ * are already populated.
+  */
+ 
+ var assert = require('assert-plus');
+ 
++
+ function
+ filterVolumesFrom(sys, servers, constraints, cb)
+ {
+@@ -23,39 +28,58 @@ filterVolumesFrom(sys, servers, constraints, cb)
+ 	assert.object(constraints);
+ 	assert.func(cb);
+ 
+-	var adequateServers = servers;
++	var log = sys.log;
+ 	var reasons = {};
++	var metadata = constraints.vm.internal_metadata;
+ 
+-	function getMsg(serverUuid, vmUuid) {
+-		sys.log.trace('Due to volumes-from and missing source VM ' +
+-		          vmUuid + ', omitting server: ' + serverUuid);
+-		var msg = 'VM needs volumes from ' + vmUuid + ', which was ' +
+-			'not found on server';
+-		return (msg);
++	// this only applies to docker containers with volumes-from
++	if (!constraints.vm.docker || !metadata) {
++		reasons.skip = 'Requested VM is not a Docker container ' +
++			'and/or has no internal_metadata';
++		return (cb(null, servers, reasons));
+ 	}
+ 
+-	adequateServers = servers.filter(function (server) {
+-		var vms = server.vms;
+-		var serverUuid = server.uuid;
+-		var metadata = constraints.vm.internal_metadata;
++	// this was already converted from JSON in validations.js
++	var requiredVms = metadata['docker:volumesfrom'];
+ 
+-		// this only applies to docker containers with volumes-from
+-		if (!constraints.vm.docker || !metadata) {
+-			return (true);
+-		}
++	if (!requiredVms || requiredVms.length === 0) {
++		reasons.skip = 'Requested VM has no VMs listed in ' +
++			'internal_data docker:volumesfrom';
++		return (cb(null, servers, reasons));
+ 
+-		// this was already converted from JSON in validations.js
+-		var requiredVms = metadata['docker:volumesfrom'];
++	}
+ 
+-		if (!requiredVms) {
+-			return (true);
+-		}
++	var getVm = sys.getVm;
++	if (getVm) {
++		loadVmAndFilter(log, servers, requiredVms, getVm, cb);
++	} else {
++		filterByPreloadedVms(log, servers, requiredVms, cb);
++	}
++
++	return (null); // silence linter
++}
++
++
++/*
++ * server.vms is already populated, so we check all servers until we
++ * find a vms hash that contains all requiredVms UUIDs.
++ */
++function
++filterByPreloadedVms(log, servers, requiredVms, cb)
++{
++	log.debug('sys.getVm not set; assuming preloaded VMs');
++
++	var reasons = {};
++
++	var adequateServers = servers.filter(function (server) {
++		var vms = server.vms;
++		var serverUuid = server.uuid;
+ 
+ 		for (var i = 0; i !== requiredVms.length; i++) {
+ 			var vmUuid = requiredVms[i];
+ 
+ 			if (!vms[vmUuid]) {
+-				var msg = getMsg(serverUuid, vmUuid);
++				var msg = genErrMsg(log, serverUuid, vmUuid);
+ 				reasons[serverUuid] = msg;
+ 				return (false);
+ 			}
+@@ -67,7 +91,73 @@ filterVolumesFrom(sys, servers, constraints, cb)
+ 	return (cb(null, adequateServers, reasons));
+ }
+ 
++
++/*
++ * server.vms is not yet populated, so we fetch the information for
++ * VMs listed in requiredVms, and determine if they are all on the same server,
++ * and that said server is in our list of servers.
++ *
++ * This function does this by invoking the sys.getVm function, a function
++ * provided to when dapi is initialized. sys.getVm takes a VM UUID, and returns
++ * a VM object in the callback.
++ *
++ * To minimize the number of queries, we don't load in parallel, only
++ * proceeding to the next query when we're sure that we still have a server
++ * which has all the previous queried VMs. The tradeoff is higher latency.
++ */
++function
++loadVmAndFilter(log, servers, requiredVms, getVm, cb)
++{
++	log.debug('sys.getVm set; fetching VMs listed in volumesfrom');
++
++	var reasons = {};
++
++	function step() {
++		if (requiredVms.length === 0 || servers.length === 0) {
++			return (cb(null, servers.slice(0, 1), reasons));
++		}
++
++		var vmUuid = requiredVms.shift();
++
++		return getVm(vmUuid, function (err, vm) {
++			if (err) {
++				log.error('Error loading VM', err);
++
++				reasons['*'] = 'Error loading VM ' + vmUuid +
++					': ' + err.message;
++
++				// is this the right thing to do...?
++				return (cb(null, [], reasons));
++			}
++
++			servers = servers.filter(function (server) {
++				if (server.uuid === vm.server_uuid) {
++					return (true);
++				}
++
++				var msg = genErrMsg(log, server.uuid, vmUuid);
++				reasons[server.uuid] = msg;
++				return (false);
++			});
++
++			return (step());
++		});
++	}
++
++	step();
++}
++
++
++function genErrMsg(log, serverUuid, vmUuid) {
++	log.trace('Due to volumes-from and missing source VM ' + vmUuid +
++		', omitting server: ' + serverUuid);
++	var msg = 'VM needs volumes from ' + vmUuid + ', which was not found ' +
++		'on server';
++	return (msg);
++}
++
++
+ module.exports = {
+-	name: 'Servers containing VMs required for volumes-from',
++	name: 'Servers containing VMs required for volumesfrom',
+ 	run: filterVolumesFrom
+ };
+diff --git a/lib/algorithms/load-server-vms.js b/lib/algorithms/load-server-vms.js
+new file mode 100644
+index 0000000..5224072
+--- /dev/null
++++ b/lib/algorithms/load-server-vms.js
+@@ -0,0 +1,96 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++/*
++ * This plugin uses an external async function to load information about
++ * all of a server's VMs into that server's object.
++ *
++ * Many plugins in dapi do not need information about VMs, or any information
++ * derived from that VM data, so dapi runs such hard-filter plugins first.
++ * This reduces the number of servers which need to have their VM information
++ * loaded (an expensive operation). Then this plugin is run, which populates
++ * the remaining servers with their VM data.
++ *
++ * This plugin does this by invoking in parallel the sys.getServerVms function,
++ * a function provided to when dapi is initialized. sys.getServerVms takes a
++ * server UUID, and returns an array of VMs in the callback, which this plugin
++ * then inserts into a server object's 'vms' attribute.
++ */
++
++var assert = require('assert-plus');
++var vasync = require('vasync');
++
++
++function
++loadServerVms(sys, servers, constraints, cb)
++{
++	assert.object(sys);
++	assert.arrayOfObject(servers);
++	assert.object(constraints);
++	assert.func(cb);
++
++	var getServerVms = sys.getServerVms;
++	var log = sys.log;
++	var reasons = {};
++	var failed = {};
++
++	if (!getServerVms) {
++		log.debug('getServerVms not set; skipping VM loading');
++		reasons.skip = 'getServerVms not set; assuming server.vms ' +
++			'is already populated';
++		return (cb(null, servers, reasons));
++	}
++
++	function loadVms(server, next) {
++		getServerVms(server.uuid, function (err, vms) {
++			if (err) {
++				log.error('Error loading VMs for server ' +
++					server.uuid + ': ' + err.message);
++
++				reasons[server.uuid] = 'Error loading VMs: ' +
++					err.message;
++
++				failed[server.uuid] = true;
++				return (next());
++			}
++
++			server.vms = {};
++			vms.forEach(function (vm) {
++				server.vms[vm.uuid] = vm;
++			});
++
++			reasons[server.uuid] = vms.length + ' VMs loaded';
++
++			log.trace('Loaded VMs for server', server.uuid);
++
++			return (next());
++		});
++	}
++
++	log.debug('Loading VMs into server objects');
++	return vasync.forEachParallel({
++		inputs: servers,
++		func: loadVms
++	}, function () {
++		log.info('VMs loaded into server objects');
++
++		// only return servers that successfully loaded VM info
++		var loadedServers = servers.filter(function (server) {
++			return (!failed[server.uuid]);
++		});
++
++		cb(null, loadedServers, reasons);
++	});
++}
++
++module.exports = {
++	name: 'Load info about all VMs for each server',
++	run: loadServerVms
++};
+diff --git a/lib/allocator.js b/lib/allocator.js
+index 13276a9..c980f3c 100644
+--- a/lib/allocator.js
++++ b/lib/allocator.js
+@@ -79,6 +79,8 @@ var Allocator = module.exports = function (sys, description, defaults)
+ {
+ 	assert.object(sys);
+ 	assert.object(sys.log);
++	assert.optionalFunc(sys.getServerVms);
++	assert.optionalFunc(sys.getVm);
+ 	assert.array(description);
+ 	assert.object(defaults);
+ 
+diff --git a/package.json b/package.json
+index 2170ddf..b9812dd 100644
+--- a/package.json
++++ b/package.json
+@@ -9,7 +9,8 @@
+     "bunyan": "~1.3.3",
+     "node-uuid": "~1.4.0",
+     "joyent-schemas": "git://github.com/joyent/schemas.git#c661af34f9fa839aada1ff5c215067d9c86cbe89",
+-    "jsprim": "~0.6.1"
++    "jsprim": "~0.6.1",
++    "vasync": "~1.6.4"
+   },
+   "devDependencies": {
+     "tape": "4.0.0"
+diff --git a/test/algorithms/hard-filter-volumes-from.test.js b/test/algorithms/hard-filter-volumes-from.test.js
+index f43158c..0d6419a 100644
+--- a/test/algorithms/hard-filter-volumes-from.test.js
++++ b/test/algorithms/hard-filter-volumes-from.test.js
+@@ -13,7 +13,7 @@ var filter = require('../../lib/algorithms/hard-filter-volumes-from.js');
+ var common = require('./common.js');
+ 
+ 
+-var SERVERS = [
++var SERVERS_PREPOPULATED = [
+ 	{
+ 		uuid: 'd8ea612d-7440-411e-8e34-e6bf1adeb008',
+ 		vms: {
+@@ -41,11 +41,37 @@ var SERVERS = [
+ 	}
+ ];
+ 
++var SERVERS = [
++	{ uuid: 'd8ea612d-7440-411e-8e34-e6bf1adeb008' },
++	{ uuid: '07d6d108-f4ed-4f2c-9b09-949f99de2b5d' },
++	{ uuid: '60eaf62c-f19e-4e15-b520-72830b0afe2d' },
++	{ uuid: '69cd993f-d679-4382-96e0-f6821a4ce36b' }
++];
+ 
+-var checkFilter = common.createPluginChecker(filter, common.SYS);
++var VM_LOOKUP = {
++	'1c713cf6-8433-4a3c-b2a0-40df6b24074f': {
++		server_uuid: 'd8ea612d-7440-411e-8e34-e6bf1adeb008'
++	},
++	'c7deac87-5f2c-46d5-9374-c3e261ab3eb8': {
++		server_uuid: 'd8ea612d-7440-411e-8e34-e6bf1adeb008'
++	},
++	'd2872179-574c-4f86-8d0c-651a8b628e64': {
++		server_uuid: '07d6d108-f4ed-4f2c-9b09-949f99de2b5d'
++	},
++	'679c97ea-065b-4a4f-9629-3aabde21cb45': {
++		server_uuid: '60eaf62c-f19e-4e15-b520-72830b0afe2d'
++	},
++	'0d0690a2-06a7-41cb-a0a4-55d5e37519e7': {
++		server_uuid: '60eaf62c-f19e-4e15-b520-72830b0afe2d'
++	}
++};
+ 
+ 
+-test('filterVolumesFrom()', function (t) {
++var SYS = common.SYS;
++var checkFilter = common.createPluginChecker(filter, SYS);
++
++
++test('filterVolumesFrom() with no getVm set', function (t) {
+ 	var vm = {
+ 		docker: true, // just something non-null for this test
+ 		internal_metadata: {
+@@ -56,7 +82,7 @@ test('filterVolumesFrom()', function (t) {
+ 		}
+ 	};
+ 
+-	var expectServers = [ SERVERS[2] ];
++	var expectServers = [ SERVERS_PREPOPULATED[2] ];
+ 	var expectReasons = {
+ 		/* BEGIN JSSTYLED */
+ 		'd8ea612d-7440-411e-8e34-e6bf1adeb008': 'VM needs volumes from 679c97ea-065b-4a4f-9629-3aabde21cb45, which was not found on server',
+@@ -65,10 +91,69 @@ test('filterVolumesFrom()', function (t) {
+ 		/* END JSSTYLED */
+ 	};
+ 
+-	checkFilter(t, SERVERS, { vm: vm }, expectServers, expectReasons);
++	checkFilter(t, SERVERS_PREPOPULATED, { vm: vm }, expectServers,
++		expectReasons);
+ });
+ 
+ 
++test('filterVolumesFrom() with getVm set', function (t) {
++	SYS.getVm = function (vmUuid, cb) {
++		return (cb(null, VM_LOOKUP[vmUuid]));
++	};
++
++	var vm = {
++		docker: true, // just something non-null for this test
++		internal_metadata: {
++			'docker:volumesfrom': [
++				'679c97ea-065b-4a4f-9629-3aabde21cb45',
++				'0d0690a2-06a7-41cb-a0a4-55d5e37519e7'
++			]
++		}
++	};
++
++	var expectServers = [ SERVERS[2] ];
++	var expectReasons = {
++		/* BEGIN JSSTYLED */
++		'd8ea612d-7440-411e-8e34-e6bf1adeb008': 'VM needs volumes from 679c97ea-065b-4a4f-9629-3aabde21cb45, which was not found on server',
++		'07d6d108-f4ed-4f2c-9b09-949f99de2b5d': 'VM needs volumes from 679c97ea-065b-4a4f-9629-3aabde21cb45, which was not found on server',
++		'69cd993f-d679-4382-96e0-f6821a4ce36b': 'VM needs volumes from 679c97ea-065b-4a4f-9629-3aabde21cb45, which was not found on server'
++		/* END JSSTYLED */
++	};
++
++	checkFilter(t, SERVERS, { vm: vm }, expectServers,
++		expectReasons);
++});
++
++
++test('filterVolumesFrom() fails, with getVm set', function (t) {
++	// SYS.getVm already set in prior test
++
++	var vm = {
++		docker: true, // just something non-null for this test
++		internal_metadata: {
++			'docker:volumesfrom': [
++				'679c97ea-065b-4a4f-9629-3aabde21cb45',
++				'1c713cf6-8433-4a3c-b2a0-40df6b24074f'
++			]
++		}
++	};
++
++	var expectServers = [];
++	var expectReasons = {
++		/* BEGIN JSSTYLED */
++		'd8ea612d-7440-411e-8e34-e6bf1adeb008': 'VM needs volumes from 679c97ea-065b-4a4f-9629-3aabde21cb45, which was not found on server',
++		'07d6d108-f4ed-4f2c-9b09-949f99de2b5d': 'VM needs volumes from 679c97ea-065b-4a4f-9629-3aabde21cb45, which was not found on server',
++		'69cd993f-d679-4382-96e0-f6821a4ce36b': 'VM needs volumes from 679c97ea-065b-4a4f-9629-3aabde21cb45, which was not found on server',
++		'60eaf62c-f19e-4e15-b520-72830b0afe2d': 'VM needs volumes from 1c713cf6-8433-4a3c-b2a0-40df6b24074f, which was not found on server'
++		/* END JSSTYLED */
++	};
++
++	checkFilter(t, SERVERS, { vm: vm }, expectServers,
++		expectReasons);
++});
++
++
++
+ test('filterVolumesFrom() with no servers', function (t) {
+ 	var vm = {
+ 		docker: true, // just something non-null for this test
+@@ -90,7 +175,10 @@ test('filterVolumesFrom() with no metadata', function (t) {
+ 	};
+ 
+ 	var expectServers = SERVERS;
+-	var expectReasons = {};
++	var expectReasons = {
++		skip: 'Requested VM is not a Docker container and/or has no ' +
++			'internal_metadata'
++	};
+ 
+ 	checkFilter(t, SERVERS, { vm: vm }, expectServers, expectReasons);
+ });
+@@ -103,7 +191,10 @@ test('filterVolumesFrom() with no volumesfrom', function (t) {
+ 	};
+ 
+ 	var expectServers = SERVERS;
+-	var expectReasons = {};
++	var expectReasons = {
++		skip: 'Requested VM has no VMs listed in internal_data ' +
++			'docker:volumesfrom'
++	};
+ 
+ 	checkFilter(t, SERVERS, { vm: vm }, expectServers, expectReasons);
+ });
+diff --git a/test/algorithms/load-server-vms.test.js b/test/algorithms/load-server-vms.test.js
+new file mode 100644
+index 0000000..e81e817
+--- /dev/null
++++ b/test/algorithms/load-server-vms.test.js
+@@ -0,0 +1,138 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++var test = require('tape');
++var loader = require('../../lib/algorithms/load-server-vms.js');
++var common = require('./common.js');
++
++
++var SERVERS = [
++	{ uuid: 'cdfe84c4-f7cc-4104-bc24-45f786bce762' },
++	{ uuid: '49878ba3-e28e-48c6-83c7-21dca018e69b' },
++	{ uuid: '8564ad6c-bfbc-475e-8b53-46bee1058a58' },
++	{ uuid: '45808bd4-a66c-400f-b138-4ff3bdd76d4c' },
++	{ uuid: 'f0908343-5410-47b0-b6c4-b724ab4ffda5' },
++	{ uuid: '00000000-0000-0000-0000-0000deadbeef' }
++];
++
++
++var SYS = common.SYS;
++var checkPlugin = common.createPluginChecker(loader, SYS);
++
++
++test('loadServerVms() with getServerVms set', function (t) {
++	var vmLookup = {
++		'cdfe84c4-f7cc-4104-bc24-45f786bce762': [
++			{ uuid: 'e34f6924-59ba-4242-8633-4aad203d060f' },
++			{ uuid: '6e539da3-e826-4590-9e00-f9665a6680a2' }
++		],
++		'49878ba3-e28e-48c6-83c7-21dca018e69b': [
++			{ uuid: 'c9e59c1c-555d-4646-8791-606ef9429d93' },
++			{ uuid: '2f7eac77-0e97-42d7-a024-7db370ca5110' }
++		],
++		'8564ad6c-bfbc-475e-8b53-46bee1058a58': [
++			{ uuid: '56b0465c-97f6-46f1-8d13-e8d87a3de558' },
++			{ uuid: '3c8ef669-4a79-4eaa-bb0b-1fd413328844' }
++		],
++		'45808bd4-a66c-400f-b138-4ff3bdd76d4c': [
++			{ uuid: '7650edda-e451-4b51-8168-3dbbcf2e71c1' },
++			{ uuid: 'acc16d76-42f6-414b-92ce-557e72663c58' }
++		]
++	};
++
++	SYS.getServerVms = function (serverUuid, cb) {
++		if (serverUuid === '00000000-0000-0000-0000-0000deadbeef') {
++			var err = new Error('test error');
++			return (cb(err));
++		}
++
++		return (cb(null, vmLookup[serverUuid] || []));
++	};
++
++	var expectServers = [ {
++		uuid: 'cdfe84c4-f7cc-4104-bc24-45f786bce762',
++		vms : {
++			'e34f6924-59ba-4242-8633-4aad203d060f': {
++				uuid: 'e34f6924-59ba-4242-8633-4aad203d060f'
++			},
++			'6e539da3-e826-4590-9e00-f9665a6680a2': {
++				uuid: '6e539da3-e826-4590-9e00-f9665a6680a2'
++			}
++		}
++	}, {
++		uuid: '49878ba3-e28e-48c6-83c7-21dca018e69b',
++		vms : {
++			'c9e59c1c-555d-4646-8791-606ef9429d93': {
++				uuid: 'c9e59c1c-555d-4646-8791-606ef9429d93'
++			},
++			'2f7eac77-0e97-42d7-a024-7db370ca5110': {
++				uuid: '2f7eac77-0e97-42d7-a024-7db370ca5110'
++			}
++		}
++	}, {
++		uuid: '8564ad6c-bfbc-475e-8b53-46bee1058a58',
++		vms : {
++			'56b0465c-97f6-46f1-8d13-e8d87a3de558': {
++				uuid: '56b0465c-97f6-46f1-8d13-e8d87a3de558'
++			},
++			'3c8ef669-4a79-4eaa-bb0b-1fd413328844': {
++				uuid: '3c8ef669-4a79-4eaa-bb0b-1fd413328844'
++			}
++		}
++	}, {
++		uuid: '45808bd4-a66c-400f-b138-4ff3bdd76d4c',
++		vms : {
++			'7650edda-e451-4b51-8168-3dbbcf2e71c1': {
++				uuid: '7650edda-e451-4b51-8168-3dbbcf2e71c1'
++			},
++			'acc16d76-42f6-414b-92ce-557e72663c58': {
++				uuid: 'acc16d76-42f6-414b-92ce-557e72663c58'
++			}
++		}
++	}, {
++		uuid: 'f0908343-5410-47b0-b6c4-b724ab4ffda5',
++		vms : {}
++	} ];
++
++	var expectReasons = {
++		'cdfe84c4-f7cc-4104-bc24-45f786bce762': '2 VMs loaded',
++		'49878ba3-e28e-48c6-83c7-21dca018e69b': '2 VMs loaded',
++		'8564ad6c-bfbc-475e-8b53-46bee1058a58': '2 VMs loaded',
++		'45808bd4-a66c-400f-b138-4ff3bdd76d4c': '2 VMs loaded',
++		'f0908343-5410-47b0-b6c4-b724ab4ffda5': '0 VMs loaded',
++		'00000000-0000-0000-0000-0000deadbeef':
++			'Error loading VMs: test error'
++	};
++
++	checkPlugin(t, SERVERS, {}, expectServers, expectReasons);
++});
++
++
++test('loadServerVms() with no servers', function (t) {
++	checkPlugin(t, [], {}, [], {});
++});
++
++
++test('loadServerVms() without getServerVms set', function (t) {
++	delete SYS.getServerVms;
++
++	var expectReasons = {
++		skip: 'getServerVms not set; assuming server.vms is already ' +
++			'populated'
++	};
++
++	checkPlugin(t, SERVERS, {}, SERVERS, expectReasons);
++});
++
++
++test('name', function (t) {
++	t.equal(typeof (loader.name), 'string');
++	t.end();
++});
+diff --git a/test/allocator.test.js b/test/allocator.test.js
+index 2f3b288..0f0efe7 100644
+--- a/test/allocator.test.js
++++ b/test/allocator.test.js
+@@ -825,6 +825,7 @@ test('load available algorithms', function (t) {
+ 		'hard-filter-vm-count',
+ 		'hard-filter-volumes-from',
+ 		'identity',
++		'load-server-vms',
+ 		'override-overprovisioning',
+ 		'score-current-platform',
+ 		'score-next-reboot',
+diff --git a/test/common.js b/test/common.js
+index 17eee72..2c588ca 100644
+--- a/test/common.js
++++ b/test/common.js
+@@ -14,24 +14,30 @@ var fs = require('fs');
+ var ALGO_DESC = [
+ 	'pipe', 'hard-filter-setup',
+ 		'hard-filter-running',
++		// servers above invalid-servers could contain gibberish
+ 		'hard-filter-invalid-servers',
++		// keep volumes-from early; if present, it cuts down number
++		// of servers to just one:
+ 		'hard-filter-volumes-from',
+-		'calculate-ticketed-vms',
+ 		'hard-filter-reserved',
+-		'hard-filter-headnode',
+-		'hard-filter-vm-count',
+-		'hard-filter-capness',
+ 		'hard-filter-vlans',
+ 		'hard-filter-platform-versions',
+ 		'hard-filter-traits',
+-		'hard-filter-owners-servers',
++		'hard-filter-headnode',
++		'hard-filter-overprovision-ratios',
++		// above plugins do not need vm info
++		// we defer vm loading as late as possible:
++		'load-server-vms',
++		'calculate-ticketed-vms',
++		'hard-filter-capness',
++		'hard-filter-vm-count',
+ 		'hard-filter-sick-servers',
+ 		'calculate-server-unreserved',
+-		'hard-filter-overprovision-ratios',
+ 		'hard-filter-min-ram',
+ 		'hard-filter-min-cpu',
+ 		'hard-filter-min-disk',
+ 		'hard-filter-locality-hints',
++		'hard-filter-owners-servers',
+ 		['or', 'hard-filter-reservoir',
+ 		        'identity'],
+ 		['or', 'hard-filter-large-servers',
+diff --git a/test/integration.test.js b/test/integration.test.js
+index d22152b..d5d1f36 100644
+--- a/test/integration.test.js
++++ b/test/integration.test.js
+@@ -161,43 +161,21 @@ test('allocate 1', function (t) {
+ 				'00000000-0000-0000-0000-0025909437d4'
+ 			]
+ 		}, {
+-			/* JSSTYLED */
+-			step: 'Servers containing VMs required for volumes-from',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+-		}, {
+-			step: 'Add VMs which have open provisioning tickets',
++			step: 'Servers containing VMs required for volumesfrom',
+ 			remaining: [
+ 				'00000000-0000-0000-0000-00259094373c',
+ 				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			],
++			reasons: {
++				/* JSSTYLED */
++				skip: 'Requested VM is not a Docker container and/or has no internal_metadata'
++			}
+ 		}, {
+ 			step: 'Servers which are not reserved',
+ 			remaining: [
+ 				'00000000-0000-0000-0000-00259094373c',
+ 				'00000000-0000-0000-0000-0025909437d4'
+ 			]
+-		}, {
+-			step: 'Servers which are not headnodes',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+-		}, {
+-			step: 'Servers with more VMs than limit',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+-		}, {
+-			/* JSSTYLED */
+-			step: 'Servers which have same existence of cpu_cap as package',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+ 		}, {
+ 			step: 'Servers supporting required VLANs',
+ 			remaining: [
+@@ -222,21 +200,35 @@ test('allocate 1', function (t) {
+ 				'00000000-0000-0000-0000-0025909437d4': 'Combined vm/pkg/img traits require {"cabbages":true} but server has {}'
+ 			}
+ 		}, {
+-			step: 'Filter CNs based on owner filters',
++			step: 'Servers which are not headnodes',
++			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
++		}, {
++			/* JSSTYLED */
++			step: 'Servers with same overprovision ratios as requested VM',
++			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
++		}, {
++			step: 'Load info about all VMs for each server',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ],
+ 			reasons: {
+-				skip: 'No filter_owner_server default to run'
++				/* JSSTYLED */
++				skip: 'getServerVms not set; assuming server.vms is already populated'
+ 			}
++		}, {
++			step: 'Add VMs which have open provisioning tickets',
++			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
+ 		}, {
+ 			/* JSSTYLED */
+-			step: 'Servers that had consecutive failed provisions recently',
++			step: 'Servers which have same existence of cpu_cap as package',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
+ 		}, {
+-			step: 'Calculate unreserved resources on each server',
++			step: 'Servers with more VMs than limit',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
+ 		}, {
+ 			/* JSSTYLED */
+-			step: 'Servers with same overprovision ratios as requested VM',
++			step: 'Servers that had consecutive failed provisions recently',
++			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
++		}, {
++			step: 'Calculate unreserved resources on each server',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
+ 		}, {
+ 			step: 'Servers with enough unreserved RAM',
+@@ -251,6 +243,12 @@ test('allocate 1', function (t) {
+ 			step: 'Servers with requested hard locality considered',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ],
+ 			reasons: { skip: 'No strict locality requested' }
++		}, {
++			step: 'Filter CNs based on owner filters',
++			remaining: [ '00000000-0000-0000-0000-00259094373c' ],
++			reasons: {
++				skip: 'No filter_owner_server default to run'
++			}
+ 		}, {
+ 			step: 'Servers which are not in the reservoir',
+ 			remaining: [ '00000000-0000-0000-0000-00259094373c' ]
+@@ -353,43 +351,21 @@ test('allocate 2', function (t) {
+ 				'00000000-0000-0000-0000-0025909437d4'
+ 			]
+ 		}, {
+-			/* JSSTYLED */
+-			step: 'Servers containing VMs required for volumes-from',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+-		}, {
+-			step: 'Add VMs which have open provisioning tickets',
++			step: 'Servers containing VMs required for volumesfrom',
+ 			remaining: [
+ 				'00000000-0000-0000-0000-00259094373c',
+ 				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			],
++			reasons: {
++				/* JSSTYLED */
++				skip: 'Requested VM is not a Docker container and/or has no internal_metadata'
++			}
+ 		}, {
+ 			step: 'Servers which are not reserved',
+ 			remaining: [
+ 				'00000000-0000-0000-0000-00259094373c',
+ 				'00000000-0000-0000-0000-0025909437d4'
+ 			]
+-		}, {
+-			step: 'Servers which are not headnodes',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+-		}, {
+-			step: 'Servers with more VMs than limit',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+-		}, {
+-			/* JSSTYLED */
+-			step: 'Servers which have same existence of cpu_cap as package',
+-			remaining: [
+-				'00000000-0000-0000-0000-00259094373c',
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
+ 		}, {
+ 			step: 'Servers supporting required VLANs',
+ 			remaining: [
+@@ -416,71 +392,65 @@ test('allocate 2', function (t) {
+ 				'00000000-0000-0000-0000-00259094373c': 'Combined vm/pkg/img require no traits but server has {"cabbages":true}'
+ 			}
+ 		}, {
+-			step: 'Filter CNs based on owner filters',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			],
++			step: 'Servers which are not headnodes',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
++		}, {
++			/* JSSTYLED */
++			step: 'Servers with same overprovision ratios as requested VM',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ],
++			reasons: { skip: 'No pkg provided' }
++		}, {
++			step: 'Load info about all VMs for each server',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ],
+ 			reasons: {
+-				skip: 'No filter_owner_server default to run'
++				/* JSSTYLED */
++				skip: 'getServerVms not set; assuming server.vms is already populated'
+ 			}
++		}, {
++			step: 'Add VMs which have open provisioning tickets',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			/* JSSTYLED */
+-			step: 'Servers that had consecutive failed provisions recently',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			step: 'Servers which have same existence of cpu_cap as package',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+-			step: 'Calculate unreserved resources on each server',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			step: 'Servers with more VMs than limit',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			/* JSSTYLED */
+-			step: 'Servers with same overprovision ratios as requested VM',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			],
+-			reasons: {
+-				skip: 'No pkg provided'
+-			}
++			step: 'Servers that had consecutive failed provisions recently',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
++		}, {
++			step: 'Calculate unreserved resources on each server',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			step: 'Servers with enough unreserved RAM',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			step: 'Servers with enough unreserved CPU',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			step: 'Servers with enough unreserved disk',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			step: 'Servers with requested hard locality considered',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			],
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ],
++			reasons: { skip: 'No strict locality requested' }
++		}, {
++			step: 'Filter CNs based on owner filters',
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ],
+ 			reasons: {
+-				skip: 'No strict locality requested'
++				skip: 'No filter_owner_server default to run'
+ 			}
+ 		}, {
+ 			step: 'Servers which are not in the reservoir',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			step: 'Filter out the largest and most empty servers',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			]
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ]
+ 		}, {
+ 			step: 'Servers with requested soft locality considered',
+-			remaining: [
+-				'00000000-0000-0000-0000-0025909437d4'
+-			],
++			remaining: [ '00000000-0000-0000-0000-0025909437d4' ],
+ 			reasons: {
+ 				'*': 'exclude: inst==~' + VM.locality.near
+ 					+ ' (ignored b/c non-strict)'

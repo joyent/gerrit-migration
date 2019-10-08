@@ -1,0 +1,632 @@
+commit 074fdf225fd8562e6bf9378c91b961e3257b55f1 (refs/changes/33/2833/2)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2017-10-20T23:05:59+00:00 (2 years ago)
+    
+    joyent/node-cueball#128 Allow configuring pool-wide queue drop policies
+
+diff --git a/docs/api.adoc b/docs/api.adoc
+index e3bfe44..ee599d6 100644
+--- a/docs/api.adoc
++++ b/docs/api.adoc
+@@ -166,6 +166,8 @@ Parameters
+     running `checker` on a connection
+   * `checker` -- optional Function(handle, connection), to be run on idle
+     connections
++  * `targetClaimDelay` -- optional Number, a target time for latency to claim
++    accept/timeout, done through Adaptive Queue Management
+   * `resolver` -- optional instance of an object meeting the Resolver interface
+     below.  You would typically obtain this object by either creating your own
+     Resolver directly or using the `resolverForIpOrDomain` function.
+diff --git a/lib/codel.js b/lib/codel.js
+new file mode 100644
+index 0000000..47d87cb
+--- /dev/null
++++ b/lib/codel.js
+@@ -0,0 +1,118 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++module.exports = {
++	ControlledDelay: ControlledDelay
++};
++
++const mod_assert = require('assert-plus');
++const mod_utils = require('./utils');
++
++const CODEL_INTERVAL = 100;
++
++/*
++ * This class implements the Controlled Delay algorithm as described
++ * here:
++ *
++ *     https://queue.acm.org/appendices/codel.html
++ */
++function ControlledDelay(targetClaimDelay) {
++	mod_assert.finite(targetClaimDelay, 'targetClaimDelay');
++
++	this.cd_targdelay = targetClaimDelay;
++	this.cd_first_above_time = 0;
++	this.cd_drop_next = 0;
++	this.cd_count = 0;
++	this.cd_dropping = false;
++}
++
++ControlledDelay.prototype.canDrop = function (now, start) {
++	var sojournTime = now - start;
++
++	if (sojournTime < this.cd_targdelay) {
++		this.cd_first_above_time = 0;
++	} else if (this.cd_first_above_time === 0) {
++		this.cd_first_above_time = now + CODEL_INTERVAL;
++	} else if (now >= this.cd_first_above_time) {
++		return (true);
++	}
++
++	return (false);
++};
++
++ControlledDelay.prototype.getDropNext = function (now) {
++	return (now + CODEL_INTERVAL / Math.sqrt(this.cd_count));
++};
++
++/*
++ * This method is fed the starting time for each claim, and determines
++ * whether we should timeout the claim or not.
++ */
++ControlledDelay.prototype.overloaded = function (start) {
++	mod_assert.number(start, 'start');
++	var now = mod_utils.currentMillis();
++	var okToDrop = this.canDrop(now, start);
++	var dropClaim = false;
++
++	if (this.cd_dropping) {
++		if (!okToDrop) {
++			this.cd_dropping = false;
++		} else if (now >= this.cd_drop_next) {
++			dropClaim = true;
++			this.cd_count += 1;
++		}
++	} else if (okToDrop &&
++	    ((now - this.cd_drop_next < CODEL_INTERVAL) ||
++	     (now - this.cd_first_above_time >= CODEL_INTERVAL))) {
++		dropClaim = true;
++		this.cd_dropping = true;
++
++		if (now - this.cd_drop_next < CODEL_INTERVAL) {
++			this.cd_count = this.cd_count > 2
++			    ? this.cd_count - 2 : 1;
++		} else {
++			this.cd_count = 1;
++		}
++
++		this.cd_drop_next = this.getDropNext(now);
++	}
++
++	return (dropClaim);
++};
++
++/*
++ * Called to indicate that the queue has been cleared out.
++ */
++ControlledDelay.prototype.empty = function () {
++	this.cd_last_empty = mod_utils.currentMillis();
++	this.cd_first_above_time = 0;
++};
++
++/*
++ * Get a maximum period of time for a request to sit idle in the queue
++ * before timing out. While we normally determine whether to timeout a
++ * claim at the point it's dequeued, if checkout durations become very
++ * long, then we may not get that opportunity soon enough to maintain
++ * our target delay.
++ *
++ * Because of this, we normally keep this value high in a healthy
++ * system, but lower it closer to our target delay when we're
++ * overloaded.
++ *
++ * See http://queue.acm.org/detail.cfm?id=2839461
++ */
++ControlledDelay.prototype.getMaxIdle = function () {
++	var bound = this.cd_targdelay * 10;
++	var now = mod_utils.currentMillis();
++
++	if (this.cd_last_empty < (now - bound)) {
++		return (this.cd_targdelay * 3);
++	} else {
++		return (bound);
++	}
++};
+diff --git a/lib/connection-fsm.js b/lib/connection-fsm.js
+index 602596c..263ed01 100644
+--- a/lib/connection-fsm.js
++++ b/lib/connection-fsm.js
+@@ -499,6 +499,7 @@ function CueBallClaimHandle(options) {
+ 	this.ch_cancelled = false;
+ 	this.ch_lastError = undefined;
+ 	this.ch_doReleaseLeakCheck = true;
++	this.ch_started = mod_utils.currentMillis();
+ 
+ 	FSM.call(this, 'waiting');
+ }
+@@ -564,6 +565,11 @@ CueBallClaimHandle.prototype.cancel = function () {
+ 	}
+ };
+ 
++CueBallClaimHandle.prototype.timeout = function () {
++	mod_assert.ok(this.isInState('waiting'));
++	this.emit('timeout');
++};
++
+ CueBallClaimHandle.prototype.fail = function (err) {
+ 	this.emit('error', err);
+ };
+@@ -603,14 +609,19 @@ CueBallClaimHandle.prototype.state_waiting = function (S) {
+ 		S.gotoState('claiming');
+ 	});
+ 
+-	if (isFinite(this.ch_claimTimeout)) {
+-		S.timeout(this.ch_claimTimeout, function () {
+-			self.ch_lastError = new mod_errors.ClaimTimeoutError(
+-			    self.ch_pool);
+-			S.gotoState('failed');
+-		});
++	function onTimeout() {
++		self.ch_lastError = new mod_errors.ClaimTimeoutError(
++		    self.ch_pool);
++		self.ch_pool._incrCounter('claim-timeout');
++		S.gotoState('failed');
++	}
++
++	if (Number.isFinite(this.ch_claimTimeout)) {
++		S.timeout(this.ch_claimTimeout, onTimeout);
+ 	}
+ 
++	S.on(this, 'timeout', onTimeout);
++
+ 	S.on(this, 'error', function (err) {
+ 		self.ch_lastError = err;
+ 		S.gotoState('failed');
+diff --git a/lib/pool.js b/lib/pool.js
+index 84cab63..285f756 100644
+--- a/lib/pool.js
++++ b/lib/pool.js
+@@ -22,6 +22,7 @@ const mod_resolver = require('./resolver');
+ const mod_uuid = require('uuid');
+ const mod_errors = require('./errors');
+ 
++const mod_codel = require('./codel');
+ const mod_monitor = require('./pool-monitor');
+ 
+ const FSM = mod_mooremachine.FSM;
+@@ -137,6 +138,7 @@ function CueBallConnectionPool(options) {
+ 	mod_assert.optionalNumber(options.maxDNSConcurrency,
+ 	    'options.maxDNSConcurrency');
+ 	mod_assert.optionalNumber(options.defaultPort, 'options.defaultPort');
++	mod_utils.assertClaimDelay(options.targetClaimDelay);
+ 
+ 	mod_assert.object(options.recovery, 'options.recovery');
+ 	mod_utils.assertRecoverySet(options.recovery);
+@@ -178,6 +180,13 @@ function CueBallConnectionPool(options) {
+ 	this.p_initq = new Queue();
+ 	this.p_waiters = new Queue();
+ 
++	this.p_codel = null;
++
++	if (Number.isFinite(options.targetClaimDelay)) {
++		this.p_codel =
++		    new mod_codel.ControlledDelay(options.targetClaimDelay);
++	}
++
+ 	this.p_lastError = undefined;
+ 
+ 	this.p_counters = {};
+@@ -649,10 +658,24 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 			 */
+ 			while (self.p_waiters.length > 0) {
+ 				var hdl = self.p_waiters.shift();
+-				if (hdl.isInState('waiting')) {
+-					hdl.try(fsm);
+-					return;
++				var drop = self.p_codel !== null &&
++				    self.p_codel.overloaded(hdl.ch_started);
++
++				if (!hdl.isInState('waiting')) {
++					continue;
+ 				}
++
++				if (drop) {
++					hdl.timeout();
++					continue;
++				}
++
++				hdl.try(fsm);
++				return;
++			}
++
++			if (self.p_codel !== null) {
++				self.p_codel.empty();
+ 			}
+ 
+ 			/* Otherwise, onto the idle queue we go! */
+@@ -733,6 +756,7 @@ CueBallConnectionPool.prototype.claim = function (options, cb) {
+ 	var self = this;
+ 	var done = false;
+ 	var handle;
++	var timeout;
+ 
+ 	if (typeof (options) === 'function' && cb === undefined) {
+ 		cb = options;
+@@ -740,12 +764,22 @@ CueBallConnectionPool.prototype.claim = function (options, cb) {
+ 	}
+ 	mod_assert.object(options, 'options');
+ 	mod_assert.optionalNumber(options.timeout, 'options.timeout');
+-	var timeout = options.timeout;
+-	if (timeout === undefined || timeout === null)
+-		timeout = Infinity;
+ 	mod_assert.optionalBool(options.errorOnEmpty, 'options.errorOnEmpty');
+ 	var errOnEmpty = options.errorOnEmpty;
+ 
++	if (this.p_codel !== null) {
++		if (typeof (options.timeout) === 'number') {
++			throw (new Error('options.timeout not allowed when ' +
++			    'targetDelay has been set'));
++		}
++
++		timeout = this.p_codel.getMaxIdle();
++	} else if (typeof (options.timeout) === 'number') {
++		timeout = options.timeout;
++	} else {
++		timeout = Infinity;
++	}
++
+ 	this._incrCounter('claim');
+ 
+ 	if (this.isInState('stopping') || this.isInState('stopped')) {
+diff --git a/lib/utils.js b/lib/utils.js
+index 8e8c95c..49b30cc 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -11,6 +11,8 @@ module.exports = {
+ 	planRebalance: planRebalance,
+ 	assertRecovery: assertRecovery,
+ 	assertRecoverySet: assertRecoverySet,
++	assertClaimDelay: assertClaimDelay,
++	currentMillis: currentMillis,
+ 	stackTracesEnabled: stackTracesEnabled,
+ 	maybeCaptureStackTrace: maybeCaptureStackTrace
+ };
+@@ -154,6 +156,24 @@ function assertRecovery(obj, name) {
+ 	}
+ }
+ 
++function assertClaimDelay(delay) {
++	mod_assert.optionalFinite(delay, 'options.targetClaimDelay');
++	if (Number.isFinite(delay)) {
++		mod_assert.ok(delay > 0, 'options.targetClaimDelay > 0');
++		mod_assert.equal(delay, Math.floor(delay),
++		    'options.targetClaimDelay');
++	}
++}
++
++/* Get monotonic time in milliseconds */
++function currentMillis() {
++	var time = process.hrtime();
++	var secs2ms = time[0] * 1000;
++	var ns2ms = time[1] / 1000000;
++
++	return (secs2ms + ns2ms);
++}
++
+ /* A Fisher-Yates shuffle. */
+ function shuffle(array) {
+ 	var i = array.length;
+diff --git a/test/codel.test.js b/test/codel.test.js
+new file mode 100644
+index 0000000..586e7d8
+--- /dev/null
++++ b/test/codel.test.js
+@@ -0,0 +1,299 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++const mod_tape = require('tape');
++const mod_sinon = require('sinon');
++const mod_events = require('events');
++const mod_util = require('util');
++const mod_assert = require('assert-plus');
++const mod_bunyan = require('bunyan');
++const mod_vasync = require('vasync');
++const VError = require('verror');
++
++const mod_pool = require('../lib/pool');
++const mod_resolver = require('../lib/resolver');
++
++var sandbox;
++var connections = [];
++var index, counts;
++var resolver;
++var log = mod_bunyan.createLogger({
++	name: 'codel-test',
++	level: process.env.LOGLEVEL || 'debug'
++});
++var recovery = {
++	default: { timeout: 500, retries: 1, delay: 0 }
++};
++
++function isClaimTimeoutError(err) {
++	if (!err) {
++		return (false);
++	}
++
++	return (VError.hasCauseWithName(err, 'ClaimTimeoutError'));
++}
++
++function sumStep(acc, cur) {
++	return (acc + cur);
++}
++
++function sum(arr) {
++	return (arr.reduce(sumStep, 0));
++}
++
++function average(arr) {
++	return (sum(arr) / arr.length);
++}
++
++function DummyResolver() {
++	resolver = this;
++	this.state = 'stopped';
++	this.backends = {};
++	mod_events.EventEmitter.call(this);
++	this.on('added', function (key) {
++		resolver.backends[key] = true;
++	});
++	this.on('removed', function (key) {
++		delete (resolver.backends[key]);
++	});
++	return (new mod_resolver.ResolverFSM(this, {}));
++}
++mod_util.inherits(DummyResolver, mod_events.EventEmitter);
++DummyResolver.prototype.start = function () {
++	this.state = 'running';
++};
++DummyResolver.prototype.stop = function () {
++	this.state = 'stopped';
++};
++DummyResolver.prototype.count = function () {
++	return (Object.keys(this.backends).length);
++};
++
++function DummyConnection(backend) {
++	connections.push(this);
++	this.backend = backend.key;
++	this.backendInfo = backend;
++	this.refd = true;
++	this.connected = false;
++	this.dead = false;
++	this.checked = false;
++	mod_events.EventEmitter.call(this);
++}
++mod_util.inherits(DummyConnection, mod_events.EventEmitter);
++DummyConnection.prototype.connect = function () {
++	mod_assert.ok(this.dead === false);
++	mod_assert.ok(this.connected === false);
++	this.connected = true;
++	this.emit('connect');
++};
++DummyConnection.prototype.unref = function () {
++	this.refd = false;
++};
++DummyConnection.prototype.ref = function () {
++	this.refd = true;
++};
++DummyConnection.prototype.destroy = function () {
++	var idx = connections.indexOf(this);
++	if (idx !== -1)
++		connections.splice(idx, 1);
++	this.connected = false;
++	this.dead = true;
++};
++
++mod_tape.test('setup sandbox', function (t) {
++	sandbox = mod_sinon.sandbox.create();
++	sandbox.stub(mod_resolver, 'Resolver', DummyResolver);
++	t.end();
++});
++
++mod_tape.test('implicit high timeout', function (t) {
++	connections = [];
++	resolver = undefined;
++
++	var delay = 100;
++	var pool = new mod_pool.ConnectionPool({
++		log: log,
++		domain: 'foobar',
++		spares: 2,
++		maximum: 2,
++		targetClaimDelay: delay,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: {
++			'default': {
++				timeout: delay * 11,
++				retries: 1,
++				delay: 0
++			}
++		}
++	});
++	t.ok(resolver);
++
++	resolver.emit('added', 'b1', {});
++	setImmediate(function () {
++		t.equal(connections.length, 2);
++		t.strictEqual(connections[0].backend, 'b1');
++		t.strictEqual(connections[1].backend, 'b1');
++
++		/* The connections haven't emitted connect() yet. */
++		pool.claim(function (err) {
++			t.ok(err);
++			t.ok(err.message.match(/timed out/i));
++
++			connections.forEach(function (c) {
++				t.strictEqual(c.refd, true);
++				c.connect();
++			});
++
++			setImmediate(claimAgain);
++		});
++
++		/* Connections now exist, and pool is usable. */
++		function claimAgain() {
++			connections.forEach(function (c) {
++				t.strictEqual(c.refd, true);
++			});
++
++			pool.claim(function (err, hdl, conn) {
++				t.ifError(err);
++				t.ok(hdl);
++				t.ok(conn);
++				hdl.release();
++				setImmediate(done);
++			});
++		}
++
++		function done() {
++			pool.on('stateChanged', function (st) {
++				if (st === 'stopped')
++					t.end();
++			});
++			pool.stop();
++		}
++	});
++});
++
++/*
++ * These tests generate the same load pattern multiple times to show that
++ * as the target delays moves up, so does the average delay.
++ */
++function runCodelTest(delay, t) {
++	connections = [];
++	resolver = undefined;
++
++	var delays = [];
++	var successes = 0;
++	var timeouts = 0;
++	var failures = 0;
++	var count = 0;
++	var barrier = mod_vasync.barrier();
++	var pool = new mod_pool.ConnectionPool({
++		log: log,
++		domain: 'foobar',
++		spares: 2,
++		maximum: 2,
++		targetClaimDelay: delay,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery
++	});
++	t.ok(resolver);
++
++	resolver.emit('added', 'b1', {});
++	setImmediate(function () {
++		t.equal(connections.length, 2);
++		t.strictEqual(connections[0].backend, 'b1');
++		t.strictEqual(connections[1].backend, 'b1');
++
++		connections.forEach(function (c) {
++			t.strictEqual(c.refd, true);
++			c.connect();
++		});
++
++		setImmediate(queueClaims);
++
++		function enqueue() {
++			var id = 'claim-' + count++;
++			var start = Date.now();
++			barrier.start(id);
++			pool.claim(function (err, hdl, conn) {
++				delays.push(Date.now() - start);
++
++				if (isClaimTimeoutError(err)) {
++					timeouts += 1;
++				} else if (err) {
++					t.ifError(err);
++					failures += 1;
++				} else {
++					successes += 1;
++					setTimeout(function () {
++					    hdl.release();
++					}, 50);
++				}
++
++				barrier.done(id);
++			});
++		}
++
++		function queueClaims() {
++			var intvl = setInterval(function () {
++				for (var i = 0; i < 5; ++i) {
++				    enqueue();
++				}
++			}, 10);
++
++			setTimeout(function () {
++				clearInterval(intvl);
++				barrier.start('draining');
++				barrier.on('drain', onDrain);
++				barrier.done('draining');
++			}, 5000);
++		}
++
++		function onDrain() {
++			var delavg = average(delays);
++			t.ok(delavg < delay + 175, 'avg(delay) < target + 175');
++			t.ok(delavg > delay - 175, 'avg(delay) > target - 175');
++			t.equal(successes + timeouts + failures, count,
++			    'no pending claim callbacks');
++			t.notEqual(successes, 0, 'successes != 0');
++			t.notEqual(timeouts, 0, 'timeouts != 0');
++			t.equal(failures, 0, 'failures == 0');
++			setImmediate(done);
++		}
++
++		function done() {
++			pool.on('stateChanged', function (st) {
++				if (st === 'stopped')
++					t.end();
++			});
++			pool.stop();
++		}
++	});
++}
++
++mod_tape.test('delay target: 300ms', runCodelTest.bind(null, 300));
++
++mod_tape.test('delay target: 500ms', runCodelTest.bind(null, 500));
++
++mod_tape.test('delay target: 1000ms', runCodelTest.bind(null, 1000));
++
++mod_tape.test('delay target: 1500ms', runCodelTest.bind(null, 1500));
++
++mod_tape.test('delay target: 2000ms', runCodelTest.bind(null, 2000));
++
++mod_tape.test('delay target: 2500ms', runCodelTest.bind(null, 2500));
++
++mod_tape.test('delay target: 5000ms', runCodelTest.bind(null, 5000));
++
++mod_tape.test('cleanup sandbox', function (t) {
++	sandbox.restore();
++	t.end();
++});

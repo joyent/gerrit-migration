@@ -1,0 +1,953 @@
+commit 66f41f214284ab1acc4d08ca315e4a9062d68a93 (refs/changes/44/3544/1)
+Author: Joshua M. Clulow <jmc@joyent.com>
+Date:   2018-03-06T00:24:27+00:00 (1 year, 7 months ago)
+    
+    MANTA-3141 binder saturated, manta sadness ensues
+
+diff --git a/docs/index.md b/docs/index.md
+index 455b054..95dad13 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -112,7 +112,7 @@ will send a 'null-response' DNS message. This is the equivalent of an HTTP 404.
+ ### server.close(onClose)
+ 
+ Stops listening and closes the socket. `onClose` is an optional callback that
+-will be attached to the underlying socket `close` event.
++will be called once all underlying resources have been released.
+ 
+ ### Event: 'listening'
+ 
+diff --git a/lib/balancer.js b/lib/balancer.js
+new file mode 100644
+index 0000000..3c376f8
+--- /dev/null
++++ b/lib/balancer.js
+@@ -0,0 +1,406 @@
++/*
++ * Copyright (c) 2018, Joyent, Inc
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/*
++ * MNAME-BALANCER INTERFACE
++ *
++ * To support vertically scaling an individual DNS server through the use of
++ * multiple Node processes, a load balancer has been built that is specifically
++ * tailored for use with this DNS server library.  A custom protocol
++ * (documented below) has been devised, which represents an interface between
++ * this library and the load balancer software.  The load balancer is available
++ * here:
++ *
++ *      https://github.com/joyent/mname-balancer
++ *
++ * PROTOCOL
++ *
++ * A simple protocol with framed messages allows the load balancer to forward
++ * UDP packets between backend processes and remote peers, while providing
++ * enough information for the backend to know the source of packets for logging
++ * and instrumentation.  The protocol also allows a session to be converted
++ * to a TCP proxy session, at which point data will be passed verbatim from
++ * clients to the backend and vice versa.
++ *
++ * All integers are little-endian.  Every frame begins with a 32-bit unsigned
++ * integer denoting the frame type.  Most frames are of a fixed length
++ * determined by the frame type.  The following frames can be sent from the
++ * load balancer to the backend server:
++ *
++ *      CLIENT_HELLO            (type 1; frame type only)
++ *
++ *      The first frame sent by the load balancer to the backend to establish
++ *      a session for health checks and forwarded UDP packets.  This frame
++ *      has no data other than the frame type.
++ *
++ *      INBOUND_UDP             (type 2; header + data)
++ *
++ *      Each inbound UDP packet is wrapped in a frame which includes the
++ *      source IPv4 address and port number for the packet, followed by
++ *      the length of the packet data and then the packet data itself.  The
++ *      frame layout is as follows:
++ *
++ *              OFFSET  LENGTH  DESCRIPTION
++ *              0       4       [u32] frame type
++ *              4       4       [u32] source IPv4 address
++ *              8       4       [u32] source port number
++ *              12      4       [u32] packet data length
++ *              16      N       packet data
++ *
++ *      INBOUND_TCP             (type 3; header only)
++ *
++ *      Each inbound TCP connection is proxied through a separate local
++ *      session to the backend.  This frame negotiates such a session, including
++ *      details about the source of the connection.  The frame is fixed length,
++ *      with the following layout:
++ *
++ *              OFFSET  LENGTH  DESCRIPTION
++ *              0       4       [u32] frame type
++ *              4       4       [u32] source IPv4 address
++ *              8       4       [u32] source port number
++ *
++ *      The backend process is expected to respond with an INBOUND_TCP_OK
++ *      frame, after which data will be forwarded between the remote peer
++ *      and the backend without any additional framing.
++ *
++ *      CLIENT_HEARTBEAT        (type 4; frame type only)
++ *
++ *      This packet is sent by the load balancer to the backend periodically to
++ *      ensure the backend is at least somewhat responsive.  The backend must
++ *      respond promptly with a SERVER_HEARTBEAT frame.  This frame has no data
++ *      other than the frame type.
++ *
++ * The backend server responds to requests from the load balancer with the
++ * following frame types:
++ *
++ *      SERVER_HELLO            (type 1001; frame type only)
++ *
++ *      Sent in response to a CLIENT_HELLO frame, signalling readiness by the
++ *      backend to process UDP packets and heartbeats on this connection.
++ *      This frame has no data other than the frame type.
++ *
++ *      OUTBOUND_UDP            (type 1002; header + data)
++ *
++ *      This frame is the outbound analogue of INBOUND_UDP.  The backend
++ *      uses it to instruct the load balancer to send an outbound UDP packet
++ *      as a response to a particular DNS query.  The frame layout is as
++ *      follows:
++ *
++ *              OFFSET  LENGTH  DESCRIPTION
++ *              0       4       [u32] frame type
++ *              4       4       [u32] destination IPv4 address
++ *              8       4       [u32] destination port number
++ *              12      4       [u32] packet data length
++ *              16      N       packet data
++ *
++ *      INBOUND_TCP_OK          (type 1003; frame type only)
++ *
++ *      Sent in response to an INBOUND_TCP frame, this frame informs the
++ *      load balancer that the backend will now treat this connection as
++ *      if it were a TCP connection from the designated remote peer.
++ *      The frame has no data other than the frame type, and is the last
++ *      frame the backend will send on this connection.
++ *
++ *      SERVER_HEARTBEAT        (type 1004; frame type only)
++ *
++ *      Sent in response to a CLIENT_HEARTBEAT message.  The frame has no
++ *      data other than the frame type.
++ */
++
++var assert = require('assert-plus');
++var util = require('util');
++var stream = require('stream');
++
++
++var FRAME_TYPE_CLIENT_HELLO = 1;
++var FRAME_TYPE_INBOUND_UDP = 2;
++var FRAME_TYPE_INBOUND_TCP = 3;
++var FRAME_TYPE_CLIENT_HEARTBEAT = 4;
++var FRAME_TYPE_SERVER_HELLO = 1001;
++var FRAME_TYPE_OUTBOUND_UDP = 1002;
++var FRAME_TYPE_INBOUND_TCP_OK = 1003;
++var FRAME_TYPE_SERVER_HEARTBEAT = 1004;
++
++var SIZE_U32 = 4;
++
++
++function BalancerTransform(opts) {
++        var self = this;
++
++        stream.Transform.call(self);
++
++        self.bal_accum = new Buffer(0);
++        self.bal_tcp = null;
++        self.bal_hello = false;
++        self.bal_log = opts.log;
++        self.bal_sock = opts.sock;
++}
++util.inherits(BalancerTransform, stream.Transform);
++
++BalancerTransform.prototype.discard = function (n) {
++        var self = this;
++
++        self.bal_accum = self.bal_accum.slice(n);
++};
++
++BalancerTransform.prototype.avail = function (n) {
++        var self = this;
++
++        return (self.bal_accum.length >= n);
++};
++
++/*
++ * Read a little endian uint32_t from a four byte aligned offset into the
++ * buffer.
++ */
++BalancerTransform.prototype.readU32 = function (offs) {
++        var self = this;
++
++        return (self.bal_accum.readUInt32LE(offs * SIZE_U32));
++};
++
++/*
++ * Read a little endian IPv4 address from a four byte aligned offset into the
++ * buffer.
++ */
++BalancerTransform.prototype.readIPv4 = function (offs) {
++        var self = this;
++
++        var ipaddr = [
++                self.bal_accum.readUInt8(offs * SIZE_U32 + 3),
++                self.bal_accum.readUInt8(offs * SIZE_U32 + 2),
++                self.bal_accum.readUInt8(offs * SIZE_U32 + 1),
++                self.bal_accum.readUInt8(offs * SIZE_U32 + 0)
++        ].join('.');
++
++        return (ipaddr);
++};
++
++BalancerTransform.prototype._transform = function (o, _, done) {
++        var self = this;
++        var sock = self.bal_sock;
++        var log = self.bal_log;
++
++        if (self.bal_tcp !== null) {
++                /*
++                 * We are piped to the emulated TCP stream, so just pass on
++                 * buffers as we get them.
++                 */
++                self.push(o);
++                setImmediate(done);
++                return;
++        }
++
++        self.bal_accum = Buffer.concat([ self.bal_accum, o ],
++            self.bal_accum.length + o.length);
++
++        while (self.avail(SIZE_U32)) {
++                /*
++                 * Read frame type.
++                 */
++                var frame_type = self.readU32(0);
++                var out, ipaddr, port;
++
++                if (frame_type === FRAME_TYPE_CLIENT_HELLO) {
++                        self.discard(SIZE_U32);
++                        self.bal_hello = true;
++
++                        /*
++                         * A CLIENT_HELLO frame requires a SERVER_HELLO
++                         * response.
++                         */
++                        out = new Buffer(SIZE_U32);
++                        out.writeUInt32LE(FRAME_TYPE_SERVER_HELLO, 0);
++                        sock.write(out);
++                        continue;
++                }
++
++                if (frame_type === FRAME_TYPE_INBOUND_TCP) {
++                        /*
++                         * This frame signals a request to convert this session
++                         * to a TCP proxy session.
++                         */
++                        if (!self.avail(3 * SIZE_U32)) {
++                                /*
++                                 * Wait for the entire frame to arrive.
++                                 */
++                                break;
++                        }
++
++                        ipaddr = self.readIPv4(1);
++                        port = self.readU32(2);
++
++                        log.info('backend TCP connection: ' +
++                            'remote peer %s:%d', ipaddr, port);
++
++                        /*
++                         * Send acknowledgement to the balancer that this is
++                         * now a proxied TCP stream.
++                         */
++                        out = new Buffer(SIZE_U32);
++                        out.writeUInt32LE(FRAME_TYPE_INBOUND_TCP_OK, 0);
++                        sock.write(out);
++
++                        sock.on('timeout', function () {
++                                self.emit('timeout');
++                        });
++                        sock.on('error', function (err) {
++                                self.emit('err', err);
++                        });
++
++                        /*
++                         * Dress this Transform up as if it were a regular TCP
++                         * connection from a DNS client.
++                         */
++                        var tcp = Object.create(self);
++
++                        tcp.remoteAddress = ipaddr;
++                        tcp.remotePort = port;
++                        tcp.setTimeout = sock.setTimeout.bind(sock);
++                        tcp.end = sock.end.bind(sock);
++                        tcp.destroy = sock.destroy.bind(sock);
++                        tcp.write = sock.write.bind(sock);
++
++                        self.bal_tcp = tcp;
++                        self.emit('inbound_tcp', tcp);
++
++                        /*
++                         * Push any remaining data after the frame header into
++                         * the emulated TCP stream.
++                         */
++                        self.discard(3 * SIZE_U32);
++                        self.push(self.bal_accum);
++                        self.bal_accum = null;
++
++                        setImmediate(done);
++                        return;
++                }
++
++                if (!self.bal_hello) {
++                        log.warn('frame type %d before HELLO', frame_type);
++                        sock.destroy();
++                        return;
++                }
++
++                if (frame_type === FRAME_TYPE_CLIENT_HEARTBEAT) {
++                        self.discard(SIZE_U32);
++
++                        /*
++                         * The balancer expects a prompt reply for each
++                         * heartbeat frame.
++                         */
++                        out = new Buffer(SIZE_U32);
++                        out.writeUInt32LE(FRAME_TYPE_SERVER_HEARTBEAT, 0);
++                        sock.write(out);
++                        continue;
++                }
++
++                /*
++                 * All other frame types have been processed already.  At this
++                 * point, the frame _must_ be an inbound UDP packet.
++                 */
++                if (frame_type !== FRAME_TYPE_INBOUND_UDP) {
++                        log.warn('frame type %d invalid', frame_type);
++                        sock.destroy();
++                        return;
++                }
++
++                var headerlen = 4 * SIZE_U32;
++                if (!self.avail(headerlen)) {
++                        /*
++                         * The complete header has not yet arrived.
++                         */
++                        break;
++                }
++
++                ipaddr = self.readIPv4(1);
++                port = self.readU32(2);
++                var datalen = self.readU32(3);
++
++                if (!self.avail(headerlen + datalen)) {
++                        /*
++                         * Entire frame has not yet arrived.
++                         */
++                        break;
++                }
++
++                log.trace('balancer packet: %s:%d (len %d)', ipaddr, port,
++                    datalen);
++
++                var rinfo = { address: ipaddr, port: port };
++
++                self.emit('inbound_udp', rinfo,
++                    self.bal_accum.slice(headerlen, headerlen + datalen),
++                    function reply(buf, from, len, sendport, addr, cb) {
++                        assert.equal(from, 0);
++                        assert.equal(len, buf.length);
++
++                        var hdr = new Buffer(4 * SIZE_U32);
++                        hdr.writeUInt32LE(FRAME_TYPE_OUTBOUND_UDP, 0);
++
++                        var octs = addr.split('.');
++                        hdr.writeUInt8(octs[3], 1 * SIZE_U32 + 0);
++                        hdr.writeUInt8(octs[2], 1 * SIZE_U32 + 1);
++                        hdr.writeUInt8(octs[1], 1 * SIZE_U32 + 2);
++                        hdr.writeUInt8(octs[0], 1 * SIZE_U32 + 3);
++
++                        hdr.writeUInt32LE(sendport, 2 * SIZE_U32);
++                        hdr.writeUInt32LE(len, 3 * SIZE_U32);
++
++                        sock.write(hdr);
++                        sock.write(buf);
++
++                        setImmediate(cb);
++                });
++
++                self.discard(headerlen + datalen);
++        }
++
++        setImmediate(done);
++};
++
++
++function wrapBalancerConnection(opts) {
++        var log = opts.log;
++        var sock = opts.sock;
++
++        var t = new BalancerTransform({ log: log, sock: sock });
++
++        sock.pipe(t);
++
++        sock.on('end', function () {
++                log.warn('balancer ended connection');
++        });
++        sock.on('error', function (err) {
++                log.warn(err, 'error on balancer connection');
++                sock.destroy();
++        });
++        sock.on('close', function () {
++                log.trace('balancer socket closed');
++        });
++
++        return (t);
++}
++
++module.exports = {
++        wrapBalancerConnection: wrapBalancerConnection
++};
+diff --git a/lib/server.js b/lib/server.js
+index e22e1a8..b98563c 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (c) 2015 Trevor Orsztynowicz
+- * Copyright (c) 2015 Joyent, Inc
++ * Copyright (c) 2018, Joyent, Inc
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a copy
+  * of this software and associated documentation files (the "Software"), to deal
+@@ -26,8 +26,10 @@ var net = require('net');
+ var EventEmitter = require('events').EventEmitter;
+ var util = require('util');
+ var crypto = require('crypto');
++var vasync = require('vasync');
+ 
+ var protocol = require('./protocol');
++var balancer = require('./balancer');
+ var Query = require('./query');
+ var DnsError = require('./errors');
+ 
+@@ -57,27 +59,122 @@ function Server(options) {
+         this._timeout = options.timeout;
+         if (this._timeout === undefined || this._timeout === null)
+                 this._timeout = 5000;
++        this._closing = false;
++        this._closed = false;
++        this._closeq = null;
+ }
+ util.inherits(Server, EventEmitter);
+ 
+ 
+ Server.prototype.close = function close(cb) {
+         var self = this;
+-        this._socket.once('close', function () {
+-                delete (self._socket);
+-                if (self._server === undefined && typeof (cb) === 'function')
+-                        cb();
++
++        if (self._closed) {
++                /*
++                 * The server is already closed.
++                 */
++                if (cb) {
++                        setImmediate(cb);
++                }
++                return;
++        }
++
++        if (self._closing) {
++                /*
++                 * The close operation is already in progress.  Join the queue.
++                 */
++                if (cb) {
++                        self._closeq.push(cb);
++                }
++                return;
++        }
++
++        /*
++         * Start the close operation.
++         */
++        self._closing = true;
++        self._closeq = [];
++        if (cb) {
++                self._closeq.push(cb);
++        }
++
++        /*
++         * Close each of the UDP, TCP, and load balancer sockets if they have
++         * been connected.
++         */
++        vasync.forEachPipeline({ inputs: [ '_socket', '_server', '_balancer' ],
++            func: function (prop, next) {
++                if (!self[prop]) {
++                        setImmediate(next);
++                        return;
++                }
++
++                self[prop].on('close', function () {
++                        delete (self[prop]);
++                        next();
++                });
++                self[prop].close();
++
++        }}, function () {
++                self._closed = true;
++                self._closeq.forEach(function (qcb) {
++                        qcb();
++                });
++                self._closeq = null;
++        });
++};
++
++/*
++ * Listen on "path", a local UNIX socket path.  Note that this routine will
++ * generally fail if called with a socket path which already exists; the
++ * consumer is responsible for unlinking a stale socket if required.
++ *
++ * The socket listens for requests from the "mname-balancer" load balancer,
++ * which will pass encapsulated TCP and UDP connections from clients with a
++ * custom protocol.  Outbound responses are similarly encapsulated and passed
++ * back through the load balancer to the remote peer.  More detail on the
++ * protocol appears in "lib/balancer.js".
++ */
++Server.prototype.listenBalancer = function listenBalancer(opts, callback) {
++        assert.object(opts, 'options');
++        assert.string(opts.path, 'path');
++        assert.optionalFunc(callback, 'callback');
++
++        /*
++         * Create a fake TCP listen socket through which we will emit TCP
++         * connections forwarded from the balancer.
++         */
++        var tcpEmul = new EventEmitter();
++        this.listenTcpCommon({ server: tcpEmul, isBalancer: true });
++
++        var self = this;
++        assert.ok(!this._closing, 'listen after close()');
++        assert.strictEqual(this._balancer, undefined,
++            'listenBalancer can only be called once');
++        this._balancer = net.createServer({
++                allowHalfOpen: true
++        });
++        this._balancer.listen({ path: opts.path }, callback);
++        this._balancer.on('error', function (err) {
++                self.emit('error', err);
+         });
+-        if (this._server) {
+-                this._server.once('close', function () {
+-                        delete (self._server);
+-                        if (self._socket === undefined &&
+-                            typeof (cb) === 'function')
+-                                cb();
++        this._balancer.on('connection', function (sock) {
++                var log = self._log.child({
++                        from: 'balancer'
+                 });
+-                this._server.close();
+-        }
+-        this._socket.close();
++                log.trace('accepted balancer connection');
++
++                var t = balancer.wrapBalancerConnection({ log: log,
++                    sock: sock, tcpEmul: tcpEmul });
++
++                t.on('inbound_tcp', function (tcp) {
++                        tcpEmul.emit('connection', tcp);
++                });
++
++                t.on('inbound_udp', function (rinfo, buffer, reply) {
++                        self.onUdpMessage(buffer, rinfo, reply);
++                });
++        });
+ };
+ 
+ Server.prototype.listenTcp = function listenTcp(opts, callback) {
+@@ -89,20 +186,33 @@ Server.prototype.listenTcp = function listenTcp(opts, callback) {
+         assert.optionalFunc(callback, 'callback');
+ 
+         var self = this;
++
++        assert.ok(!this._closing, 'listen after close()');
+         assert.strictEqual(this._server, undefined,
+             'listenTcp can only be called once');
+         this._server = net.createServer({
+                 allowHalfOpen: true
+         });
+-        this._server.listen(opts.port, opts.address, callback);
+-        this._server.on('close', function onSocketClose() {
+-                self.emit('close');
+-        });
++
++        this.listenTcpCommon({ server: this._server, isBalancer: false });
++
+         this._server.on('error', function (err) {
+                 self.emit('error', err);
+         });
+-        this._server.on('connection', function (sock) {
++
++        this._server.listen(opts.port, opts.address, callback);
++};
++
++Server.prototype.listenTcpCommon = function listenTcpCommon(opts) {
++        assert.object(opts, 'options');
++        assert.object(opts.server, 'server');
++        assert.bool(opts.isBalancer, 'isBalancer');
++
++        var self = this;
++
++        opts.server.on('connection', function (sock) {
+                 var log = self._log.child({
++                        balancer: opts.isBalancer ? true : undefined,
+                         from: sprintf('tcp/%s:%d', sock.remoteAddress,
+                             sock.remotePort)
+                 });
+@@ -140,7 +250,7 @@ Server.prototype.listenTcp = function listenTcp(opts, callback) {
+                         sock.destroy();
+                         qbuf = undefined;
+                 });
+-                sock.on('readable', function (data) {
++                sock.on('readable', function () {
+                         var b, bs = [qbuf];
+                         while ((b = sock.read()) !== null)
+                                 bs.push(b);
+@@ -249,9 +359,87 @@ Server.prototype.listenTcp = function listenTcp(opts, callback) {
+                         qbuf = undefined;
+                 });
+         });
+-        this._server.on('close', function () {
+-                self.emit('close');
++};
++
++Server.prototype.onUdpMessage = function onUdpMessage(buffer, rinfo, reply) {
++        var self = this;
++
++        var query;
++
++        var qopts = {
++                family: 'udp',
++                address: rinfo.address,
++                port: rinfo.port,
++                data: buffer
++        };
++
++        var log = self._log.child({
++                from: sprintf('udp/%s:%d', rinfo.address, rinfo.port)
+         });
++
++        try {
++                query = Query.parse(qopts);
++                /*
++                 * Note that it's important we call the
++                 * query.operation() function under the try{}
++                 * block here (it can throw).
++                 */
++                log = log.child({
++                        qId: query.id,
++                        qName: query.name(),
++                        qType: query.type(),
++                        qOp: query.operation()
++                });
++                query._log = log;
++        } catch (e) {
++                if (EventEmitter.listenerCount(self, 'clientError') <= 0) {
++                        log.warn(e, 'query failed to parse');
++                } else {
++                        var err = new ProtocolError('invalid DNS datagram');
++                        err.client = {
++                                address: rinfo.address,
++                                port: rinfo.port
++                        };
++                        err.innerError = e;
++                        self.emit('clientError', err);
++                }
++                return;
++        }
++
++        if (query === undefined || query === null) {
++                return;
++        }
++
++        if (query.operation() === 'notify') {
++                var n = self._notifies[query.id];
++                if (n !== undefined) {
++                        clearTimeout(n._timerRef);
++                        delete n._timerRef;
++                        query.response.header.flags = Object.create(
++                            query.query.header.flags);
++                        n.emit('response', query);
++                        delete self._notifies[query.id];
++                        return;
++                }
++        }
++
++        query.respond = query.send = function respond() {
++                var opts = {};
++
++                if (reply) {
++                        opts.balancer = { send: reply };
++                }
++
++                self.send(query, opts);
++        };
++
++        query.end = function end() {
++                log.trace('end() called, destroying');
++                self.emit('after', query);
++                delete query.src;
++        };
++
++        self.emit('query', query, query.end);
+ };
+ 
+ Server.prototype.listenUdp = function listenUdp(opts, callback) {
+@@ -266,6 +454,7 @@ Server.prototype.listenUdp = function listenUdp(opts, callback) {
+         assert.optionalFunc(callback, 'callback');
+ 
+         var self = this;
++        assert.ok(!this._closing, 'listen after close()');
+         assert.strictEqual(this._socket, null,
+             'listen can only be called once');
+ 
+@@ -275,9 +464,6 @@ Server.prototype.listenUdp = function listenUdp(opts, callback) {
+                 if (typeof (callback) === 'function')
+                         process.nextTick(callback);
+         });
+-        this._socket.on('close', function onSocketClose() {
+-                self.emit('close');
+-        });
+         this._socket.on('error', function onSocketError(err) {
+                 if (self._socket.bound || opts.family === 'udp4') {
+                         self.emit('error', err);
+@@ -297,78 +483,7 @@ Server.prototype.listenUdp = function listenUdp(opts, callback) {
+                 }
+         });
+         this._socket.on('message', function (buffer, rinfo) {
+-                var query;
+-
+-                var qopts = {
+-                        family: 'udp',
+-                        address: rinfo.address,
+-                        port: rinfo.port,
+-                        data: buffer
+-                };
+-
+-                var log = self._log.child({
+-                        from: sprintf('udp/%s:%d', rinfo.address, rinfo.port)
+-                });
+-
+-                try {
+-                        query = Query.parse(qopts);
+-                        /*
+-                         * Note that it's important we call the
+-                         * query.operation() function under the try{}
+-                         * block here (it can throw).
+-                         */
+-                        log = log.child({
+-                                qId: query.id,
+-                                qName: query.name(),
+-                                qType: query.type(),
+-                                qOp: query.operation()
+-                        });
+-                        query._log = log;
+-                } catch (e) {
+-                        if (EventEmitter.listenerCount(self, 'clientError')
+-                            <= 0) {
+-                                log.warn(e, 'query failed to parse');
+-                        } else {
+-                                var err = new ProtocolError(
+-                                    'invalid DNS datagram');
+-                                err.client = {
+-                                        address: rinfo.address,
+-                                        port: rinfo.port
+-                                };
+-                                err.innerError = e;
+-                                self.emit('clientError', err);
+-                        }
+-                        return;
+-                }
+-
+-                if (query === undefined || query === null) {
+-                        return;
+-                }
+-
+-                if (query.operation() === 'notify') {
+-                        var n = self._notifies[query.id];
+-                        if (n !== undefined) {
+-                                clearTimeout(n._timerRef);
+-                                delete n._timerRef;
+-                                query.response.header.flags = Object.create(
+-                                    query.query.header.flags);
+-                                n.emit('response', query);
+-                                delete self._notifies[query.id];
+-                                return;
+-                        }
+-                }
+-
+-                query.respond = query.send = function respond() {
+-                        self.send(query);
+-                };
+-
+-                query.end = function end() {
+-                        log.trace('end() called, destroying');
+-                        self.emit('after', query);
+-                        delete query.src;
+-                };
+-
+-                self.emit('query', query, query.end);
++                self.onUdpMessage(buffer, rinfo, null);
+         });
+         this._socket.bind(opts.port, opts.address, function () {
+                 self._socket.bound = true;
+@@ -389,7 +504,7 @@ Server.prototype.listen = function listen(port, address, callback) {
+ };
+ 
+ 
+-Server.prototype.send = function send(res) {
++Server.prototype.send = function send(res, opts) {
+         assert.object(res, 'a query object');
+ 
+         assert.func(res.encode, 'a query object with .encode');
+@@ -410,46 +525,51 @@ Server.prototype.send = function send(res) {
+         var len = buf.length;
+ 
+         switch (family) {
+-                case 'udp':
+-                        assert.number(res.src.port);
+-
+-                        var addr = res.src.address;
+-                        var port = res.src.port;
+-
+-                        log.trace({
+-                                len: len
+-                        }, 'send: writing DNS message to socket');
+-
+-                        this._socket.send(buf, 0, len, port, addr,
+-                            function (err, bytes) {
+-                                if (err) {
+-                                        log.warn(err,
+-                                            'send: unable to send response');
+-                                        self.emit('error',
+-                                            new ExceptionError(err.message));
+-                                }
+-                        });
+-                        break;
++        case 'udp':
++                assert.number(res.src.port);
+ 
+-                case 'tcp':
+-                        var sock = res.src.socket;
+-                        if (!sock) {
+-                                log.debug('send: connection already closed, ' +
+-                                    ' dropping data');
+-                                break;
+-                        }
++                var addr = res.src.address;
++                var port = res.src.port;
+ 
+-                        log.trace({len: len},
+-                            'send: writing DNS message to TCP socket');
+-                        var lenbuf = new Buffer(2);
+-                        lenbuf.writeUInt16BE(buf.length, 0);
+-                        sock.write(Buffer.concat([lenbuf, buf]));
++                var type = 'socket';
++                var s = this._socket;
++                if (opts && opts.balancer) {
++                        s = opts.balancer;
++                        type = 'balancer';
++                }
++
++                log.trace({
++                        len: len
++                }, 'send: writing DNS message to %s', type);
+ 
+-                        res.reset();
++                s.send(buf, 0, len, port, addr, function (err, bytes) {
++                        if (err) {
++                                log.warn(err, 'send: unable to send response');
++                                self.emit('error',
++                                    new ExceptionError(err.message));
++                        }
++                });
++                break;
++
++        case 'tcp':
++                var sock = res.src.socket;
++                if (!sock) {
++                        log.debug('send: connection already closed, ' +
++                            ' dropping data');
+                         break;
++                }
++
++                log.trace({len: len},
++                    'send: writing DNS message to TCP socket');
++                var lenbuf = new Buffer(2);
++                lenbuf.writeUInt16BE(buf.length, 0);
++                sock.write(Buffer.concat([lenbuf, buf]));
++
++                res.reset();
++                break;
+ 
+-                default:
+-                        throw new Error('Unknown protocol family ' + family);
++        default:
++                throw new Error('Unknown protocol family ' + family);
+         }
+ };
+ 
+diff --git a/package.json b/package.json
+index 46f6721..290072a 100644
+--- a/package.json
++++ b/package.json
+@@ -1,13 +1,14 @@
+ {
+   "name": "mname",
+   "description": "DNS server library for node.js",
+-  "version": "1.3.5",
++  "version": "1.4.0",
+   "author": "arekinath <alex@cooperi.net>",
+   "contributors": [
+     "Mark Cavage",
+     "Alex Wilson",
+     "Lorenz Brun",
+-    "Trevor Orsztynowicz"
++    "Trevor Orsztynowicz",
++    "Joshua M. Clulow"
+   ],
+   "repository": {
+     "type": "git",
+@@ -20,7 +21,8 @@
+   "dependencies": {
+     "assert-plus": "^1.0.0",
+     "bunyan": "^1.5.1",
+-    "ipaddr.js": "^1.0.0"
++    "ipaddr.js": "^1.0.0",
++    "vasync": "^2.2.0"
+   },
+   "devDependencies": {
+     "nodeunit": "0.9.1"

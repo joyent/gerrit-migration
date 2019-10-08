@@ -1,0 +1,914 @@
+commit 98efd03e819b61cfb83909cdbc73b3f4436373d9 (refs/changes/00/1200/4)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2017-01-05T10:32:35-08:00 (2 years, 9 months ago)
+    
+    ZAPI-757 VMAPI should dump core when an uncaught error is thrown
+
+diff --git a/lib/apis/moray.js b/lib/apis/moray.js
+index 14b2da7..81c54bc 100644
+--- a/lib/apis/moray.js
++++ b/lib/apis/moray.js
+@@ -1033,4 +1033,10 @@ Moray.prototype.delVmRoleTags = function (uuid, cb) {
+     });
+ };
+ 
++Moray.prototype.close = function close() {
++    if (this.connection) {
++        this.connection.close();
++    }
++};
++
+ module.exports = Moray;
+diff --git a/lib/apis/wfapi.js b/lib/apis/wfapi.js
+index 3399d90..d251ec3 100644
+--- a/lib/apis/wfapi.js
++++ b/lib/apis/wfapi.js
+@@ -5,18 +5,18 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+ /*
+  * This contains the functions for talking to the workflow API.
+  */
+ 
+-
++var assert = require('assert-plus');
++var async = require('async');
+ var sprintf = require('sprintf').sprintf;
+ var uuid = require('libuuid');
+ var WfClient = require('wf-client');
+-var async = require('async');
+ 
+ var common = require('./../common');
+ var clone = common.clone;
+@@ -37,6 +37,7 @@ function Wfapi(options) {
+ 
+     this.client = new WfClient(options);
+     this.connected = false;
++    this.url = options.url;
+ }
+ 
+ 
+@@ -44,7 +45,7 @@ function Wfapi(options) {
+ /*
+  * Wait until wfapi is online before proceeding to create workflows
+  */
+-Wfapi.prototype.connect = function () {
++Wfapi.prototype.connect = function connect() {
+     var self = this;
+     self.log.debug('Loading the WFAPI workflows...');
+ 
+@@ -62,8 +63,9 @@ Wfapi.prototype.connect = function () {
+                     if (error) {
+                         self.log.error(error, 'Error initializing workflows');
+                         init();
++                    } else {
++                        self.log.info('All workflows have been loaded');
+                     }
+-                    self.log.info('All workflows have been loaded');
+                 });
+             });
+     }
+diff --git a/lib/endpoints/vms.js b/lib/endpoints/vms.js
+index f713507..63fe178 100644
+--- a/lib/endpoints/vms.js
++++ b/lib/endpoints/vms.js
+@@ -351,7 +351,7 @@ function getVm(req, res, next) {
+ 
+ function handleUpdateVMResponse(req, res, next, juuid) {
+     // Allow clients to know the location of WFAPI
+-    res.header('workflow-api', req.app.config.wfapi.url);
++    res.header('workflow-api', req.app.wfapi.url);
+ 
+     var sync = req.params.sync;
+     if (sync) {
+@@ -786,7 +786,7 @@ function deleteVm(req, res, next) {
+     // It's faster, and uses far less resources of the overall system.
+     if (req.vm.server_uuid === undefined || req.vm.server_uuid === null) {
+         _destroyVm(req.vm, {
+-            publisher: req.app.publisher,
++            publisher: req.app.changefeedPublisher,
+             moray: req.app.moray
+         }, function (err, destroyedVm) {
+             if (err) {
+@@ -806,7 +806,7 @@ function deleteVm(req, res, next) {
+ 
+                 if (serverNotFoundError) {
+                     _destroyVm(req.vm, {
+-                        publisher: req.app.publisher,
++                        publisher: req.app.changefeedPublisher,
+                         moray: req.app.moray
+                     }, function (destroyErr, destroyedVm) {
+                         if (destroyErr) {
+@@ -903,7 +903,7 @@ function createVm(req, res, next) {
+             return next(err);
+         }
+ 
+-        common.setDefaultValues(req.params, {config: req._config});
++        common.setDefaultValues(req.params, {config: req.app.options});
+ 
+         if (sync && ['true', 'false'].indexOf(sync) === -1) {
+             var error = [ errors.invalidParamErr('sync') ];
+@@ -1149,7 +1149,7 @@ function putVms(req, res, next) {
+             },
+             function _pub(diffs, cb2) {
+                 if (diffs && diffs.length != 0) {
+-                    var publisher = req.app.publisher;
++                    var publisher = req.app.changefeedPublisher;
+                     common.publishChange(publisher, VM, diffs, uuid, cb2);
+                 } else {
+                     cb2(null);
+@@ -1186,11 +1186,11 @@ function putVm(req, res, next) {
+ 
+     // Parse whatever is needed before putting a raw object from vm-agent
+     var vm = common.translateVm(req.params, false);
+-    var publisher = req.app.publisher;
++    var publisher = req.app.changefeedPublisher;
+ 
+     if (vm.state === 'destroyed') {
+         _destroyVm(vm, {
+-            publisher: req.app.publisher,
++            publisher: req.app.changefeedPublisher,
+             moray: req.app.moray
+         }, function vmDestroyed(err, destroyedVm) {
+             if (err) {
+diff --git a/lib/vmapi.js b/lib/vmapi.js
+index 6cc72d9..079921b 100644
+--- a/lib/vmapi.js
++++ b/lib/vmapi.js
+@@ -12,116 +12,91 @@
+  * Main entry-point for the VMs API.
+  */
+ 
+-var restify = require('restify');
+-var Logger = require('bunyan');
+-var util = require('util');
++
++
+ var assert = require('assert-plus');
+ var async = require('async');
+-var trace_event = require('trace-event');
++var bunyan = require('bunyan');
+ var changefeed = require('changefeed');
+-
+ var EffluentLogger = require('effluent-logger');
++var EventEmitter = require('events').EventEmitter;
++var once = require('once');
++var restify = require('restify');
++var trace_event = require('trace-event');
++var util = require('util');
+ 
+ var curlUserAgent = require('./restify-plugins/curl-user-agent');
+ var interceptors = require('./interceptors');
+-
+ var jobs = require('./endpoints/jobs');
+ var metadata = require('./endpoints/metadata');
+ var ping = require('./endpoints/ping');
+ var roleTags = require('./endpoints/role-tags');
+ var statuses = require('./endpoints/statuses');
+ var vms = require('./endpoints/vms');
+-
+-var CNAPI = require('./apis/cnapi');
+-var IMGAPI = require('./apis/imgapi');
+-var MORAY = require('./apis/moray');
+-var NAPI = require('./apis/napi');
+-var PAPI = require('./apis/papi');
+-var WFAPI = require('./apis/wfapi');
+-
+ var validations = require('./common/validation');
+ 
+-var EventEmitter = require('events').EventEmitter;
+-
+ var os = require('os');
+ var crypto = require('crypto');
+ var http = require('http');
+ var https = require('https');
+ 
+ var request_seq_id = 0;
+-
++var API_SERVER_DEFAULT_PORT = 80;
+ 
+ /*
+  * VMAPI constructor
+  */
+ function VMAPI(options) {
+-    this.validateConfig(options);
+-    this.config = options;
+-
+     EventEmitter.call(this);
+ 
+-    http.globalAgent.maxSockets = this.config.maxSockets || 100;
+-    https.globalAgent.maxSockets = this.config.maxSockets || 100;
++    assert.object(options, 'options');
++    assert.optionalObject(options.log, 'options.log');
+ 
+-    validations.init(options);
++    assert.optionalObject(options.apiClients, 'options.apiClients');
++    if (options.apiClients) {
++        assert.optionalObject(options.apiClients.wfapi,
++            'options.apiClients.wfapi');
++        this.wfapi = options.apiClients.wfapi;
+ 
+-    this._initApis();
+-}
++        assert.optionalObject(options.apiClients.cnapi,
++            'options.apiClients.cnapi');
++        this.cnapi = options.apiClients.cnapi;
+ 
+-util.inherits(VMAPI, EventEmitter);
++        assert.optionalObject(options.apiClients.imgapi,
++            'options.apiClients.imgapi');
++        this.imgapi = options.apiClients.imgapi;
+ 
++        assert.optionalObject(options.apiClients.napi,
++            'options.apiClients.napi');
++        this.napi = options.apiClients.napi;
+ 
++        assert.optionalObject(options.apiClients.papi,
++            'options.apiClients.papi');
++        this.papi = options.apiClients.papi;
++    }
+ 
+-/*
+- * Validates that the minimum configuration values are present
+- */
+-VMAPI.prototype.validateConfig = function (options) {
+-    assert.object(options, 'VMAPI configuration');
+-    assert.object(options.api, 'VMAPI config.api');
+-
+-    // WFAPI
+-    assert.object(options.wfapi, 'VMAPI config.wfapi');
+-    assert.string(options.wfapi.url, 'VMAPI config.wfapi.url');
+-    assert.arrayOfString(options.wfapi.workflows,
+-        'VMAPI config.wfapi.workflows');
+-
+-    // CNAPI
+-    assert.object(options.cnapi, 'VMAPI config.cnapi');
+-    assert.string(options.cnapi.url, 'VMAPI config.cnapi.url');
+-
+-    // IMGAPI
+-    assert.object(options.imgapi, 'VMAPI config.imgapi');
+-    assert.string(options.imgapi.url, 'VMAPI config.imgapi.url');
+-
+-    // NAPI
+-    assert.object(options.napi, 'VMAPI config.napi');
+-    assert.string(options.napi.url, 'VMAPI config.napi.url');
+-
+-    // PAPI
+-    assert.object(options.papi, 'VMAPI config.papi');
+-    assert.string(options.papi.url, 'VMAPI config.papi.url');
+-
+-    // Moray
+-    assert.object(options.moray, 'Moray config.host');
+-    assert.string(options.moray.host, 'Moray config.moray.host');
+-    assert.finite(options.moray.port, 'Moray config.moray.port');
+-
+-    // Changefeed
+-    assert.object(options.changefeed,
+-        'Changefeed config.changefeed');
+-    assert.object(options.changefeed.moray,
+-        'Changefeed config.changefeed.moray');
+-    assert.string(options.changefeed.moray.bucketName,
+-        'Changefeed config.changefeed.moray.bucketName');
+-    assert.string(options.changefeed.moray.host,
+-        'Changefeed config.changefeed.moray.host');
+-    assert.finite(options.changefeed.moray.port,
+-        'Changefeed config.changefeed.moray.port');
+-    assert.finite(options.changefeed.maxAge,
+-        'Changefeed config.changefeed.maxAge');
+-    assert.arrayOfObject(options.changefeed.resources,
+-        'Changefeed config.Changefeed.resources');
+-};
++    assert.object(options.moray, 'options.moray');
++    this.moray = options.moray;
++
++    assert.optionalObject(options.changefeed, 'options.changefeed');
++
++    if (options.log === undefined) {
++        this.log = bunyan.createLogger({
++            name: 'vmapi',
++            level: 'debug',
++            serializers: restify.bunyan.serializers
++        });
++    } else {
++        this.log = options.log;
++    }
++
++    this.changefeedOptions = options.changefeed;
++
++    validations.init(options);
++    this._initApis(options);
++}
++
++util.inherits(VMAPI, EventEmitter);
+ 
+ function addFluentdHost(log, host) {
+     var evtLogger = new EffluentLogger({
+@@ -152,36 +127,32 @@ function responseIndicatesSuccess(res) {
+ /*
+  * VMAPI API objects initialization code
+  */
+-VMAPI.prototype._initApis = function () {
+-    var config = this.config;
+-    config.api.url = 'http://' + this.serverIp();
++VMAPI.prototype._initApis = function _initApis(options) {
++    assert.object(options, 'options');
+ 
+-    // Init logger
++    var apiVersion = options.version;
+ 
+-    var log = this.log = new Logger({
+-        name: 'vmapi',
+-        level: config.logLevel,
+-        serializers: restify.bunyan.serializers
+-    });
++    var log = this.log;
++    assert.object(log, 'log');
+ 
+     // EXPERIMENTAL
+-    if (config.fluentd_host) {
+-        addFluentdHost(log, config.fluentd_host);
++    if (options.fluentd_host) {
++        addFluentdHost(log, options.fluentd_host);
+     }
+ 
+     // Init VMAPI server
+-
+     this.server = restify.createServer({
+         name: 'VMAPI',
+         log: log.child({ component: 'api' }, true),
+-        version: config.version,
++        version: apiVersion,
+         serverName: 'SmartDataCenter',
+         formatters: {
+             'application/json': formatJSON,
+             'text/plain': formatJSON,
+             'application/octet-stream': formatJSON,
+             'application/x-json-stream': formatJSON,
+-            '*/*': formatJSON }
++            '*/*': formatJSON },
++        handleUncaughtExceptions: false
+     });
+ 
+     // This allows VMAPI to respond to HEAD requests sent by curl with proper
+@@ -226,71 +197,55 @@ VMAPI.prototype._initApis = function () {
+         })(req, res, route, err);
+     });
+ 
+-    this.server.on('uncaughtException', function (req, res, route, error) {
+-        req.log.info({
+-            err: error,
+-            url: req.url,
+-            params: req.params
+-        });
+-
+-        res.send(new restify.InternalError('Internal Server Error'));
+-    });
+-
+-    config.napi.log = log.child({ component: 'napi' }, true);
+-    config.cnapi.log = log.child({ component: 'cnapi' }, true);
+-    config.wfapi.log = log.child({ component: 'wfapi' }, true);
+-    config.moray.log = log.child({ component: 'moray' }, true);
+-    config.changefeed.log = log.child({ component: 'changefeed' }, true);
+-
+-    // Init Moray
+-
+-    this.moray = new MORAY(config.moray);
+-
+-    // Add restify server to changefeed config so that it can add routes
+-    config.changefeed.restifyServer = this.server;
+-
+-    // Init APIs
+-
+-    this.cnapi = new CNAPI(config.cnapi);
+-    this.imgapi = new IMGAPI(config.imgapi);
+-    this.napi = new NAPI(config.napi);
+-    this.papi = new PAPI(config.papi);
+-    this.wfapi = new WFAPI(config.wfapi);
+-
+     // Init Server middleware
+-
+     this.setMiddleware();
+     this.setStaticRoutes();
+     this.setRoutes();
+ };
+ 
++VMAPI.prototype.init = function init(callback) {
++    assert.func(callback, 'callback');
+ 
++    var callbackOnce = once(callback);
++    var changefeedPublisher;
+ 
+-/*
+- * Starts each of its services in order
+- */
+-VMAPI.prototype.init = function () {
+-    var self = this;
++    if (this.changefeedOptions) {
++        /*
++         * Add restify server to changefeed config so that it can
++         * add routes.
++         */
++        this.changefeedOptions.restifyServer = this.server;
+ 
+-    self.moray.connect();
+-    self.wfapi.connect();
++        changefeedPublisher =
++            changefeed.createPublisher(this.changefeedOptions);
+ 
+-    self.publisher = changefeed.createPublisher(self.config.changefeed);
+-    self.publisher.once('moray-ready', function __listen() {
+-        self.listen(function () {
+-            self.publisher.start();
+-            self.emit('ready');
+-        });
+-    });
++        changefeedPublisher.on('moray-ready',
++            function onChangefeedReady() {
++                callbackOnce();
++            });
++
++        changefeedPublisher.start();
++
++        this.changefeedPublisher = changefeedPublisher;
++    } else {
++        callback();
++    }
+ };
+ 
++VMAPI.prototype.close = function close() {
++    if (this.server) {
++        this.server.close();
++    }
+ 
++    if (this.changefeedPublisher) {
++        this.changefeedPublisher.close();
++    }
++};
+ 
+ /*
+  * Sets custom middlewares to use for the API
+  */
+ VMAPI.prototype.setMiddleware = function () {
+-    var self = this;
+     var server = this.server;
+     server.use(function (req, res, next) {
+         res.on('header', function onHeader() {
+@@ -302,7 +257,7 @@ VMAPI.prototype.setMiddleware = function () {
+             res.header('x-response-time', t);
+             res.header('x-server-name', os.hostname());
+         });
+-        req._config = self.config;
++
+         next();
+     });
+ 
+@@ -390,13 +345,34 @@ VMAPI.prototype.serverIp = function () {
+ 
+ 
+ /*
+- * Starts listening on the port given specified by config.api.port. Takes a
+- * callback as an argument. The callback is called with no arguments
++ * Starts listening on the port given by options.port or config.api.port. Takes
++ * options and a callback function as arguments. The callback is called with no
++ * arguments.
+  */
+-VMAPI.prototype.listen = function (callback) {
++VMAPI.prototype.listen = function (options, callback) {
+     var self = this;
++    var bindAddr = '0.0.0.0';
++    var port = API_SERVER_DEFAULT_PORT;
++
++    if (typeof (options) === 'function') {
++        callback = options;
++        options = undefined;
++    }
++
++    if (options === undefined) {
++        options = {};
++    }
++
++    assert.object(options, 'options');
++    assert.optionalNumber(options.port, 'options.port');
++
++    assert.optionalFunc(callback, 'callback');
++
++    if (options && options.port !== undefined) {
++        port = options.port;
++    }
+ 
+-    this.server.listen(this.config.api.port || 80, '0.0.0.0', function () {
++    self.server.listen(port, bindAddr, function () {
+         self.log.info({ url: self.server.url },
+                       '%s listening', self.server.name);
+ 
+diff --git a/package.json b/package.json
+index 942d370..686e158 100644
+--- a/package.json
++++ b/package.json
+@@ -17,7 +17,7 @@
+     "moray": "git+https://github.com/joyent/node-moray.git#fd5781bc25a9bfe2ba82167664639753fb9f0ca5",
+     "nodeunit": "0.9.1",
+     "once": "^1.3.3",
+-    "restify": "4.2.0",
++    "restify": "4.3.0",
+     "sdc-clients": "10.0.3",
+     "sigyan": "0.2.0",
+     "sprintf": "0.1.1",
+diff --git a/server.js b/server.js
+index 4165d10..917e218 100644
+--- a/server.js
++++ b/server.js
+@@ -12,16 +12,29 @@
+  * Main entry-point for the VMs API.
+  */
+ 
+-var path = require('path');
++var assert = require('assert-plus');
+ var fs = require('fs');
++var http = require('http');
++var https = require('https');
++var jsprim = require('jsprim');
++var Logger = require('bunyan');
++var path = require('path');
++var restify = require('restify');
++var sigyan = require('sigyan');
++var vasync = require('vasync');
+ 
+-var VMAPI = require('./lib/vmapi');
+-var configLoader = require('./lib/config-loader');
++var CNAPI = require('./lib/apis/cnapi');
++var IMGAPI = require('./lib/apis/imgapi');
++var MORAY = require('./lib/apis/moray');
++var NAPI = require('./lib/apis/napi');
++var PAPI = require('./lib/apis/papi');
++var vmapi = require('./lib/vmapi');
++var WFAPI = require('./lib/apis/wfapi');
+ 
++var configLoader = require('./lib/config-loader');
+ var VERSION = false;
+ 
+-
+-/**
++/*
+  * Returns the current semver version stored in CloudAPI's package.json.
+  * This is used to set in the API versioning and in the Server header.
+  *
+@@ -36,31 +49,126 @@ function version() {
+     return VERSION;
+ }
+ 
+-var configFilePath = path.join(__dirname, 'config.json');
+-var config = configLoader.loadConfig(configFilePath);
+-config.version = version() || '7.0.0';
+-
+-
+-var vmapi;
+-
+-try {
+-    vmapi = new VMAPI(config);
+-    vmapi.init();
+-} catch (e) {
+-    console.error('Error produced when initializing VMAPI services');
+-    console.error(e.message);
+-    console.error(e.stack);
++/*
++ * Creates instances of objects providing abstractions to various Triton APIs
++ * that are used by VMAPI. It returns an object of the following form:
++ *
++ * {
++ *   cnapi: cnapiClientInstance,
++ *   imgapi: imgapiClientInstance,
++ *   ...
++ * }
++ *
++ * with each property named after these APIs, and each value being set to an
++ * instance of each corresponding abstraction layer for these APIs.
++ */
++function createApiClients(config, parentLog) {
++    assert.object(config, 'config');
++    assert.object(parentLog, 'parentLog');
++
++    assert.object(config.cnapi, 'config.cnapi');
++    var cnapiClientOpts = jsprim.deepCopy(config.cnapi);
++    cnapiClientOpts.log = parentLog.child({ component: 'cnapi' }, true);
++    var cnapiClient = new CNAPI(cnapiClientOpts);
++
++    assert.object(config.imgapi, 'config.imgapi');
++    var imgapiClientOpts = jsprim.deepCopy(config.imgapi);
++    imgapiClientOpts.log = parentLog.child({ component: 'imgapi' }, true);
++    var imgapiClient = new IMGAPI(imgapiClientOpts);
++
++    assert.object(config.napi, 'config.napi');
++    var napiClientOpts = jsprim.deepCopy(config.napi);
++    napiClientOpts.log = parentLog.child({ component: 'napi' }, true);
++    var napiClient = new NAPI(napiClientOpts);
++
++    assert.object(config.papi, 'config.papi');
++    var papiClientOpts = jsprim.deepCopy(config.papi);
++    papiClientOpts.log = parentLog.child({ component: 'papi' }, true);
++    var papiClient = new PAPI(papiClientOpts);
++
++    assert.object(config.wfapi, 'config.wfapi');
++    var wfapiClientOpts = jsprim.deepCopy(config.wfapi);
++    wfapiClientOpts.log = parentLog.child({ component: 'wfapi' }, true);
++    var wfapiClient = new WFAPI(wfapiClientOpts);
++
++    return {
++        cnapi: cnapiClient,
++        imgapi: imgapiClient,
++        napi: napiClient,
++        papi: papiClient,
++        wfapi: wfapiClient
++    };
+ }
+ 
+-vmapi.once('ready', function () {
+-    vmapi.log.info('All services are up');
+-});
+-
+-process.on('uncaughtException', function (err) {
+-    vmapi.log.error(err, 'Uncaught Exception');
+-});
+-
++function startVmapiService() {
++    var configFilePath = path.join(__dirname, 'config.json');
++    var config = configLoader.loadConfig(configFilePath);
++    config.version = version() || '7.0.0';
++
++    var vmapiLog = new Logger({
++        name: 'vmapi',
++        level: config.logLevel,
++        serializers: restify.bunyan.serializers
++    });
++
++    // Increase/decrease loggers levels using SIGUSR2/SIGUSR1:
++    sigyan.add([vmapi.log]);
++
++    http.globalAgent.maxSockets = config.maxSockets || 100;
++    https.globalAgent.maxSockets = config.maxSockets || 100;
++
++    var changefeedOptions = jsprim.deepCopy(config.changefeed);
++    changefeedOptions.log =
++        vmapiLog.child({ component: 'changefeed' }, true);
++
++    var morayApi = new MORAY(config.moray);
++
++    var apiClients = createApiClients(config, vmapiLog);
++
++    vasync.parallel({funcs: [
++        function connectToMoray(done) {
++            morayApi.connect();
++
++            morayApi.on('moray-ready', function onMorayReady() {
++                done();
++            });
++        },
++        function connectToWfApi(done) {
++            apiClients.wfapi.connect();
++            /*
++             * We intentionally don't need and want to wait for the Workflow API
++             * client to be connected before continuing the process of standing
++             * up VMAPI. Individual request handlers will handle the Workflow
++             * API client's connection status appropriately and differently.
++             */
++            done();
++        }
++    ]}, function dependenciesInitDone(err) {
++        if (err) {
++            vmapi.log.error({
++                error: err
++            }, 'failed to initialize VMAPI\'s dependencies');
++
++            morayApi.close();
++        } else {
++            var vmapiService = new vmapi({
++                version: config.version,
++                log: vmapiLog.child({ component: 'http-api' }, true),
++                serverConfig: {
++                    bindPort: config.api.port
++                },
++                apiClients: apiClients,
++                moray: morayApi,
++                changefeed: changefeedOptions,
++                overlay: config.overlay,
++                reserveKvmStorage: config.reserveKvmStorage
++            });
++
++            vmapiService.init(function onVmapiInitialized() {
++                vmapiService.listen();
++            });
++        }
++    });
++}
+ 
+-// Increase/decrease loggers levels using SIGUSR2/SIGUSR1:
+-var sigyan = require('sigyan');
+-sigyan.add([vmapi.log]);
++startVmapiService();
+diff --git a/test/fixtures/vmapi-server-throwing-expected-stderr.txt b/test/fixtures/vmapi-server-throwing-expected-stderr.txt
+new file mode 100644
+index 0000000..84f1533
+--- /dev/null
++++ b/test/fixtures/vmapi-server-throwing-expected-stderr.txt
+@@ -0,0 +1,6 @@
++/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:16
++    throw new Error('boom');
++    ^
++
++Error: boom
++    at Server.throwingRestifyHandler (/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:16:11)
+\ No newline at end of file
+diff --git a/test/fixtures/vmapi-server-with-throwing-handler.js b/test/fixtures/vmapi-server-with-throwing-handler.js
+new file mode 100644
+index 0000000..b168278
+--- /dev/null
++++ b/test/fixtures/vmapi-server-with-throwing-handler.js
+@@ -0,0 +1,91 @@
++var libuuid = require('libuuid');
++var mod_vmapiClient = require('sdc-clients').VMAPI;
++var path = require('path');
++var vasync = require('vasync');
++
++var configLoader = require('../../lib/config-loader');
++var MORAY = require('../../lib/apis/moray');
++var vmapi = require('../../lib/vmapi');
++
++var UNIQUE_ENDPOINT_PATH = '/' + libuuid.create();
++
++var CONFIG_FILE_PATH = path.join(__dirname, '../..', 'config.json');
++var CONFIG = configLoader.loadConfig(CONFIG_FILE_PATH);
++
++function throwingRestifyHandler(req, res, next) {
++    throw new Error('boom');
++}
++
++var morayApi;
++var vmapiService;
++
++var mockedWfapiClient = {
++    connected: true,
++    connect: function mockedWfapiConnect(callback) {
++        callback();
++    }
++};
++
++var vmapiClient;
++
++vasync.pipeline({funcs: [
++    function initMoray(arg, next) {
++        console.log('initializing moray...');
++
++        morayApi = new MORAY(CONFIG.moray);
++        morayApi.connect();
++
++        morayApi.on('moray-ready', function onMorayReady() {
++            console.log('moray initialized!');
++            next();
++        });
++    },
++    function initVmapi(arg, next) {
++        console.log('initializing vmapi...');
++
++        vmapiService = new vmapi({
++            apiClients: {
++                wfapi: mockedWfapiClient
++            },
++            moray: morayApi
++        });
++
++        vmapiService.init(next);
++    },
++    function addThrowingHandler(arg, next) {
++        console.log('adding throwing restify handler...');
++
++        vmapiService.server.get({
++            path: UNIQUE_ENDPOINT_PATH
++        }, throwingRestifyHandler);
++
++        next();
++    },
++    function listenOnVmapiServer(arg, next) {
++        console.log('listening on vmapi server\'s socket...');
++
++        vmapiService.listen({
++            port: 0
++        }, next);
++    }
++]}, function onVmapiServiceReady(initErr) {
++    var vmapiServerAddress = vmapiService.server.address();
++    var vmapiServerUrl = 'http://' + vmapiServerAddress.address +
++        ':' + vmapiServerAddress.port;
++
++    console.log('vmapi service ready!');
++
++    vmapiClient = new mod_vmapiClient({
++        url: vmapiServerUrl
++    });
++
++    console.log('sending GET request to throwing endpoint...');
++
++    vmapiClient.get(UNIQUE_ENDPOINT_PATH, function onGet() {
++        console.log('got response from get request!');
++
++        vmapiClient.close();
++        vmapiService.close();
++        morayApi.close();
++    });
++});
+\ No newline at end of file
+diff --git a/test/vms.delete_non_existing_no_workflow.test.js b/test/vms.delete_non_existing_no_workflow.test.js
+index 0c1e6ae..f0cf9b0 100644
+--- a/test/vms.delete_non_existing_no_workflow.test.js
++++ b/test/vms.delete_non_existing_no_workflow.test.js
+@@ -13,12 +13,12 @@
+ // represent a CN that actually exists, a destroy workflow is not started and
+ // instead the VM's state is set to destroyed immediately.
+ 
+-var libuuid = require('libuuid');
+ var assert = require('assert-plus');
++var libuuid = require('libuuid');
+ 
+ var common = require('./common');
+-var vmTest = require('./lib/vm');
+ var moray = require('../lib/apis/moray');
++var vmTest = require('./lib/vm');
+ 
+ var client;
+ var TEST_VM_UUID = libuuid.create();
+diff --git a/test/vms.exits-on-uncaught.test.js b/test/vms.exits-on-uncaught.test.js
+new file mode 100644
+index 0000000..99a2910
+--- /dev/null
++++ b/test/vms.exits-on-uncaught.test.js
+@@ -0,0 +1,40 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++var child_process = require('child_process');
++var fs = require('fs');
++var path = require('path');
++
++var THROWING_VMAPI_SERVER = path.join(__dirname, 'fixtures',
++    'vmapi-server-with-throwing-handler.js');
++var SERVER_EXPECTED_STDERR = fs.readFileSync(path.join(__dirname, 'fixtures',
++    'vmapi-server-throwing-expected-stderr.txt'));
++
++exports.vmapi_aborts_on_restify_handler_uncaught_exception = function (t) {
++    var child = child_process.spawn(process.execPath, [THROWING_VMAPI_SERVER]);
++    var stderr = '';
++
++    child.on('exit', function onChildExit(exitCode, signal) {
++        t.strictEqual(stderr.indexOf(SERVER_EXPECTED_STDERR), 0,
++            'server\'s stderr output should start with: ' +
++                SERVER_EXPECTED_STDERR);
++        t.strictEqual(exitCode, 1, 'exit code should be 1');
++        t.done();
++    });
++
++    child.stderr.on('data', function onStderr(data) {
++        stderr += data.toString();
++    });
++
++    child.on('error', function onError(childErr) {
++        t.notOk(childErr, 'error event should not be emitted');
++        t.done();
++    });
++};
+\ No newline at end of file
+diff --git a/test/vms.marker.test.js b/test/vms.marker.test.js
+index bbe7bf6..9bc654f 100644
+--- a/test/vms.marker.test.js
++++ b/test/vms.marker.test.js
+@@ -8,18 +8,16 @@
+  * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+-var url = require('url');
+-
+ var assert = require('assert-plus');
+ var async = require('async');
+ var libuuid = require('libuuid');
++var url = require('url');
+ 
+ var common = require('./common');
+-var vmTest = require('./lib/vm');
+-
+ var MORAY = require('../lib/apis/moray');
+ var sortValidation = require('../lib/validation/sort.js');
+ var vmCommon = require('../lib/common/vm-common.js');
++var vmTest = require('./lib/vm');
+ 
+ var client;
+ 

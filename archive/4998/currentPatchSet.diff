@@ -1,0 +1,447 @@
+commit e25b963bc381a444de3f6700adce4c6468a3bd18 (refs/changes/98/4998/1)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2018-10-24T17:40:11-04:00 (12 months ago)
+    
+    OS-7326 vminfod not blocking on initial metadata properly
+
+diff --git a/src/vm/node_modules/VM.js b/src/vm/node_modules/VM.js
+index 30280a8a..e37189f6 100644
+--- a/src/vm/node_modules/VM.js
++++ b/src/vm/node_modules/VM.js
+@@ -884,51 +884,305 @@ function validateImage(image, log, callback)
+     });
+ }
+ 
+-function createConfigDir(zonepath, log, cb) {
+-    var configDir = path.join(zonepath, 'config');
++/*
++ * Clear out any existing config directory for a zone and recreate it with the
++ * enecessary JSON files (set to empty objects).
++ *
++ * Because a dataset is cloned from existing image, it is possible that JSON
++ * files may already exist with 1 or more keys set.  With vminfod, we can't just
++ * delete the JSON files and recreate them, as we need to wait for vminfod to be
++ * aware of any possible changes.
++ *
++ * As an example, imagine that an image has a `tags.json` file set to
++ * `{"foo":1}`.  Vminfod knows about the zone existing when it first sees a
++ * zone sysevent fired for a new zone uuid.  Once this happens, vminfod will
++ * then start up all of the necessary file watchers for that zone, even though
++ * the dataset won't exist yet.  This is ok, because the fswatcher class that
++ * vminfod uses will retry watching files periodically until they exist, or the
++ * zone is deleted.  When we clone the image (which may be done explicitly, or
++ * as a part of `zoneadm install`), vminfod will already know about the VM
++ * existing and be trying to watch the metadata files - because these files
++ * didn't exist before the clone, vminfod will have all of the metadata
++ * properties of the vmobj set to an empty object (`{}`).  Sometime after the
++ * clone is completed, vminfod will realize the files exist, begin to watch them
++ * using event ports, and also read the files to set the initial metadata on the
++ * vmobj.
++ *
++ * In this example, if we just blindly deleted the files and recreated them as
++ * the empty object, we won't know if vminfod has any pending events for the
++ * files to be reread.  If the user had their payload setup with `vmobj.tags =
++ * {foo: 1}` (the same as the image default) we could potentially be waiting for
++ * an event that will never come.  Since we delete and recreate the metadata
++ * files, it's possible that this could happen so fast that by the time vminfod
++ * could react to the delete and recreate events, no effective change has
++ * happened.
++ *
++ * Because of all of this, this function below will need to:
++ *
++ * 1. Check the existing metadata files directly to see what vminfod *should*
++ *    know about the VM.
++ * 2. Load the current vmobj (by starting a vminfod event stream) and checking
++ *    if the metadata files match what vminfod reports.
++ * 3. If the data is different, wait for vminfod to see that the metadata files
++ *    have been modified and move on, otherwise just move on.
++ * 4. Delete all of the metadata files and wait for vminfod to reflect the
++ *    changes (if data was set previously by the image defaults).
++ */
++function createConfigDir(vmobj, log, cb) {
++    assert.object(vmobj, 'vmobj');
++    assert.string(vmobj.zonepath, 'vmobj.zonepath');
++    assert.uuid(vmobj.uuid, 'vmobj.uuid');
++    assert(log, 'log');
++    assert.func(cb, 'cb');
++
++    var configDir = path.join(vmobj.zonepath, 'config');
+     var files = [
+         'tags.json',
+         'metadata.json',
+         'routes.json'
+     ];
++    var existing = {};
++    var vs;
+ 
+-    /*
+-     * Zone images quite often contain the configuration of the zone
+-     * they were made from. We remove the old directory here so that
+-     * we don't accidentally end up using inherited files.
+-     */
+     vasync.pipeline({funcs: [
+         function (_, cb2) {
+-            log.debug('rm -rf %s', configDir);
+-            traceExecFile('/bin/rm', ['-rf', configDir],
+-                {}, log, 'rm-image-config', cb2);
+-        }, function (_, cb2) {
+-            /*jsl:ignore*/
+-            var mode = 0755;
+-            /*jsl:end*/
++            // Create the vminfod event stream and load the latest vmobj.
++            vs = new vminfod.VminfodEventStream({
++                name: sprintf('VM.js createConfigDir (%s)', vmobj.uuid),
++                parseReady: true,
++                log: log
++            });
+ 
+-            /*
+-             * Now that any pre-existing directory is out of the way, create
+-             * one for us to use:
+-             */
+-            log.debug('fs.mkdir(%s)', configDir);
+-            fs.mkdir(configDir, mode, cb2);
++            vs.once('ready', function (ready_ev) {
++                try {
++                    vmobj = vminfodEventGetVM(vmobj.uuid, ready_ev);
++                } catch (e) {
++                    cb2(e);
++                    return;
++                }
++
++                log.debug({vmobj: vmobj}, 'createConfigDir for %s', vmobj.uuid);
++                cb2();
++            });
+         }, function (_, cb2) {
+             /*
+-             * Create skeleton files for the JSON config files.
++             * Check what the metadata should look like on the vmobj by loading
++             * the files manually.
+              */
+             vasync.forEachParallel({
+                 inputs: files,
+-                func: function (f, cb3) {
+-                    f = path.join(configDir, f);
+-                    log.debug('Writing empty metadata file %s', f);
+-                    fs.writeFile(f, '{}\n', cb3);
++                func: function (file, cb3) {
++                    var fullpath = path.join(configDir, file);
++
++                    log.trace({file: fullpath},
++                        'reading existing file %s', file);
++
++                    fs.readFile(fullpath, 'utf8', function (err, data) {
++                        if (err && err.code === 'ENOENT') {
++                            existing[file] = {};
++                            log.trace({file: fullpath},
++                                'file does not exist - ignoring');
++                            cb3();
++                            return;
++                        }
++
++                        if (err) {
++                            log.error({file: fullpath}, 'error reading file');
++                            cb3(err);
++                            return;
++                        }
++
++                        try {
++                            existing[file] = JSON.parse(data);
++                        } catch (e) {
++                            log.error(e, '%s failed to parse JSON', file);
++                            cb3(e);
++                            return;
++                        }
++
++                        cb3();
++                    });
+                 }
+             }, cb2);
++        }, function (_, cb2) {
++            /*
++             * Compare the JSON data read from the filesystem to the data
++             * currently on the vmobj and potentially block until the vmobj
++             * reflects the filesystem data.
++             */
++            var shouldBlock = false;
++
++            var obj = {
++                uuid: vmobj.uuid,
++                vm: {}
++            };
++
++            [
++                {
++                    key: 'customer_metadata',
++                    data: existing['metadata.json'].customer_metadata
++                },
++                {
++                    key: 'internal_metadata',
++                    data: existing['metadata.json'].internal_metadata
++                },
++                {
++                    key: 'tags',
++                    data: existing['tags.json']
++                },
++                {
++                    key: 'routes',
++                    data: existing['routes.json']
++                }
++            ].forEach(function (o) {
++                var key = o.key;
++                var data = o.data;
++
++                obj.vm[key] = data || {};
++
++                /*
++                 * If the vmobj property does not match the data from
++                 * the filesystem we cue blocking on vminfod for it
++                 * to update its records.
++                 */
++                if (!deepEqual(vmobj[key], obj.vm[key])) {
++                    log.debug({
++                        key: key,
++                        from: vmobj[key],
++                        to: obj.vm[key]},
++                        'waiting for vmobj key "%s" to be set to image '
++                        + 'default',
++                        key);
++                    shouldBlock = true;
++                }
++            });
++
++            /*
++             * Skip blocking on vminfod if no metadata has been
++             * modified
++             */
++            if (!shouldBlock) {
++                log.debug('vmobj metadata up-to-date - '
++                    + 'not blocking on vminfod');
++                cb2();
++                return;
++            }
++
++            var opts = {
++                timeout: VMINFOD_TIMEOUT,
++                catchErrors: true
++            };
++
++            vs.watchForEvent(obj, opts, cb2);
++        }, function (_, cb2) {
++            /*
++             * Once here, we know that vminfod has the metadata up-to-date with
++             * what the files have on the filesystem.  We now delete the
++             * directory and recreate it with placeholder files (empty objects)
++             * and block on vminfod to be aware of this change.
++             */
++
++            var cancelFn = noop;
++
++            vasync.parallel({funcs: [
++                function (cb3) {
++                    var shouldBlock = false;
++
++                    var obj = {
++                        uuid: vmobj.uuid,
++                        vm: {
++                            customer_metadata: {},
++                            internal_metadata: {},
++                            tags: {},
++                            routes: {}
++                        }
++                    };
++
++                    var vs_opts = {
++                        timeout: VMINFOD_TIMEOUT,
++                        startFresh: true,
++                        catchErrors: true
++                    };
++
++                    [
++                        'customer_metadata',
++                        'internal_metadata',
++                        'tags',
++                        'routes'
++                    ].forEach(function (key) {
++                        obj.vm[key] = {};
++
++                        if (vmobj.hasOwnProperty(key)
++                            && Object.keys(vmobj[key]).length > 0) {
++
++                            log.debug('metadata key "%" will be cleared by '
++                                + 'createConfigDir - blocking on vminfod',
++                                key);
++                            shouldBlock = true;
++                        }
++                    });
++
++                    /*
++                     * Skip blocking on vminfod if no metadata has been
++                     * modified.
++                     */
++                    if (!shouldBlock) {
++                        log.debug('no metadata will be removed by '
++                            + 'createConfigDir - not blocking on vminfod');
++                        cb3();
++                        return;
++                    }
++
++                    cancelFn = vs.watchForEvent(obj, vs_opts, cb3);
++                }, function (cb3) {
++                    vasync.pipeline({funcs: [
++                        function (__, cb4) {
++                            // Remove the existing directory
++                            log.debug('rm -rf %s', configDir);
++
++                            traceExecFile('/bin/rm', ['-rf', configDir],
++                                {}, log, 'rm-image-config', cb4);
++                        }, function (__, cb4) {
++                            // Recreate the directory
++
++                            /*jsl:ignore*/
++                            var mode = 0755;
++                            /*jsl:end*/
++
++                            log.debug('fs.mkdir(%s)', configDir);
++                            fs.mkdir(configDir, mode, cb4);
++                        }, function (__, cb4) {
++                            // Create skeleton files for the JSON config files.
++                            vasync.forEachParallel({
++                                inputs: files,
++                                func: function (f, cb5) {
++                                    f = path.join(configDir, f);
++                                    log.debug('Writing empty file %s', f);
++                                    fs.writeFile(f, '{}\n', cb5);
++                                }
++                            }, cb4);
++                        }
++                    ]}, function (err) {
++                        if (err) {
++                            log.error(err, 'error recreating %s', configDir);
++                            cancelFn();
++                            cb3(err);
++                            return;
++                        }
++
++                        cb3();
++                    });
++                }
++            ]}, cb2);
+         }
+     ]}, function (err) {
++        if (vs) {
++            vs.stop();
++            vs = null;
++        }
++
+         if (err) {
+-            log.error({err: err}, 'createConfigDir %s failed', zonepath);
++            log.error({err: err}, 'createConfigDir %s failed', vmobj.zonepath);
+             cb(err);
+             return;
+         }
+@@ -8184,70 +8438,13 @@ function installZone(payload, log, callback)
+                 return;
+             }
+ 
+-            var cancelFn;
+-
+-            vasync.parallel({funcs: [
+-                function (cb2) {
+-                    var shouldBlock = false;
+-
+-                    var obj = {
+-                        uuid: payload.uuid,
+-                        vm: {}
+-                    };
+-
+-                    /*
+-                     * Check the following keys for modifications.  If any key
+-                     * has been modified then shouldBlock will be set to true,
+-                     * and we will block on vminfod below for the changes to be
+-                     * reflected.
+-                     */
+-                    [
+-                        'customer_metadata',
+-                        'internal_metadata',
+-                        'routes',
+-                        'tags'
+-                    ].forEach(function (key) {
+-                        obj.vm[key] = {};
+-
+-                        if (vmobj.hasOwnProperty(key)
+-                            && Object.keys(vmobj[key]).length > 1) {
+-
+-                            shouldBlock = true;
+-                        }
+-                    });
+-
+-                    /*
+-                     * Skip blocking on vminfod if no metadata has been
+-                     * modified
+-                     */
+-                    if (!shouldBlock) {
+-                        cb2();
+-                        return;
+-                    }
+-
+-                    var opts = {
+-                        timeout: VMINFOD_TIMEOUT,
+-                        catchErrors: true,
+-                        startFresh: true
+-                    };
+-
+-
+-                    cancelFn = vs.watchForEvent(obj, opts, cb2);
+-                }, function (cb2) {
+-                    createConfigDir(vmobj.zonepath, log, function (err) {
+-                        if (err) {
+-                            if (cancelFn) {
+-                                cancelFn();
+-                            }
+-                            cb2(err);
+-                            return;
+-                        }
+-
+-                        cb2();
+-                    });
++            createConfigDir(vmobj, log, function (err) {
++                if (err) {
++                    cb(err);
++                    return;
+                 }
+-            ]}, function (err) {
+-                cb(err);
++
++                cb();
+             });
+         }, function (cb) {
+             var createFileOpts = {};
+@@ -10608,7 +10805,7 @@ exports.reprovision = function (uuid, payload, options, callback)
+                 cb(err);
+             });
+         }, function (cb) {
+-            createConfigDir(vmobj.zonepath, log, function (err) {
++            createConfigDir(vmobj, log, function (err) {
+                 if (err) {
+                     cb(err);
+                     return;
+@@ -10638,6 +10835,9 @@ exports.reprovision = function (uuid, payload, options, callback)
+                         if (vmobj.hasOwnProperty(key)
+                             && Object.keys(vmobj[key]).length > 0) {
+ 
++                            log.debug('metadata key "%s" will be modified by '
++                                + 'metadata copy - will block on vminfod',
++                                key);
+                             obj.vm[key] = vmobj[key];
+                             shouldBlock = true;
+                         }
+@@ -10651,6 +10851,8 @@ exports.reprovision = function (uuid, payload, options, callback)
+ 
+                     if (!shouldBlock) {
+                         // Nothing will be changed by the metadata copy
++                        log.debug('no metadata will be modified by '
++                            + 'metadata copy - not blocking on vminfod');
+                         cb2();
+                         return;
+                     }

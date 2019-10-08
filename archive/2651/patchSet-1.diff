@@ -1,0 +1,363 @@
+commit 8a8c65dbe4e44f1e51fef75ab66414367d158ddd (refs/changes/51/2651/1)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2017-09-25T21:17:48+00:00 (2 years ago)
+    
+    MORAY-428 Make it safer to use reindexing buckets
+
+diff --git a/docs/index.md b/docs/index.md
+index 91e1e06..cb7ebb9 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -489,9 +489,16 @@ for a full example.
+ | -------- | -------- | ------------------------------------------ |
+ | bucket   | string   | bucket to write this key in                |
+ | key      | string   | bucket to write this key in                |
+-| options  | object   | any optional parameters (req\_id, noCache) |
++| options  | object   | any optional parameters, see below         |
+ | callback | function | arguments of `err` and `obj`               |
+ 
++#### Options
++
++- [noBucketCache](#option-nobucketcache)
++- [onlineReindexing](#option-onlinereindexing)
++- [req_id](#option-req_id)
++- [timeout](#option-timeout)
++
+ ### Errors
+ 
+ * `BucketNotFoundError`
+@@ -572,7 +579,7 @@ expect to receive back up to N records from this call.
+ | ------- | ------ | ------------------------------------------------------ |
+ | bucket  | string | bucket to search in                                    |
+ | filter  | string | search filter string                                   |
+-| options | object | any optional parameters, see below |
++| options | object | any optional parameters, see below                     |
+ 
+ #### Options
+ 
+@@ -586,7 +593,7 @@ dangerous. The design center of Moray is around short-lived requests, and there
+ are serious consequences in PostgreSQL for leaving connections open in
+ transactions for extended periods while other transactions are making changes.
+ 
+-##### noBucketCache
++##### <a name="option-nobucketcache">noBucketCache</a>
+ 
+ A boolean which, when set to `true`, makes Moray refresh its bucket cache before
+ handling the request. Default is `false`.
+@@ -619,7 +626,12 @@ transactions are making changes.
+ A number which indicates the offset at which Moray starts processing records
+ that would be returned by the same request with no `offset`. Default is `0`.
+ 
+-##### req_id
++##### <a name="option-onlinereindexing">onlineReindexing</a>
++
++When passing `onlineReindexing: true`, the client will make sure that the server
++supports safely reading the contents of a reindexing bucket.
++
++##### <a name="option-req_id">req_id</a>
+ 
+ A string that can be used to track a request. Default is an automatically
+ generated V4 UUID.
+@@ -648,7 +660,7 @@ A boolean which, if `true`, makes Moray send the SQL statement that would be
+ executed in the response instead of sending actual data records. Default is
+ `false`.
+ 
+-##### timeout
++##### <a name="option-timeout">timeout</a>
+ 
+ A number that represents the delay in milliseconds that the request waits on a
+ reply from its underlying Postgres query before it errors with a
+diff --git a/lib/control.js b/lib/control.js
+index 61f9534..f7b8b39 100644
+--- a/lib/control.js
++++ b/lib/control.js
+@@ -181,7 +181,7 @@ function buildReq(opts, rpc, serverOpts) {
+         msgid: msgid,
+         route: route,
+         req_id: reqid
+-    });
++    }, true);
+ 
+     var req = {
+         log: log,
+diff --git a/lib/objects/common.js b/lib/objects/common.js
+index 3b53eb4..da1c4bf 100644
+--- a/lib/objects/common.js
++++ b/lib/objects/common.js
+@@ -868,10 +868,23 @@ function verifyBucket(req, cb) {
+ }
+ 
+ 
+-function rowToObject(bucket, row, ignore) {
++function getReindexingFields(bucket) {
++    var ignore = [];
++
++    if (bucket.reindex_active) {
++        Object.keys(bucket.reindex_active).forEach(function (ver) {
++            ignore = ignore.concat(bucket.reindex_active[ver]);
++        });
++    }
++
++    return ignore;
++}
++
++
++function rowToObject(bucket, ignore, row) {
+     assert.object(bucket, 'bucket');
++    assert.array(ignore, 'ignore');
+     assert.object(row, 'row');
+-    ignore = ignore || [];
+ 
+     var obj = {
+         bucket: bucket.name,
+@@ -1130,6 +1143,26 @@ function getUnusableIndexes(filter, bucket, log) {
+ }
+ 
+ 
++function checkOnlyUsableIndexes(req, cb) {
++    var log = req.log;
++    var unusable = getUnusableIndexes(req.filter, req.bucket, log);
++
++    if (unusable.unindexedFields.length > 0 ||
++        unusable.reindexingFields.length > 0) {
++        log.error({ unusable: unusable }, 'filter uses unusable indexes');
++        cb(new NotIndexedError({}, req.bucket.name, req.rawFilter, {
++            unindexedFields: unusable.unindexedFields,
++            reindexingFields: unusable.reindexingFields
++        }));
++        return;
++    }
++
++    log.trace('filter does not use unusable indexes');
++
++    cb();
++}
++
++
+ ///--- Exports
+ 
+ module.exports = {
+@@ -1147,5 +1180,7 @@ module.exports = {
+     runPostChain: runPostChain,
+     selectForUpdate: selectForUpdate,
+     indexObject: indexObject,
++    checkOnlyUsableIndexes: checkOnlyUsableIndexes,
++    getReindexingFields: getReindexingFields,
+     getUnusableIndexes: getUnusableIndexes
+ };
+diff --git a/lib/objects/del_many.js b/lib/objects/del_many.js
+index bb6c9bf..4eb789d 100644
+--- a/lib/objects/del_many.js
++++ b/lib/objects/del_many.js
+@@ -29,6 +29,7 @@ var PIPELINE = [
+     control.getPGHandleAndTransaction,
+     common.parseFilter,
+     common.loadBucket,
++    common.checkOnlyUsableIndexes,
+     common.decorateFilter,
+     common.buildWhereClause,
+     drop
+diff --git a/lib/objects/find.js b/lib/objects/find.js
+index 74c99e2..fd93212 100644
+--- a/lib/objects/find.js
++++ b/lib/objects/find.js
+@@ -48,6 +48,7 @@ var HANDLED_FINDOBJECTS_OPTIONS = [
+     'sql_only',
+     'noBucketCache',
+     'timeout',
++    'onlineReindexing',
+     'requireIndexes'
+ ];
+ 
+@@ -184,6 +185,8 @@ function getRecords(req, cb) {
+     }, 'getRecords: entered');
+ 
+     var query = req.pg.query(sql, req.where.args);
++    var ignore = common.getReindexingFields(req.bucket);
++
+     query.on('error', function (err) {
+         query.removeAllListeners('end');
+         query.removeAllListeners('row');
+@@ -202,7 +205,7 @@ function getRecords(req, cb) {
+         var obj;
+ 
+         try {
+-            obj = common.rowToObject(req.bucket, row);
++            obj = common.rowToObject(req.bucket, ignore, row);
+         } catch (e) {
+             log.error({
+                 bucket: req.bucket.name,
+diff --git a/lib/objects/get.js b/lib/objects/get.js
+index c0aa9f2..52562bc 100644
+--- a/lib/objects/get.js
++++ b/lib/objects/get.js
+@@ -44,9 +44,18 @@ var PIPELINE = [
+             common.loadBucket(r, cb);
+         }
+     },
++    sendHandledOptions,
+     loadObject
+ ];
+ 
++var HANDLED_GETOBJECT_OPTIONS = [
++    'noBucketCache',
++    'noCache',
++    'req_id',
++    'onlineReindexing',
++    'timeout'
++];
++
+ 
+ ///--- Handlers
+ 
+@@ -62,6 +71,24 @@ function checkCache(req, cb) {
+     cb();
+ }
+ 
++
++/**
++ * Sends a record that contains the list of getObject request options that the
++ * server handles. This allows Moray clients to compare this set of handled
++ * options with what they expect the server to handle.
++ */
++function sendHandledOptions(req, cb) {
++    var res = req.rpc;
++
++    if (req.opts && req.opts.internalOpts &&
++        req.opts.internalOpts.sendHandledOptions === true) {
++        res.write({ _handledOptions: HANDLED_GETOBJECT_OPTIONS });
++    }
++
++    cb();
++}
++
++
+ function loadObject(req, cb) {
+     if (req.object) {
+         cb();
+@@ -98,7 +125,8 @@ function loadObject(req, cb) {
+         if (!row) {
+             cb(new ObjectNotFoundError(bucket, req.key));
+         } else {
+-            req.object = common.rowToObject(req.bucket, row);
++            var ignore = common.getReindexingFields(req.bucket);
++            req.object = common.rowToObject(req.bucket, ignore, row);
+             req.cache.set(req.cacheKey, req.object);
+             log.debug({
+                 object: req.object
+diff --git a/lib/objects/reindex.js b/lib/objects/reindex.js
+index 58ca424..33068db 100644
+--- a/lib/objects/reindex.js
++++ b/lib/objects/reindex.js
+@@ -134,24 +134,18 @@ function processRows(req, cb) {
+     var result = req.pg.query(sql);
+     var queue = vasync.queue(indexObject, 1);
+ 
+-
+-    // Ignore field being reindexed when performing row->obj conversion.
+-    // This prevents empty/stale fields from clobbering good data.
+-    var ignore = [];
+-    if (req.bucket.reindex_active) {
+-        Object.keys(req.bucket.reindex_active).forEach(function (ver) {
+-            ignore = ignore.concat(req.bucket.reindex_active[ver]);
+-        });
+-    }
++    var ignore = common.getReindexingFields(req.bucket);
+ 
+     result.on('row', function (row) {
+-        var obj = common.rowToObject(req.bucket, row, ignore);
++        var obj = common.rowToObject(req.bucket, ignore, row);
+         queue.push(obj);
+     });
++
+     result.once('error', function (err) {
+         log.debug(err, 'reindexRows: failed');
+         cb(err);
+     });
++
+     result.once('end', queue.close.bind(queue));
+ 
+     queue.once('end', function () {
+diff --git a/lib/objects/update.js b/lib/objects/update.js
+index 47ab8c7..b8487a4 100644
+--- a/lib/objects/update.js
++++ b/lib/objects/update.js
+@@ -36,6 +36,7 @@ var PIPELINE = [
+     control.getPGHandleAndTransaction,
+     common.parseFilter,
+     common.loadBucket,
++    common.checkOnlyUsableIndexes,
+     common.decorateFilter,
+     common.buildWhereClause,
+     updateRows
+@@ -72,6 +73,8 @@ function updateRows(req, cb) {
+         return;
+     }
+ 
++    var reindexing = common.getReindexingFields(req.bucket);
++
+     for (i = 0; i < req.fieldKeys.length; i++) {
+         k = req.fieldKeys[i];
+         if (!req.bucket.index[k]) {
+@@ -79,6 +82,14 @@ function updateRows(req, cb) {
+             return;
+         }
+ 
++        if (reindexing.indexOf(k) !== -1) {
++            cb(new NotIndexedError({}, b.name, JSON.stringify(req.fields), {
++                unindexedFields: [],
++                reindexingFields: reindexing
++            }));
++            return;
++        }
++
+         if (args[k] === null) {
+             cb(new NotNullableError(k, req.bucket.index[k].type));
+             return;
+diff --git a/lib/schema.js b/lib/schema.js
+index b1904e6..1f9e8ff 100644
+--- a/lib/schema.js
++++ b/lib/schema.js
+@@ -164,6 +164,11 @@ AJV_ENV.addSchema({
+             description: 'Information to pass to pre/post-triggers',
+             allOf: [ { '$ref': 'object' } ]
+         },
++        'onlineReindexing': {
++            description: 'Return fields being reindexed ' +
++                'instead of dropping their value',
++            type: 'boolean'
++        },
+ 
+         // Filter options
+         'noLimit': {
+@@ -198,6 +203,10 @@ AJV_ENV.addSchema({
+                 'instead of running it',
+             type: 'boolean'
+         },
++        'requireIndexes': {
++            description: 'Check the filter for unindexed or reindexing fields',
++            type: 'boolean'
++        },
+ 
+         // Misc options
+         'no_reindex': {
+@@ -205,6 +214,19 @@ AJV_ENV.addSchema({
+         },
+         'deep': {
+             type: 'boolean'
++        },
++
++        // Internal options
++        'internalOpts': {
++            description: 'Internal options sent by the client',
++            type: 'object',
++            properties: {
++                'sendHandledOptions': {
++                    description: 'Whether the client expects the server to ' +
++                        'report which options were honored',
++                    type: 'boolean'
++                }
++            }
+         }
+     }
+ });

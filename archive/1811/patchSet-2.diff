@@ -1,0 +1,621 @@
+commit bb0ad29bbd45bc61e7f351b36302a1be759109ff (refs/changes/11/1811/2)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2017-04-19T15:42:49-07:00 (2 years, 6 months ago)
+    
+    MORAY-104 moray: disallow filtering on non-indexed fields except interactively
+
+diff --git a/Makefile b/Makefile
+index 3d3e066..1899a4f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,7 @@ CONFIGURE	 = ./tools/configure
+ # always cleaned up.  However, on systems that don't provide ctrun(1), this
+ # could be commented out.
+ #
+-CTRUN		 = ctrun -o noorphan
++CTRUN		 ?= ctrun -o noorphan
+ 
+ 
+ #
+@@ -71,6 +71,7 @@ test: | $(FAUCET) $(MORAY_TEST_ENV_FILE)
+ 	$(CTRUN) node test/arrays.test.js | $(FAUCET) && \
+ 	$(CTRUN) node test/version.test.js | $(FAUCET) && \
+ 	$(CTRUN) node test/clientparams.test.js | $(FAUCET) && \
++	$(CTRUN) node test/findobjects-requireindexes.test.js | $(FAUCET) && \
+ 	$(CTRUN) node test/loop.test.js | bunyan -lfatal )
+ 	@echo tests passed
+ 
+diff --git a/test/findobjects-requireindexes.test.js b/test/findobjects-requireindexes.test.js
+new file mode 100644
+index 0000000..22e27d1
+--- /dev/null
++++ b/test/findobjects-requireindexes.test.js
+@@ -0,0 +1,533 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * This file implements a tests suite for the changes described in RFD 78 (see
++ * https://github.com/joyent/rfd/blob/master/rfd/0078/README.md for more info).
++ *
++ * More specifically, that RFD describes a new "requireIndexes" option that can
++ * be passed when instantiating a moray client, or when calling its
++ * "findObjects" method.
++ *
++ * When this parameter is set to true, findObjects requests error if all fields
++ * in the request's search filter are not usable, e.g they haven't been
++ * reindexed fully yet.
++ */
++
++var assert = require('assert-plus');
++var jsprim = require('jsprim');
++var libuuid = require('libuuid');
++var tape = require('tape');
++var vasync = require('vasync');
++var VError = require('verror');
++
++var helper = require('./helper.js');
++
++/*
++ * Since the crux of RFD 78 is to have findObjects requests error when the
++ * search filter uses fields whose indexes are not usable yet, this test needs
++ * to create a test bucket that has at least one index that is not usable.
++ *
++ * We do this by creating a new test bucket, and upgrading it to a second
++ * version that adds a new index. This new index won't be usable until the
++ * reindexObjects method is called and returns that the reindexing process has
++ * completed.
++ *
++ * We need to have a test bucket that has more than one index because, even
++ * without setting requireIndexes to true, findObjects requests fail with an
++ * InvalidQueryError when a search filter contains _only one_ field whose index
++ * is not usable.
++ */
++var BUCKET_CFG_V1 = {
++    index: {
++        foo: {
++            type: 'string'
++        }
++    },
++    options: {
++        version: 1
++    }
++};
++
++var BUCKET_CFG_V2 = {
++    index: {
++        foo: {
++            type: 'string'
++        },
++        bar: {
++            type: 'string'
++        }
++    },
++    options: {
++        version: 2
++    }
++};
++
++var CLIENT_WITHOUT_REQUIRE_INDEXES;
++var CLIENT_WITH_REQUIRE_INDEXES;
++
++var SERVER;
++
++var TEST_BUCKET = 'moray_unit_test_' + libuuid.create().substr(0, 7);
++
++var TEST_OBJECT_KEY = 'someFoo';
++var TEST_OBJECT_VALUE = {foo: 'bar', bar: 'baz'};
++var TEST_SEARCH_FILTER = '(&(foo=bar)(bar=baz))';
++
++/*
++ * Some fields usable in a findObjects request's search filter have underlying
++ * indexes that are usable from the time the bucket is created. We want to make
++ * sure that setting requireIndexes to true doesn't change that.
++ */
++var FILTERS_ON_INTERNAL_FIELDS = [
++    '(_mtime>=0)',
++    '(_id=1)',
++    '(_key=' + TEST_OBJECT_KEY + ')',
++    '(&(_id=1)(_etag=*))'
++];
++
++/*
++ * Reindexes all rows in the moray bucket with name "bucketName" using the moray
++ * client "client". When all rows are reindexed, or if an error occurs, the
++ * function "callback" is called. The first parameter of callback is an error
++ * object or null if there was no error.
++ */
++function reindexBucket(bucketName, client, callback) {
++    assert.string(bucketName, 'bucketName');
++    assert.object(client, 'client');
++    assert.func(callback, 'callback');
++
++    function doReindex() {
++        client.reindexObjects(bucketName, 100,
++            function onBucketReindexed(reindexErr, result) {
++                if (reindexErr || result.processed === 0) {
++                    callback(reindexErr);
++                    return;
++                } else {
++                    doReindex();
++                    return;
++                }
++            });
++    }
++
++    doReindex();
++}
++
++function performFindObjectsTest(t, client, options) {
++    assert.object(t, 't');
++    assert.object(client, 'client');
++    assert.object(options, 'options');
++    assert.string(options.bucketName, 'options.bucketName');
++    assert.string(options.searchFilter, 'options.searchFilter');
++    assert.object(options.findObjectsOpts, 'options.findObjectsOpts');
++    assert.object(options.expectedResults, 'options.expectedResults');
++    assert.bool(options.expectedResults.error, 'options.expectedResults.error');
++    assert.number(options.expectedResults.nbRecordsFound,
++        'options.expectedResults.nbRecordsFound');
++
++    var bucketName = options.bucketName;
++    var errorExpected = options.expectedResults.error;
++    var findObjectsOpts = jsprim.deepCopy(options.findObjectsOpts);
++    var nbRecordsExpected = options.expectedResults.nbRecordsFound;
++    var nbRecordsFound = 0;
++    var req;
++    var searchFilter = options.searchFilter;
++
++    /*
++     * We intentionally bypass the bucket cache when performing findObjects
++     * requests because we want to run tests before and after the test bucket
++     * has been reindexed, and we don't want to wait for all buckets to have
++     * their cache expired before we can be sure that all instances of the moray
++     * service we're connected to have their bucket cache reflect the fact that
++     * all indexes are usable.
++     */
++    findObjectsOpts.noBucketCache = true;
++
++    req = client.findObjects(bucketName, searchFilter, findObjectsOpts);
++
++    req.on('error', function onFindObjError(findObjErr) {
++        var expectedErrorName = 'NotIndexedError';
++
++        if (errorExpected) {
++            t.ok(findObjErr, 'findObjects request should error');
++            t.ok(VError.findCauseByName(findObjErr, expectedErrorName) !==
++                null, 'error name should be ' + expectedErrorName);
++            t.equal(nbRecordsFound, 0,
++                'no record should have been sent as part of the response');
++        } else {
++            t.ifErr(findObjErr, 'findObjects request shoult not error');
++        }
++
++        t.end();
++    });
++
++    req.on('record', function onRecord(record) {
++        ++nbRecordsFound;
++    });
++
++    req.on('end', function onFindObjEnd() {
++        if (errorExpected) {
++            t.ok(false, 'should not get end event, only error event');
++        } else {
++            t.ok(true, 'should get end event and not error');
++            t.equal(nbRecordsFound, nbRecordsExpected, 'should have found ' +
++                nbRecordsExpected + ' record');
++        }
++        t.end();
++    });
++}
++
++tape.test('setup', function (t) {
++    vasync.pipeline({arg: {}, funcs: [
++        function createServer(ctx, next) {
++            helper.createServer(null, function onServerCreated(server) {
++                SERVER = server;
++                next();
++            });
++        },
++        function createClients(ctx, next) {
++            CLIENT_WITH_REQUIRE_INDEXES = helper.createClient({
++                requireIndexes: true
++            });
++            CLIENT_WITHOUT_REQUIRE_INDEXES = helper.createClient();
++            CLIENT_WITHOUT_REQUIRE_INDEXES.on('connect',
++                function onClientConnected() {
++                    next();
++                });
++        },
++        function createBucketV1(ctx, next) {
++            CLIENT_WITHOUT_REQUIRE_INDEXES.createBucket(TEST_BUCKET,
++                BUCKET_CFG_V1, function onBucketCreated(bucketCreateErr) {
++                    t.ifError(bucketCreateErr);
++                    next();
++                });
++        },
++        function putTestObject(ctx, next) {
++            CLIENT_WITHOUT_REQUIRE_INDEXES.putObject(TEST_BUCKET,
++                TEST_OBJECT_KEY, TEST_OBJECT_VALUE, {etag: null},
++                function onPutObj(putObjErr, meta) {
++                    t.ifErr(putObjErr);
++                    t.ok(meta);
++                    if (meta) {
++                        t.ok(meta.etag);
++                    }
++                    next();
++                });
++        },
++        function updateTestBucketToV2(ctx, next) {
++            CLIENT_WITHOUT_REQUIRE_INDEXES.updateBucket(TEST_BUCKET,
++                BUCKET_CFG_V2, function onBucketUpdate(bucketUpdateErr) {
++                    t.ifErr(bucketUpdateErr);
++                    next();
++                });
++        }
++    ]}, function onTestSetupDone(testSetupErr) {
++        t.end();
++    });
++});
++
++tape.test('client() - findobjects()', function (t) {
++    performFindObjectsTest(t, CLIENT_WITHOUT_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {},
++        expectedResults: {
++            /*
++             * Not using requireIndexes: true should not result in an error,
++             * even if the test filter contains fields whose index is not
++             * usable.
++             */
++            error: false,
++            /*
++             * However, because the second index added to the bucket hasn't been
++             * reindexed yet, the findObjects request will return no record.
++             */
++            nbRecordsFound: 0
++        }
++    });
++});
++
++tape.test('client() - findobjects(requireIndexes: false})', function (t) {
++    performFindObjectsTest(t, CLIENT_WITHOUT_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {requireIndexes: false},
++        expectedResults: {
++            error: false,
++            nbRecordsFound: 0
++        }
++    });
++});
++
++tape.test('client() - findobjects(requireIndexes: true})', function (t) {
++    performFindObjectsTest(t, CLIENT_WITHOUT_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {requireIndexes: true},
++        expectedResults: {
++            /*
++             * Using requireIndexes: true should result in an error, because the
++             * test filter contains fields whose index is not usable.
++             */
++            error: true,
++            nbRecordsFound: 0
++        }
++    });
++});
++
++function createTestFindobjectsRequireIndexes(searchFilter) {
++    tape.test('client() - findobjects(' + searchFilter + ', requireIndexes: ' +
++        'true})', function (t) {
++        performFindObjectsTest(t, CLIENT_WITHOUT_REQUIRE_INDEXES, {
++            bucketName: TEST_BUCKET,
++            searchFilter: searchFilter,
++            findObjectsOpts: {requireIndexes: true},
++            expectedResults: {
++                /*
++                 * All the internal fields are usable in a search filter from
++                 * the time the bucket is created. So even when passing
++                 * requireIndexes: true to findObjects, the request should not
++                 * error.
++                 */
++                error: false,
++                nbRecordsFound: 1
++            }
++        });
++    });
++}
++
++FILTERS_ON_INTERNAL_FIELDS.forEach(createTestFindobjectsRequireIndexes);
++
++tape.test('client({requireIndexes: true}) - findobjects()', function (t) {
++    performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {},
++        expectedResults: {
++            /*
++             * Using requireIndexes: true when instantiating the moray client
++             * should make findObjects requests result in an error, because the
++             * test filter contains fields whose index is not usable.
++             */
++            error: true,
++            nbRecordsFound: 0
++        }
++    });
++});
++
++FILTERS_ON_INTERNAL_FIELDS.forEach(function (searchFilter) {
++    tape.test('client({requireIndexes: true}) - findobjects(' + searchFilter +
++        ')', function (t) {
++        performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++            bucketName: TEST_BUCKET,
++            searchFilter: searchFilter,
++            findObjectsOpts: {},
++            expectedResults: {
++                /*
++                 * All the internal fields are usable in a search filter from
++                 * the time the bucket is created. So even when passing
++                 * requireIndexes: true when instantiating the moray client,
++                 * findObjects requests should not error.
++                 */
++                error: false,
++                nbRecordsFound: 1
++            }
++        });
++    });
++});
++
++tape.test('client({requireIndexes: true}) - findobjects({requireIndexes: ' +
++    'true})', function (t) {
++    performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {requireIndexes: true},
++        expectedResults: {
++            /*
++             * Using requireIndexes: true when instantiating the moray client
++             * _and_ passing requireIndexes: true to findObjects should make
++             * findObjects requests result in an error, because the test filter
++             * contains fields whose index is not usable.
++             */
++            error: true,
++            nbRecordsFound: 0
++        }
++    });
++});
++
++function createTestClientRequiresIndexes(searchFilter) {
++    tape.test('client({requireIndexes: true}) - findobjects(' + searchFilter +
++        ', requireIndexes: true})', function (t) {
++        performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++            bucketName: TEST_BUCKET,
++            searchFilter: searchFilter,
++            findObjectsOpts: {requireIndexes: true},
++            expectedResults: {
++                /*
++                 * All the internal fields are usable in a search filter from
++                 * the time the bucket is created. So even when passing
++                 * requireIndexes: true when instantiating the moray client
++                 * _and_ passing requireIndexes: true to the findObjects method,
++                 * findObjects requests should not error.
++                 */
++                error: false,
++                nbRecordsFound: 1
++            }
++        });
++    });
++}
++
++FILTERS_ON_INTERNAL_FIELDS.forEach(createTestClientRequiresIndexes);
++
++tape.test('client({requireIndexes: true}) - findobjects({requireIndexes: ' +
++    'false})', function (t) {
++    performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {requireIndexes: false},
++        expectedResults: {
++            /*
++             * Using requireIndexes: true when instantiating the moray client
++             * _but_ passing requireIndexes: false to findObjects should make
++             * findObjects requests _not_ result in an error.
++             */
++            error: false,
++            nbRecordsFound: 0
++        }
++    });
++});
++
++function createTestRequireIndexesOverriden(searchFilter) {
++    tape.test('client({requireIndexes: true}) - findobjects(' + searchFilter +
++        ', requireIndexes: false})', function (t) {
++        performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++            bucketName: TEST_BUCKET,
++            searchFilter: searchFilter,
++            findObjectsOpts: {requireIndexes: false},
++            expectedResults: {
++                /*
++                 * Using requireIndexes: true when instantiating the moray
++                 * client _but_ passing requireIndexes: false to findObjects
++                 * should make findObjects requests _not_ result in an error.
++                 */
++                error: false,
++                nbRecordsFound: 1
++            }
++        });
++    });
++}
++
++FILTERS_ON_INTERNAL_FIELDS.forEach(createTestRequireIndexesOverriden);
++
++/*
++ * After this test completes, the second index that was added when upgrading the
++ * bucket "TEST_BUCKET" to its second version is usable, so no findObjects
++ * request using any combination of the two indexed fields as a search filter
++ * should error, regardless of what value for requireIndexes is passed when
++ * instantiating a moray client or when calling its findObjects method.
++ */
++tape.test('reindexObjects', function (t) {
++    reindexBucket(TEST_BUCKET, CLIENT_WITHOUT_REQUIRE_INDEXES,
++        function onReindexDone(reindexErr) {
++            t.ifErr(reindexErr);
++            t.end();
++        });
++});
++
++tape.test('client() - findobjects()', function (t) {
++    performFindObjectsTest(t, CLIENT_WITHOUT_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {},
++        expectedResults: {
++            error: false,
++            nbRecordsFound: 1
++        }
++    });
++});
++
++tape.test('client() - findobjects({requireIndexes: true})', function (t) {
++    performFindObjectsTest(t, CLIENT_WITHOUT_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {requireIndexes: true},
++        expectedResults: {
++            error: false,
++            nbRecordsFound: 1
++        }
++    });
++});
++
++tape.test('client({requireIndexes: true}) - findobjects()', function (t) {
++    performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {},
++        expectedResults: {
++            error: false,
++            nbRecordsFound: 1
++        }
++    });
++});
++
++tape.test('client({requireIndexes: true}) - findobjects({requireIndexes: ' +
++    'false})', function (t) {
++    performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {requireIndexes: false},
++        expectedResults: {
++            error: false,
++            nbRecordsFound: 1
++        }
++    });
++});
++
++tape.test('client({requireIndexes: true}) - findobjects({requireIndexes: ' +
++    'true})', function (t) {
++    performFindObjectsTest(t, CLIENT_WITH_REQUIRE_INDEXES, {
++        bucketName: TEST_BUCKET,
++        searchFilter: TEST_SEARCH_FILTER,
++        findObjectsOpts: {requireIndexes: true},
++        expectedResults: {
++            error: false,
++            nbRecordsFound: 1
++        }
++    });
++});
++
++tape.test('teardown', function (t) {
++    function closeServerAndEnd() {
++        helper.cleanupServer(SERVER, function onCleanupServer() {
++            t.pass('closed');
++            t.end();
++        });
++    }
++
++    function onClientClosed() {
++        ++nbClientsClosed;
++        if (nbClientsClosed === 2) {
++            closeServerAndEnd();
++        }
++    }
++
++    var nbClientsClosed = 0;
++
++    CLIENT_WITHOUT_REQUIRE_INDEXES.delBucket(TEST_BUCKET,
++        function onDelBucket(delBucketErr) {
++            t.ifError(delBucketErr);
++
++            CLIENT_WITHOUT_REQUIRE_INDEXES.once('close', onClientClosed);
++            CLIENT_WITHOUT_REQUIRE_INDEXES.once('close', onClientClosed);
++
++            CLIENT_WITHOUT_REQUIRE_INDEXES.close();
++            CLIENT_WITH_REQUIRE_INDEXES.close();
++        });
++});
+\ No newline at end of file
+diff --git a/test/helper.js b/test/helper.js
+index af54ac4..f159398 100644
+--- a/test/helper.js
++++ b/test/helper.js
+@@ -53,10 +53,14 @@ function createClient(opts) {
+ 
+     clientparams.log = createLogger();
+ 
+-    if (opts && opts.unwrapErrors) {
++    if (opts && opts.unwrapErrors !== undefined) {
+     	clientparams.unwrapErrors = opts.unwrapErrors;
+     }
+ 
++    if (opts && opts.requireIndexes !== undefined) {
++        clientparams.requireIndexes = opts.requireIndexes;
++    }
++
+     return (moray.createClient(clientparams));
+ }
+ 
+diff --git a/test/objects.test.js b/test/objects.test.js
+index 17212bb..eebd51c 100644
+--- a/test/objects.test.js
++++ b/test/objects.test.js
+@@ -611,16 +611,16 @@ test('find _mtime', function (t) {
+             req.once('error', cb);
+             req.once('end', cb);
+             req.once('record', function (obj) {
+-                t.ok(obj);
++                t.ok(obj, 'record is truthy');
+                 if (!obj)
+                     return (undefined);
+ 
+                 t.equal(obj.bucket, b);
+                 t.equal(obj.key, k);
+                 t.deepEqual(obj.value, v);
+-                t.ok(obj._id);
+-                t.ok(obj._etag);
+-                t.ok(obj._mtime);
++                t.ok(obj._id, '_id property is truthy');
++                t.ok(obj._etag, '_etag property is truthy');
++                t.ok(obj._mtime, '_mtime is truthy');
+                 found = true;
+                 return (undefined);
+             });
+@@ -628,7 +628,7 @@ test('find _mtime', function (t) {
+         arg: {}
+     }, function (err) {
+         t.ifError(err);
+-        t.ok(found);
++        t.ok(found, 'found a record');
+         t.end();
+     });
+ });

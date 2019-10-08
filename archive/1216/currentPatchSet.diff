@@ -1,0 +1,360 @@
+commit 0c7c8634c1b61a1f2a42efc327fbf88e94bf2735 (refs/changes/16/1216/1)
+Author: David Pacheco <dap@joyent.com>
+Date:   2016-12-15T11:32:47-08:00 (2 years, 10 months ago)
+    
+    remove backfill, various tweaks
+
+diff --git a/bin/backfill b/bin/backfill
+deleted file mode 100755
+index 352a287..0000000
+--- a/bin/backfill
++++ /dev/null
+@@ -1,284 +0,0 @@
+-#!/usr/bin/env node
+-// -*- mode: js -*-
+-/**
+- *
+- * Copyright (c) 2013, Joyent, Inc. All rights reserved.
+- *
+- *
+- * Backfill a bucket in moray with data for a new index column.
+- *
+- * When a new field is to be indexed in a Moray bucket, a new column is added
+- * for that field. Moray uses the value in that column for (a) indexed searching
+- * and (b) as the value for that field in gets. The problem is that the starter
+- * value for that cell is *empty*, so we must backfill it from the JSON blob
+- * in that row's "_value". This script does that.
+- *
+- * Examples:
+- *      Backfill the 'name' field in the 'wf_jobs' bucket using a limit (really
+- *      a batch size) of 10.
+- *      $ ./backfill -i name -l 10 wf_jobs
+- *
+- *      Backfill the 'version' field in the 'ufds_o_smartdc' bucket, limiting
+- *      the processing the rows with 'objectclass' equal to 'sdcpackage' or
+- *      'sdcimage'.
+- *      $ ./backfill -i version -l 50 -P objectclass=sdcpackage \
+- *           -P objectclass=sdcimage ufds_o_smartdc
+- */
+-
+-
+-var path = require('path');
+-var util = require('util');
+-var cmdutil = require('cmdutil');
+-var ProgressBar = require('progbar').ProgressBar;
+-var format = util.format;
+-
+-var moray = require('../lib');
+-var moraycli = require('../lib/cmd');
+-
+-
+-///--- Globals
+-
+-// Total number of objects to backfill
+-var TOTAL = 0;
+-// Number of objects we've already backfilled:
+-var PROCESSED = 0;
+-var START = Date.now();
+-
+-// Moray client options
+-var clientOptions = {};
+-
+-// Backfill options
+-var options = {
+-    indexes: [],
+-    limit: 100,
+-    predicates: {}
+-};
+-
+-var LOG;
+-
+-
+-///--- Functions
+-
+-function usage(msg) {
+-    if (msg) {
+-        console.error(msg);
+-    }
+-
+-    var str = 'usage: ' + path.basename(process.argv[1]);
+-    // "limit" here is really batch size.
+-    str += moraycli.commonUsage + ' [-i index] [-l batch-size] ' +
+-        '[-P predicate] bucket';
+-    console.error(str);
+-    process.exit(1);
+-}
+-
+-function parseOptions() {
+-    var parser = moraycli.parseCliOptions({
+-        'argv': process.argv,
+-        'env': process.env,
+-        'extraOptStr': 'i:l:p:',
+-        'clientOptions': clientOptions,
+-        'onUsage': usage,
+-        'onOption': function (option) {
+-            switch (option.option) {
+-            case 'i':
+-                options.indexes.push(option.optarg);
+-                break;
+-
+-            case 'l':
+-                options.limit = parseInt(option.optarg, 10);
+-                break;
+-
+-            case 'P':
+-                var equal = option.optarg.indexOf('=');
+-                if (equal === -1) {
+-                    usage('error: "-P" arg is not of the form "field=value":'
+-                          + option.optarg);
+-                }
+-                var field = option.optarg.slice(0, equal);
+-                var value = option.optarg.slice(equal + 1);
+-                if (!options.predicates[field]) {
+-                    options.predicates[field] = [];
+-                }
+-                options.predicates[field].push(value);
+-                break;
+-
+-            default:
+-                process.exit(1);
+-                break;
+-            }
+-        }
+-    });
+-
+-    if (parser.optind() >= process.argv.length) {
+-        usage('missing required argument: "bucket"');
+-    }
+-
+-    options.name = process.argv[parser.optind()];
+-    LOG = clientOptions.log;
+-}
+-
+-
+-function backfillBucket() {
+-    var client = moray.createClient(clientOptions);
+-    var bar;
+-
+-    client.on('error', cmdutil.fail);
+-    client.on('connect', function onConnect() {
+-        var pred;
+-        function getPredicate(cb) {
+-            client.getBucket(options.name, function (err, bucket) {
+-                if (err) {
+-                    cb(err);
+-                    return;
+-                }
+-                var ary = [];
+-                options.indexes.forEach(function (i) {
+-                    ary.push('\'%' + i + '%\'');
+-                });
+-                pred = 'from ' + options.name +
+-                    ' where _value like any (array[' + ary.join(',') + '])';
+-                Object.keys(options.predicates).forEach(function (field) {
+-                    var isArray = bucket.index[field] &&
+-                        bucket.index[field].type[0] == '[';
+-                    var values = options.predicates[field];
+-                    if (isArray) {
+-                        pred += format(' and %s in (array[\'%s\'])', field,
+-                            values.join('\'], array[\''));
+-                    } else {
+-                        pred += format(' and %s in (\'%s\')', field,
+-                            values.join('\', \''));
+-                    }
+-                });
+-                cb(null, pred);
+-            });
+-        }
+-
+-        function countObjects(cb) {
+-            if (TOTAL === 0) {
+-                var sql = 'select count(_id) ' + pred;
+-                // console.log(sql);
+-
+-                var countReq = client.sql(sql);
+-
+-                countReq.once('error', function (err) {
+-                    console.error(err.message);
+-                    return (cb(err));
+-                });
+-
+-                countReq.on('record', function (obj) {
+-                    if (typeof (obj) === 'object' && obj !== null) {
+-                        TOTAL = Number(obj.count);
+-                        console.log('Backfilling %d records', TOTAL);
+-                        bar = new ProgressBar({
+-                            size: TOTAL,
+-                            filename: options.name,
+-                            bytes: false
+-                        });
+-                    }
+-                });
+-
+-                countReq.once('end', cb);
+-            } else {
+-                cb();
+-            }
+-        }
+-
+-        function backfillObjects(offset, limit, cb) {
+-            var done = 0;
+-            var _2update = {};
+-
+-            function wait() {
+-                if (done === limit || TOTAL === PROCESSED) {
+-                    return (cb());
+-                } else {
+-                    return (setTimeout(wait, 1000));
+-                }
+-            }
+-
+-            var sql = 'select * ' + pred + ' order by _id limit ' + limit +
+-                ' offset ' + offset;
+-
+-            var req = client.sql(sql);
+-
+-            req.once('error', function (err) {
+-                console.error(err.message);
+-                return (cb(err));
+-            });
+-
+-            req.on('record', function (obj) {
+-                if (obj) {
+-                    _2update[obj._key] = obj;
+-                }
+-            });
+-
+-            req.on('end', function () {
+-                Object.keys(_2update).forEach(function (key) {
+-                    var data = JSON.parse(_2update[key]._value);
+-                    var skip = true;
+-                    for (var i = 0; i < options.indexes.length; i++) {
+-                        // XXX Not sure about a UFDS field with multiple values.
+-                        var idx = options.indexes[i];
+-                        if (data.hasOwnProperty(idx) &&
+-                            String(data[idx]) !== _2update[key][idx]) {
+-                            skip = false;
+-                            break;
+-                        }
+-                    }
+-                    bar.advance(1);
+-                    if (skip) {
+-                        done += 1;
+-                        PROCESSED += 1;
+-                        return;
+-                    }
+-                    client.putObject(options.name, key, data, function (err) {
+-                        done += 1;
+-                        PROCESSED += 1;
+-                        if (err) {
+-                            bar.log('error with _key "' + key + '":'
+-                                    + err.message);
+-                        } else {
+-                            bar.log('Updated ' + options.name
+-                                    + ' record with _key "' + key + '"');
+-                        }
+-                    });
+-                });
+-                return (wait());
+-            });
+-
+-        }
+-
+-        function processCb(err) {
+-            if (err) {
+-                console.log(err.message);
+-                if (err.message ===
+-                    'the underlying connection has been closed') {
+-                    LOG.warn('Waiting for client to reconnect');
+-                    client.once('connect', function reconnectCallback() {
+-                        backfillObjects(PROCESSED, options.limit, processCb);
+-                    });
+-                }
+-            } else if (PROCESSED < TOTAL) {
+-                backfillObjects(PROCESSED, options.limit, processCb);
+-            } else {
+-                bar.end();
+-                client.close();
+-                console.log('Backfill of %d objects done (in %d seconds)',
+-                            TOTAL, (Date.now() - START) / 1000);
+-            }
+-        }
+-
+-        getPredicate(function (pErr, pred_) {
+-            countObjects(function (err) {
+-                if (err) {
+-                    console.error(err.message);
+-                }
+-                backfillObjects(0, options.limit, processCb);
+-            });
+-        });
+-    });
+-
+-}
+-
+-parseOptions();
+-backfillBucket();
+diff --git a/bin/delmany b/bin/delmany
+index fb22e1e..44a640c 100755
+--- a/bin/delmany
++++ b/bin/delmany
+@@ -37,8 +37,7 @@ parser = moraycli.parseCliOptions({
+         case 'l':
+             p = parseInt(option.optarg, 10);
+             if (isNaN(p) || p < 0) {
+-                cmdutil.usage('unsupported value for -l / --limit: "%s"',
+-                    option.optarg);
++                cmdutil.usage('unsupported value for -l: "%s"', option.optarg);
+             }
+             delOptions.limit = p;
+             break;
+@@ -46,8 +45,7 @@ parser = moraycli.parseCliOptions({
+         case 'o':
+             p = parseInt(option.optarg, 10);
+             if (isNaN(p) || p < 0) {
+-                cmdutil.usage('unsupported value for -o / --offset: "%s"',
+-                    option.optarg);
++                cmdutil.usage('unsupported value for -o: "%s"', option.optarg);
+             }
+             delOptions.offset = p;
+             break;
+diff --git a/bin/findobjects b/bin/findobjects
+index 6aa5d25..ff469a9 100755
+--- a/bin/findobjects
++++ b/bin/findobjects
+@@ -21,8 +21,8 @@ var prettyPrint = true;
+ cmdutil.configure({
+     'usageMessage': 'fetch objects from Moray matching a filter',
+     'synopses': [
+-        moraycli.commonUsage + '[-H] [-a attr] [-d attr] [-l limit] ' +
+-            '[-o offset] [-s] [-n] BUCKET FILTER'
++        moraycli.commonUsage + '[-Hns] [-a attr] [-d attr] [-l limit] ' +
++            '[-o offset] BUCKET FILTER'
+     ]
+ });
+ 
+diff --git a/bin/getbucket b/bin/getbucket
+index 961f2c3..26a14b8 100755
+--- a/bin/getbucket
++++ b/bin/getbucket
+@@ -34,7 +34,6 @@ parser = moraycli.parseCliOptions({
+ if (parser.optind() >= process.argv.length) {
+     cmdutil.usage('missing required argument: "bucket"');
+ }
+-
+ bucket = process.argv[parser.optind()];
+ 
+ client = moray.createClient(clientOptions);
+diff --git a/bin/putobject b/bin/putobject
+index 9a8271c..9f4d92f 100755
+--- a/bin/putobject
++++ b/bin/putobject
+@@ -19,7 +19,7 @@ var clientOptions, parser, client;
+ var bucket, key, value, putOptions;
+ 
+ cmdutil.configure({
+-    'usageMessage': 'insert an object into Moray',
++    'usageMessage': 'create or update an object in Moray',
+     'synopses': [ moraycli.commonUsage + ' [-d DATA] [-e ETAG] ' +
+         'BUCKET KEY' ]
+ });

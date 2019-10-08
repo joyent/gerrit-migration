@@ -1,0 +1,306 @@
+commit 5d95cfb748721d2ed10aa5638cc340d35e8e4b4b (refs/changes/45/3745/1)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2018-03-30T22:14:25+00:00 (1 year, 6 months ago)
+    
+    TOOLS-2014 Shut down Moray sandboxes once they're no longer referenced
+
+diff --git a/lib/client.js b/lib/client.js
+index fac55e8..3873332 100644
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -42,10 +42,12 @@ function MockMorayClient(opts) {
+     assert.object(opts.pgmgr, 'opts.pgmgr');
+     assert.object(opts.stack, 'opts.stack');
+     assert.object(opts.config, 'opts.config');
++    assert.string(opts.morayID, 'opts.morayID');
+     assert.optionalObject(opts.mock_errors, 'opts.mock_errors');
+ 
+     this.closed = false;
+     this.stack = opts.stack;
++    this.morayID = opts.morayID;
+ 
+     this._pgmgr = opts.pgmgr;
+     this._config = opts.config;
+@@ -62,7 +64,7 @@ function MockMorayClient(opts) {
+         };
+     }
+ 
+-    this._pgmgr.clients.push(this);
++    this._pgmgr.addClient(this);
+ 
+     Object.seal(this);
+ }
+@@ -124,6 +126,10 @@ MockMorayClient.prototype.batch = function batchProxy(data, opts, callback) {
+ 
+ 
+ MockMorayClient.prototype.close = function closeProxy() {
++    if (!this.closed) {
++        this._pgmgr.removeClient(this);
++    }
++
+     this.closed = true;
+     this._client.close.apply(this._client, arguments);
+ };
+@@ -356,6 +362,7 @@ MockMorayClient.prototype.clone = function duplicateClient() {
+         log: this.log,
+         pgmgr: this._pgmgr,
+         config: this._config,
++        morayID: this.morayID,
+         mock_errors: this._mock_errors,
+         stack: getOpenStack()
+     });
+diff --git a/lib/pg-server.js b/lib/pg-server.js
+index c9465ec..f90f16b 100644
+--- a/lib/pg-server.js
++++ b/lib/pg-server.js
+@@ -21,9 +21,14 @@
+  *     - "client-info", containing a new Moray instance's configuration
+  *
+  * All of these but "log_file" contain a "req_id" field indicating what
+- * request from TemporaryPostgres resulted in the failure. The only
+- * message sent to the child is "createdb", which requests that a new
+- * Moray instance be started.
++ * request from TemporaryPostgres resulted in the failure.
++ *
++ * Message types that get sent to the child are:
++ *
++ *     - "createdb", which requests that a new Moray instance be started
++ *       and identified by the "req_id" value
++ *     - "stopdb", which requests that the instance identified by "req_id"
++ *       be stopped
+  *
+  * The child is the session leader of its own process group, and handles
+  * cleanup of the Postgres processes by signalling the group. This ensures
+@@ -48,10 +53,17 @@ function TemporaryPostgres(log, callback) {
+ 
+     // Set up internal state
+     this._original = mod_uuid.v4();
++    this._log = log;
++
++    // Callbacks for messages received from the child process
+     this._cbs = { };
+     this._cbs[this._original] = callback;
++
++    // Stack traces to show who constructed a client
+     this._stacks = { };
+-    this._log = log;
++
++    // Reference counts for Moray instances
++    this._refs = { };
+ 
+     // Start child process
+     this._child = mod_child.fork('run.js', [ this._original ], {
+@@ -81,6 +93,7 @@ TemporaryPostgres.prototype._processResponse =
+             log: this._log,
+             pgmgr: this,
+             config: response.config,
++            morayID: response.req_id,
+             stack: this._stacks[response.req_id]
+         });
+         this._cbs[response.req_id](null, client);
+@@ -104,10 +117,12 @@ TemporaryPostgres.prototype._spawnMoray =
+ 
+     var req_id = mod_uuid.v4();
+     assert.ok(!this._cbs.hasOwnProperty(req_id), 'unique req_id');
++    assert.ok(!this._refs.hasOwnProperty(req_id), 'unique req_id');
+     assert.ok(!this._stacks.hasOwnProperty(req_id), 'unique req_id');
+ 
+     this._cbs[req_id] = callback;
+     this._stacks[req_id] = stack;
++    this._refs[req_id] = 0;
+     this._child.send({ req_id: req_id, type: 'createdb' });
+ };
+ 
+@@ -117,6 +132,24 @@ TemporaryPostgres.prototype.spawnMoray = function spawnNewMoray(callback) {
+ };
+ 
+ 
++TemporaryPostgres.prototype.addClient = function addClient(client) {
++    this._refs[client.morayID] += 1;
++    this.clients.push(client);
++};
++
++
++TemporaryPostgres.prototype.removeClient = function removeClient(client) {
++    assert.number(this._refs[client.morayID], 'valid moray id');
++    assert.ok(this._refs[client.morayID] > 0, 'nonzero reference count');
++
++    this._refs[client.morayID] -= 1;
++
++    if (this._refs[client.morayID] === 0) {
++        this._child.send({ req_id: client.morayID, type: 'stopdb' });
++    }
++};
++
++
+ TemporaryPostgres.prototype.stop = function stopPostgres() {
+     this.clients.forEach(function (client) {
+         if (!client.closed) {
+diff --git a/lib/run.js b/lib/run.js
+index a9b9e5a..4770cf0 100644
+--- a/lib/run.js
++++ b/lib/run.js
+@@ -100,6 +100,9 @@ mod_tmp.dir({ unsafeCleanup: true }, function (dErr, path, cleanup) {
+                 case 'createdb':
+                     createdb(message.req_id, message.port || getRandomPort());
+                     return;
++                case 'stopdb':
++                    stopdb(message.req_id);
++                    return;
+                 default:
+                     log.error(message,
+                         'Child received unknown message from parent');
+@@ -125,17 +128,7 @@ function createdb(req_id, port) {
+     assert.uuid(req_id, 'req_id');
+     assert.number(port, 'port');
+ 
+-    mod_vasync.waterfall([
+-        function (cb) {
+-            sandbox._createDB(req_id, cb);
+-        },
+-        function (connstr, cb) {
+-            sandbox._startMoray({
+-                connstr: connstr,
+-                port: port
+-            }, cb);
+-        }
+-    ], function (err, params) {
++    sandbox.startDB(req_id, port, function (err, params) {
+         if (err) {
+             log.error(err, 'Creating new Moray instance failed');
+             process.send({
+@@ -153,3 +146,11 @@ function createdb(req_id, port) {
+         }
+     });
+ }
++
++
++function stopdb(req_id) {
++    assert.uuid(req_id, 'req_id');
++    sandbox.stopDB(req_id, function () {
++        log.info({ req_id: req_id }, 'stopped moray instance');
++    });
++}
+diff --git a/lib/sandbox.js b/lib/sandbox.js
+index 219f59d..dbbf0cd 100644
+--- a/lib/sandbox.js
++++ b/lib/sandbox.js
+@@ -25,6 +25,7 @@
+ var assert = require('assert-plus');
+ var mod_forkexec = require('forkexec');
+ var mod_fs = require('fs');
++var mod_jsprim = require('jsprim');
+ var mod_moray_server = require('moray-server');
+ var mod_util = require('util');
+ var mod_vasync = require('vasync');
+@@ -93,7 +94,7 @@ function MoraySandbox(log, baseDir, cleanup) {
+     this._cleanup = cleanup;
+     this.stopping = false;
+     this.pg_child = null;
+-    this.servers  = [];
++    this.servers  = {};
+ 
+     Object.seal(this);
+ }
+@@ -137,8 +138,10 @@ MoraySandbox.prototype._startPG = function startPG(callback) {
+     var self = this;
+     var args = [ 'postgres', '-D', self.dbDir, '-k', self.unixDir ];
+     self.log.info({ cmd: 'postgres', argv: args }, 'Executing command');
+-    self.pg_child = mod_forkexec.forkExecWait({ argv: args },
+-        function (err, info) {
++    self.pg_child = mod_forkexec.forkExecWait({
++        argv: args,
++        maxBuffer: 1024 * 500
++    }, function (err, info) {
+         if (err) {
+             self.log.error(info, 'Postgres exited with an error');
+         } else {
+@@ -211,7 +214,33 @@ MoraySandbox.prototype._startMoray = function startMoray(opts, callback) {
+         });
+     });
+     server.listen();
+-    self.servers.push(server);
++    self.servers[opts.req_id] = server;
++};
++
++
++MoraySandbox.prototype.startDB = function startDB(req_id, port, callback) {
++    var self = this;
++
++    self._createDB(req_id, function (err, connstr) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        self._startMoray({
++            req_id: req_id,
++            connstr: connstr,
++            port: port
++        }, callback);
++    });
++};
++
++MoraySandbox.prototype.stopDB = function stopDB(req_id, callback) {
++    var server = this.servers[req_id];
++    delete this.servers[req_id];
++
++    server.on('close', callback);
++    server.close();
+ };
+ 
+ 
+@@ -233,14 +262,25 @@ MoraySandbox.prototype.stop = function stopAll() {
+         setTimeout(self._cleanup, 5000);
+     }
+ 
++    function stopMorays() {
++        var barrier = mod_vasync.barrier();
++        barrier.on('drain', killPostgres);
++        mod_jsprim.forEachKey(self.servers, function (req_id, server) {
++            barrier.start(req_id);
++            server.on('close', function () {
++                barrier.done(req_id);
++            });
++            server.close();
++        });
++        self.servers = {};
++    }
++
+     if (self.pg_child !== null) {
+-        mod_vasync.forEachParallel({
+-            'inputs': self.servers,
+-            'func': function (server, cb) {
+-                server.on('close', cb);
+-                server.close();
+-            }
+-        }, killPostgres);
++        if (mod_jsprim.isEmpty(self.servers)) {
++            killPostgres();
++        } else {
++            stopMorays();
++        }
+     } else {
+         self._cleanup();
+     }
+diff --git a/package.json b/package.json
+index b79c9d0..22fd206 100644
+--- a/package.json
++++ b/package.json
+@@ -2,7 +2,7 @@
+   "name": "moray-sandbox",
+   "description": "Library for managing temporary, sandboxed Moray instances",
+   "main": "./lib/index.js",
+-  "version": "0.1.2",
++  "version": "0.1.3",
+   "keywords": [ "moray" ],
+   "repository": {
+     "type": "git",
+@@ -13,6 +13,7 @@
+     "bunyan": "^1.8.5",
+     "clone": "1.0.2",
+     "forkexec": "1.1.0",
++    "jsprim": "1.4.0",
+     "moray-server": "git+https://github.com/joyent/moray.git#3e9f411",
+     "uuid": "3.0.0",
+     "vasync": "1.6.4",

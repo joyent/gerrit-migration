@@ -1,0 +1,555 @@
+commit 1c66e385dd2ab9f8e7b1d1263b17ff7209834a26 (refs/changes/52/552/3)
+Author: Marsell Kukuljevic <marsell@joyent.com>
+Date:   2016-10-24T22:52:28+13:00 (2 years, 11 months ago)
+    
+    CNAPI-671: Load servers to dapi in batches.
+    CNAPI-672: Update dapi to support queries to vmapi.
+
+diff --git a/lib/common.js b/lib/common.js
+index 18f6bd0..30b5f26 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -127,6 +127,21 @@ function getAdminIp(sysinfo) {
+     return ip;
+ }
+ 
++// Take an array and sort it randomly.
++
++function randSort(array) {
++    /* Durstenfeld shuffle */
++    for (var i = array.length - 1; i !== 0; i--) {
++        var j = Math.floor(Math.random() * (i + 1));
++
++        var tmp = array[i];
++        array[i] = array[j];
++        array[j] = tmp;
++    }
++
++    return array;
++}
++
+ 
+ module.exports = {
+     genId: genId,
+@@ -135,6 +150,7 @@ module.exports = {
+     timestamp: timestamp,
+     isString: isString,
+     filterEscape: filterEscape,
++    randSort: randSort,
+     orderedKVString: orderedKVString,
+     HEARTBEATER_PERIOD: HEARTBEATER_PERIOD
+ };
+diff --git a/lib/endpoints/allocator.js b/lib/endpoints/allocator.js
+index d83f348..16699a2 100644
+--- a/lib/endpoints/allocator.js
++++ b/lib/endpoints/allocator.js
+@@ -44,6 +44,10 @@ var CAPACITY_VALIDATION_RULES = {
+     servers:  ['optional', 'isArrayType']
+ };
+ 
++var SERVER_CHUNK_SIZE = 50;
++
++var VOLUMES_MSG = 'Servers containing VMs required for volumes-from';
++
+ var DEFAULT_WEIGHT_CURRENT_PLATFORM = 1;
+ var DEFAULT_WEIGHT_NEXT_REBOOT      = 0.5;
+ var DEFAULT_WEIGHT_NUM_OWNER_ZONES  = 0;
+@@ -64,7 +68,37 @@ function Allocator(algoDesc, changeDefaults, useVmapi) {
+         throw new Error(err);
+     }
+ 
+-    this.allocator = new dapiAlloc(ModelServer.log, algoDesc, this.defaults);
++    var sys = {
++        log: ModelServer.log
++    };
++
++    if (useVmapi) {
++        sys.getVm = function getVm(vmUuid, cb) {
++            ModelVm.getVmViaVmapi({ uuid: vmUuid }, cb);
++        };
++
++        sys.getServerVms = function getServerVms(serverUuid, cb) {
++            var opts = {
++                server_uuid: serverUuid,
++                predicate: {
++                    and: [
++                        { ne: ['state', 'destroyed'] },
++                        { ne: ['state', 'failed'] },
++                        // We include this one since vmapi sometimes provides
++                        // nulls in some of the attributes here, which dapi
++                        // is not expecting. Waitlist tickets still cover
++                        // the existence of these VMs, without this problem.
++                        { ne: ['state', 'provisioning'] }
++                    ]
++                }
++            };
++
++            ModelVm.listVmsViaVmapi(opts, cb);
++        };
++    }
++
++    this.allocator = new dapiAlloc(sys, algoDesc, this.defaults);
++    this.filterHeadnode = this.defaults.filter_headnode;
+     this.useVmapi = useVmapi;
+ }
+ 
+@@ -155,6 +189,7 @@ Allocator.prototype.allocate = function (req, res, next) {
+ 
+     vm.nic_tags = tags;
+ 
++    var log = req.log;
+     var httpBody;
+     var imgapiPeers = [];
+     var serverDetails;
+@@ -162,8 +197,8 @@ Allocator.prototype.allocate = function (req, res, next) {
+ 
+     async.series([
+         function getAllUnreservedServers(cb) {
+-            getServers(req.log, servers, false, self.useVmapi,
+-                       function (err2, _details) {
++            getServers(log, servers, false, self.filterHeadnode,
++                       self.useVmapi, function (err2, _details) {
+                 if (err2) {
+                     cb(new restify.InternalError(err2.message));
+                     return;
+@@ -175,10 +210,10 @@ Allocator.prototype.allocate = function (req, res, next) {
+         },
+ 
+         function getOpenTickets(cb) {
+-            req.log.debug({ servers: serverDetails },
++            log.debug({ servers: serverDetails },
+                       'Servers found, fetching tickets...');
+ 
+-            getOpenProvisioningTickets(req.log, function (err3, _tickets) {
++            getOpenProvisioningTickets(log, function (err3, _tickets) {
+                 if (err3) {
+                     cb(new restify.InternalError(err3.message));
+                     return;
+@@ -190,42 +225,70 @@ Allocator.prototype.allocate = function (req, res, next) {
+         },
+ 
+         function allocateToServer(cb) {
+-            req.log.debug({ tickets: tickets },
+-                          'Tickets found, running allocator...');
+-
+-            var startTime = new Date();
+-            var results = self.allocator.allocate(serverDetails, vm, img, pkg,
+-                                                  tickets);
+-            var server = results[0];
+-            var stepSummary = results[1];
+-            var deltaTime = new Date() - startTime;
+-
+-            req.log.debug('Allocator run took ' + deltaTime + ' ms');
+-            req.log.debug(httpBody, 'Allocator run');
+-            logResults(req.log, server, serverDetails, req.params, tickets,
+-                       this.defaults, stepSummary);
+-
+-            httpBody = {
+-                server: server,
+-                steps: stepSummary
+-            };
++            log.debug({ tickets: tickets },
++                      'Tickets found, running allocator...');
+ 
+-            // XXX we need a better way of determining which step in particular
+-            // we were on when the sequence came to an end
+-            var VOLUMES_MSG =
+-                'Servers containing VMs required for volumes-from';
++            common.randSort(serverDetails); // mutates with a random reorder
+ 
+-            if (!server && stepSummary.slice(-1)[0].step === VOLUMES_MSG) {
+-                cb(new errors.VolumeServerNoResourcesError());
+-                return;
++            // cut servers into arrays of max size SERVER_CHUNK_SIZE
++            var chunks = [];
++            for (var j = 0; j <= serverDetails.length; j += SERVER_CHUNK_SIZE) {
++                chunks.push(serverDetails.slice(j, j + SERVER_CHUNK_SIZE));
+             }
+ 
+-            if (!server) {
+-                cb(new errors.NoAllocatableServersError());
+-                return;
++            var allocator = self.allocator;
++            function allocChunk() {
++                var serversChunk = chunks.pop();
++                var startTime = new Date();
++
++                allocator.allocate(serversChunk, vm, img, pkg, tickets,
++                        function (err2, server, stepSummary) {
++                    if (err2) {
++                        log.error('Error while running dapi:', err2);
++                        cb(err);
++                        return;
++                    }
++
++                    var deltaTime = new Date() - startTime;
++                    log.debug('Allocator run took', deltaTime, 'ms');
++
++                    logResults(log, server, serversChunk, req.params, tickets,
++                               self.defaults, stepSummary);
++
++                    // after allocation and logging, remove vms hash so the
++                    // GC can collect it
++                    serversChunk.forEach(function (s) { delete s.vms; });
++
++                    httpBody = {
++                        server: server,
++                        steps: stepSummary
++                    };
++                    log.debug(httpBody, 'Allocator run');
++
++                    if (server) {
++                        cb();
++                        return;
++                    }
++
++                    // check if we should run another chunk through dapi
++                    if (chunks.length > 0) {
++                        allocChunk();
++                        return;
++                    }
++
++                    // XXX we need a better way of determining which step in
++                    // particular we were on when the sequence came to an end
++                    if (stepSummary.slice(-1)[0].step === VOLUMES_MSG) {
++                        cb(new errors.VolumeServerNoResourcesError());
++                        return;
++                    }
++
++                    cb(new errors.NoAllocatableServersError());
++                    return;
++                });
+             }
+ 
+-            cb();
++            allocChunk();
+         },
+ 
+         // Get available IMGAPI peers (cn-agents) that can provide this server
+@@ -334,28 +397,33 @@ Allocator.prototype.capacity = function (req, res, next) {
+         }
+     }
+ 
+-    getServers(req.log, servers, null, self.useVmapi,
+-               function (err2, serverDetails) {
+-        if (err2) {
+-            next(new restify.InternalError(err2.message));
++    getServers(req.log, servers, null, null, self.useVmapi,
++               function (err, serverDetails) {
++        if (err) {
++            next(new restify.InternalError(err.message));
+             return;
+         }
+ 
+         req.log.debug({ servers: serverDetails },
+                       'Servers found, running capacity');
+ 
+-        var results = self.allocator.serverCapacity(serverDetails);
++        self.allocator.serverCapacity(serverDetails,
++                function (err2, capacities, reasons) {
++            if (err2) {
++                next(new restify.InternalError(err2.message));
++                return;
++            }
+ 
+-        var httpBody = {
+-            capacities: results[0],
+-            errors: results[1]
+-        };
++            var httpBody = {
++                capacities: capacities
++            };
+ 
+-        req.log.debug(httpBody, 'Capacity run');
++            req.log.debug(httpBody, 'Capacity run');
+ 
+-        res.send(httpBody);
+-        next();
+-        return;
++            res.send(httpBody);
++            next();
++            return;
++        });
+     });
+ 
+     return;
+@@ -404,12 +472,13 @@ function getDefaults(changeDefaults) {
+ }
+ 
+ 
+-function getServers(log, serverUuids, reserved, useVmapi, cb) {
++function getServers(log, serverUuids, reserved, filterHeadnode, useVmapi, cb) {
+     var options = {
+         wantFinal: true,
+         uuid: serverUuids,
+         default: false,
+         setup: true,
++        status: 'running',
+         extras: {
+             status: true,
+             sysinfo: true,
+@@ -422,6 +491,10 @@ function getServers(log, serverUuids, reserved, useVmapi, cb) {
+         options.reserved = reserved;
+     }
+ 
++    if (filterHeadnode) {
++        options.headnode = false;
++    }
++
+     if (!useVmapi) {
+         options.extras.vms = true;
+     }
+@@ -434,49 +507,7 @@ function getServers(log, serverUuids, reserved, useVmapi, cb) {
+         var delta = new Date() - start;
+         log.debug('Servers search took ' + delta + ' ms');
+ 
+-        if (err || !useVmapi) {
+-            cb(err, servers);
+-            return;
+-        }
+-
+-        // if we're using vmapi, load the vms from vmapi for each server, and
+-        // populate the server.vms hash
+-        async.forEach(servers, function (server, next) {
+-            ModelVm.listVmsViaVmapi({
+-                server_uuid: server.uuid,
+-                predicate: {
+-                    and: [
+-                        { ne: ['state', 'destroyed'] },
+-                        { ne: ['state', 'failed'] },
+-                        // We include this one since vmapi sometimes provides
+-                        // nulls in some of the attributes here, which dapi
+-                        // is not expecting. Waitlist tickets still cover
+-                        // the existence of these VMs, without this problem.
+-                        { ne: ['state', 'provisioning'] }
+-                    ]
+-                }
+-            }, function (err2, vms) {
+-                if (err2) {
+-                    next(err2);
+-                    return;
+-                }
+-
+-                // dapi should prevent there being 1000 vms on a server, but
+-                // if we see 1000 vms here, we're probably missing some since
+-                // vmapi has a limit of 1000 per request
+-                assert.ok(vms.length < 1000);
+-
+-                server.vms = {};
+-                vms.forEach(function (vm) {
+-                    server.vms[vm.uuid] = vm;
+-                });
+-
+-                next();
+-                return;
+-            });
+-        }, function (err2) {
+-            cb(err2, servers);
+-        });
++        cb(err, servers);
+     });
+ }
+ 
+diff --git a/lib/endpoints/servers.js b/lib/endpoints/servers.js
+index 34d2b95..8c958d4 100644
+--- a/lib/endpoints/servers.js
++++ b/lib/endpoints/servers.js
+@@ -26,7 +26,8 @@ function Server() {}
+ 
+ Server.init = function () {
+     Server.log = ModelServer.log;
+-    Server.allocator = new dapiAlloc(ModelServer.log, ['pipe', 'identity']);
++    Server.allocator = new dapiAlloc({ log: ModelServer.log },
++        ['pipe', 'identity'], {});
+ };
+ 
+ 
+@@ -149,51 +150,57 @@ Server.list = function (req, res, next) {
+             }
+ 
+             req.log.debug(options, 'Searching for all servers');
+-            ModelServer.list(
+-                options,
+-                function (error, s) {
+-                    if (error) {
+-                        cb(error);
+-                        return;
+-                    }
++            ModelServer.list(options, function (error, s) {
++                if (error) {
++                    cb(error);
++                    return;
++                }
+ 
+-                    req.log.debug({ servers: s }, 'Servers found');
++                req.log.debug({ servers: s }, 'Servers found');
+ 
+-                    if (!extras || (!extras.all && !extras.sysinfo)) {
+-                        for (var i in s) {
+-                            delete s[i].sysinfo;
+-                        }
++                if (!extras || (!extras.all && !extras.sysinfo)) {
++                    for (var i in s) {
++                        delete s[i].sysinfo;
+                     }
++                }
+ 
+-                    if (extras && (extras.capacity || extras.all)) {
+-                        req.log.debug('Running capacity');
++                if (!(extras && (extras.capacity || extras.all))) {
++                    result = s;
++                    cb();
++                    return;
++                }
+ 
+-                        // this mutates s, adding unreserved_cpu, unreserved_ram
+-                        // and unreserved_disk to eligible servers
+-                        Server.allocator.serverCapacity(s);
++                req.log.debug('Running capacity');
+ 
+-                        req.log.debug('Done running capacity');
++                // this mutates s, adding unreserved_cpu, unreserved_ram
++                // and unreserved_disk to eligible servers
++                Server.allocator.serverCapacity(s, function (err) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
+ 
+-                        if (noAll) {
+-                            // if noAll is true, we know options.extras exists
+-                            if (!extras.vms) {
+-                                for (i in s) {
+-                                    delete s[i].vms;
+-                                }
++                    req.log.debug('Done running capacity');
++
++                    if (noAll) {
++                        // if noAll is true, options.extras exists
++                        if (!extras.vms) {
++                            for (i in s) {
++                                delete s[i].vms;
+                             }
++                        }
+ 
+-                            if (!extras.sysinfo) {
+-                                for (i in s) {
+-                                    delete s[i].sysinfo;
+-                                }
++                        if (!extras.sysinfo) {
++                            for (i in s) {
++                                delete s[i].sysinfo;
+                             }
+                         }
+                     }
+ 
+                     result = s;
+                     cb();
+-                    return;
+                 });
++            });
+         }
+     ],
+     function (error) {
+@@ -243,14 +250,25 @@ Server.get = function (req, res, next) {
+             memory: true
+         },
+         function (error, server) {
++            if (error) {
++                next(error);
++                return;
++            }
++
+             req.log.debug('Running capacity');
+             // this mutates server, adding unreserved_cpu, unreserved_ram and
+             // unreserved_disk to eligible servers
+-            Server.allocator.serverCapacity([server]);
+-            req.log.debug('Done running capacity');
++            Server.allocator.serverCapacity([server], function (err) {
++                if (err) {
++                    next(err);
++                    return;
++                }
+ 
+-            res.send(server);
+-            next();
++                req.log.debug('Done running capacity');
++
++                res.send(server);
++                next();
++            });
+         });
+ };
+ 
+diff --git a/package.json b/package.json
+index 693c140..a834721 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "cnapi",
+   "description": "SmartDataCenter Compute Node API",
+-  "version": "1.4.0",
++  "version": "1.5.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+@@ -9,7 +9,7 @@
+     "assert-plus": "0.1.5",
+     "async": "1.5.2",
+     "bunyan": "1.3.4",
+-    "dapi": "git+https://github.com/joyent/sdc-designation.git#db24809071ed2c2e5fe26fbd0b8d27d4b0f01d0a",
++    "dapi": "git+https://github.com/joyent/sdc-designation.git#69d11960f7e7af05d9599d6052115508c07f0fcc",
+     "deep-equal": "git+https://github.com/substack/node-deep-equal.git#b2cfeb95da6982f8bc2e676231820a3a47385db3",
+     "dox": "0.4.1",
+     "effluent-logger": "git+https://github.com/joshwilsdon/effluent-logger.git#d662f161a07f94045ad2afb45442931511c40e51",
+diff --git a/sapi_manifests/cnapi/template b/sapi_manifests/cnapi/template
+index f3a0555..87c8d9a 100644
+--- a/sapi_manifests/cnapi/template
++++ b/sapi_manifests/cnapi/template
+@@ -75,25 +75,26 @@
+ 			        "hard-filter-running",
+ 			        "hard-filter-invalid-servers",
+ 			        "hard-filter-volumes-from",
+-			        "calculate-ticketed-vms",
+ 			        "hard-filter-reserved",
+-			        "hard-filter-headnode",
+-			        "hard-filter-vm-count",
+-			        "hard-filter-capness",
+ 			        "hard-filter-vlans",
+ 			        "hard-filter-platform-versions",
+ 			        "hard-filter-traits",
+-			        "hard-filter-owners-servers",
+-			        "hard-filter-sick-servers",
++			        "hard-filter-headnode",
+ 			        "override-overprovisioning",
+-			        "calculate-server-unreserved",
+ 			        "hard-filter-overprovision-ratios",
++			        "load-server-vms",
++			        "calculate-ticketed-vms",
++			        "hard-filter-capness",
++			        "hard-filter-vm-count",
++			        "hard-filter-sick-servers",
++			        "calculate-server-unreserved",
+ 			        "hard-filter-min-ram",
+ 			        "hard-filter-min-cpu",
+ {{#ALLOC_FILTER_MIN_DISK}}
+ 			        "hard-filter-min-disk",
+ {{/ALLOC_FILTER_MIN_DISK}}
+ 			        "hard-filter-locality-hints",
++			        "hard-filter-owners-servers",
+ 			        ["or", "hard-filter-reservoir",
+ 			               "identity"],
+ 			        ["or", "hard-filter-large-servers",
+diff --git a/test/test-allocator.js b/test/test-allocator.js
+index 64b472f..183a7ca 100644
+--- a/test/test-allocator.js
++++ b/test/test-allocator.js
+@@ -160,7 +160,6 @@ function callApiErr(t, path, data, errField, errMsg) {
+ function validateCapacityResults(t, results) {
+     t.ok(results);
+     t.ok(typeof (results.capacities) === 'object');
+-    t.deepEqual(results.errors, {});
+ 
+     var serverUuid   = Object.keys(results.capacities)[0];
+     var serverCap    = results.capacities[serverUuid];

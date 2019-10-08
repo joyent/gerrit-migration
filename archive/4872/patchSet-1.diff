@@ -1,0 +1,235 @@
+commit 22c48fce8f528eba50d0141f9533a04acc4eaf09 (refs/changes/72/4872/1)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2018-09-25T02:56:13-07:00 (1 year ago)
+    
+    TRITON-243 Change to using refquota instead of quota for zoneroots of bhyve VMs
+
+diff --git a/src/vm/node_modules/VM.js b/src/vm/node_modules/VM.js
+index 17cd6655..84cba437 100644
+--- a/src/vm/node_modules/VM.js
++++ b/src/vm/node_modules/VM.js
+@@ -140,6 +140,7 @@ var DEFAULT_MAX_MSG_IDS = 4096;
+ var DEFAULT_MAX_SEM_IDS = 4096;
+ var DEFAULT_MAX_SHM_IDS = 4096;
+ var DEFAULT_MDATA_TIMEOUT = 300;
++var DEFAULT_BHYVE_QUOTA = (100 * 1024 * 1024);
+ var DISABLED = 0;
+ var MAX_HOSTVOL_FILE_BYTES = (10 * 1024 * 1024);
+ var MAX_SNAPNAME_LENGTH = 64;
+@@ -1399,10 +1400,8 @@ function setQuota(opts, callback)
+     }
+ 
+     if (brand === 'bhyve') {
+-        // For bhyve we want to use refquota so that the quota only applies to
+-        // the zonepath dataset, and not the zvol 'disks' that are underneath as
+-        // zones/<uuid>/diskX
+-        quotaKey = 'refquota';
++        setQuotaBhyve(opts, callback);
++        return;
+     }
+ 
+     zfs(['set', quotaKey + '=' + newval, dataset], log, function (err, fds) {
+@@ -1416,6 +1415,203 @@ function setQuota(opts, callback)
+     });
+ }
+ 
++/*
++ * See: https://github.com/joyent/rfd/edit/master/rfd/0148/snapspace.md
++ *
++ * | Dataset              | refquota | quota | refreservation | reservation |
++ * | -------------------- | -------- | ----- | -------------- | ----------- |
++ * | zones/<uuid>         | [1]      | [2]   | [1]            | [2]         |
++ * | zones/<uuid>/disk<N> | none     | none  | [3]            | none        |
++ *
++ * 1. A size sufficiently large to store configuration and log files.  100 MiB
++ *    is probably plenty large, but a historical allocation (quota) of 10 GiB
++ *    may exist.
++ * 2. This is the sum of [1] and all [3]s for this instance.  The vmadm payload
++ *    value of *quota* may override this value, but only if it is larger than
++ *    the calculated value.
++ * 3. The value calculated by the system when *refreservation* is set to
++ *    *auto*.
++ *
++ * Steps:
++ *   - Set refquota, refreservation to `DEFAULT_BHYVE_QUOTA`
++ *   - Set refreservation on instance volumes to 'auto'
++ *   - Read value which was calculated for refreservation (auto_refres)
++ *   - Set quota zone root dataset to (DEFAULT_BHYVE_QUOTA + auto_refres)
++ */
++
++function setQuotaBhyve(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.dataset, 'opts.dataset');
++    assert.object(opts.log, 'opts.log');
++    assert(opts.hasOwnProperty('quota'), 'opts.quota');
++
++    var log = opts.log;
++    var dataset = opts.dataset;
++    var datasets;
++
++    // Convert the quota value into a number.
++    // ("123m" = 123 * 1024 *1024)
++    var normalizedQuota = parseSizeValue(opts.quota);
++
++    vasync.waterfall([
++        function setRefQuotaRefRes(next) {
++            var zfsArgs = [
++                'set',
++                'refquota=' + DEFAULT_BHYVE_QUOTA,
++                'refreservation=' + DEFAULT_BHYVE_QUOTA,
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onSetQuotaRefRes(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve() "zfs set quota, refquota" '
++                        + 'cmd failed: ' + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                next();
++            });
++        },
++
++        function getVolumesRefRes(next) {
++            // Look up the refreservation value of all zone volumes
++            var zfsArgs = [
++                'get', '-Hpr', '-t', 'volume',
++                'refreservation',
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onGetVolumeRefRes(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve() "zfs get" cmd failed: '
++                        + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                datasets = parseZfsGet(fds.stdout);
++                next();
++            });
++        },
++
++        function setVolumesRefResAuto(next) {
++            // Set the 'refreservation' values on all the volumes to 'auto'
++            vasync.forEachPipeline({
++                inputs: Object.keys(datasets),
++                func: function (disk, cb) {
++                    var zfsArgs = ['set', 'refreservation=auto', disk];
++                    zfs(zfsArgs, log, function _onSetRefResAuto(err, fds) {
++                        if (err) {
++                            log.error(
++                                'setQuotaBhyve() "zfs set refres auto" '
++                                + 'cmd failed: ' + fds.stderr);
++                            cb(new Error(rtrim(fds.stderr)));
++                            return;
++                        }
++                    });
++                }
++            },
++            function _onSetVolumesRefResAutoPipeline(err) {
++                next(err);
++            });
++        },
++
++        function getVolumeCalculatedRefRes(next) {
++            // Get the values which were calculated by the system when we set
++            // the refreservation to 'auto'
++            var zfsArgs = [
++                'get', '-Hpr', '-t', 'volume',
++                'refreservation',
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onGetVolumesRefRes(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve() "zfs get" cmd failed: '
++                        + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                datasets = parseZfsGet(fds.stdout);
++                next();
++            });
++        },
++        function setDatasetQuota(next) {
++            // Compare the quota value passed in to the one which we've
++            // computed based on volume refreservation values.
++
++            var sum = Object.keys(datasets).reduce(function (acc, cur) {
++                return acc + datasets[cur].refreservation;
++            });
++
++            var quota = normalizedQuota > sum ? normalizedQuota : sum;
++
++            var zfsArgs = [
++                'set',
++                'quota=' + quota,
++                'reservation=' + quota,
++                dataset
++            ];
++
++            zfs(zfsArgs, log, function _onSetDatasetQuota(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve: "zfs set quota, reservation" '
++                        + 'cmd failed: ' + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                next();
++                return;
++            });
++        }
++    ], function _onSetQuotaBhyveWaterfall(err) {
++        callback(err);
++    });
++}
++
++
++function parseZfsGet(output) {
++    var lines = output.split('\n');
++    var line;
++    var splitLine = new RegExp('\\s+');
++    var parseNum = new RegExp('[1-9][0-9]*');
++    var datasets = {};
++
++    for (var idx in lines) {
++        if (!lines[idx]) break;
++        line = lines[idx].split(splitLine);
++
++        if (!datasets[line[0]]) {
++            datasets[line[0]] = {};
++        }
++
++        if (line[2].match(parseNum)) {
++            datasets[line[0]][line[1]] = parseInt(line[2], 10);
++        } else {
++            datasets[line[0]][line[1]] = line[2];
++        }
++    }
++
++    return datasets;
++}
++
++
++function parseSizeValue(input) {
++    var multipliers = 'kmgtpezy';
++
++    if (typeof (input) === 'number') {
++        return input;
++    } else {
++        assert.string(input, 'input');
++    }
++
++    if (input[input.length-1].match(/[0-9]/)) {
++        return parseInt(input, 10);
++    }
++
++    var suffix = input[input.length-1];
++    var numberPart = input.slice(0, input.length-1);
++
++    return numberPart * Math.pow(1024, 1+multipliers.indexOf(suffix));
++}
++
++
+ exports.flatten = function (vmobj, key)
+ {
+     var index;

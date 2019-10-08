@@ -1,0 +1,554 @@
+commit 39212e039b1f3c2b43ca94c02993252460e43f2b (refs/changes/22/2122/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2017-06-16T18:47:38-07:00 (2 years, 4 months ago)
+    
+    joyent/node-zkstream#13 client should not reconnect at audible frequency
+
+diff --git a/lib/client-fsm.js b/lib/client-fsm.js
+index 9032434..9493d5c 100644
+--- a/lib/client-fsm.js
++++ b/lib/client-fsm.js
+@@ -67,6 +67,10 @@ function ZKClientFSM(opts) {
+ 	this.zs_lastPkt = undefined;
+ 	this.zs_lastZxid = new mod_jsbn.BigInteger('0');
+ 
++	this.zs_minDelay = 1000;
++	this.zs_maxDelay = this.zs_timeout;
++	this.zs_delay = this.zs_minDelay;
++
+ 	mod_fsm.FSM.call(this, 'init');
+ }
+ mod_util.inherits(ZKClientFSM, mod_fsm.FSM);
+@@ -102,11 +106,13 @@ ZKClientFSM.prototype.state_closed = function (S) {
+ 		S.gotoState('connecting');
+ 	});
+ 
+-	this.zs_log.info('closing connection');
++	this.zs_log.info('closed connection');
+ 
+-	this.zs_encoder.end();
++	if (this.zs_encoder)
++		this.zs_encoder.end();
+ 	this.zs_encoder = undefined;
+-	this.zs_socket.destroy();
++	if (this.zs_socket)
++		this.zs_socket.destroy();
+ 	this.zs_socket = undefined;
+ 	this.zs_decoder = undefined;
+ 
+@@ -119,6 +125,8 @@ ZKClientFSM.prototype.state_closed = function (S) {
+ 	this.zs_reqs = {};
+ 	this.zs_watchers = {};
+ 
++	this.zs_delay = this.zs_minDelay;
++
+ 	var self = this;
+ 	S.immediate(function () {
+ 		self.emit('close');
+@@ -153,7 +161,7 @@ ZKClientFSM.prototype.state_connecting = function (S) {
+ 	});
+ 	S.on(this.zs_socket, 'error', function (err) {
+ 		self.zs_lastError = err;
+-		S.gotoState('error');
++		S.gotoState('connectError');
+ 	});
+ 	S.on(this.zs_socket, 'close', function () {
+ 		S.gotoState('closed');
+@@ -163,6 +171,51 @@ ZKClientFSM.prototype.state_connecting = function (S) {
+ 	});
+ };
+ 
++ZKClientFSM.prototype.state_connectError = function (S) {
++	var self = this;
++
++	if (this.zs_encoder)
++		this.zs_encoder.end();
++	this.zs_encoder = undefined;
++	if (this.zs_socket)
++		this.zs_socket.destroy();
++	this.zs_socket = undefined;
++	this.zs_decoder = undefined;
++
++	this.zs_log.warn(this.zs_lastError, 'failed to connect to ZK');
++	/*
++	 * Don't use S.immediate here, we always want to make sure this gets
++	 * emitted, even though we're leaving this state.
++	 */
++	setImmediate(function () {
++		self.emit('error', self.zs_lastError);
++	});
++
++	if (this.zs_cr !== undefined && this.zs_lastPkt !== undefined) {
++		var now = new Date();
++		var delta = now.getTime() - this.zs_lastPkt.getTime();
++		if (delta > this.zs_cr.timeOut) {
++			this.zs_log.trace('has been %d ms since last ' +
++			    'session renewal, zk session lost',
++			    delta);
++			S.gotoState('closed');
++			return;
++		}
++	}
++
++	S.timeout(this.zs_delay, function () {
++		S.gotoState('connecting');
++	});
++
++	S.on(this, 'closeAsserted', function () {
++		S.gotoState('closed');
++	});
++
++	this.zs_delay *= 2;
++	if (this.zs_delay > this.zs_maxDelay)
++		this.zs_delay = this.zs_maxDelay;
++};
++
+ ZKClientFSM.prototype.state_handshaking = function (S) {
+ 	var self = this;
+ 	S.on(this.zs_decoder, 'readable', function zkReadConnectResp() {
+@@ -203,24 +256,27 @@ ZKClientFSM.prototype.state_handshaking = function (S) {
+ 		self.zs_lastPkt = new Date();
+ 		S.gotoState('connected');
+ 	});
+-	S.on(this.zs_decoder, 'error', function (err) {
+-		self.zs_lastError = err;
+-		S.gotoState('error');
+-	});
+-	S.on(this.zs_encoder, 'error', function (err) {
+-		self.zs_lastError = err;
+-		S.gotoState('error');
+-	});
+-	S.on(this.zs_decoder, 'end', function () {
+-		S.gotoState('closed');
+-	});
+-	S.on(this.zs_socket, 'error', function (err) {
++	function onError(err) {
+ 		self.zs_lastError = err;
+-		S.gotoState('error');
++		S.gotoState('connectError');
++	}
++	S.on(this.zs_decoder, 'error', onError);
++	S.on(this.zs_encoder, 'error', onError);
++	S.on(this.zs_socket, 'error', onError);
++	S.on(this.zs_socket, 'end', function () {
++		self.zs_lastError = new mod_errors.ZKProtocolError(
++		    'CONNECTION_LOSS', 'Connection closed unexpectedly.');
++		S.gotoState('connectError');
+ 	});
+ 	S.on(this, 'closeAsserted', function () {
+ 		S.gotoState('closed');
+ 	});
++	S.timeout(Math.round(this.zs_timeout / 2), function () {
++		self.zs_lastError = new mod_errors.ZKProtocolError(
++		    'TIMEOUT', 'Timed out while waiting for ZK handshake to ' +
++		    'complete');
++		S.gotoState('connectError');
++	});
+ 	this.zs_socket.pipe(this.zs_decoder);
+ 	this.zs_encoder.pipe(this.zs_socket);
+ 	if (this.zs_cr !== undefined) {
+@@ -257,31 +313,7 @@ ZKClientFSM.prototype.state_connected = function (S) {
+ 			self.zs_lastPkt = new Date();
+ 
+ 			if (pkt.opcode === 'NOTIFICATION') {
+-				if (pkt.state !== 'SYNC_CONNECTED') {
+-					self.zs_log.warn({
+-						xid: pkt.xid,
+-						errorCode: pkt.err,
+-						state: pkt.state,
+-						type: pkt.type,
+-						zxid: pkt.zxid.toString('hex')
+-					}, 'received notification with bad ' +
+-					    'state %s', pkt.state);
+-					continue;
+-				}
+-				var watcher = self.zs_watchers[pkt.path];
+-				var evt = pkt.type.toLowerCase().
+-				    replace(/_[a-z]/g, function (s) {
+-					return (s.slice(1).toUpperCase());
+-				    });
+-				self.zs_log.trace({
+-					xid: pkt.xid,
+-					errorCode: pkt.err,
+-					state: pkt.state,
+-					zxid: pkt.zxid.toString('hex'),
+-					type: pkt.type
+-				}, 'notification %s for %s', evt, pkt.path);
+-				if (watcher)
+-					watcher.emit(evt);
++				self.processNotification(pkt);
+ 				continue;
+ 			}
+ 
+@@ -291,23 +323,7 @@ ZKClientFSM.prototype.state_connected = function (S) {
+ 				self.zs_lastZxid = zxid;
+ 			}
+ 
+-			var req = self.zs_reqs[pkt.xid];
+-			self.zs_log.trace({
+-				xid: pkt.xid,
+-				opcode: req.packet.opcode,
+-				errorCode: pkt.err
+-			}, 'server replied to request');
+-			if (req === undefined) {
+-				self.emit('packet', pkt);
+-			} else {
+-				if (pkt.err === 'OK') {
+-					req.emit('reply', pkt);
+-					continue;
+-				}
+-				var err = new mod_errors.ZKError(pkt.err,
+-				    mod_consts.ERR_TEXT[pkt.err]);
+-				req.emit('error', err, pkt);
+-			}
++			self.processReply(pkt);
+ 		}
+ 	});
+ 	S.on(this.zs_decoder, 'end', function () {
+@@ -315,19 +331,14 @@ ZKClientFSM.prototype.state_connected = function (S) {
+ 		    'CONNECTION_LOSS', 'Connection closed unexpectedly.');
+ 		S.gotoState('error');
+ 	});
+-	S.on(this.zs_decoder, 'error', function (err) {
+-		self.zs_lastError = err;
+-		S.gotoState('error');
+-	});
+-	S.on(this.zs_encoder, 'error', function (err) {
+-		self.zs_lastError = err;
+-		S.gotoState('error');
+-	});
+-	S.on(this.zs_socket, 'error', function (err) {
++	function onError(err) {
+ 		self.zs_lastError = err;
+ 		S.gotoState('error');
+-	});
+-	S.on(this.zs_socket, 'close', function () {
++	}
++	S.on(this.zs_decoder, 'error', onError);
++	S.on(this.zs_encoder, 'error', onError);
++	S.on(this.zs_socket, 'error', onError);
++	S.on(this.zs_socket, 'end', function () {
+ 		self.zs_lastError = new mod_errors.ZKProtocolError(
+ 		    'CONNECTION_LOSS', 'Connection closed unexpectedly.');
+ 		S.gotoState('error');
+@@ -346,6 +357,57 @@ ZKClientFSM.prototype.state_connected = function (S) {
+ 	});
+ };
+ 
++ZKClientFSM.prototype.processNotification = function (pkt) {
++	var self = this;
++	if (pkt.state !== 'SYNC_CONNECTED') {
++		self.zs_log.warn({
++			xid: pkt.xid,
++			errorCode: pkt.err,
++			state: pkt.state,
++			type: pkt.type,
++			zxid: pkt.zxid.toString('hex')
++		}, 'received notification with bad state %s', pkt.state);
++		return;
++	}
++	var watcher = self.zs_watchers[pkt.path];
++	var evt = pkt.type.toLowerCase().replace(/_[a-z]/g, function (s) {
++		return (s.slice(1).toUpperCase());
++	});
++	self.zs_log.trace({
++		xid: pkt.xid,
++		errorCode: pkt.err,
++		state: pkt.state,
++		zxid: pkt.zxid.toString('hex'),
++		type: pkt.type
++	}, 'notification %s for %s', evt, pkt.path);
++	if (watcher)
++		watcher.emit(evt);
++};
++
++ZKClientFSM.prototype.processReply = function (pkt) {
++	var self = this;
++
++	var req = self.zs_reqs[pkt.xid];
++
++	self.zs_log.trace({
++		xid: pkt.xid,
++		opcode: req.packet.opcode,
++		errorCode: pkt.err
++	}, 'server replied to request');
++
++	if (req === undefined) {
++		self.emit('packet', pkt);
++	} else {
++		if (pkt.err === 'OK') {
++			req.emit('reply', pkt);
++			return;
++		}
++		var err = new mod_errors.ZKError(
++		    pkt.err, mod_consts.ERR_TEXT[pkt.err]);
++		req.emit('error', err, pkt);
++	}
++};
++
+ ZKClientFSM.prototype.state_closing = function (S) {
+ 	var self = this;
+ 	var xid = this.nextXid();
+@@ -402,6 +464,15 @@ ZKClientFSM.prototype.state_error = function (S) {
+ 		self.zs_reqs[xid].emit('error', self.zs_lastError);
+ 	});
+ 	this.zs_reqs = {};
++
++	if (this.zs_encoder)
++		this.zs_encoder.end();
++	this.zs_encoder = undefined;
++	if (this.zs_socket)
++		this.zs_socket.destroy();
++	this.zs_socket = undefined;
++	this.zs_decoder = undefined;
++
+ 	if (this.zs_cr !== undefined && this.zs_lastPkt !== undefined) {
+ 		var now = new Date();
+ 		var delta = now.getTime() - this.zs_lastPkt.getTime();
+@@ -418,7 +489,7 @@ ZKClientFSM.prototype.state_error = function (S) {
+ 	 * emitted, even though we're leaving this state.
+ 	 */
+ 	setImmediate(function () {
+-		this.emit('error', this.zs_lastError);
++		self.emit('error', self.zs_lastError);
+ 	});
+ 
+ 	S.gotoState('closed');
+@@ -587,7 +658,7 @@ ZKClientFSM.prototype.list = function (path, cb) {
+ 		watch: false
+ 	});
+ 	if (cb) {
+-		req.once('reply', function (pkt) {
++		req.once('reply', function onReply(pkt) {
+ 			cb(null, pkt.children, pkt.stat);
+ 		});
+ 		req.once('error', cb);
+@@ -604,7 +675,7 @@ ZKClientFSM.prototype.get = function (path, cb) {
+ 		watch: false
+ 	});
+ 	if (cb) {
+-		req.once('reply', function (pkt) {
++		req.once('reply', function onReply(pkt) {
+ 			cb(null, pkt.data, pkt.stat);
+ 		});
+ 		req.once('error', cb);
+@@ -641,7 +712,7 @@ ZKClientFSM.prototype.create = function (path, data, options, cb) {
+ 		flags: options.flags
+ 	});
+ 	if (cb) {
+-		req.once('reply', function (pkt) {
++		req.once('reply', function onReply(pkt) {
+ 			cb(null, pkt.path);
+ 		});
+ 		req.once('error', cb);
+@@ -665,7 +736,7 @@ ZKClientFSM.prototype.set = function (path, data, version, cb) {
+ 		version: version
+ 	});
+ 	if (cb) {
+-		req.once('reply', function (pkt) {
++		req.once('reply', function onReply(pkt) {
+ 			cb(null, pkt.path);
+ 		});
+ 		req.once('error', cb);
+@@ -684,7 +755,7 @@ ZKClientFSM.prototype.delete = function (path, version, cb) {
+ 		version: version
+ 	});
+ 	if (cb) {
+-		req.once('reply', function (pkt) {
++		req.once('reply', function onReply(pkt) {
+ 			cb(null);
+ 		});
+ 		req.once('error', cb);
+@@ -702,7 +773,7 @@ ZKClientFSM.prototype.stat = function (path, cb) {
+ 		watch: false
+ 	});
+ 	if (cb) {
+-		req.once('reply', function (pkt) {
++		req.once('reply', function onReply(pkt) {
+ 			cb(null, pkt.stat);
+ 		});
+ 		req.once('error', cb);
+@@ -719,7 +790,7 @@ ZKClientFSM.prototype.sync = function (path, cb) {
+ 		path: path
+ 	});
+ 	if (cb) {
+-		req.once('reply', function (pkt) {
++		req.once('reply', function onReply(pkt) {
+ 			cb(null);
+ 		});
+ 		req.once('error', cb);
+diff --git a/package.json b/package.json
+index 64d29e5..e048dad 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "zkstream",
+-  "version": "0.6.1",
++  "version": "0.6.2",
+   "description": "",
+   "main": "lib/index.js",
+   "dependencies": {
+diff --git a/test/basic.test.js b/test/basic.test.js
+index 957ec8a..b992a29 100644
+--- a/test/basic.test.js
++++ b/test/basic.test.js
+@@ -18,6 +18,81 @@ var log = mod_bunyan.createLogger({
+ });
+ 
+ var zk;
++var connCount = 0;
++
++mod_tape.test('connect failure: refused', function (t) {
++	var errs = 0;
++
++	var zkc = new mod_zkc.Client({
++		log: log,
++		host: 'localhost',
++		port: 2181
++	});
++	zkc.connect();
++
++	zkc.on('stateChanged', function (st) {
++		if (st === 'closed') {
++			t.end();
++		}
++	})
++
++	zkc.on('error', function (err) {
++		t.ok(err);
++		t.strictEqual(err.code, 'ECONNREFUSED');
++		++errs;
++	});
++
++	setTimeout(function () {
++		zkc.close();
++		t.ok(errs < 5);
++	}, 5000);
++});
++
++mod_tape.test('start awful zk server', function (t) {
++	zk = mod_net.createServer();
++	zk.on('connection', function (sock) {
++		++connCount;
++		sock.destroy();
++	});
++	zk.listen(2181, function () {
++		t.end();
++	});
++});
++
++mod_tape.test('connect failure: immediate close', function (t) {
++	var errs = 0;
++
++	var zkc = new mod_zkc.Client({
++		log: log,
++		host: 'localhost',
++		port: 2181
++	});
++	zkc.connect();
++
++	zkc.on('stateChanged', function (st) {
++		if (st === 'closed') {
++			t.end();
++		}
++	});
++
++	zkc.on('error', function (err) {
++		t.ok(err);
++		t.strictEqual(err.code, 'CONNECTION_LOSS');
++		++errs;
++	});
++
++	setTimeout(function () {
++		zkc.close();
++		t.ok(errs < 5);
++		t.strictEqual(errs, connCount);
++	}, 5000);
++});
++
++mod_tape.test('stop awful zk server', function (t) {
++	zk.close();
++	zk = undefined;
++	t.end();
++});
+ 
+ mod_tape.test('start zk server', function (t) {
+ 	zk = new mod_zk.ZKServer();
+@@ -47,6 +122,56 @@ mod_tape.test('simple connect and ping', function (t) {
+ 	});
+ });
+ 
++mod_tape.test('simple connect and ping, with death', function (t) {
++	var stopped = false;
++	var errs = 0;
++	var t1, t2;
++
++	var zkc = new mod_zkc.Client({
++		log: log,
++		host: 'localhost',
++		port: 2181,
++		timeout: 5000
++	});
++	zkc.connect();
++
++	zkc.on('stateChanged', function (st) {
++		if (st === 'connected') {
++			zkc.ping(function (err) {
++				t1 = new Date();
++				t.error(err);
++				zk.stop();
++			});
++		} else if (st === 'closed') {
++			t2 = new Date();
++			var delta = t2.getTime() - t1.getTime();
++			t.ok(delta >= 5000);
++			t.ok(errs < 10);
++			t.end();
++		}
++	});
++
++	zkc.on('error', function (err) {
++		t.ok(err);
++		t.strictEqual(err.code, 'ECONNREFUSED');
++		++errs;
++	});
++
++	zk.on('stateChanged', function (st) {
++		if (st === 'stopped') {
++			stopped = true;
++		}
++	});
++});
++
++mod_tape.test('start zk server', function (t) {
++	zk = new mod_zk.ZKServer();
++	zk.on('stateChanged', function (st) {
++		if (st === 'running')
++			t.end();
++	});
++});
++
+ mod_tape.test('set up test object', function (t) {
+ 	zk.cli('create', '/foo', 'hi', 'world:anyone:cdrwa', function (err) {
+ 		t.error(err);
+@@ -386,6 +511,11 @@ mod_tape.test('session resumption with watcher', function (t) {
+ 	});
+ 	zkc2.connect();
+ 
++	zkc1.on('error', function (err) {
++		t.ok(err);
++		t.ok(err.message === 'I killed it');
++	});
++
+ 	zkc1.on('stateChanged', function (st) {
+ 		if (st === 'closed' && ++closed >= 2)
+ 			t.end();
+@@ -439,6 +569,7 @@ mod_tape.test('session resumption with watcher', function (t) {
+ 			t.error(err);
+ 
+ 			var sock = zkc1.zs_socket;
++			t.ok(sock.listeners('error').length > 0);
+ 			sock.emit('error', new Error('I killed it'));
+ 			sock.destroy();
+ 

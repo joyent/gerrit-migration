@@ -1,0 +1,234 @@
+commit 148ce48864886dfe1549b6c23e59aaa1546b7aab (refs/changes/67/4667/5)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2018-08-21T12:50:50-07:00 (1 year, 2 months ago)
+    
+    TRITON-677 CNAPI gets stuck in a loop while trying to expire a ticket which is queued, which is also at the "top" of the waitlist queue for thats server/scope/id
+
+diff --git a/lib/models/waitlist.js b/lib/models/waitlist.js
+index 047d80f..cb12338 100644
+--- a/lib/models/waitlist.js
++++ b/lib/models/waitlist.js
+@@ -158,31 +158,30 @@ function WaitlistDirectorOnUpdate(timestamp, tickets) {
+     assert.optionalDate(timestamp, 'timestamp');
+     assert.array(tickets, 'tickets');
+ 
+-    self.log.trace('onUpdate with %d tickets', tickets.length);
++    self.log.info({ tickets: tickets },
++        'onUpdate: called with %d tickets', tickets.length);
++
+     async.forEach(
+         tickets,
+         function _forEachTicket(ticket, next) {
+             var i;
+             // Check if ticket needs to be expired.
+-            if (ticket.status === TICKET_STATUS_EXPIRED &&
+-                self.callbacks[ticket.uuid]) {
+-                self.log.info(
+-                    'ticket %s expired, invoking %d callbacks',
+-                    ticket.uuid, self.callbacks[ticket.uuid].length);
+-                // If ticket went into 'active' status, kick off callbacks.
+-                var expErr = new VError('ticket has expired');
+-                for (i in self.callbacks[ticket.uuid]) {
+-                    self.callbacks[ticket.uuid][i](expErr);
+-                }
+-                delete self.callbacks[ticket.uuid];
+-                next();
+-                return;
+-            // Check if a pending (active/queued) ticket is expired but not
+-            // marked as such.
+-            } else if (ticket.status !== TICKET_STATUS_FINISHED &&
++            if (ticket.status !== TICKET_STATUS_FINISHED &&
++                       ticket.status !== TICKET_STATUS_EXPIRED &&
+                        timestamp &&
+                        timestamp.toISOString() > ticket.expires_at) {
+                 ModelWaitlist.expireTicket(ticket.uuid, function (err) {
++                    if (self.callbacks[ticket.uuid]) {
++                        self.log.info(
++                            'ticket %s expired, invoking %d callbacks',
++                            ticket.uuid, self.callbacks[ticket.uuid].length);
++                        var expErr = new VError('ticket has expired');
++                        for (i in self.callbacks[ticket.uuid]) {
++                            self.callbacks[ticket.uuid][i](expErr);
++                        }
++                        delete self.callbacks[ticket.uuid];
++                    }
++
+                     if (err) {
+                         self.log.error(err);
+                         next(err);
+@@ -357,17 +356,16 @@ function ModelWaitlistTicketsUpdatedSince(opts, callback) {
+     var filter;
+     var findOpts;
+ 
+-    self.log.trace('checking for tickets since %s', opts.timestamp);
++    self.log.debug('checking for tickets since %s', opts.timestamp);
+ 
+     if (opts.timestamp) {
+         var ts = new Date(opts.timestamp);
+         var escts = common.filterEscape(ts.toISOString());
+ 
+         // Return any tickets which:
+-        // - are not finished|expired and have been updated since the
+-        //   last check.
+-        // - are not are not marked as finished or expired but have an
+-        //   expiry date which has been exceeded.
++        // - Were updated since the last check and are not finished or expired.
++        // - Are not are not marked as finished or expired but have an expiry
++        //   date which has been exceeded.
+         filter = sprintf(
+             '(&' +
+                 '(!(status=finished))' +
+@@ -392,6 +390,7 @@ function ModelWaitlistTicketsUpdatedSince(opts, callback) {
+             callback(new VError(err, 'failed to query moray'));
+             return;
+         }
++
+         if (tickets.length > 0) {
+             self.log.info({ tickets: tickets }, 'new ticket(s)');
+         }
+@@ -604,6 +603,7 @@ function modelWaitlistFindNextTickets(opts, callback) {
+     assert.string(opts.server_uuid, 'opts.server_uuid');
+     assert.optionalNumber(opts.limit, 'opts.limit');
+     assert.optionalBool(opts.omitActive, 'opts.omitActive');
++    assert.optionalUuid(opts.omitTicketUuid, 'opts.omitTicketUuid');
+ 
+     var filter = sprintf(
+         '(&' +
+@@ -611,6 +611,8 @@ function modelWaitlistFindNextTickets(opts, callback) {
+             '(scope=%s)' +
+             '(id=%s)' +
+             (opts.omitActive ? '(!(status=active))' : '') +
++            (opts.omitTicketUuid
++                ? '(!(uuid=' + opts.omitTicketUuid + '))' : '') +
+             '(!(status=finished))' +
+             '(!(status=expired))' +
+         ')', opts.server_uuid, opts.scope, opts.id);
+@@ -689,6 +691,9 @@ function ModelWaitlistUpdateTicketActivateNext(opts, callback) {
+                     return;
+                 }
+ 
++                self.log.debug({ result: result },
++                    'modifyTicketActivateNext: getTicket result');
++
+                 ticket = result.ticket;
+                 ticketEtag = result.etag;
+                 ticket.updated_at = (new Date()).toISOString();
+@@ -744,6 +749,7 @@ function ModelWaitlistUpdateTicketActivateNext(opts, callback) {
+                 server_uuid: ticket.server_uuid,
+                 limit: 1,
+                 omitActive: true,
++                omitTicketUuid: ticket.uuid,
+                 id: ticket.id,
+                 scope: ticket.scope
+             },
+diff --git a/test/waitlist/test-waitlist-expiry.js b/test/waitlist/test-waitlist-expiry.js
+index 7043ec1..d33634b 100644
+--- a/test/waitlist/test-waitlist-expiry.js
++++ b/test/waitlist/test-waitlist-expiry.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -230,10 +230,96 @@ function testExpireSingleTicketStartNext(test) {
+     });
+ }
+ 
++
++/*
++ * Test a situation in which we have an active ticket and a subsequent ticket,
++ * which is queued, expires. We should be able to wait on the queued ticket and
++ * have our callback called when the ticket expires.
++ */
++
++function testExpireQueuedTicket(test) {
++    test.expect(16);
++    var expireTimeSeconds0 = 600;
++    var expireTimeSeconds1 = 2;
++    var ticket1;
++
++    // This ticket will be active first.
++    var ticketPayload0 = {
++        scope: 'test-expire-queued',
++        id: '123',
++        expires_at: (
++            new Date((new Date().valueOf()) +
++                      expireTimeSeconds0 * 1000)).toISOString()
++    };
++
++    // This ticket will expire while queued.
++    var ticketPayload1 = {
++        scope: 'test-expire-queued',
++        id: '123',
++        expires_at: (
++            new Date((new Date().valueOf()) +
++                      expireTimeSeconds1 * 1000)).toISOString()
++    };
++
++    async.waterfall([
++        function (next) {
++            client.post(wlurl, ticketPayload0, function (err, req, res, t) {
++                test.deepEqual(err, null);
++                test.equal(res.statusCode, 202,
++                           'POST waitlist ticket returned 202');
++                test.ok(res, 'got a response');
++                test.ok(t, 'got an ticket');
++                test.ok(t.uuid, 'got a ticket uuid');
++
++                next();
++            });
++        },
++        function (next) {
++            client.post(wlurl, ticketPayload1, function (err, req, res, t) {
++                ticket1 = t;
++                test.deepEqual(err, null);
++                test.equal(res.statusCode, 202,
++                           'POST waitlist ticket returned 202');
++                test.ok(res, 'got a response');
++                test.ok(t, 'got an ticket');
++                ticket1 = t;
++                test.ok(t.uuid, 'got a ticket uuid');
++
++                next();
++            });
++        },
++        function (next) {
++            var waiturl = sprintf('/tickets/%s/wait', ticket1.uuid);
++            var timeout = setTimeout(function () {
++                var errMsg = 'cnapi got stuck';
++                test.ok(false, errMsg);
++                next(new Error(errMsg));
++            }, 5000);
++
++            client.get(waiturl, getcb);
++            function getcb(err, req, res, v) {
++                clearTimeout(timeout);
++                test.ok(err, 'expected an error');
++                test.equal(err.message, 'ticket has expired');
++                test.equal(err.restCode, 'InternalError');
++                test.equal(err.statusCode, 500);
++                test.ok(true);
++                next();
++            }
++        }
++    ],
++    function (error) {
++        test.equal(error, null);
++        test.done();
++    });
++}
++
+ module.exports = {
+     setUp: setup,
+     tearDown: teardown,
+     'expire single ticket': testExpireSingleTicket,
+     'create two tickets expire first, start next':
+-        testExpireSingleTicketStartNext
++        testExpireSingleTicketStartNext,
++    'create two tickets, second one expires':
++        testExpireQueuedTicket
+ };

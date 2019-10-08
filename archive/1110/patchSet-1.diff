@@ -1,0 +1,497 @@
+commit 586ee054449cdc1021a583c03175850e098dc2b9 (refs/changes/10/1110/1)
+Author: Wyatt Preul <wpreul@gmail.com>
+Date:   2016-12-12T16:38:27-06:00 (2 years, 10 months ago)
+    
+    Add client encryption support
+
+diff --git a/lib/client.js b/lib/client.js
+index c13be29..c70f0b7 100644
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -8,6 +8,7 @@ var path = require('path-platform');
+ var util = require('util');
+ 
+ var assert = require('assert-plus');
++var b64 = require('b64');
+ var bunyan = require('bunyan');
+ var clone = require('clone');
+ var libuuid = require('uuid');
+@@ -171,7 +172,11 @@ function createOptions(opts, userOpts) {
+         headers: normalizeHeaders(userOpts.headers),
+         id: id,
+         path: opts.path.replace(/\/$/, ''),
+-        query: clone(userOpts.query || {})
++        query: clone(userOpts.query || {}),
++        keyId: opts.keyId || userOpts.keyId,
++        key: opts.key || userOpts.key,
++        cipher: opts.cipher || userOpts.cipher,
++        getKey: opts.getKey || userOpts.getKey
+     };
+ 
+     if (userOpts.role)
+@@ -818,7 +823,13 @@ MantaClient.prototype.get = function get(p, opts, cb) {
+ 
+             res.pause();
+ 
+-            cb(null, stream, res);
++            // Not encrypted, return original file stream
++            if (res.headers['m-encrypt-support'] !== 'client') {
++                cb(null, stream, res);
++            } else {
++                decryptResponse(opts, stream, res, cb);
++            }
++
+ 
+             if (length === false &&
+                 res.headers['content-length'] &&
+@@ -886,6 +897,127 @@ MantaClient.prototype.get = function get(p, opts, cb) {
+     _get();
+ };
+ 
++function decryptResponse(opts, stream, res, cb) {
++    var invalidHeaders = validateHeaders(res.headers);
++    if (invalidHeaders) {
++        return (cb(new Error('Headers are missing or invalid: ' +
++          invalidHeaders), null, res));
++    }
++
++    return opts.getKey(res.headers['m-encrypt-key-id'], function (err, key) {
++        if (err) {
++            return (cb(err, null, res));
++        }
++
++        var algorithm = getAlgorithm(res.headers['m-encrypt-cipher']);
++        var decipher = crypto.createDecipheriv(algorithm, key,
++            b64.decode(new Buffer(res.headers['m-encrypt-iv'])));
++        var hmac = crypto.createHmac('sha256', key);
++        var output = new PassThrough();
++        var byteLength = 0;
++
++        stream.on('data', function (data) {
++            hmac.update(data);
++        });
++
++        stream.on('error', function (streamErr) {
++            decipher.removeAllListeners();
++            stream.removeAllListeners();
++            cb(streamErr);
++        });
++
++        decipher.on('data', function (data) {
++            byteLength += Buffer.byteLength(data);
++        });
++
++        decipher.once('error', function (decErr) {
++            decipher.removeAllListeners();
++            cb(decErr);
++        });
++
++        decipher.once('end', function (data) {
++            var digest = hmac.digest('base64');
++
++            if (digest !== res.headers['m-encrypt-mac']) {
++                return (cb(new Error('cipher hmac doesn\'t match stored' +
++                  ' m-encrypt-mac value'), null, res));
++            }
++
++            if (byteLength !== parseInt(
++              res.headers['m-encrypt-original-content-length'], 10)) {
++                return (cb(new Error(
++                  'decrypted file size doesn\'t match original copy'),
++                  null, res));
++            }
++
++            return decryptMetadata(res.headers, key, function () {
++                cb(null, output, res);
++            });
++        });
++
++
++        return (stream.pipe(decipher).pipe(output));
++    });
++}
++
++
++var requiredHeaders = [
++    'm-encrypt-key-id',
++    'm-encrypt-iv',
++    'm-encrypt-cipher',
++    'm-encrypt-mac',
++    'm-encrypt-original-content-length'
++];
++
++function validateHeaders(headers) {
++    var missingHeaders = [];
++    requiredHeaders.forEach(function (header) {
++        if (headers[header] === undefined || headers[header] === null) {
++            missingHeaders.push(header);
++        }
++    });
++
++    if ((headers['m-encrypt-metadata'] !== undefined &&
++      headers['m-encrypt-metadata'] !== null) &&
++      !headers['m-encrypt-metadata-cipher']) {
++
++      missingHeaders.push('m-encrypt-metadata-cipher');
++    }
++
++    return (missingHeaders.length ? missingHeaders : null);
++}
++
++
++function decryptMetadata(headers, key, cb) {
++    if (!headers['m-encrypt-metadata']) {
++        return (cb());
++    }
++
++    var algorithm = getAlgorithm(headers['m-encrypt-metadata-cipher']);
++    var decipher = crypto.createDecipheriv(algorithm, key,
++        b64.decode(new Buffer(headers['m-encrypt-metadata-iv'])));
++    var hmac = crypto.createHmac('sha256', key);
++
++    var bufs = [];
++    decipher.on('data', function (data) {
++        bufs.push(data);
++    });
++
++    decipher.once('finish', function () {
++        hmac.update(b64.decode(new Buffer(headers['m-encrypt-metadata'])));
++        headers['m-encrypt-metadata'] = Buffer.concat(bufs).toString();
++
++        if (headers['m-encrypt-metadata-mac'] !== hmac.digest('base64')) {
++            return (cb(new Error('mac hash doesn\'t match')));
++        }
++
++        return (cb());
++    });
++
++    decipher.write(b64.decode(new Buffer(headers['m-encrypt-metadata'])));
++    return (decipher.end());
++}
++
+ 
+ /**
+  * Same API as `get`, but idiomatic for node streaming.
+@@ -1799,6 +1931,8 @@ MantaClient.prototype.mkdirp = function mkdirp(dir, opts, cb) {
+  *  - cb: callback of the form f(err)
+  */
+ MantaClient.prototype.put = function put(p, input, opts, cb) {
++    var self = this;
++
+     assert.string(p, 'path');
+     assert.stream(input, 'input');
+     if (typeof (opts) === 'function') {
+@@ -1834,17 +1968,116 @@ MantaClient.prototype.put = function put(p, input, opts, cb) {
+             parseInt(opts.copies, 10);
+     }
+ 
+-    if (options.headers['content-length'] === undefined)
++    if (options.headers['content-length'] === undefined) {
+         options.headers['transfer-encoding'] = 'chunked';
++    }
+ 
+     options._original_path = p; // needed for mkdirp case
+ 
+-    log.debug(options, 'put: entered');
+-    doPut(this, log, options, input, cb, opts.mkdirs);
++    if (options.keyId !== null && options.keyId !== undefined) {
++      return doEncrypt(options, input, function (err, encrypted) {
++        if (err) {
++          return (cb(err));
++        }
++
++        return (doPut(self, log, options, encrypted, cb, opts.mkdirs));
++      });
++    }
++
++    return (doPut(this, log, options, input, cb, opts.mkdirs));
+ };
+ 
++function doEncrypt(options, input, cb) {
++    assert.string(options.key, 'key is required when encrypting');
++    assert.string(options.cipher, 'cipher is required when encrypting');
++
++    var iv = crypto.randomBytes(16);
++    var algorithm = getAlgorithm(options.cipher);
++
++    var cipher = crypto.createCipheriv(algorithm, options.key, iv);
++    var hmac = crypto.createHmac('sha256', options.key);
++    var output = new PassThrough();
++    var byteLength = 0;
++
++    cipher.on('data', function (data) {
++        hmac.update(data);
++    });
++
++    cipher.once('error', function (err) {
++        cipher.removeAllListeners();
++        cb(err);
++    });
++
++    input.on('data', function (data) {
++        byteLength += Buffer.byteLength(data);
++    });
++
++    cipher.once('end', function (data) {
++        options.headers['m-encrypt-support'] = 'client';
++        options.headers['m-encrypt-key-id'] = options.keyId;
++        options.headers['m-encrypt-iv'] = b64.encode(iv).toString();
++        options.headers['m-encrypt-cipher'] = options.cipher;
++        options.headers['m-encrypt-mac'] = hmac.digest('base64');
++        options.headers['m-encrypt-original-content-length'] = byteLength;
++
++        if (options.headers && options.headers['m-encrypt-metadata']) {
++            return encryptMetadata(options.headers, iv, options.key,
++                function (err) {
++                    if (err) {
++                        return (cb(err));
++                    }
++
++                    return (cb(null, output));
++                });
++        }
++
++        return (cb(null, output));
++    });
++
++    input.pipe(cipher).pipe(output);
++}
++
++
++function encryptMetadata(headers, iv, key, cb) {
++    headers['m-encrypt-metadata-iv'] = b64.encode(iv).toString();
++    headers['m-encrypt-metadata-cipher'] = headers['m-encrypt-metadata-cipher'];
++
++    var algorithm = getAlgorithm(headers['m-encrypt-metadata-cipher']);
++
++    var cipher = crypto.createCipheriv(algorithm, key, iv);
++    var hmac = crypto.createHmac('sha256', key);
++
++    var bufs = [];
++    cipher.on('data', function (data) {
++        bufs.push(data);
++    });
++
++    cipher.once('finish', function () {
++        var encrypted = Buffer.concat(bufs);
++        headers['m-encrypt-metadata'] = b64.encode(encrypted).toString();
++        hmac.update(encrypted);
++        headers['m-encrypt-metadata-mac'] = hmac.digest('base64');
++        cb();
++    });
++
++    cipher.once('error', function (err) {
++        cipher.removeAllListeners();
++        cb(err);
++    });
++
++    cipher.write(headers['m-encrypt-metadata']);
++    cipher.end();
++}
++
++
++function getAlgorithm(cipher) {
++    var parts = cipher.split('/');
++    return (parts[0] + parts[1]);
++}
++
+ 
+ function doPut(self, log, options, input, cb, allowretry) {
++    log.debug(options, 'put: entered');
+     self.signRequest({
+         headers: options.headers
+     }, function onSignRequest(err) {
+diff --git a/package.json b/package.json
+index 7d813f2..69393ed 100644
+--- a/package.json
++++ b/package.json
+@@ -1,55 +1,56 @@
+ {
+-    "name": "manta",
+-    "author": "Joyent (joyent.com)",
+-    "description": "Manta Client API",
+-    "homepage": "http://apidocs.joyent.com/manta",
+-    "repository": {
+-        "type": "git",
+-        "url": "git://github.com/joyent/node-manta.git"
+-    },
+-    "version": "4.1.0",
+-    "main": "./lib/index.js",
+-    "dependencies": {
+-        "assert-plus": "^1.0.0",
+-        "backoff": "~2.3.0",
+-        "bunyan": "^1.8.1",
+-        "clone": "~0.1.11",
+-        "cmdln": "4.1.2",
+-        "dashdash": "1.14.1",
+-        "extsprintf": "^1.3.0",
+-        "hogan.js": "~2.0.0",
+-        "jsprim": "^1.3.0",
+-        "lomstream": "^1.1.0",
+-        "lstream": "~0.0.4",
+-        "mime": "~1.2.11",
+-        "moment": "~2.13.0",
+-        "once": "~1.3.3",
+-        "path-platform": "~0.0.1",
+-        "progbar": "^1.1.0",
+-        "readable-stream": "~1.1.9",
+-        "restify-clients": "~1.4.1",
+-        "showdown": "~1.4.2",
+-        "smartdc-auth": "^2.4.1",
+-        "tar": "~2.2.1",
+-        "uuid": "~2.0.2",
+-        "vasync": "^1.6.4",
+-        "verror": "^1.6.1",
+-        "watershed": "^0.3.1"
+-    },
+-    "devDependencies": {
+-        "forkexec": "^1.0.0",
+-        "nodeunit": "~0.9.1"
+-    },
+-    "directories": {
+-        "bin": "./bin",
+-        "lib": "./lib",
+-        "man": "./man/man1"
+-    },
+-    "engines": {
+-        "node": ">=0.10"
+-    },
+-    "scripts": {
+-        "test": "./node_modules/.bin/nodeunit test/*.test.js"
+-    },
+-    "license": "MIT"
++  "name": "manta",
++  "author": "Joyent (joyent.com)",
++  "description": "Manta Client API",
++  "homepage": "http://apidocs.joyent.com/manta",
++  "repository": {
++    "type": "git",
++    "url": "git://github.com/joyent/node-manta.git"
++  },
++  "version": "4.1.0",
++  "main": "./lib/index.js",
++  "dependencies": {
++    "assert-plus": "^1.0.0",
++    "b64": "^2.0.0",
++    "backoff": "~2.3.0",
++    "bunyan": "^1.8.1",
++    "clone": "~0.1.11",
++    "cmdln": "4.1.2",
++    "dashdash": "1.14.1",
++    "extsprintf": "^1.3.0",
++    "hogan.js": "~2.0.0",
++    "jsprim": "^1.3.0",
++    "lomstream": "^1.1.0",
++    "lstream": "~0.0.4",
++    "mime": "~1.2.11",
++    "moment": "~2.13.0",
++    "once": "~1.3.3",
++    "path-platform": "~0.0.1",
++    "progbar": "^1.1.0",
++    "readable-stream": "~1.1.9",
++    "restify-clients": "~1.4.1",
++    "showdown": "~1.4.2",
++    "smartdc-auth": "^2.4.1",
++    "tar": "~2.2.1",
++    "uuid": "~2.0.2",
++    "vasync": "^1.6.4",
++    "verror": "^1.6.1",
++    "watershed": "^0.3.1"
++  },
++  "devDependencies": {
++    "forkexec": "^1.0.0",
++    "nodeunit": "~0.9.1"
++  },
++  "directories": {
++    "bin": "./bin",
++    "lib": "./lib",
++    "man": "./man/man1"
++  },
++  "engines": {
++    "node": ">=0.10"
++  },
++  "scripts": {
++    "test": "./node_modules/.bin/nodeunit test/*.test.js"
++  },
++  "license": "MIT"
+ }
+diff --git a/test/client.test.js b/test/client.test.js
+index 7b27aab..ad206bc 100644
+--- a/test/client.test.js
++++ b/test/client.test.js
+@@ -163,6 +163,27 @@ test('#231: put (special characters)', function (t) {
+     });
+ });
+ 
++test('put (encrypt stream)', function (t) {
++    var text = 'The lazy brown fox \nsomething \nsomething foo';
++    var stream = new MemoryStream();
++    var options = {
++      key: 'FFFFFFFBD96783C6C91E2222',
++      keyId: 'dev/test',
++      cipher: 'aes/192/cbc'
++    };
++
++    this.client.put(ROOT + '/encrypted', stream, options, function (err, res) {
++        t.ifError(err);
++        t.ok(res.req._headers['m-encrypt-key-id']);
++        t.done();
++    });
++
++    process.nextTick(function () {
++        stream.write(text);
++        stream.end();
++    });
++});
++
+ test('#231: ls (special characters)', function (t) {
+     this.client.ls(SUBDIR1, function (err, res) {
+         t.ifError(err);
+@@ -196,6 +217,47 @@ test('#231: get (special characters)', function (t) {
+     });
+ });
+ 
++test('get (decrypt stream)', function (t) {
++    var self = this;
++    var text = 'The lazy brown fox \nsomething \nsomething foo';
++    var stream = new MemoryStream();
++    var fpath = ROOT + '/todecrypt';
++    var key = 'FFFFFFFBD96783C6C91E2222';
++    var options = {
++      key: key,
++      keyId: 'dev/test',
++      cipher: 'aes/192/cbc',
++      getKey: function (keyId, cb) {
++          cb(null, key);
++      }
++    };
++
++    self.client.put(fpath, stream, options, function (putErr, putRes) {
++        t.ifError(putErr);
++        t.ok(putRes.req._headers['m-encrypt-key-id']);
++        setTimeout(function () {
++          self.client.get(fpath, options, function (getErr, decrypted, getRes) {
++              t.ifError(getErr);
++
++              var result = '';
++              decrypted.on('data', function (data) {
++                result += data.toString();
++              });
++
++              decrypted.once('end', function () {
++                t.ok(result === text);
++                t.done();
++              });
++          });
++        }, 10);
++    });
++
++    process.nextTick(function () {
++        stream.write(text);
++        stream.end();
++    });
++});
++
+ 
+ test('#231: rm (special characters)', function (t) {
+     this.client.unlink(SPECIALOBJ1, function (err) {

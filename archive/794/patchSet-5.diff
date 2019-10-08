@@ -1,0 +1,275 @@
+commit 92843a0b23858395534206e9b71fad4866a44b44 (refs/changes/94/794/5)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-12-19T15:42:56-08:00 (2 years, 10 months ago)
+    
+    MANTA-2989 Use cueball in muskie->mako
+    Reviewed by: David Pacheco <dap@joyent.com>
+
+diff --git a/etc/config.coal.json b/etc/config.coal.json
+index 5465d66..cd5dd04 100644
+--- a/etc/config.coal.json
++++ b/etc/config.coal.json
+@@ -31,6 +31,30 @@
+             "expiry": 30
+         }
+     },
++    "cueballHttpAgent": {
++        "resolver": ["nameservice.coal.joyent.us"],
++        "initialDomains": [
++          "authservice.coal.joyent.us"
++        ],
++        "spares": 8,
++        "maximum": 200,
++        "recovery": {
++          "default": {
++            "timeout": 2000,
++            "maxTimeout": 10000,
++            "retries": 5,
++            "delay": 250,
++            "maxDelay": 2000
++          },
++          "dns_srv": {
++            "timeout": 2000,
++            "maxTimeout": 10000,
++            "retries": 1,
++            "delay": 0,
++            "maxDelay": 0
++          }
++        }
++    },
+     "medusa": {
+         "moray": {
+             "host": "electric-moray.coal.joyent.us",
+@@ -49,11 +73,16 @@
+     },
+     "sharkConfig": {
+         "connectTimeout": 2000,
+-        "maxIdleTime": 1000,
++        "maxTimeout": 10000,
++        "delay": 250,
++        "maxIdleTime": 10000,
+         "maxClients": 50,
+         "retry": {
+-            "retries": 2
+-        }
++          "retries": 2
++        },
++        "spares": 2,
++        "maximum": 2000,
++        "resolver": ["nameservice.coal.joyent.us"]
+     },
+     "authToken": {
+         "salt": "C93A670ACC05C166",
+diff --git a/lib/common.js b/lib/common.js
+index 7ee2a83..8996f9f 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -872,6 +872,7 @@ module.exports = {
+             req.picker = options.picker();
+             req.sharks = [];
+             req.sharkConfig = options.sharkConfig;
++            req.sharkAgent = options.sharkAgent();
+             req.medusa = options.medusa();
+ 
+             var _opts = {
+diff --git a/lib/obj.js b/lib/obj.js
+index 4e9272d..31f38cb 100644
+--- a/lib/obj.js
++++ b/lib/obj.js
+@@ -110,7 +110,8 @@ function sharkConnect(opts, sharkInfo, cb) {
+         connectTimeout: opts.sharkConfig.connectTimeout,
+         log: opts.log,
+         retry: opts.sharkConfig.retry,
+-        shark: opts.shark
++        shark: opts.shark,
++        agent: opts.sharkAgent
+     });
+     assert.ok(client, 'sharkClient returned null');
+ 
+@@ -357,7 +358,8 @@ function startSharkStreams(req, res, next) {
+         objectId: req.objectId,
+         owner: req.owner.account.uuid,
+         requestId: req.getId(),
+-        sharkConfig: req.sharkConfig
++        sharkConfig: req.sharkConfig,
++        sharkAgent: req.sharkAgent
+     };
+ 
+     req.sharksContacted = [];
+@@ -832,7 +834,8 @@ function streamFromSharks(req, res, next) {
+             connectTimeout: req.sharkConfig.connectTimeout,
+             log: req.log,
+             retry: req.sharkConfig.retry,
+-            shark: s
++            shark: s,
++            agent: req.sharkAgent
+         }));
+     });
+ 
+diff --git a/lib/shark_client.js b/lib/shark_client.js
+index 7a15947..61fe682 100644
+--- a/lib/shark_client.js
++++ b/lib/shark_client.js
+@@ -181,14 +181,13 @@ function SharkClient(options) {
+     assert.object(options.log, 'options.log');
+     assert.optionalObject(options.retry, 'options.retry');
+     assert.object(options.shark, 'options.shark');
++    assert.object(options.agent, 'options.agent');
+ 
+     EventEmitter.call(this);
+ 
+     var self = this;
+ 
+-    this.agent = new KeepAliveAgent({
+-        maxSockets: MAX_SOCKETS
+-    });
++    this.agent = options.agent;
+     this.connectTimeout = options.connectTimeout || 2000;
+     this.hostname = options.shark.manta_storage_id;
+     this.log = options.log.child({
+@@ -198,6 +197,10 @@ function SharkClient(options) {
+     this.port = 80;
+ 
+     this.close = once(function close() {
++        if (typeof (self.agent.stop) === 'function') {
++            self.agent.stop();
++            return;
++        }
+         var sockets = self.agent.idleSockets || {};
+         Object.keys(sockets).forEach(function (k) {
+             sockets[k].forEach(function (s) {
+diff --git a/main.js b/main.js
+index e467457..9971302 100644
+--- a/main.js
++++ b/main.js
+@@ -50,6 +50,7 @@ var LOG = bunyan.createLogger({
+     serializers: restify.bunyan.serializers
+ });
+ var AGENT;
++var SHARKAGENT;
+ var MAHI;
+ var MARLIN;
+ var KEYAPI;
+@@ -134,6 +135,8 @@ function configure() {
+         cfg.marlin.log = LOG;
+         cfg.moray.log = LOG;
+         cfg.medusa.log = LOG;
++        cfg.cueballHttpAgent.log = LOG;
++        cfg.sharkConfig.log = LOG;
+     }
+ 
+     if (opts.verbose || !cfg.bunyan) {
+@@ -202,8 +205,34 @@ function usage(parser, message)
+     process.exit(2);
+ }
+ 
+-function createCueballHttpAgent(cfg) {
++function createCueballHttpAgent(cfg, sharkCfg) {
++    /* Used for connections to mahi and other services. */
+     AGENT = new cueball.HttpAgent(cfg);
++
++    /* Used only for connections to sharks. */
++    var sharkCueball = {
++        resolver: sharkCfg.resolver,
++        spares: sharkCfg.spares,
++        maximum: sharkCfg.maximum,
++        linger: sharkCfg.maxIdleTime,
++        tcpKeepAliveInitialDelay: sharkCfg.maxIdleTime,
++        log: sharkCfg.log,
++        recovery: {
++            default: {
++                retries: sharkCfg.retry.retries,
++                timeout: sharkCfg.connectTimeout,
++                maxTimeout: sharkCfg.maxTimeout,
++                delay: sharkCfg.maxTimeout
++            },
++            'dns_srv': {
++                retries: 0,
++                timeout: sharkCfg.connectTimeout,
++                maxTimeout: sharkCfg.maxTimeout,
++                delay: 0
++            }
++        }
++    };
++    SHARKAGENT = new cueball.HttpAgent(sharkCueball);
+ }
+ 
+ function createPickerClient(cfg) {
+@@ -403,7 +432,7 @@ function version() {
+ (function main() {
+     var cfg = configure();
+ 
+-    createCueballHttpAgent(cfg.cueballHttpAgent);
++    createCueballHttpAgent(cfg.cueballHttpAgent, cfg.sharkConfig);
+     createMarlinClient(cfg.marlin);
+     createPickerClient(cfg.storage);
+     createAuthCacheClient(cfg.auth);
+@@ -422,6 +451,7 @@ function version() {
+     cfg.picker = function picker() { return (PICKER); };
+     cfg.moray = function moray() { return (MORAY); };
+     cfg.medusa = function medusaClient() { return (MEDUSA); };
++    cfg.sharkAgent = function sharkAgent() { return (SHARKAGENT); };
+ 
+     cfg.name = 'ssl';
+ 
+diff --git a/package.json b/package.json
+index 30922b1..97e78da 100644
+--- a/package.json
++++ b/package.json
+@@ -14,7 +14,7 @@
+         "backoff": "2.3.0",
+         "bunyan": "0.22.1",
+         "bunyan-syslog": "0.2.2",
+-        "cueball": "1.1.1",
++        "cueball": "1.2.1",
+         "dashdash": "1.3.2",
+         "deep-equal": "0.0.0",
+         "dtrace-provider": "0.2.8",
+diff --git a/sapi_manifests/muskie/template b/sapi_manifests/muskie/template
+index a663967..5adcf67 100644
+--- a/sapi_manifests/muskie/template
++++ b/sapi_manifests/muskie/template
+@@ -36,8 +36,8 @@
+     "initialDomains": [
+       "{{AUTH_SERVICE}}"
+     ],
+-    "spares": 4,
+-    "maximum": 20,
++    "spares": 8,
++    "maximum": 200,
+     "recovery": {
+       "default": {
+         "timeout": 2000,
+@@ -45,6 +45,13 @@
+         "retries": 5,
+         "delay": 250,
+         "maxDelay": 2000
++      },
++      "dns_srv": {
++        "timeout": 2000,
++        "maxTimeout": 10000,
++        "retries": 1,
++        "delay": 0,
++        "maxDelay": 0
+       }
+     }
+   },
+@@ -67,11 +74,16 @@
+   },
+   "sharkConfig": {
+     "connectTimeout": 2000,
+-    "maxIdleTime": 1000,
++    "maxTimeout": 10000,
++    "delay": 250,
++    "maxIdleTime": 10000,
+     "maxClients": 50,
+     "retry": {
+       "retries": 2
+-    }
++    },
++    "spares": 2,
++    "maximum": 2000,
++    "resolver": ["nameservice.{{DOMAIN_NAME}}"]
+   },
+   "authToken": {
+     "salt": "{{MUSKIE_JOB_TOKEN_AES_SALT}}",

@@ -1,0 +1,344 @@
+commit 05eb4bfacbe2544d1e651aed3171600c4bc4fdcb (refs/changes/19/4619/4)
+Author: Robert Bogart <robert.bogart@joyent.com>
+Date:   2018-08-11T00:02:02+00:00 (1 year, 2 months ago)
+    
+    MANTA-3854 Mako sometimes fails to create manifests due to limitations in 'find'
+
+diff --git a/Makefile b/Makefile
+index 400083a..4aec373 100644
+--- a/Makefile
++++ b/Makefile
+@@ -58,6 +58,7 @@ else
+ endif
+ include ./tools/mk/Makefile.node_deps.defs
+ include ./tools/mk/Makefile.nginx.defs
++include ./tools/mk/Makefile.ctf.defs
+ 
+ #
+ # MG Variables
+@@ -72,7 +73,6 @@ RELSTAGEDIR          := /tmp/$(STAMP)
+ # See marlin.git Makefile.
+ #
+ NPM_ENV          = MAKE_OVERRIDES="CTFCONVERT=/bin/true CTFMERGE=/bin/true"
+-
+ #
+ # Repo-specific targets
+ #
+@@ -115,7 +115,7 @@ clean::
+ 	-(cd deps/nginx && $(MAKE) clean)
+ 
+ .PHONY: release
+-release: all deps docs $(SMF_MANIFESTS) check-nginx
++release: all deps docs $(SMF_MANIFESTS) check-nginx makofind
+ 	@echo "Building $(RELEASE_TARBALL)"
+ 	@mkdir -p $(RELSTAGEDIR)/root/opt/smartdc/mako
+ 	@mkdir -p $(RELSTAGEDIR)/root/opt/smartdc/boot
+@@ -131,6 +131,7 @@ release: all deps docs $(SMF_MANIFESTS) check-nginx
+ 	    $(ROOT)/smf \
+ 	    $(RELSTAGEDIR)/root/opt/smartdc/mako/
+ 	cp -r $(ROOT)/build/scripts $(RELSTAGEDIR)/root/opt/smartdc/mako/boot
++	cp $(ROOT)/makofind $(RELSTAGEDIR)/root/opt/smartdc/mako
+ 	ln -s /opt/smartdc/mako/boot/setup.sh \
+ 	    $(RELSTAGEDIR)/root/opt/smartdc/boot/setup.sh
+ 	chmod 755 $(RELSTAGEDIR)/root/opt/smartdc/mako/boot/setup.sh
+@@ -156,3 +157,4 @@ endif
+ include ./tools/mk/Makefile.node_deps.targ
+ include ./tools/mk/Makefile.nginx.targ
+ include ./tools/mk/Makefile.targ
++include ./tools/mk/Makefile.ctf.targ
+diff --git a/bin/upload_mako_ls.sh b/bin/upload_mako_ls.sh
+index 658150f..84fbd7a 100755
+--- a/bin/upload_mako_ls.sh
++++ b/bin/upload_mako_ls.sh
+@@ -6,7 +6,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2017, Joyent, Inc.
++# Copyright (c) 2018, Joyent, Inc.
+ #
+ 
+ ###############################################################################
+@@ -35,7 +35,10 @@ PID=$$
+ PID_FILE=/tmp/upload_mako_ls.pid
+ TMP_DIR=/var/tmp/mako_dir
+ LISTING_FILE=$TMP_DIR/$MANTA_STORAGE_ID
++LISTING_FILE_PARTIAL=${LISTING_FILE}.incomplete
+ MANTA_DIR=/mako
++MAKO_DIR=/opt/smartdc/mako
++TARGET_DIR=/manta
+ START_TIME=`date -u +"%Y-%m-%dT%H:%M:%SZ"` # Time that this script started.
+ 
+ 
+@@ -119,9 +122,15 @@ log "starting directory listing upload"
+ 
+ mkdir -p $TMP_DIR
+ 
+-# %p is filename, %s is *logical* size in *bytes*, %T@ is last modified time,
+-# %unix time, %k is the *physical* size in *kilobytes*
+-find /manta -type f -printf '%p\t%s\t%T@\t%k\n' >$LISTING_FILE
++"$MAKO_DIR"/makofind $TARGET_DIR > "$LISTING_FILE_PARTIAL"
++
++if [[ $? -eq 1 ]]; then
++	echo "Error: makofind failed to obtain a complete listing"
++	exit 1
++fi
++
++# Rename the file to reflect that makofind completed successfully
++mv "$LISTING_FILE_PARTIAL" "$LISTING_FILE"
+ 
+ log "Going to upload $LISTING_FILE to $MANTA_DIR/$MANTA_STORAGE_ID"
+ manta_put_directory $MANTA_DIR
+diff --git a/src/makofind.c b/src/makofind.c
+new file mode 100644
+index 0000000..d975951
+--- /dev/null
++++ b/src/makofind.c
+@@ -0,0 +1,142 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * This is a tool intended to mimic a lot of the behavior of find(1) when
++ * invoked from the command line and supplied with one or more paths.
++ *
++ * It will traverse the entirety of one or more caller-supplied directory trees,
++ * and for each object discovered of type file, it will print the logical size
++ * (in bytes), the time of last data modification (epoch time) and the physical
++ * size in kilobytes.
++ *
++ * This utility uses nftw(3C).  The creation of this program was born out of
++ * necessity.  Apparently GNU find (version 4.2.33) builds out an internal
++ * representation of a directory tree in memory which is obviously problematic
++ * in systems where the number of objects in the tree is sufficiently high.  In
++ * a situation where GNU find taps out, our file listing is truncated, giving an
++ * incomplete picture of the tree's contents.  As a mitigation to this problem,
++ * makofind was created.  It was written with nftw(3C) at the foundation which
++ * does not make over-gratuitous use of memory during directory tree traversal.
++ */
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <err.h>
++#include <errno.h>
++#include <stdarg.h>
++#include <ftw.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++
++/*
++ * The directory structure currently used in mako is as follows:
++ *
++ * /manta/<account uuid>/<object uuid>
++ *
++ * Since nftw(3C) uses one file descriptor for each level in the tree, this
++ * should be more than enough to traverse the depths of /manta.
++ */
++#define	MAX_DESCRIPTORS	10
++
++static void nftw_warn(const char *, ...);
++static int ntfw_cb(const char *, const struct stat *, int, struct FTW *);
++
++/* Globals */
++static int error;
++
++int
++main(int argc, char *argv[])
++{
++	int i, ret, flags;
++
++	if (argc < 2)
++		errx(1, "usage: %s dir1 dir2 ... dirN", argv[0]);
++
++	flags = (FTW_PHYS | FTW_MOUNT);
++
++	/*
++	 * Roll through the list of caller-supplied directories and call
++	 * `nftw()' on each.  Record any errors along the way.
++	 */
++	for (i = 1; i < argc; i++) {
++		ret = nftw(argv[i], ntfw_cb, MAX_DESCRIPTORS, flags);
++
++		if (ret == -1) {
++			warn("An error occured traversing %s", argv[i]);
++			error = 1;
++		}
++
++		/*
++		 * The only way that this can happen is if we reach the default
++		 * case in `nftw_cb()'.  This should never happen.
++		 */
++		if (ret == 1)
++			break;
++	}
++
++	return (error);
++}
++
++static void
++nftw_warn(const char *fmt, ...)
++{
++	va_list args;
++
++	va_start(args, fmt);
++	vwarnx(fmt, args);
++	va_end(args);
++
++	error = 1;
++}
++
++static int
++ntfw_cb(const char *path, const struct stat *st, int objtype, struct FTW *ftw)
++{
++	int ret = 0;
++	blkcnt_t logical;
++
++	switch (objtype) {
++	case FTW_F:
++		logical = st->st_blocks / 2;
++		if (st->st_blocks % 2 > 0)
++			logical++;
++		printf("%s\t%lu\t%lu\t%lu\n", path, st->st_size, st->st_mtime,
++		    logical);
++		break;
++
++	/* We are not interested in directories or symlinks */
++	case FTW_D:
++	case FTW_SL:
++		break;
++
++	case FTW_DNR:
++		nftw_warn("Unable to read directory: %s", path);
++		break;
++
++	case FTW_NS:
++		nftw_warn("stat failed at %s", path);
++		break;
++
++	default:
++		/*
++		 * In the pratically impossible case that objtype is of a value
++		 * that's not known at all, it could be a sign of something
++		 * more systemmic.
++		 */
++		nftw_warn("%s: unknown type (%d)", path, objtype);
++		ret = 1;
++		break;
++	}
++
++	return (ret);
++}
+diff --git a/tools/mk/Makefile.ctf.defs b/tools/mk/Makefile.ctf.defs
+new file mode 100644
+index 0000000..213a3df
+--- /dev/null
++++ b/tools/mk/Makefile.ctf.defs
+@@ -0,0 +1,31 @@
++#
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++#
++
++#
++# Copyright (c) 2018, Joyent, Inc.
++#
++
++#
++# Tools
++#
++CTFCONVERT :=	tmp/ctftools/bin/ctfconvert
++
++#
++# We need to build some C software, and to make it debuggable we should
++# include CTF information.  Download the CTF tools:
++#
++STAMP_CTF :=		tmp/ctftools/.stamp
++
++CLEAN_FILES += tmp/ctftools tmp/ctftools.*.tar.gz tmp/makofind.obj makofind
++
++MAKOFIND_OBJS =	makofind.o
++
++MAKOFIND_CFLAGS =	-gdwarf-2 -m32 -std=c99 -D__EXTENSIONS__ \
++			-Wall -Wextra -Werror \
++			-Wno-unused-parameter \
++			-Isrc/
++
++MAKOFIND_OBJDIR =	tmp/makofind.obj
+diff --git a/tools/mk/Makefile.ctf.targ b/tools/mk/Makefile.ctf.targ
+new file mode 100644
+index 0000000..a5fb080
+--- /dev/null
++++ b/tools/mk/Makefile.ctf.targ
+@@ -0,0 +1,30 @@
++#
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++#
++
++#
++# Copyright (c) 2018, Joyent, Inc.
++#
++
++#
++# We need to build some C software, and to make it debuggable we should
++# include CTF information.  Download the program used to download and deploy
++# the Manta CTF tools.
++#
++$(STAMP_CTF):
++	rm -rf tmp/ctftools 
++	rm -f tools/download_ctftools
++	./tools/pre_downloadctf.sh
++	./tools/download_ctftools
++	touch $@
++
++.PHONY: makofind
++makofind: $(MAKOFIND_OBJS:%=$(MAKOFIND_OBJDIR)/%) | $(STAMP_CTF)
++	gcc -o $@ $^ $(MAKOFIND_CFLAGS)
++	$(CTFCONVERT) -l $@ $@
++
++$(MAKOFIND_OBJDIR)/%.o: src/%.c
++	@mkdir -p $(@D)
++	gcc -o $@ -c $(MAKOFIND_CFLAGS) $<
+diff --git a/tools/pre_downloadctf.sh b/tools/pre_downloadctf.sh
+new file mode 100755
+index 0000000..67e2018
+--- /dev/null
++++ b/tools/pre_downloadctf.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++#
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++#
++
++#
++# Copyright (c) 2018, Joyent, Inc.
++#
++
++#
++# This script will download the program used to download and deploy the CTF
++# tools from Manta (download_ctftools).  Currently, download_ctftools  resides
++# in the binder repository, but it should probably eventually be moved to the
++# "eng" repo.
++#
++
++CTF_TOOLS='https://raw.githubusercontent.com/joyent/binder/master/tools/download_ctftools'
++
++rm -f tools/download_ctftools
++if ! curl -sSf -o "tools/download_ctftools" $CTF_TOOLS; then
++	printf 'ERROR: could not download download_ctftools' >&2
++	exit 1
++fi
++chmod 755 tools/download_ctftools

@@ -1,0 +1,833 @@
+commit 2469e71e8c080c55ca3793571f3a20c69d0cb858 (refs/changes/92/1492/4)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2017-04-10T13:04:22-04:00 (2 years, 6 months ago)
+    
+    OS-5954 need javascript queue with pause, fast-forward, and resume functionality
+
+diff --git a/src/Makefile b/src/Makefile
+index 050daaee..3ce81e63 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -104,6 +104,7 @@ JS_CHECK_TARGETS=\
+ 	vm/tests/test-internal_metadata_namespaces.js \
+ 	vm/tests/test-lastexited.js \
+ 	vm/tests/test-openonerrlogger.js \
++	vm/tests/test-queue.js \
+ 	vm/tests/test-reboot.js \
+ 	vm/tests/test-reprovision.js \
+ 	vm/tests/test-snapshots.js \
+diff --git a/src/manifest b/src/manifest
+index 9c6b3b2c..0c6793e3 100644
+--- a/src/manifest
++++ b/src/manifest
+@@ -508,6 +508,7 @@ f usr/vm/node_modules/openonerrlogger.js 0444 root bin
+ f usr/vm/node_modules/props.js 0444 root bin
+ f usr/vm/node_modules/proptable.js 0444 root bin
+ f usr/vm/node_modules/qmp.js 0444 root bin
++f usr/vm/node_modules/queue.js 0444 root root
+ f usr/vm/node_modules/sysevent-stream.js 0444 root bin
+ f usr/vm/node_modules/utils.js 0444 root bin
+ d usr/vm/node_modules/vasync 0755 root root
+diff --git a/src/vm/node_modules/queue.js b/src/vm/node_modules/queue.js
+new file mode 100644
+index 00000000..4aa31a0d
+--- /dev/null
++++ b/src/vm/node_modules/queue.js
+@@ -0,0 +1,559 @@
++/*
++ * CDDL HEADER START
++ *
++ * The contents of this file are subject to the terms of the
++ * Common Development and Distribution License, Version 1.0 only
++ * (the "License").  You may not use this file except in compliance
++ * with the License.
++ *
++ * You can obtain a copy of the license at http://smartos.org/CDDL
++ *
++ * See the License for the specific language governing permissions
++ * and limitations under the License.
++ *
++ * When distributing Covered Code, include this CDDL HEADER in each
++ * file.
++ *
++ * If applicable, add the following below this CDDL HEADER, with the
++ * fields enclosed by brackets "[]" replaced with your own identifying
++ * information: Portions Copyright [yyyy] [name of copyright owner]
++ *
++ * CDDL HEADER END
++ *
++ * Copyright 2017, Joyent, Inc.
++ *
++ */
++
++/*
++ * Queue is a wrapper around a vasync queue with a few added features:
++ *
++ * - Ability to pause, fast-forward, and resume the queue
++ * - Optional deduplication for queued tasks with the same string identifier
++ * - Optional timeout for tasks taking too long
++ * - Tasks (functions) get a custom logger with unique task identifier
++ * - Timing stats for task create (enqueue), start, and finish.
++ *
++ * Every task pushed to the queue must contain at least a function to run, and
++ * a string identifier (called description).
++ *
++ * Example
++ *
++ * var q = new Queue({
++ *     log: log,     // [required] bunyan logger
++ *     workers: 1,   // [required] number of concurrent workers
++ *     dedup: true,  // [optional] discard enqueued tasks with same description
++ *     paused: true, // [optional] start paused, defauts to false
++ *
++ * });
++ *
++ * q.enqueue({
++ *     // used for logging, and deduplication if enabled
++ *     description: 'sysevent seen for zone foo',
++ *
++ *     // kill the task if it takes more than 30 seconds, default is no timeout
++ *     timeout: 30 * 1000,
++ *
++ *     // the function to run - cb doesn't expect any arguments
++ *     func: function myTask(extras, cb) {
++ *         // this logger contains the task object, which has the tasks UUID,
++ *         // description, and more.  This is a childlog of the logger passed
++ *         // in during queue creation.
++ *         extras.log('doing something');
++ *
++ *         somethingAsync(function () {
++ *             cb(); // let the queue know this task is over
++ *         });
++ *     }
++ * });
++ *
++ * q.enqueue({
++ *     description: 'sysevent seen for zone bar',
++ *     func: function (extras, cb) { cb(); }
++ * });
++ *
++ * .enqueue() also returns a value: true if the task was queued or false if it
++ * was discarded by deduplication.  For example:
++ *
++ * ret = q.enqueue({
++ *     description: 'foo',
++ *     func: function (extras, cb) { cb(); }
++ * });
++ * // ret => true, no task with this name is enqueued
++ *
++ * ret = q.enqueue({
++ *     description: 'foo',
++ *     func: function (extras, cb) { cb(); }
++ * });
++ * // ret => false, a task with this name is enqueued so this task is discarded
++ *
++ * There are now 3 tasks on the queue but it is currently paused, we can uncork
++ * it with:
++ *
++ * q.resume();
++ *
++ * Finally, Queue supports fast-forwarding the queue.  When a task is enqueued,
++ * the current timestamp is stored for it (called "create" time).  When you
++ * call .fastForward(), you pass in a JavaScript Date object, and all items
++ * created on or before that Date will be run through the queue, and the
++ * callback will fire when all tasks are completed.
++ *
++ * For Example (queue must be paused or an error is thrown)
++ *
++ * var one_minute_ago = new Date(Date.now() - (60 * 1000));
++ * var opts = {
++ *     timeout: 60 * 1000  [optional] timeout to error out fast-forward
++ * };
++ * q.fastForward(one_minute_ago, opts, function fastForwarded(err) {
++ *     // `err` can only be set if opts.timeout was specified and exceeded.
++ *     // In this event, the tasks are still running when this callback is
++ *     // fired, but the queue is still technically paused and not running
++ *     // any new tasks enqueued.
++ *
++ *     // Otherwise, this means the enqueued tasks created exactly or more than
++ *     // a minute ago are now complete.
++ * });
++ *
++ */
++
++var assert = require('/usr/node/node_modules/assert-plus');
++var libuuid = require('/usr/node/node_modules/uuid');
++var vasync = require('/usr/vm/node_modules/vasync');
++
++module.exports.Queue = Queue;
++
++/*
++ * Create an event queue
++ *
++ * opts = {
++ *     log: log,     // [required] bunyan logger
++ *     workers: 1,   // [required] number of concurrent workers
++ *     dedup: true,  // [optional] discard enqueued tasks with same description
++ *     paused: true, // [optional] start paused, defauts to false
++ * };
++ */
++function Queue(opts) {
++    var self = this;
++
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.number(opts.workers, 'opts.workers');
++    assert.optionalBool(opts.dedup, 'opts.dedup');
++    assert.optionalBool(opts.paused, 'opts.paused');
++
++    // paused
++    self.paused = !!opts.paused;
++    self.paused_time = self.paused ? process.hrtime() : null;
++
++    // max workers
++    self.workers = opts.workers;
++
++    // logger
++    self.log = opts.log;
++
++    // should dedup
++    self.dedup = opts.dedup;
++
++    // tasks waiting to run (pushed when paused)
++    self.paused_queue = [];
++
++    // vasync queue
++    self.queue = vasync.queue(function (task, cb) {
++        assert.object(task, 'task');
++        assert.func(cb, 'cb');
++
++        task.started_at = process.hrtime();
++
++        // "extras" is passed to the user function when it is called
++        var childlog = self.log.child({task: task});
++        var extras = {
++            log: childlog
++        };
++
++        // create a timer for this task - this will effectively crash the
++        // process if a task takes too long
++        var timeout;
++        if (task.timeout) {
++            timeout = setTimeout(function () {
++                var err = new Error('timeout exceeded');
++                childlog.fatal({err: err, timeout: task.timeout},
++                    'task took longer than %dms', task.timeout);
++                throw err;
++            }, task.timeout);
++        }
++
++        childlog.debug('starting task');
++        task.func(extras, function () {
++            task.finished_at = process.hrtime();
++            var delta = hrtimeDeltaMs(task.finished_at, task.started_at);
++
++            childlog.debug({delta: delta}, 'finished task in %dms', delta);
++
++            // clear the timeout
++            if (timeout) {
++                clearTimeout(timeout);
++                timeout = null;
++            }
++
++            cb();
++        });
++    }, self.workers);
++}
++
++/*
++ * Push a task to the queue.  If we are currently paused the task will be
++ * stored in the "paused_queue" array, to be pushed onto the vasync queue
++ * at a later time as either part of a .resume() or .fastForward().  If
++ * we are not paused, the task is pushed directly onto the vasync queue.
++ *
++ * A task must have a function set, as well as a string description.  If the
++ * description of a task being pushed matches the description of a task
++ * already queued to run, and opts.dedup was set in the queues constructor,
++ * the task is discarded.
++ *
++ * Returns:
++ *   true    the task was enqueued, either while paused or running
++ *   false   the task wes discarded as a dup (only happens when opts.dedup)
++ */
++Queue.prototype.enqueue = function (opts, cb) {
++    var self = this;
++    var found;
++
++    assert.object(opts, 'opts');
++    assert.func(opts.func, 'opts.func');
++    assert.string(opts.description, 'opts.description');
++    assert.optionalNumber(opts.timeout, 'opts.timeout');
++
++    // when a task is created, we record the date and create a unique id
++    // for it
++    opts.id = libuuid.create();
++    opts.created_at = process.hrtime();
++    opts.created_at_date = new Date();
++
++    if (self.paused) {
++        if (!self.dedup) {
++            self.log.debug({opts: opts}, 'pushed to paused queue');
++            self.paused_queue.push({opts: opts, cb: cb});
++            return true;
++        }
++
++        found = self.paused_queue.some(function (o) {
++            return o.opts.description === opts.description;
++        });
++
++        if (found) {
++            self.log.debug({opts: opts}, 'duplicate task found - discarding');
++            return false;
++        }
++
++        self.log.debug({opts: opts},
++            'no duplicate task found - pushing to paused queue');
++        self.paused_queue.push({opts: opts, cb: cb});
++        return true;
++    } else {
++        if (!self.dedup) {
++            self.log.debug({opts: opts}, 'pushed to vasync queue');
++            self.queue.push(opts, cb);
++            return true;
++        }
++
++        found = self.queue.queued.some(function (o) {
++            return o.task.description === opts.description;
++        });
++
++        if (found) {
++            self.log.debug({opts: opts}, 'duplicate task found - discarding');
++            return false;
++        }
++
++        self.log.debug({opts: opts},
++            'no duplicate task found - pushing to vasync queue');
++        self.queue.push(opts, cb);
++        return true;
++    }
++};
++
++/*
++ * Pause the queue
++ *
++ * This will pause processing any newly enqueued tasks and wait for all
++ * currently running and enqueued tasks to finish.
++ *
++ * An optional timeout may be specified to callback with an
++ * error if it takes too long to stop the queue.
++ */
++Queue.prototype.pause = function (opts, cb) {
++    var self = this;
++
++    if (typeof (opts) === 'function') {
++        cb = opts;
++        opts = {};
++    }
++
++    assert(!self.paused, 'queue is already paused!');
++    assert.object(opts, 'opts');
++    assert.optionalNumber(opts.timeout, 'opts.timeout');
++    assert.func(cb, 'cb');
++
++    self.paused = true;
++    self.paused_time = process.hrtime();
++
++    // short-circuit logic if no task is currently running
++    if (self.queue.npending === 0) {
++        self.log.debug('queue paused');
++        cb();
++        return;
++    }
++
++    // task(s) running - wait for finish
++    var timeout;
++    if (opts.timeout) {
++        timeout = setTimeout(function () {
++            var err = new Error('pause timeout exceeded');
++            self.log.fatal({err: err, timeout: opts.timeout},
++                'pause took longer than %dms', opts.timeout);
++            self.queue.removeListener('drain', ondrain);
++            self.resume();
++            cb(err);
++        }, opts.timeout);
++    }
++
++    self.queue.once('drain', ondrain);
++
++    // vasync queue has drained, we can pause
++    function ondrain() {
++        if (timeout) {
++            clearTimeout(timeout);
++            timeout = null;
++        }
++        cb();
++    }
++};
++
++/*
++ * Resume the queue.
++ *
++ * This will take all of the elements of the paused_queue and push them into
++ * the vasync queue.
++ */
++Queue.prototype.resume = function () {
++    var self = this;
++
++    assert(self.paused, 'queue is not paused!');
++
++    self.paused = false;
++    self.paused_time = null;
++    self.log.debug('queue resumed - enqueueing %d tasks',
++        self.paused_queue.length);
++
++    self.paused_queue.forEach(function (o) {
++        self.queue.push(o.opts, o.cb);
++    });
++    self.paused_queue = [];
++};
++
++/*
++ * Fast Forward the queue to a given date.
++ *
++ * The queue must be paused for this to work.  Given a date object as the first
++ * argument, this function will process every item in the queue that was queued
++ * before the date given and call the callback given when it has finished (or
++ * if it has timedout)..
++ *
++ * opts.timeout   a max time (in ms) to wait for the queue to fast-forward,
++ *                this may be omitted to not create a timeout
++ *
++ */
++Queue.prototype.fastForward = function (time, opts, cb) {
++    var self = this;
++
++    if (typeof (opts) === 'function') {
++        cb = opts;
++        opts = {};
++    }
++
++    assert(self.paused, 'queue must be paused to fast-forward');
++    assert.date(time, 'time');
++    assert.object(opts, 'opts');
++    assert.optionalNumber(opts.timeout, 'opts.timeout');
++    assert.func(cb, 'cb');
++
++    // loop all queued tasks and dispatch them if they were created before the
++    // fast-forward date
++    var task;
++    var i = 0;
++    while ((task = self.paused_queue.shift())) {
++        if (task.opts.created_at_date <= time) {
++            i++;
++            self.queue.push(task.opts, task.cb);
++        } else {
++            self.paused_queue.unshift(task);
++            break;
++        }
++    }
++    self.log.debug('fast-forward pushed %d tasks into queue', i);
++
++    // just callback immediately if no tasks were pushed
++    if (i === 0) {
++        cb();
++        return;
++    }
++
++    // task(s) running - wait for finish
++    var timeout;
++    if (opts.timeout) {
++        timeout = setTimeout(function () {
++            var err = new Error('fast-forward timeout exceeded');
++            self.log.error({err: err, timeout: opts.timeout},
++                'fast-forward took longer than %dms', opts.timeout);
++            self.queue.removeListener('drain', ondrain);
++            cb(err);
++        }, opts.timeout);
++    }
++
++    self.queue.once('drain', ondrain);
++
++    function ondrain() {
++        if (timeout) {
++            clearTimeout(timeout);
++            timeout = null;
++        }
++        cb();
++    }
++};
++
++/*
++ * Return the queue status as an object.
++ *
++ * This is useful for stringifying and outputting as part of an HTTP request
++ * for a web service, or running this and storing in memory before a process
++ * crash.
++ */
++Queue.prototype.dump = function () {
++    var self = this;
++
++    var now = process.hrtime();
++
++    var state = {
++        now: now,
++        paused: self.paused,
++        vasync_queue: {
++            concurrency: self.queue.concurrency,
++            npending: self.queue.npending,
++            nqueued: self.queue.length(),
++            pending: {},
++            queued: []
++        }
++    };
++
++    Object.keys(self.queue.pending).forEach(function (id) {
++        var task = self.queue.pending[id].task;
++        var o = {
++            description: task.description,
++            created_at: task.created_at,
++            started_at: task.started_at,
++            created_ago: relative(task.created_at, now),
++            started_ago: relative(task.started_at, now),
++            start_latency: relative(hrtimeDeltaMs(task.started_at -
++                task.created_at))
++
++        };
++        state.vasync_queue.pending[task.id] = o;
++    });
++
++    self.queue.queued.forEach(function (q) {
++        var task = q.task;
++        var o = {
++            description: task.description,
++            created_at: task.created_at,
++            created_ago: relative(task.created_at, now)
++        };
++        state.vasync_queue.queued.push(o);
++    });
++
++    if (self.paused) {
++        state.paused_at = self.paused_time;
++        state.paused_ago = relative(self.paused_time);
++        state.paused_nqueued = self.paused_queue.length;
++        state.paused_queue = self.paused_queue;
++    }
++
++    return state;
++};
++
++/*
++ * Convert a date to a relative representation - returns strings like "5
++ * minutes ago", "4 days ago", etc.
++ *
++ * Arguments
++ *   time       This variable can be one of three types of input:
++ *              1. JavaScript Date object
++ *              2. HR Time (process.hrtime())
++ *              3. A number (representing milliseconds)
++ *              If the input is a Date or hrtime object, the relative date will
++ *              be calculated by subtracting the input given from now
++ *   now        Optional, a time to use that represents now.  The type of this
++ *              argument depends on the type given for the "time" argument:
++ *              1. If time is a Date object, now (if given) must be a Date
++ *              object
++ *              2. If time is an hrtime object, now (if given) must be an
++ *              hrtime object
++ *              3. If time is a number in milliseconds, this argument is unused
++ *
++ */
++function relative(time, now) {
++    var ms;
++
++    if (time instanceof Date) {
++        now = now || new Date();
++        assert.date(now, 'now');
++        ms = now - time;
++    } else if (Array.isArray(time)) {
++        now = now || process.hrtime();
++        assert.arrayOfNumber(time, 'time');
++        assert.arrayOfNumber(now, 'now');
++        ms = hrtimeDeltaMs(now, time);
++    } else {
++        ms = time;
++    }
++
++    assert.number(ms, 'ms');
++
++    var times = [
++        ms / 1000 / 60 / 60 / 24, // days
++        ms / 1000 / 60 / 60,      // hours
++        ms / 1000 / 60,           // minutes
++        ms / 1000,                // seconds
++        ms                        // ms
++    ];
++    var names = ['d', 'h', 'm', 's', 'ms'];
++
++    for (var i = 0; i < names.length; i++) {
++        var t = Math.floor(times[i]);
++        if (t > 0)
++            return t + names[i];
++    }
++    return '0ms';
++}
++
++/*
++ * Convert an hrtime to a time representing milliseconds.
++ *
++ * For example
++ *
++ * > var time = process.hrtime();
++ * > time
++ * [ 2155114, 360170738 ]
++ * > hrtimeToMs(time)
++ * 2155114360
++ */
++function hrtimeToMs(hrtime) {
++    assert.arrayOfNumber(hrtime, 'hrtime');
++    return ((hrtime[0] * 1000) + (Math.floor(hrtime[1] / 1e6)));
++}
++
++/*
++ * Calculate the delta (in ms) of 2 hrtimes
++ */
++function hrtimeDeltaMs(hr1, hr2) {
++    return (hrtimeToMs(hr1) - hrtimeToMs(hr2));
++}
+diff --git a/src/vm/tests/test-queue.js b/src/vm/tests/test-queue.js
+new file mode 100644
+index 00000000..4f4d02d3
+--- /dev/null
++++ b/src/vm/tests/test-queue.js
+@@ -0,0 +1,232 @@
++/*
++ * Copyright 2017, Joyent, Inc.
++ *
++ */
++
++var Queue = require('/usr/vm/node_modules/queue').Queue;
++var bunyan = require('/usr/vm/node_modules/bunyan');
++var vasync = require('/usr/vm/node_modules/vasync');
++
++// this puts test stuff in global, so we need to tell jsl about that:
++/* jsl:import ../node_modules/nodeunit-plus/index.js */
++require('/usr/vm/node_modules/nodeunit-plus');
++
++var log = bunyan.createLogger({
++    level: 'error',
++    name: 'queue-test-dummy',
++    stream: process.stderr,
++    serializers: bunyan.stdSerializers
++});
++
++// this puts test stuff in global, so we need to tell jsl about that:
++/* jsl:import ../node_modules/nodeunit-plus/index.js */
++require('nodeunit-plus');
++
++test('test queue unpaused 100 tasks', function (t) {
++    var tasks = 100;
++
++    var q = new Queue({
++        log: log,
++        workers: 10
++    });
++
++    var i = 0;
++    for (var j = 0; j < tasks; j++) {
++        q.enqueue({
++            description: 'task ' + j,
++            func: function (extras, cb) {
++                if (++i === tasks) {
++                    t.ok(true, 'tasks completed');
++                    t.end();
++                }
++                cb();
++            }
++        });
++    }
++});
++
++test('test queue paused 100 tasks', function (t) {
++    var tasks = 100;
++
++    var q = new Queue({
++        log: log,
++        paused: true,
++        workers: 10
++    });
++
++    var i = 0;
++    for (var j = 0; j < tasks; j++) {
++        q.enqueue({
++            description: 'task ' + j,
++            func: function (extras, cb) {
++                if (++i === tasks) {
++                    t.ok(true, 'tasks completed');
++                    t.end();
++                }
++                cb();
++            }
++        });
++    }
++
++    setImmediate(function () {
++        t.ok(true, 'unpausing queue');
++        q.resume();
++    });
++});
++
++test('test queue throws to prevent unintended states', function (t) {
++    var q = new Queue({
++        log: log,
++        workers: 1
++    });
++
++    vasync.pipeline({funcs: [
++        function (_, cb) {
++            // ensure the queue is running
++            testIsRunning();
++            cb();
++        }, function (_, cb) {
++            // pause the queue and ensure it is stopped, pause is async
++            q.pause(function (err) {
++                testIsPaused();
++                cb(err);
++            });
++        }, function (_, cb) {
++            // resume the queue and ensure it is running, resume is sync
++            q.resume();
++            testIsRunning();
++            cb();
++        }, function (_, cb) {
++            // try to resume the queue again, should throw an error
++            t.throws(function () {
++                q.resume();
++            }, null, 'queue is already running');
++            testIsRunning();
++            cb();
++        }, function (_, cb) {
++            // pause the queue again and ensure it is stopped
++            q.pause(function (err) {
++                testIsPaused();
++                cb(err);
++            });
++        }, function (_, cb) {
++            // try to pause the queue again
++            t.throws(function () {
++                q.pause(function () {});
++            }, null, 'queue is already paused');
++            cb();
++        }
++    ]}, function (err) {
++        t.ok(!err, 'error: ' + (err ? err.message : 'none'));
++        t.end();
++    });
++
++    function testIsRunning() {
++        t.equal(q.paused, false, 'queue is running');
++    }
++    function testIsPaused() {
++        t.equal(q.paused, true, 'queue is paused');
++    }
++});
++
++test('test queue fast-forward', function (t) {
++    var ret;
++
++    var q = new Queue({
++        log: log,
++        workers: 5,
++        paused: true
++    });
++
++    var done = {
++        foo: false,
++        bar: false,
++        bat: false
++    };
++
++    ret = q.enqueue({
++        description: 'foo',
++        func: function (extras, cb) {
++            done.foo = true;
++            cb();
++        }
++    });
++    t.equal(ret, true, 'task foo enqueued');
++
++    ret = q.enqueue({
++        description: 'bar',
++        func: function (extras, cb) {
++            done.bar = true;
++            cb();
++        }
++    });
++    t.equal(ret, true, 'task bar enqueued');
++
++    var time = new Date();
++
++    // enqueue the 'bat' task after we grab the timestamp
++    setTimeout(function () {
++        ret = q.enqueue({
++            description: 'bat',
++            func: function (extras, cb) {
++                done.bat = true;
++                cb();
++            }
++        });
++        t.equal(ret, true, 'task bat enqueued');
++
++        // fast forward queue: this should process foo and bar, but not bat
++        q.fastForward(time, function (err) {
++            t.ok(!err, 'error: ' + (err ? err.message : 'none'));
++            t.equal(done.foo, true, 'task foo is done');
++            t.equal(done.bar, true, 'task bar is done');
++            t.equal(done.bat, false, 'task bat is not done');
++            t.end();
++        });
++    }, 5);
++});
++
++test('test deduplication', function (t) {
++    var ret;
++
++    var q = new Queue({
++        log: log,
++        workers: 5,
++        dedup: true,
++        paused: true
++    });
++
++    ret = q.enqueue({
++        description: 'foo',
++        func: function (extras, cb) {
++            cb();
++        }
++    });
++    t.equal(ret, true, 'task foo enqueued');
++
++    ret = q.enqueue({
++        description: 'foo',
++        func: function (extras, cb) {
++            cb();
++        }
++    });
++    t.equal(ret, false, 'task foo is discarded');
++
++    ret = q.enqueue({
++        description: 'bar',
++        func: function (extras, cb) {
++            cb();
++        }
++    });
++    t.equal(ret, true, 'task bar enqueued');
++
++    ret = q.enqueue({
++        description: 'bar',
++        func: function (extras, cb) {
++            cb();
++        }
++    });
++    t.equal(ret, false, 'task bar is discarded');
++
++    t.end();
++});

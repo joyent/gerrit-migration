@@ -1,0 +1,661 @@
+commit 32b063ce20fbf8706a974d878a93226515d81dfb (refs/changes/44/2844/2)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2017-10-23T16:39:39-07:00 (2 years ago)
+    
+    NAPI-258 Delete NAT instance when last vm using the network is deleted
+
+diff --git a/lib/workflows/destroy.js b/lib/workflows/destroy.js
+index fec63d3..137659b 100644
+--- a/lib/workflows/destroy.js
++++ b/lib/workflows/destroy.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -14,8 +14,9 @@
+ 
+ var async = require('async');
+ var common = require('./job-common');
++var fabricCommon = require('./fabric-common');
+ var restify = require('restify');
+-var VERSION = '7.1.0';
++var VERSION = '7.1.1';
+ 
+ 
+ /*
+@@ -184,7 +185,12 @@ var workflow = module.exports = {
+         retry: 1,
+         body: common.waitOnVMTicket,
+         modules: { sdcClients: 'sdc-clients' }
+-    }, {
++    },
++
++    /* Get NIC info, to check if any are on a fabric network. */
++    fabricCommon.getFabricNatNics,
++
++    {
+         name: 'cnapi.destroy_vm',
+         timeout: 10,
+         retry: 1,
+@@ -224,7 +230,13 @@ var workflow = module.exports = {
+         retry: 1,
+         body: common.releaseVMTicket,
+         modules: { sdcClients: 'sdc-clients' }
+-    }],
++    }
++
++    /**
++     * Fabric NAT destruction.
++     */
++    ].concat(fabricCommon.destroyChain),
++
+     timeout: 180,
+     onerror: [ {
+         name: 'vmapi.refresh_vm',
+@@ -246,7 +258,12 @@ var workflow = module.exports = {
+                 return;
+             });
+         }
+-    }],
++    },
++
++    /* If there were fabric nics, release the NAT destroy ticket(s). */
++    fabricCommon.releaseFabricNatTickets
++
++    ],
+     oncancel: [ {
+         name: 'on_cancel.release_vm_ticket',
+         modules: { sdcClients: 'sdc-clients' },
+@@ -263,5 +280,10 @@ var workflow = module.exports = {
+                 return;
+             });
+         }
+-    } ]
++    },
++
++    /* If there were fabric nics, release the NAT destroy ticket(s). */
++    fabricCommon.releaseFabricNatTickets
++
++    ]
+ };
+diff --git a/lib/workflows/fabric-common.js b/lib/workflows/fabric-common.js
+index fcd1a8c..af55153 100644
+--- a/lib/workflows/fabric-common.js
++++ b/lib/workflows/fabric-common.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -33,6 +33,10 @@ var async = require('async');
+  * zones on demand: the various VMAPI workflows determine if a network doesn't
+  * have a NAT zone yet and provision one on behalf of the user.
+  *
++ * When a VM has an associated NAT zone, when the last NIC in that fabric
++ * network is deleted, then the corresponding NAT zone will also be deleted,
++ * so that there are no unused NAT zones hanging around.
++ *
+  * ## VMAPI Implementation
+  *
+  * In VMAPI, there are three different components to NAT zone provisioning
+@@ -63,12 +67,12 @@ var async = require('async');
+ 
+ 
+ /*
+- * If there are fabric NATs that need provisioning, obtain a ticket for
+- * each of them.
++ * If there are fabric NATs that need provisioning/destroying, obtain a ticket
++ * for each of them.
+  */
+ function acquireFabricTickets(job, cb) {
+     if (!job.params.fabricNatNics || job.params.fabricNatNics.length === 0) {
+-        return cb(null, 'No fabric NATs to provision');
++        return cb(null, 'No fabric NICs');
+     }
+ 
+     var cnapi = new sdcClients.CNAPI({
+@@ -369,6 +373,266 @@ function waitForFabricNatProvisions(job, cb) {
+ }
+ 
+ 
++/*
++ * Get information on the vm NIC's to see if any are fabric NICs.
++ */
++function getFabricNatNics(job, cb) {
++    if (!job.currentVm) {
++        cb(null, 'Skipping task -- VM missing from job');
++        return;
++    }
++
++    if (!job.currentVm.nics || !Array.isArray(job.currentVm.nics)) {
++        cb(null, 'Skipping task -- VM is missing .nics');
++        return;
++    }
++
++    var napi = new sdcClients.NAPI({
++        url: napiUrl,
++        headers: { 'x-request-id': job.params['x-request-id'] }
++    });
++
++    var vmNics = job.currentVm.nics.filter(function _filterNics(nic) {
++        return nic.mac;
++    });
++
++    job.params.fabricNatNics = [];
++
++    /*
++     * Unfortunately NAPI can return differing error responses, so we use
++     * this helper to consolidate the error checking.
++     */
++    function isNapiResourceNotFoundError(err) {
++        if (!err || !err.body) {
++            return false;
++        }
++        if (err.body.code && err.body.code === 'ResourceNotFound') {
++            /*
++             * Sometimes when NIC doesn't exist, we get 404 and body.code
++             * with value 'ResourceNotFound'.
++             */
++            return true;
++        }
++        if (err.body.message &&
++            err.body.message.match(/^napi_nics::.*does not exist$/)) {
++            /*
++             * Other times it returns just a 500 and a message like:
++             *
++             *  'napi_nics::159123443660586 does not exist'
++             */
++            return true;
++        }
++        return false;
++    }
++
++    async.mapSeries(vmNics, function (vmNic, next) {
++        napi.getNic(vmNic.mac, function getNicCb(err, nic) {
++            if (err) {
++                if (isNapiResourceNotFoundError(err)) {
++                    /* No NIC, then nothing to do. */
++                    next();
++                    return;
++                }
++                next(err);
++                return;
++            }
++
++            /*
++             * If this is a nic on a fabric, which has a gateway provisioned,
++             * and the network uses an internet NAT, add it to the fabricNat
++             * list. This fabricNat list will be used later to check whether
++             * the provisioned NAT zone is no longer used and thus should be
++             * deleted.
++             */
++            if (nic.fabric && nic.gateway && nic.gateway_provisioned &&
++                    nic.ip !== nic.gateway && nic.internet_nat) {
++                job.log.debug({nic: nic}, 'found fabric NIC');
++                job.params.fabricNatNics.push(nic);
++            }
++            next();
++        });
++    }, function (err) {
++        if (err) {
++            cb(err);
++            return;
++        }
++        cb(null, 'Fabric NIC count: ' + job.params.fabricNatNics.length);
++    });
++}
++
++/*
++ * Wait for any tickets obtained in acquireFabricTickets(), then:
++ * 1. Check if this is the last NIC in the associated network, if not, then
++ *    there is nothing to do, else proceed to 2.
++ * 2. Check if another workflow holding the ticket has already used or destroyed
++ *    the NAT, if yes, then there is nothing to do, else proceed to 3.
++ * 3. This is the last NIC, kick off the NAT destruction process.
++ */
++function destroyFabricNats(job, cb) {
++    if (!job.params.fabricNatTickets ||
++            job.params.fabricNatTickets.length === 0) {
++        cb(null, 'No fabric NATs to destroy');
++        return;
++    }
++
++    var headers = {
++        'x-request-id': job.params['x-request-id']
++    };
++    var cnapi = new sdcClients.CNAPI({
++        url: cnapiUrl,
++        headers: headers
++    });
++    var napi = new sdcClients.NAPI({
++        url: napiUrl,
++        headers: headers
++    });
++    var vmapi = new sdcClients.VMAPI({
++        url: vmapiUrl,
++        headers: headers
++    });
++
++    /* Find the NAT VM and destroy it. */
++    function destroyNatZone(fabricNic, done) {
++        var listVmParams = {
++            alias: 'nat-' + fabricNic.network_uuid,
++            state: 'running'
++        };
++        vmapi.listVms(listVmParams, function onGetVm(err, vms) {
++            if (err) {
++                done(err);
++                return;
++            }
++
++            if (!vms || vms.length === 0) {
++                job.log.debug({ fabricNic: fabricNic },
++                    'No NAT vm found for fabric network');
++                done();
++                return;
++            }
++
++            if (!vms.length > 1) {
++                job.log.warn({ fabricNic: fabricNic, vms: vms },
++                    'Multiple NAT vms found for fabric network - using first');
++            }
++
++            job.log.info({ alias: vms[0].alias, zone_uuid: vms[0].uuid },
++                'Destroying NAT zone');
++
++            /* Synchronously destroy the NAT vm. */
++            var deleteVmParams = {
++                sync: true,
++                uuid: vms[0].uuid
++            };
++            vmapi.deleteVm(deleteVmParams, function (dErr) {
++                if (dErr && dErr.statusCode !== 404) {
++                    done(dErr);
++                    return;
++                }
++                done();
++            });
++        });
++    }
++
++    /*
++     * Check whether we should destroy the associated NAT zone.
++     */
++    function checkDestroyNatZone(tick, done) {
++        var fabricNic = tick.nic;
++
++        /* Check if this is the last NIC assigned in the network. */
++        napi.listNics({ network_uuid: fabricNic.network_uuid },
++                { headers: headers },
++                function (netErr, nics) {
++            if (netErr) {
++                done(netErr);
++                return;
++            }
++
++            job.log.info({ nics: nics }, 'listNics result');
++
++            if (!nics || !Array.isArray(nics)) {
++                job.log.warn({ fabricNic: fabricNic },
++                    'No nics array returned for napi.listNics');
++                done(new Error(
++                    'Expected array of nics for napi.listNics, got: ' + nics));
++                return;
++            }
++
++            /*
++             * Filter out the NAT gateway nic (as the NAT zone will own one nic
++             * on this network that is used as the gateway).
++             */
++            nics = nics.filter(function nicFilter(nic) {
++                return nic.ip !== nic.gateway;
++            });
++
++            if (nics.length >= 1) {
++                job.log.debug({ fabricNic: fabricNic },
++                    'More nics found on fabric network - nothing to do');
++                done();
++                return;
++            }
++
++            destroyNatZone(fabricNic, done);
++        });
++    }
++
++    /*
++     * Iterate over the NAT tickets, wait for the ticket to become active then
++     * check/destroy the associated NAT zone.
++     */
++    async.forEach(job.params.fabricNatTickets,
++            function forEachNatTicket(tick, next) {
++        if (tick.ticket.status === 'active') {
++            checkDestroyNatZone(tick, next);
++            return;
++        }
++
++        cnapi.waitlistTicketWait(tick.ticket.uuid, function _afterWait(tErr) {
++            if (tErr) {
++                next(tErr);
++                return;
++            }
++            checkDestroyNatZone(tick, next);
++        });
++    }, function (err) {
++        if (err) {
++            cb(err);
++            return;
++        }
++        cb(null, 'Successful');
++    });
++}
++
++
++/*
++ * Release all fabric NAT tickets.
++ */
++function releaseFabricNatTickets(job, cb) {
++    if (!job.params.fabricNatTickets ||
++            job.params.fabricNatTickets.length === 0) {
++        return cb(null, 'No fabric NAT tickets to release');
++    }
++
++    var cnapi = new sdcClients.CNAPI({
++        url: cnapiUrl,
++        headers: { 'x-request-id': job.params['x-request-id'] }
++    });
++
++    async.forEach(job.params.fabricNatTickets, function (tick, next) {
++        cnapi.waitlistTicketRelease(tick.ticket.uuid, function (err) {
++            if (err && err.code !== 'ResourceNotFound') {
++                job.log.warn({ticket: tick.ticket},
++                    'Unable to release CNAPI NAT ticket');
++                next(err);
++                return;
++            }
++            next();
++        });
++    }, cb);
++}
++
++
+ module.exports = {
+     acquireFabricTickets: acquireFabricTickets,
+     provisionFabricNats: provisionFabricNats,
+@@ -400,6 +664,46 @@ module.exports = {
+         modules: { sdcClients: 'sdc-clients', async: 'async' }
+     },
+ 
++    getFabricNatNics: {
++        name: 'napi.get_fabric_nat_nics',
++        timeout: 60,
++        retry: 1,
++        body: getFabricNatNics,
++        modules: { sdcClients: 'sdc-clients', async: 'async' }
++    },
++
++    destroyChain: [
++        {
++            name: 'cnapi.acquire_fabric_nat_tickets',
++            timeout: 60,
++            retry: 1,
++            body: acquireFabricTickets,
++            modules: { sdcClients: 'sdc-clients', async: 'async' }
++        },
++        {
++            name: 'napi.destroy_fabric_nats',
++            timeout: 300,
++            retry: 1,
++            body: destroyFabricNats,
++            modules: { sdcClients: 'sdc-clients', async: 'async' }
++        },
++        {
++            name: 'cnapi.release_fabric_nat_tickets',
++            timeout: 60,
++            retry: 1,
++            body: releaseFabricNatTickets,
++            modules: { sdcClients: 'sdc-clients', async: 'async' }
++        }
++    ],
++
++    releaseFabricNatTickets: {
++        name: 'cnapi.release_fabric_nat_tickets',
++        timeout: 60,
++        retry: 1,
++        body: releaseFabricNatTickets,
++        modules: { sdcClients: 'sdc-clients', async: 'async' }
++    },
++
+     releaseTicketTask: {
+         name: 'cnapi.release_fabric_nat_ticket',
+         timeout: 60,
+diff --git a/package.json b/package.json
+index 565d77b..43f4776 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "vmapi",
+   "description": "VMs API",
+-  "version": "9.1.0",
++  "version": "9.2.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+diff --git a/test/vms.full.test.js b/test/vms.full.test.js
+index 3ac7971..7d66e66 100644
+--- a/test/vms.full.test.js
++++ b/test/vms.full.test.js
+@@ -20,6 +20,7 @@ var common = require('./common');
+ // --- Globals
+ 
+ var client;
++var fabricNetwork;
+ var muuid;
+ var newUuid;
+ var jobLocation;
+@@ -2238,3 +2239,196 @@ exports.destroy_docker_vm = function (t) {
+         t.done();
+     });
+ };
++
++
++/**
++ * Fabric NAT provision and destroy testing.
++ *
++ * Start off with no NAT provisioned, create a vm that uses a fabric NAT,
++ * test that a NAT zone was provisioned as part of the vm provisioning process.
++ * Destroy the vm, then check back to ensure the NAT zone was also destroyed.
++ */
++
++exports.find_fabric_network = function (t) {
++    assert.arrayOfObject(NETWORKS, 'NETWORKS');
++
++    fabricNetwork = NETWORKS.find(function _findFabricNetwork(n) {
++        return n.fabric === true;
++    });
++
++    t.ok(fabricNetwork, 'found a fabric network');
++    t.done();
++};
++
++
++exports.ensure_no_fabric_nat_provisioned = function (t) {
++    if (!fabricNetwork) {
++        t.fail('No fabric network available');
++        t.done();
++        return;
++    }
++
++    var opts = createOpts('/vms');
++    opts.query = {
++        alias: 'nat-' + fabricNetwork.uuid,
++        state: 'running'
++    };
++
++    client.get(opts, function (err, req, res, vms) {
++        /**
++         * We expect to either get back a destroyed vm, or a 404 error.
++         */
++        common.ifError(t, err);
++        t.equal(res.statusCode, 200, 'expected a 200 status');
++        t.equal(vms.length, 0, 'should be no NAT vm found');
++
++        t.done();
++    });
++};
++
++
++exports.find_fabric_vm_package = function (t) {
++    fabricNetwork = NETWORKS.find(function _findFabricNetwork(n) {
++        return n.fabric === true;
++    });
++
++    t.ok(fabricNetwork, 'found a fabric network');
++    t.done();
++};
++
++
++exports.create_vm_on_fabric_network = function (t) {
++    if (!fabricNetwork) {
++        t.fail('No fabric network available');
++        t.done();
++        return;
++    }
++
++    var vm = {
++        owner_uuid: CUSTOMER,
++        image_uuid: IMAGE,
++        server_uuid: SERVER.uuid,
++        networks: [ { uuid: fabricNetwork.uuid } ],
++        brand: 'joyent-minimal',
++        billing_id: pkgId,
++        ram: 128,
++        quota: 10,
++        creator_uuid: CUSTOMER,
++        origin: 'cloudapi'
++    };
++
++    var opts = createOpts('/vms', vm);
++
++    client.post(opts, vm, function (err, req, res, body) {
++        common.ifError(t, err);
++        t.equal(res.statusCode, 202, '202 Accepted');
++
++        jobLocation = '/jobs/' + body.job_uuid;
++        t.ok(true, 'jobLocation: ' + jobLocation);
++        newUuid = body.vm_uuid;
++        vmLocation = '/vms/' + newUuid;
++
++        t.done();
++    });
++};
++
++
++exports.wait_provisioned_fabric_vm_job = function (t) {
++    if (!fabricNetwork) {
++        t.fail('No fabric network available');
++        t.done();
++        return;
++    }
++
++    waitForValue(jobLocation, 'execution', 'succeeded', function (err) {
++        common.ifError(t, err);
++        t.done();
++    });
++};
++
++
++exports.ensure_fabric_nat_provisioned = function (t) {
++    if (!fabricNetwork) {
++        t.fail('No fabric network available');
++        t.done();
++        return;
++    }
++
++    var opts = createOpts('/vms');
++    opts.query = {
++        alias: 'nat-' + fabricNetwork.uuid,
++        state: 'running'
++    };
++
++    client.get(opts, function (err, req, res, vms) {
++        /**
++         * We expect to either get back a destroyed vm, or a 404 error.
++         */
++        common.ifError(t, err);
++        t.equal(res.statusCode, 200, 'expected a 200 status');
++        t.equal(vms.length, 1, 'should have found one NAT vm');
++
++        t.done();
++    });
++};
++
++
++exports.destroy_fabric_vm = function (t) {
++    if (!fabricNetwork) {
++        t.fail('No fabric network available');
++        t.done();
++        return;
++    }
++
++    var opts = createOpts(vmLocation);
++
++    client.del(opts, function (err, req, res, body) {
++        common.ifError(t, err);
++        t.equal(res.statusCode, 202, '202 Accepted');
++        common.checkHeaders(t, res.headers);
++        t.ok(body, 'body is set');
++        jobLocation = '/jobs/' + body.job_uuid;
++        t.ok(true, 'jobLocation: ' + jobLocation);
++        t.done();
++    });
++};
++
++
++exports.wait_destroyed_fabric_vm_job = function (t) {
++    if (!fabricNetwork) {
++        t.fail('No fabric network available');
++        t.done();
++        return;
++    }
++
++    waitForValue(jobLocation, 'execution', 'succeeded', function (err) {
++        common.ifError(t, err);
++        t.done();
++    });
++};
++
++
++exports.ensure_fabric_nat_destroyed = function (t) {
++    if (!fabricNetwork) {
++        t.fail('No fabric network available');
++        t.done();
++        return;
++    }
++
++    var opts = createOpts('/vms');
++    opts.query = {
++        alias: 'nat-' + fabricNetwork.uuid,
++        state: 'running'
++    };
++
++    client.get(opts, function (err, req, res, vms) {
++        /**
++         * We expect to either get back a destroyed vm, or a 404 error.
++         */
++        common.ifError(t, err);
++        t.equal(res.statusCode, 200, 'expected a 200 status');
++        t.equal(vms.length, 0, 'should be no NAT vm found');
++
++        t.done();
++    });
++};

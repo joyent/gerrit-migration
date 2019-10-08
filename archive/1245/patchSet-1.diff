@@ -1,0 +1,180 @@
+commit cc4ff6408c9ad3d7b34de6dbb04f6f280d7baad2 (refs/changes/45/1245/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2017-01-12T17:52:11-08:00 (2 years, 9 months ago)
+    
+    joyent/node-cueball#72 'end' or 'close' during idle state should not be considered an error
+
+diff --git a/lib/connection-fsm.js b/lib/connection-fsm.js
+index bcbd5a1..2135af2 100644
+--- a/lib/connection-fsm.js
++++ b/lib/connection-fsm.js
+@@ -277,6 +277,11 @@ ConnectionFSM.prototype.state_closed = function (S) {
+ 	S.on(this, 'closeAsserted', function () { });
+ };
+ 
++/*
++ * Entered when we have experienced an error of some kind. We make the decision
++ * here as to whether we should retry with backoff or give up, and then proceed
++ * to either 'delay' (to retry) or 'closed' (to give up).
++ */
+ ConnectionFSM.prototype.state_error = function (S) {
+ 	S.validTransitions(['delay', 'closed']);
+ 
+@@ -334,6 +339,7 @@ ConnectionFSM.prototype.state_error = function (S) {
+ 	}
+ };
+ 
++/* Back off and delay before a retry. */
+ ConnectionFSM.prototype.state_delay = function (S) {
+ 	S.validTransitions(['connect', 'closed']);
+ 	var delay = this.cf_delay;
+@@ -354,8 +360,30 @@ ConnectionFSM.prototype.state_delay = function (S) {
+ 	});
+ };
+ 
++/*
++ * An alternative to the "error" state for cases where the socket closure was
++ * not in fact an error (e.g. an idle socket that cleanly closed). We don't
++ * delay before retrying.
++ */
++ConnectionFSM.prototype.state_reconnect = function (S) {
++	S.on(this, 'closeAsserted', function () {
++		S.gotoState('closed');
++	});
++
++	if (this.cf_conn)
++		this.cf_conn.destroy();
++	this.cf_conn = undefined;
++
++	if (this.cf_shadow) {
++		this.cf_shadow.sh_error = true;
++		this.cf_shadow = undefined;
++	}
++
++	S.gotoState('connect');
++};
++
+ ConnectionFSM.prototype.state_idle = function (S) {
+-	S.validTransitions(['busy', 'error', 'closed']);
++	S.validTransitions(['busy', 'error', 'closed', 'reconnect']);
+ 	var self = this;
+ 
+ 	this.cf_claimed = false;
+@@ -443,9 +471,7 @@ ConnectionFSM.prototype.state_idle = function (S) {
+ 		if (self.cf_closeAfter === true) {
+ 			S.gotoState('closed');
+ 		} else {
+-			self.cf_lastError =
+-			    new mod_errors.ConnectionClosedError(self);
+-			S.gotoState('error');
++			S.gotoState('reconnect');
+ 			self.cf_pool._incrCounter('close-during-idle');
+ 		}
+ 	});
+@@ -453,9 +479,7 @@ ConnectionFSM.prototype.state_idle = function (S) {
+ 		if (self.cf_closeAfter === true) {
+ 			S.gotoState('closed');
+ 		} else {
+-			self.cf_lastError = new
+-			    mod_errors.ConnectionClosedError(self);
+-			S.gotoState('error');
++			S.gotoState('reconnect');
+ 			self.cf_pool._incrCounter('end-during-idle');
+ 		}
+ 	});
+@@ -481,7 +505,7 @@ ConnectionFSM.prototype.state_idle = function (S) {
+ };
+ 
+ ConnectionFSM.prototype.state_ping = function (S) {
+-	S.validTransitions(['error', 'closed', 'idle']);
++	S.validTransitions(['error', 'closed', 'idle', 'reconnect']);
+ 	this.cf_lastCheck = new Date();
+ 
+ 	this.cf_claimStack = [
+@@ -538,8 +562,7 @@ ConnectionFSM.prototype.state_ping = function (S) {
+ 		self.cf_pool._incrCounter('end-during-ping');
+ 	});
+ 	S.on(this, 'closeAsserted', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		S.gotoState('error');
++		S.gotoState('reconnect');
+ 	});
+ 	var t = S.timeout(this.cf_checkTimeout, function () {
+ 		var info = {};
+@@ -575,7 +598,7 @@ function countListeners(eve, event) {
+ }
+ 
+ ConnectionFSM.prototype.state_busy = function (S) {
+-	S.validTransitions(['error', 'closed', 'idle']);
++	S.validTransitions(['error', 'closed', 'idle', 'reconnect']);
+ 	var self = this;
+ 	if (this.cf_doRef)
+ 		this.cf_conn.ref();
+@@ -624,9 +647,14 @@ ConnectionFSM.prototype.state_busy = function (S) {
+ 		S.gotoState('error');
+ 		self.cf_pool._incrCounter('close-during-busy');
+ 	});
++	/*
++	 * The pool will not call .close() on us when we are in "busy" state:
++	 * this call can only come from our claimer via the handle. As a result,
++	 * treat this is a deliberate protocol-level closure and don't delay
++	 * before we retry (go to 'reconnect' not 'error').
++	 */
+ 	S.on(this, 'closeAsserted', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		S.gotoState('error');
++		S.gotoState('reconnect');
+ 	});
+ 	if (this.cf_checkTimeout !== undefined) {
+ 		var t = S.timeout(this.cf_checkTimeout, function () {
+diff --git a/test/pool.test.js b/test/pool.test.js
+index a461011..e278d92 100644
+--- a/test/pool.test.js
++++ b/test/pool.test.js
+@@ -319,6 +319,46 @@ mod_tape.test('error while claimed', function (t) {
+ 	});
+ });
+ 
++mod_tape.test('close while idle', function (t) {
++	connections = [];
++	resolver = undefined;
++
++	var pool = new mod_pool.ConnectionPool({
++		log: log,
++		domain: 'foobar',
++		spares: 1,
++		maximum: 1,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery
++	});
++	t.ok(resolver);
++
++	resolver.emit('added', 'b1', {});
++	setImmediate(function () {
++		t.equal(connections.length, 1);
++		var conn = connections[0];
++		conn.connect();
++
++		setTimeout(function () {
++			conn.emit('close');
++
++			setImmediate(function () {
++				t.ok(conn.dead);
++				t.equal(connections.length, 1);
++				t.notStrictEqual(conn, connections[0]);
++				t.ok(!connections[0].dead);
++				connections[0].connect();
++
++				t.notStrictEqual(conn.cf_fsm.fsm_history.
++				    indexOf('reconnect'), -1);
++				t.end();
++			});
++		}, 100);
++	});
++});
++
+ mod_tape.test('removing a backend', function (t) {
+ 	connections = [];
+ 	resolver = undefined;

@@ -1,0 +1,1064 @@
+commit b56907cd13edffc84ede4f266c0a5d506a284000 (refs/changes/28/4228/7)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2018-06-22T19:04:04+00:00 (1 year, 4 months ago)
+    
+    MORAY-295 Add support for filtering subnets by contained addresses
+    MORAY-471 Filtering on arrays is broken for non-equality tests
+    MORAY-327 Add support for "numrange" and "daterange" types
+    MORAY-476 Add support for "date", "mac", and "uuid" types
+    MORAY-477 Float values put into "number" fields get truncated to integers
+    Reviewed by: Jason King <jason.king@joyent.com>
+    Reviewed by: Dan McDonald <danmcd@joyent.com>
+    Approved by: Dan McDonald <danmcd@joyent.com>
+
+diff --git a/lib/buckets/common.js b/lib/buckets/common.js
+index 1af3456..fe47c4f 100644
+--- a/lib/buckets/common.js
++++ b/lib/buckets/common.js
+@@ -29,14 +29,6 @@ var TYPES = require('../types').TYPES;
+ 
+ // --- Globals
+ 
+-var INDEX_TYPES = {
+-    string: true,
+-    number: true,
+-    'boolean': true,
+-    ip: true,
+-    subnet: true
+-};
+-
+ // Postgres rules:
+ // start with a letter, everything else is alphum or '_', and must be
+ // <= 63 characters in length
+@@ -259,7 +251,6 @@ function shootdownBucket(req, cb) {
+ // --- Exports
+ 
+ module.exports = {
+-    INDEX_TYPES: INDEX_TYPES,
+     BUCKET_NAME_RE: BUCKET_NAME_RE,
+     RESERVED_BUCKETS: RESERVED_BUCKETS,
+     buildIndexString: buildIndexString,
+diff --git a/lib/objects/common.js b/lib/objects/common.js
+index f4c97fb..20e953a 100644
+--- a/lib/objects/common.js
++++ b/lib/objects/common.js
+@@ -14,11 +14,13 @@ var clone = require('clone');
+ var filters = require('moray-filter');
+ var ip6addr = require('ip6addr');
+ var jsprim = require('jsprim');
++var macaddr = require('macaddr');
+ var once = require('once');
+ var util = require('util');
+ var vasync = require('vasync');
+ var verror = require('verror');
+ var vm = require('vm');
++var VError = require('verror');
+ 
+ var mod_errors = require('../errors');
+ var BucketNotFoundError = mod_errors.BucketNotFoundError;
+@@ -35,6 +37,11 @@ var VE = verror.VError;
+ 
+ var TYPES = require('../types').TYPES;
+ 
++var DATERANGE_RE = /^([([])([\d:.TZ+-]+)?,([\d:.TZ+-]+)?([)\]])$/;
++var NUMRANGE_RE = /^[([](-?\d+(?:\.\d+)?)?,(-?\d+(?:\.\d+)?)?[)\]]$/;
++var ISO8601_RE = /^(?:[-+]00)?\d+-\d+-\d+T\d+:\d+:\d+(?:.\d+)?Z$/;
++var UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
++
+ 
+ // --- Globals
+ 
+@@ -118,110 +125,251 @@ var EXTENDED_ID = '_idx';
+ 
+ // --- Internal Helpers
+ 
+-/**
+- * This function is used during processing of the parsed Moray filter to:
++/*
++ * Validate an ISO 8601 timestamp, and return a normalized representation of it.
+  *
+- *   - Convert the string value into what will be sent to Postgres as a
+- *     parameter to the generated SQL query.
+- *   - Update the filter object with the JavaScript value to compare to.
+- *   - Determine if this is an array type.
++ * Note that while our regular expression supports BCE dates, Postgres will not
++ * accept them due to broken handling of BCE timestamps. Instead, the error
++ * message "time zone displacement out of range" will be returned to the
++ * consumer. Postgres will however accept its own unique method of writing
++ * timestamps with a "BC" suffix.
++ *
++ * While the node-postgres client will parse these when it encounters them, and
++ * it will convert Date objects into Postgres's mangled interpretation of ISO
++ * 8601, it doesn't generate the "BC" suffix. (It also doesn't convert Date
++ * objects in Arrays.) Maybe someday it will gain support for it, at which
++ * point we maybe can use Date objects in our query parameters array.
++ *
++ * It is, of course, possible that this is entirely moot: Triton and Manta will
++ * most likely never actually care about dates before the vulgar era.
+  */
+-function _value(schema, key, val, filter) {
+-    var array = false;
+-    var value;
++function parseISO8601(value) {
++    if (!ISO8601_RE.test(value)) {
++        throw new VError('invalid ISO 8601 timestamp: %j', value);
++    }
+ 
+-    if (schema[key]) {
+-        switch (schema[key].type) {
+-        case 'boolean':
+-            filter.value = /^true$/i.test(val);
+-            value = filter.value.toString().toUpperCase();
+-            break;
++    return (new Date(value)).toISOString();
++}
+ 
+-        case '[boolean]':
+-            filter.value = /^true$/i.test(val);
+-            value = filter.value.toString().toUpperCase();
+-            array = true;
+-            break;
++function parseNumber(value) {
++    var v = value;
+ 
+-        case 'number':
+-            filter.value = value = parseInt(val, 10);
+-            break;
++    if (typeof (v) === 'string') {
++        v = parseFloat(value, 10);
++    }
+ 
+-        case '[number]':
+-            filter.value = value = parseInt(val, 10);
+-            array = true;
+-            break;
++    if (typeof (v) !== 'number' || Number.isNaN(v)) {
++        throw new VError('invalid number: %j', value);
++    }
+ 
+-        case 'ip':
+-            filter.value = ip6addr.parse(val);
+-            value = filter.value.toString();
+-            break;
++    return v;
++}
+ 
+-        case '[ip]':
+-            filter.value = ip6addr.parse(val);
+-            value = filter.value.toString();
+-            array = true;
+-            break;
++function parseDateRange(value) {
++    var lower = '';
++    var upper = '';
+ 
+-        case 'subnet':
+-            filter.value = ip6addr.createCIDR(val);
+-            value = filter.value.toString();
+-            break;
++    var m = DATERANGE_RE.exec(value);
++    if (m === null) {
++        throw new VError('invalid date range: %j', value);
++    }
+ 
+-        case '[subnet]':
+-            filter.value = ip6addr.createCIDR(val);
+-            value = filter.value.toString();
+-            array = true;
+-            break;
++    if (m[2]) {
++        lower = parseISO8601(m[2]);
++    }
+ 
+-        case '[string]':
+-            value = val;
+-            array = true;
+-            break;
++    if (m[3]) {
++        upper = parseISO8601(m[3]);
++    }
+ 
+-        default:
+-            value = val;
+-            break;
+-        }
++    return m[1] + lower + ',' + upper + m[4];
++}
++
++function parseNumericRange(value) {
++    if (NUMRANGE_RE.test(value)) {
++        return value;
+     } else {
++        throw new VError('invalid numeric range: %j', value);
++    }
++}
++
++function _parse(val, filter, type) {
++    var array = TYPES[type].array;
++    var value;
++
++    switch (type) {
++    case '[boolean]':
++    case 'boolean':
++        filter.value = /^true$/i.test(val);
++        value = filter.value.toString().toUpperCase();
++        break;
++
++    case '[date]':
++    case 'date':
++        filter.value = parseISO8601(val);
++        value = new Date(filter.value);
++        break;
++
++    case '[daterange]':
++    case 'daterange':
++        filter.value = value = parseDateRange(val);
++        break;
++
++    case '[number]':
++    case 'number':
++        filter.value = value = parseNumber(val);
++        break;
++
++    case '[numrange]':
++    case 'numrange':
++        filter.value = value = parseNumericRange(val);
++        break;
++
++    case '[ip]':
++    case 'ip':
++        filter.value = ip6addr.parse(val);
++        value = filter.value.toString();
++        break;
++
++    case '[mac]':
++    case 'mac':
++        filter.value = macaddr.parse(val);
++        value = filter.value.toString();
++        break;
++
++    case '[subnet]':
++    case 'subnet':
++        filter.value = ip6addr.createCIDR(val);
++        value = filter.value.toString();
++        break;
++
++    case '[string]':
++    case 'string':
++        value = val;
++        break;
++
++    default:
++        value = val;
++        break;
++    }
++
++    return {
++        isArray: array,
++        value: value
++    };
++}
++
++/**
++ * Parse the right-hand side of a filter, and return an object with the fields
++ * "isArray" (whether this is an array type) and "value", the value to pass in
++ * the array of query parameters.
++ *
++ * We also update the filter.value field passed in to a normalized or object
++ * representation of the value, to use later when post-processing the objects
++ * return from Postgres.
++ */
++function parse(val, filter, type) {
++    try {
++        return _parse(val, filter, type);
++    } catch (e) {
++        throw new InvalidQueryError(e, filter.toString());
++    }
++}
++
++/**
++ * This function is used during processing of the parsed Moray filter to:
++ *
++ *   - Convert the string value into what will be sent to Postgres as a
++ *     parameter to the generated SQL query.
++ *   - Update the filter object with the JavaScript value to compare to.
++ *   - Determine if this is an array type.
++ */
++function _value(schema, key, val, filter) {
++    if (!jsprim.hasKey(schema, key)) {
+         switch (key) {
+         case '_id':
+         case '_txn_snap':
+         case '_mtime':
+-            filter.value = value = parseInt(val, 10);
+-            if (isNaN(value))
+-                value = ' ';
+-            break;
++            return parse(val, filter, 'number');
+         case '_etag':
+         case '_key':
+-            value =  val;
+-            break;
++            return parse(val, filter, 'string');
+         default:
+-            break;
++            return {
++                isArray: false,
++                value: undefined
++            };
+         }
+     }
+ 
+-    return ({
+-        isArray: array,
+-        value: value
+-    });
++    return parse(val, filter, schema[key].type);
+ }
+ 
+ 
+-function compileQuery(b, f, count) {
++/**
++ * This function takes care of converting a filter into a SQL query that we can
++ * pass to Postgres. When it encounters an attribute that can't be searched in
++ * the database, we throw a NotIndexedError. If the operation is invalid for the
++ * type or the filter's value is malformed/nonsensical, then we throw an
++ * InvalidQueryError.
++ *
++ * One tricky thing to keep in mind while reading this code: we always generate
++ * comparisons with the column name on the right-hand side, which is the
++ * *opposite* of how they are written in the filter. This is because Postgres
++ * requires the ANY keyword to always appear on the right-hand side of an
++ * operation. Thus, the following filter:
++ *
++ *     (&(a>=5)(b<=40))
++ *
++ * Turns into the second of the two equivalent expressions:
++ *
++ *     a >= 5 AND b <= 40
++ *     5 <= a AND 40 >= b
++ */
++function compileQuery(b, f, args) {
+     assert.object(b, 'bucket');
+     assert.string(b.name, 'bucket.name');
+     assert.object(b.index, 'bucket.index');
+     assert.bool(b.hasExtendedId, 'b.hasExtendedId');
+     assert.object(f, 'query');
+-    assert.number(count, 'count');
++    assert.array(args, 'args');
+ 
+-    var args = [];
+     var clause = '';
+     var i;
+-    var type;
+     var v;
+ 
++    function _mapOp(direction) {
++        var ltype, rtype, op;
++
++        if (!jsprim.hasKey(b.index, f.attribute)) {
++            throw new NotIndexedError(b.name, f.toString());
++        }
++
++        ltype = b.index[f.attribute].type;
++        if (!jsprim.hasKey(TYPES, ltype)) {
++            throw new InvalidQueryError(f.toString());
++        }
++
++        if (TYPES[ltype][direction] === null) {
++            throw new InvalidQueryError(f.toString());
++        }
++
++        rtype = TYPES[ltype][direction].type;
++        op = TYPES[ltype][direction].op;
++
++        v = parse(f.value, f, rtype);
++
++        args.push(v.value);
++
++        if (TYPES[ltype].array) {
++            clause += util.format('$%d::%s %s ANY(%s)',
++                args.length, typeToPg(rtype), op, f.attribute);
++        } else {
++            clause += util.format('$%d::%s %s %s',
++                args.length, typeToPg(rtype), op, f.attribute);
++        }
++    }
++
+     function _append(op) {
+         /*
+          * If this bucket has the extended ID column ("_idx"), and this is a
+@@ -233,7 +381,6 @@ function compileQuery(b, f, count) {
+         v = _value(b.index, f.attribute, f.value, f);
+         if (v.value !== undefined) {
+             args.push(v.value);
+-            count += 1;
+ 
+             if (extid) {
+                 clause += ' (';
+@@ -242,14 +389,14 @@ function compileQuery(b, f, count) {
+             clause += ' ( ';
+             if (v.isArray) {
+                 if (op === '=') {
+-                    clause += f.attribute + ' @> ARRAY[$' + count + ']::'
++                    clause += f.attribute + ' @> ARRAY[$' + args.length + ']::'
+                         + typeToPg(b.index[f.attribute].type);
+                 } else {
+-                    clause += '$' + count + ' ' + op +
++                    clause += '$' + args.length + ' ' + op +
+                         ' ANY(' + f.attribute + ')';
+                 }
+             } else {
+-                clause += f.attribute + ' ' + op + ' $' + count;
++                clause += '$' + args.length + ' ' + op + ' ' + f.attribute;
+                 if (extid) {
+                     /*
+                      * PostgreSQL appears to select a type for a parameter
+@@ -269,7 +416,7 @@ function compileQuery(b, f, count) {
+ 
+             if (extid) {
+                 clause += 'OR ( ';
+-                clause += EXTENDED_ID + ' ' + op + ' $' + count;
++                clause += '$' + args.length + ' ' + op + ' ' + EXTENDED_ID;
+                 clause += ' AND ' + EXTENDED_ID + ' IS NOT NULL';
+                 clause += ' ) ) ';
+             }
+@@ -311,7 +458,7 @@ function compileQuery(b, f, count) {
+         if (valid) {
+             args.push(_like_tmp);
+             clause += ' ( ';
+-            clause += f.attribute + ' ' + op + ' $' + (++count);
++            clause += f.attribute + ' ' + op + ' $' + (args.length);
+             clause += ' AND ' + f.attribute + ' IS NOT NULL';
+             clause += ' ) ';
+         }
+@@ -321,52 +468,44 @@ function compileQuery(b, f, count) {
+     case 'and':
+         var ands = [];
+         f.filters.forEach(function (_f) {
+-            v = compileQuery(b, _f, count);
+-            if (v && v.clause.length > 0) {
++            v = compileQuery(b, _f, args);
++            if (v !== '') {
+                 ands.push(v);
+-                args = args.concat(v.args);
+-                count += v.args.length;
+             }
+         });
+         if (ands.length === 0)
+             throw new NotIndexedError(b.name, f.toString());
+ 
+-        type = f.type.toUpperCase();
+         for (i = 0; i < ands.length; i++) {
+-            clause += ' (' + ands[i].clause + ') ';
++            clause += ' (' + ands[i] + ') ';
+             if (i < ands.length - 1)
+-                clause += type;
++                clause += 'AND';
+         }
+         break;
+ 
+     case 'or':
+         var ors = [];
+         f.filters.forEach(function (_f) {
+-            v = compileQuery(b, _f, count);
+-            if (!v || !v.clause.length)
++            v = compileQuery(b, _f, args);
++            if (v === '')
+                 throw new NotIndexedError(b.name, f.toString());
+ 
+             ors.push(v);
+-            args = args.concat(v.args);
+-            count += v.args.length;
+         });
+         if (ors.length === 0)
+             throw new NotIndexedError(b.name, f.toString());
+ 
+-        type = f.type.toUpperCase();
+         for (i = 0; i < ors.length; i++) {
+-            clause += ' (' + ors[i].clause + ') ';
++            clause += ' (' + ors[i] + ') ';
+             if (i < ors.length - 1)
+-                clause += type;
++                clause += 'OR';
+         }
+         break;
+ 
+     case 'not':
+-        v = compileQuery(b, f.filter, count);
+-        if (v.clause.length > 0) {
+-            args = args.concat(v.args);
+-            clause += ' NOT (' + v.clause + ')';
+-            count += v.args.length;
++        v = compileQuery(b, f.filter, args);
++        if (v !== '') {
++            clause += ' NOT (' + v + ')';
+         }
+         break;
+ 
+@@ -383,15 +522,21 @@ function compileQuery(b, f, count) {
+         break;
+ 
+     case 'ge':
+-        _append('>=');
++        _append('<=');
+         break;
+ 
+     case 'le':
+-        _append('<=');
++        _append('>=');
+         break;
+ 
+     case 'ext':
+         switch (f.rule) {
++        case 'overlaps':
++        case 'contains':
++        case 'within':
++            _mapOp(f.rule);
++            break;
++
+         case 'caseIgnoreMatch':
+             _append('ILIKE');
+             break;
+@@ -411,14 +556,7 @@ function compileQuery(b, f, count) {
+         break;
+     }
+ 
+-    if (count === undefined && clause.length === 0)
+-        throw new NotIndexedError(b.name, f.toString());
+-
+-    return ({
+-        args: args,
+-        clause: clause,
+-        count: count
+-    });
++    return clause;
+ }
+ 
+ 
+@@ -428,13 +566,56 @@ function compileQuery(b, f, count) {
+  */
+ function _mapType(type, value, key, isArray) {
+     var ret;
++
+     switch (type) {
+     case 'boolean':
+         ret = value.toString().toUpperCase();
++        if (ret !== 'TRUE' && ret !== 'FALSE') {
++            throw new InvalidIndexTypeError(key, type);
++        }
++        break;
++
++    case 'date':
++        try {
++            ret = parseISO8601(value);
++            if (!isArray) {
++                ret = new Date(ret);
++            }
++        } catch (e) {
++            throw new InvalidIndexTypeError(e, key, type);
++        }
++        break;
++
++    case 'daterange':
++        try {
++            ret = parseDateRange(value);
++        } catch (e) {
++            throw new InvalidIndexTypeError(e, key, type);
++        }
++        break;
++
++    case 'mac':
++        try {
++            ret = (macaddr.parse(value)).toString();
++        } catch (e) {
++            throw new InvalidIndexTypeError(e, key, type);
++        }
+         break;
+ 
+     case 'number':
+-        ret = parseInt(value, 10);
++        try {
++            ret = parseNumber(value);
++        } catch (e) {
++            throw new InvalidIndexTypeError(e, key, type);
++        }
++        break;
++
++    case 'numrange':
++        try {
++            ret = parseNumericRange(value);
++        } catch (e) {
++            throw new InvalidIndexTypeError(e, key, type);
++        }
+         break;
+ 
+     case 'string':
+@@ -456,12 +637,25 @@ function _mapType(type, value, key, isArray) {
+         break;
+ 
+     case 'subnet':
+-        ret = value + '';
++        try {
++            ret = ip6addr.createCIDR(value).toString();
++        } catch (e) {
++            throw new InvalidIndexTypeError(e, key, type);
++        }
++        break;
++
++    case 'uuid':
++        if (UUID_RE.test(value)) {
++            ret = value;
++        } else {
++            throw new InvalidIndexTypeError(key, type);
++        }
+         break;
+ 
+     default:
+         throw new InvalidIndexTypeError(key, type);
+     }
++
+     return (ret);
+ }
+ 
+@@ -513,6 +707,39 @@ function _matchCaseInsensitiveSubstr(filter) {
+     filter.matches = matches.bind(filter);
+ }
+ 
++/**
++ * Decorate ge/le filters to support mac type.
++ */
++function _matchTypeMAC(filter) {
++    function matchesMAC(target) {
++        var self = this;
++        var tv = filters.getAttrValue(target, this.attribute);
++
++        return filters.testValues(function (v) {
++            try {
++                var mac = macaddr.parse(v);
++                switch (self.type) {
++                case 'ge':
++                    return (mac.compare(self.value) >= 0);
++                case 'le':
++                    return (mac.compare(self.value) <= 0);
++                case 'equal':
++                    return (mac.compare(self.value) === 0);
++                default:
++                    return false;
++                }
++            } catch (_) {
++                return false;
++            }
++        }, tv);
++    }
++    if (filter.type === 'ge' ||
++        filter.type === 'le' ||
++        filter.type === 'equal') {
++        filter.matches = matchesMAC.bind(filter);
++    }
++}
++
+ /**
+  * Decorate ge/le filters to support ip type.
+  */
+@@ -578,6 +805,18 @@ function _matchTypeSubnet(filter) {
+     }
+ }
+ 
++function _matchAlwaysTrue() {
++    return true;
++}
++
++function _matchPgOnly(b, filter) {
++    if (!jsprim.hasKey(b.index, filter.attribute)) {
++        throw new NotIndexedError(b.name, filter.toString());
++    }
++
++    filter.matches = _matchAlwaysTrue;
++}
++
+ 
+ // --- API
+ 
+@@ -629,6 +868,11 @@ function decorateFilter(req, cb) {
+             }
+             if (f.type === 'ext') {
+                 switch (f.rule) {
++                case 'overlaps':
++                case 'contains':
++                case 'within':
++                    _matchPgOnly(req.idxBucket, f);
++                    break;
+                 case '2.5.13.2':
+                 case 'caseIgnoreMatch':
+                     _matchCaseInsensitive(f);
+@@ -655,6 +899,10 @@ function decorateFilter(req, cb) {
+             /* Support correct eq/ge/le comparison for special types */
+             if (req.idxBucket.index[f.attribute] !== undefined) {
+                 switch (req.idxBucket.index[f.attribute].type) {
++                case 'mac':
++                case '[mac]':
++                    _matchTypeMAC(f);
++                    break;
+                 case 'ip':
+                 case '[ip]':
+                     _matchTypeIP(f);
+@@ -663,6 +911,15 @@ function decorateFilter(req, cb) {
+                 case '[subnet]':
+                     _matchTypeSubnet(f);
+                     break;
++
++                case '[date]':
++                case 'date':
++                case '[daterange]':
++                case 'daterange':
++                case '[numrange]':
++                case 'numrange':
++                    _matchPgOnly(req.idxBucket, f);
++                    break;
+                 default:
+                     break;
+                 }
+@@ -709,16 +966,18 @@ function buildWhereClause(opts, cb) {
+     var log = opts.log;
+     var o = opts.opts;
+     var where = 'WHERE ';
++    var args = [];
++    var sql;
+ 
+     // Query only against fields with valid indices
+     var b = opts.idxBucket;
+ 
+     try {
+-        var q = compileQuery(b, f, 0);
+-        if (!q.clause)
++        sql = compileQuery(b, f, args);
++        if (sql === '')
+             throw new InvalidQueryError(f.toString());
++        where += sql;
+ 
+-        where += q.clause;
+         if (o.sort) {
+             var sorts = Array.isArray(o.sort) ? o.sort : [ o.sort ];
+ 
+@@ -789,7 +1048,7 @@ function buildWhereClause(opts, cb) {
+ 
+         opts.where = {
+             clause: where,
+-            args: q.args
++            args: args
+         };
+     } catch (e) {
+         log.debug(e, 'buildWhereClause: failed');
+@@ -797,12 +1056,6 @@ function buildWhereClause(opts, cb) {
+         return;
+     }
+ 
+-    if (!opts.where) {
+-        log.debug('Unable to generate WHERE clause');
+-        cb(new InvalidQueryError(f.toString()));
+-        return;
+-    }
+-
+     cb();
+ }
+ 
+diff --git a/lib/pg.js b/lib/pg.js
+index b083c4b..02b25cc 100644
+--- a/lib/pg.js
++++ b/lib/pg.js
+@@ -31,6 +31,8 @@ var NoDatabasePeersError = mod_errors.NoDatabasePeersError;
+ var QueryTimeoutError = mod_errors.QueryTimeoutError;
+ var UniqueAttributeError = mod_errors.UniqueAttributeError;
+ 
++var parsePgDate = pg.types.getTypeParser(1082, 'text');
++
+ var TYPES = require('./types').TYPES;
+ 
+ // --- Globals
+@@ -58,6 +60,11 @@ var SERIALIZERS = {
+     err: bunyan.stdSerializers.err
+ };
+ 
++var TSTZRANGE_OID = 3910;
++var TSTZRANGE_ARRAY_OID = 3911;
++
++var TSTZRANGE_PG_RE =
++    /^([([])(?:"([ \d:.TZ+-]+)")?,(?:"([ \d:.TZ+-]+)")?([)\]])$/;
+ 
+ // --- Internal helpers
+ 
+@@ -82,6 +89,31 @@ function createOverloadedError() {
+         'OverloadedError', 'maximum moray queue length reached');
+ }
+ 
++function fixupDateRange(value) {
++    if (value === null) {
++        return null;
++    }
++
++    var lower = '';
++    var upper = '';
++
++    var m = TSTZRANGE_PG_RE.exec(value);
++    if (m === null) {
++        throw new VError('invalid date range: %j', value);
++    }
++
++    if (m[2]) {
++        lower = parsePgDate(m[2]).toISOString();
++    }
++
++    if (m[3]) {
++        upper = parsePgDate(m[3]).toISOString();
++    }
++
++    return m[1] + lower + ',' + upper + m[4];
++}
++
++
+ // --- Postgres Client Wrapper Class
+ 
+ /*
+@@ -893,6 +925,18 @@ function typeToPg(type) {
+     }
+ }
+ 
++// --- Initialize
++
++pg.types.setTypeParser(TSTZRANGE_OID, fixupDateRange);
++pg.types.setTypeParser(TSTZRANGE_ARRAY_OID, function (val) {
++    if (val === null) {
++        return null;
++    }
++
++    var p = pg.types.arrayParser.create(val);
++    return p.parse().map(fixupDateRange);
++});
++
+ // --- Exports
+ 
+ module.exports = {
+diff --git a/lib/types.js b/lib/types.js
+index 7942bc8..6ce71fd 100644
+--- a/lib/types.js
++++ b/lib/types.js
+@@ -15,58 +15,202 @@
+  *   - "array", whether this is an array type.
+  *   - "pg", the name of the Postgres type that it maps to.
+  *   - "index", the kind of Postgres index to use on the column.
++ *   - "overlaps", "contains", "within", which describe how to handle the
++ *     extended filters of the same name for each type, using the following
++ *     attributes:
++ *
++ *     - "type", the name of the Moray type for handling the filter's
++ *       argument
++ *     - "op", the Postgres operation to apply; keep in mind that compileQuery()
++ *       always moves the column name to the right side of the operator, so the
++ *       filter "(attr>=5)" becomes "5 <= attr".
++ *
+  */
+ 
+ var TYPES = {
+     'string': {
+         array: false,
++        overlaps: null,
++        contains: null,
++        within: null,
+         pg: 'TEXT',
+         index: 'BTREE'
+     },
+     '[string]': {
+         array: true,
++        overlaps: null,
++        contains: null,
++        within: null,
+         pg: 'TEXT[]',
+         index: 'GIN'
+     },
+     'number': {
+         array: false,
++        overlaps: null,
++        contains: null,
++        within: {
++            type: 'numrange',
++            op: '@>'
++        },
+         pg: 'NUMERIC',
+         index: 'BTREE'
+     },
+     '[number]': {
+         array: true,
++        overlaps: null,
++        contains: null,
++        within: {
++            type: 'numrange',
++            op: '@>'
++        },
+         pg: 'NUMERIC[]',
+         index: 'GIN'
+     },
++    'numrange': {
++        array: false,
++        overlaps: {
++            type: 'numrange',
++            op: '&&'
++        },
++        contains: {
++            type: 'number',
++            op: '<@'
++        },
++        within: null,
++        pg: 'NUMRANGE',
++        index: 'GIST'
++    },
+     'boolean': {
+         array: false,
++        overlaps: null,
++        contains: null,
++        within: null,
+         pg: 'BOOLEAN',
+         index: 'BTREE'
+     },
+     '[boolean]': {
+         array: true,
++        overlaps: null,
++        contains: null,
++        within: null,
+         pg: 'BOOLEAN[]',
+         index: 'GIN'
+     },
++    'date': {
++        array: false,
++        overlaps: null,
++        contains: null,
++        within: {
++            type: 'daterange',
++            op: '@>'
++        },
++        pg: 'TIMESTAMPTZ',
++        index: 'BTREE'
++    },
++    '[date]': {
++        array: true,
++        overlaps: null,
++        contains: null,
++        within: {
++            type: 'daterange',
++            op: '@>'
++        },
++        pg: 'TIMESTAMPTZ[]',
++        index: 'GIN'
++    },
++    'daterange': {
++        array: false,
++        overlaps: {
++            type: 'daterange',
++            op: '&&'
++        },
++        contains: {
++            type: 'date',
++            op: '<@'
++        },
++        within: null,
++        pg: 'TSTZRANGE',
++        index: 'GIST'
++    },
+     'ip': {
+         array: false,
++        overlaps: null,
++        contains: null,
++        within: {
++            type: 'subnet',
++            op: '>>'
++        },
+         pg: 'INET',
++        /*
++         * Once we move to a newer version of Postgres, we can change the
++         * default index type here (and for "subnet") to GIST, as long as
++         * we also make sure to specify the "inet_ops" operator class during
++         * the CREATE INDEX.
++         */
+         index: 'BTREE'
+     },
+     '[ip]': {
+         array: true,
++        overlaps: null,
++        contains: null,
++        within: {
++            type: 'subnet',
++            op: '>>'
++        },
+         pg: 'INET[]',
+         index: 'GIN'
+     },
++    'mac': {
++        array: false,
++        overlaps: null,
++        contains: null,
++        within: null,
++        pg: 'MACADDR',
++        index: 'BTREE'
++    },
++    '[mac]': {
++        array: true,
++        overlaps: null,
++        contains: null,
++        within: null,
++        pg: 'MACADDR[]',
++        index: 'GIN'
++    },
+     'subnet': {
+         array: false,
++        /*
++         * Postgres 9.4 added support for the "&&" operator for the CIDR
++         * type, but we currently have to always maintain compatibility
++         * with Postgres 9.2. As soon as we can assume a higher minimum
++         * version, we can update "overlaps" here.
++         */
++        overlaps: null,
++        contains: {
++            type: 'ip',
++            op: '<<'
++        },
++        within: null,
+         pg: 'CIDR',
+         index: 'BTREE'
+     },
+     '[subnet]': {
+         array: true,
++        overlaps: null,
++        contains: {
++            type: 'ip',
++            op: '<<'
++        },
++        within: null,
+         pg: 'CIDR[]',
+         index: 'GIN'
++    },
++    'uuid': {
++        array: false,
++        overlaps: null,
++        contains: null,
++        within: null,
++        pg: 'UUID',
++        index: 'BTREE'
+     }
+ };
+ 
+diff --git a/package.json b/package.json
+index 1a6fcd4..ef079bb 100644
+--- a/package.json
++++ b/package.json
+@@ -17,9 +17,10 @@
+         "dtrace-provider": "~0.8",
+         "deep-equal": "0.0.0",
+         "fast": "2.3.2",
+-        "ip6addr": "0.1.1",
++        "ip6addr": "0.2.2",
+         "jsprim": "1.4.0",
+         "kang": "1.2.0",
++        "macaddr": "0.0.1",
+         "moray-filter": "1.0.0",
+         "libuuid": "0.1.3",
+         "lru-cache": "2.5.0",

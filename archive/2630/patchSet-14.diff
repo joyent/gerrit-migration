@@ -1,0 +1,295 @@
+commit aeb6fbda30383f8700df0b5b48d5c3603a66433d (refs/changes/30/2630/14)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2017-10-20T20:05:08+00:00 (2 years ago)
+    
+    MANTA-3284 want operator-configurable throttle on muskie requests
+
+diff --git a/etc/config.coal.json b/etc/config.coal.json
+index ea3521f..b57ceb8 100644
+--- a/etc/config.coal.json
++++ b/etc/config.coal.json
+@@ -7,6 +7,11 @@
+             "type": "udp"
+         }
+     },
++    "throttle": {
++        "enabled": false,
++        "concurrency": 50,
++        "queueTolerance": 25
++    },
+     "maxObjectCopies": 6,
+     "maxRequestAge": 600,
+     "enableMPU": true,
+diff --git a/lib/errors.js b/lib/errors.js
+index 8e1e22d..9fd4628 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -593,6 +593,14 @@ function SSLRequiredError() {
+ }
+ util.inherits(SSLRequiredError, MuskieError);
+ 
++function ThrottledError() {
++    MuskieError.call(this, {
++        restCode: 'ThrottledError',
++        statusCode: 503,
++        message: 'manta throttled this request'
++    });
++}
++util.inherits(ThrottledError, MuskieError);
+ 
+ function UploadAbandonedError() {
+     MuskieError.call(this, {
+diff --git a/lib/server.js b/lib/server.js
+index b04eb4b..4d08423 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -29,6 +29,7 @@ var obj = require('./obj');
+ var other = require('./other');
+ var picker = require('./picker');
+ var uploads = require('./uploads');
++var throttle = require('./throttle');
+ 
+ // injects into the global namespace
+ require('./errors');
+@@ -101,6 +102,7 @@ function createServer(options, clearProxy) {
+     assert.object(options, 'options');
+     assert.object(options.log, 'options.log');
+     assert.object(options.collector, 'options.collector');
++    assert.object(options.throttle, 'options.throttle');
+ 
+     options.formatters = {
+         'application/json': formatJSON,
+@@ -210,6 +212,9 @@ function createServer(options, clearProxy) {
+         }
+     });
+ 
++    var throttleHandle = throttle.createThrottle(options.throttle);
++
++    server.use(throttle.throttleHandler(throttleHandle));
+     server.use(auth.authenticationHandler({
+         log: log,
+         mahi: options.mahi,
+diff --git a/lib/throttle.js b/lib/throttle.js
+new file mode 100644
+index 0000000..2ca0b58
+--- /dev/null
++++ b/lib/throttle.js
+@@ -0,0 +1,175 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
++var vasync = require('vasync');
++var uuid = require('node-uuid');
++var util = require('util');
++var mod_url = require('url');
++var fs = require('fs');
++var dtrace = require('dtrace-provider');
++var restify = require('restify');
++var jsprim = require('jsprim');
++
++require('./errors');
++
++/*
++ * High Level Operation
++ *
++ * This module exports a 'wait' method, which serves as the entry point
++ * to all throttling operations the module provides. Users of the module
++ * simply call the 'wait' function in a request-processing code path,
++ * passing in a callback representing the work required to handle the
++ * request. Currently, 'req' and 'res' arguments are also supplied
++ * because the throttle is plugged in as restify middleware in muskie.
++ * Future iterations of this throttle will aim to be generic across all
++ * communication protocols, requiring only an argumentless work function
++ * as input.
++ *
++ * The operation of wait() can be summarized as follows:
++ *  - If the number of queued requests exceeds 'queueTolerance' and
++ *    the throttle is enabled, throttle the incoming request and
++ *    return.
++ *  - If the throttle is enabled, put the incoming request-processing
++ *    function on the request queue. This will result in either the
++ *    request callback being scheduled immediately or, if all slots
++ *    are occupied, being put on the request queue.
++ *  - If the throttle is disabled, simply call the request-processing
++ *    work function.
++ *
++ * Overview of Tunables and Tradeoffs
++ *
++ * The following parameters are implemented as sapi tunables. Modification
++ * of any of these values will require a muskie restart.
++ *
++ * queueTolerance - the number of requests the throttle can queue before
++ * it starts sending indications that requests have been throttled to
++ * clients.
++ *
++ * Higher 'queueTolerance' values make it less likely that the throttle
++ * will reject incoming requests and will increase muskies memory footprint
++ * during period of high load. Lower 'queueTolerance' values make it more
++ * likely that muskie will reject incoming requests.
++ *
++ * concurrency - the number of slots the request queue has for scheduling
++ * request-handling worker callbacks concurrently. When all the slots are
++ * filled, the throttle will queue up to 'queueTolerance' callbacks before
++ * throttling requests.
++ *
++ * Higher 'concurrency' values allow manta to handle more requests
++ * concurrently and also makes it less likely that requests will spend time in
++ * the queue and/or be throttled. Lower 'concurrency' values restrict
++ * the number of requests manta can handle at once and make it more likely
++ * that requests will spend time in the queue and/or be throttled.
++ *
++ * To prevent dropping incoming traffic needlessly, it is recommended that
++ * lower 'concurrency' values be accompanied by proportionally higher
++ * 'queueTolerance' values. This is effectively a cpu/memory trade-off.
++ *
++ * enabled - a boolean value describing whether the throttle should queue
++ * and throttle requests as designed.
++ *
++ * If enabled is false, the throttle will invoke the request-processing
++ * callback immediately. The operation of muskie with 'enabled' set to
++ * false is identical to the operation of muskie prior to the change
++ * introducing this throttle.
++ *
++ * If enabled is true, the throttle will queue and throttle requests as
++ * necessary.
++ */
++
++///--- Exports
++
++module.exports = {
++
++    createThrottle: function createThrottle(options) {
++        return (new Throttle(options));
++    },
++
++    throttleHandler: function (throttle) {
++        function throttleRequest(req, res, next) {
++            throttle.wait(req, res, next);
++        }
++        return (throttleRequest);
++    }
++
++};
++
++// Used for nanosecond to second conversion
++const NANOSEC_PER_SEC = Math.pow(10, 9);
++
++/*
++ * The throttle object maintains all the state used by the throttle. This state
++ * consists of the tunables described above in addition to dtrace probes that
++ * help to describe the runtime operation of the throttle. Structuring the
++ * throttle as an object allows us to potentially instantiate multiple
++ * throttles for different communication abstractions in the same service.
++ */
++function Throttle(options) {
++    assert.bool(options.enabled, 'options.enabled');
++    assert.number(options.concurrency, 'options.concurrency');
++    assert.ok(options.concurrency > 0, 'concurrency must positive');
++    assert.number(options.queueTolerance, 'options.queueTolerance');
++    assert.ok(options.queueTolerance > 0, 'queueTolerance must be positive');
++
++    this.log = bunyan.createLogger({ name: 'throttle' });
++
++    this.dtp = dtrace.createDTraceProvider('muskie-throttle');
++    this.throttle_probes = {
++        // number of occupied slots, number of queued requests
++        // request rate, url, method
++        request_throttled: this.dtp.addProbe('request_throttled', 'int', 'int',
++                'char *', 'char *'),
++        // number of occupied slots, number of queued requests
++        request_handled: this.dtp.addProbe('request_handled', 'int', 'int',
++                'char *', 'char *')
++    };
++    this.dtp.enable();
++
++    this.enabled = options.enabled;
++    this.concurrency = options.concurrency;
++    this.queueTolerance = options.queueTolerance;
++
++    this.requestQueue = vasync.queue(function (task, callback) {
++        task(callback);
++    }, this.concurrency);
++}
++
++Throttle.prototype.wait = function wait(req, res, next) {
++    var self = this;
++
++    if (self.requestQueue.length() >= self.queueTolerance) {
++        self.throttle_probes.request_throttled.fire(function () {
++            return ([self.requestQueue.npending, self.requestQueue.length(),
++                req.url, req.method]);
++        });
++        if (self.enabled) {
++            next(new ThrottledError());
++            return;
++        }
++    }
++
++    // The request only passes through the request queue if the throttle is
++    // enabled. Otherwise, we invoke the work function immediately.
++    if (self.enabled) {
++        self.requestQueue.push(function (cb) {
++            next();
++            cb();
++        });
++    } else {
++        next();
++    }
++
++    self.throttle_probes.request_handled.fire(function () {
++        return ([self.requestQueue.npending, self.requestQueue.queued.length,
++            req.url, req.method]);
++    });
++};
+diff --git a/sapi_manifests/muskie/template b/sapi_manifests/muskie/template
+index 998e3ed..34ad468 100644
+--- a/sapi_manifests/muskie/template
++++ b/sapi_manifests/muskie/template
+@@ -7,6 +7,26 @@
+       "type": "udp"
+     }
+   },
++  "throttle": {
++    {{#MUSKIE_THROTTLE_ENABLED}}
++    "enabled": {{MUSKIE_THROTTLE_ENABLED}},
++    {{/MUSKIE_THROTTLE_ENABLED}}
++    {{^MUSKIE_THROTTLE_ENABLED}}
++    "enabled": false,
++    {{/MUSKIE_THROTTLE_ENABLED}}
++    {{#MUSKIE_THROTTLE_CONCURRENCY}}
++    "concurrency": {{MUSKIE_THROTTLE_CONCURRENCY}},
++    {{/MUSKIE_THROTTLE_CONCURRENCY}}
++    {{^MUSKIE_THROTTLE_CONCURRENCY}}
++    "concurrency": 50,
++    {{/MUSKIE_THROTTLE_CONCURRENCY}}
++    {{#MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++    "queueTolerance": {{MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++    {{/MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++    {{^MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++    "queueTolerance": 25
++    {{/MUSKIE_THROTTLE_QUEUE_TOLERANCE}}
++  },
+   "maxObjectCopies": 6,
+   "maxRequestAge": 600,
+   "numWorkers": 4,
+diff --git a/tools/jsl.node.conf b/tools/jsl.node.conf
+index 76a1fc1..293bc4c 100644
+--- a/tools/jsl.node.conf
++++ b/tools/jsl.node.conf
+@@ -185,6 +185,7 @@
+ +define ServiceUnavailableError
+ +define SharksExhaustedError
+ +define SSLRequiredError
+++define ThrottledError
+ +define UploadAbandonedError
+ +define UploadTimeoutError
+ +define UserDoesNotExistError

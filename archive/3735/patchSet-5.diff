@@ -1,0 +1,301 @@
+commit ce7654fa1b2b5db621d3f9fe48b9a005a592b60a (refs/changes/35/3735/5)
+Author: Brittany Wald <brittany.wald@joyent.com>
+Date:   2018-05-09T00:41:54+00:00 (1 year, 5 months ago)
+    
+    MANATEE-307 manatee-snapshotter failing on snapshot with dependent clones
+    MANATEE-332 manatee-snapshotter fails spuriously during rebuild
+
+diff --git a/README.md b/README.md
+index 595a881..056cf57 100644
+--- a/README.md
++++ b/README.md
+@@ -5,7 +5,7 @@
+ -->
+ 
+ <!--
+-    Copyright (c) 2014, Joyent, Inc.
++    Copyright (c) 2018, Joyent, Inc.
+ -->
+ 
+ # Manatee
+@@ -238,7 +238,8 @@ the first peer runs postgres on port 5432, the second peer runs postgres on port
+ 
+ There are currently two components to run for each peer: the sitter (which also
+ starts postgres) and the backup server (which is used for bootstrapping
+-replication for new downstream peers).  To start the first peer, use:
++replication for new downstream peers).  These commands are all intended to be
++run with "root" user privileges.  To start the first peer, use:
+ 
+     # node sitter.js -f devconfs/sitter1/sitter.json
+ 
+@@ -249,5 +250,25 @@ Similarly, to run the backupserver, use:
+ 
+     # node backupserver.js -f devconfs/sitter1/backupserver.json
+ 
+-There's also a snapshotter, but running that for development is not yet
+-documented.
++There's also a snapshotter, but running that for development takes a few more
++steps:
++
++    1. Create a file for the snapshotter configuration, i.e. `etc/snapshotter_test_config.json`
++
++    {
++      "//": "The ZFS dataset used by Manatee."
++      "dataset": "zones/$ZONE_UUID/data/manatee",
++      "//" : "Snapshot period in ms",
++      "pollInterval": 36000,
++      "//" : "Number of snapshots to keep.",
++      "snapshotNumber": 20
++    }
++
++    2. Set these environment variables:
++
++    # export SHARD=1.moray.$YOUR_LAB_OR_VM.joyent.us
++    # export ZK_IPS=$NAMESERVICE_INSTANCE_IP
++
++    3. Run the snapshotter with the config file:
++
++    # node snapshotter.js -f etc/snapshotter_test_config.json 2>&1 | bunyan
+diff --git a/lib/snapShotter.js b/lib/snapShotter.js
+index 88d3bae..599b638 100644
+--- a/lib/snapShotter.js
++++ b/lib/snapShotter.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2018 Joyent, Inc.
+  */
+ 
+ /**
+@@ -27,6 +27,7 @@ var once = require('once');
+ var restify = require('restify');
+ var util = require('util');
+ var vasync = require('vasync');
++var verror = require('verror');
+ 
+ /*
+  * For determining if a ZFS snapshot name is at least somewhat well-formed.
+@@ -156,11 +157,18 @@ SnapShotter.prototype.start = function start(callback) {
+             }
+         });
+     }
+-    // manually start the first time as setInterval waits the interval before
+-    // starting
++
++    /*
++     * Call create() before setting the interval so that the function fires
++     * immediately rather than waiting before its first execution.
++     */
+     create();
+     setInterval(create, self._pollInterval);
+ 
++
++    /*
++     * Call cleanup() immediately, it will be scheduled to repeat later.
++     */
+     (function cleanup() {
+         log.info('cleaning up snapshots');
+         vasync.pipeline({funcs: [
+@@ -235,42 +243,96 @@ SnapShotter.prototype.start = function start(callback) {
+             function _deleteSnapshots(_, cb) {
+                 cb = once(cb);
+                 var snapshots = _.snapshots;
+-                if (snapshots.length > self._snapshotNumber) {
+-                    log.info({
+-                        numberOfSnapshots: snapshots.length,
+-                        threshHold: self._snapshotNumber
+-                    }, 'deleting snapshots as number exceeds threshold');
+ 
+-                    var barrier = vasync.barrier();
++                if (snapshots.length < self._snapshotNumber) {
++                    setImmediate(cb);
++                    return;
++                }
+ 
+-                    barrier.on('drain', cb);
+-                    for (var i = 0;
+-                         i < snapshots.length - self._snapshotNumber;
+-                         i++) {
++                log.info({
++                    numberOfSnapshots: snapshots.length,
++                    threshHold: self._snapshotNumber
++                }, 'deleting snapshots as number exceeds threshold');
+ 
+-                        var delSnapshot = snapshots[i];
+-                        barrier.start(delSnapshot);
++                var excessSnapshots =
++                    snapshots.length - self._snapshotNumber;
++                var deletedCount = 0;
++                /*
++                 * stuckSnapshots is an array of objects containing a
++                 * snapshot and the error messages that occured when that
++                 * snapshot could not be deleted in the following loop.
++                 */
++                var stuckSnapshots = [];
++
++                vasync.forEachPipeline({
++                    inputs: snapshots,
++                    func: function (s, next) {
++
++                        /*
++                         * If enough snapshots have been deleted to bring the
++                         * total number under the configured threshold, move on.
++                         */
++                        if (deletedCount >= excessSnapshots) {
++                            setImmediate(next);
++                            return;
++                        }
+ 
+-                        /* jshint loopfunc: true */
+-                        self._deleteSnapshot(delSnapshot,
+-                                             function (err, snapshot) {
++                        self._deleteSnapshot(s, function (err, snapshot) {
+                             if (err) {
+-                                log.error({
++                                /*
++                                 * Though the callback has passed an error, we
++                                 * do not want to fire an amon alert on a single
++                                 * delete failure, since the reason for it may
++                                 * resolve with a retry.  Collect the failed
++                                 * deletions with information about which
++                                 * snapshot could not be deleted and why in case
++                                 * intervention is required.
++                                 */
++                                var deleteFailure = {
+                                     err: err,
+-                                    snapshot: delSnapshot
+-                                }, 'unable to delete snapshot');
+-                                return cb(err);
++                                    snapshot: snapshot
++                                };
++                                stuckSnapshots.push(deleteFailure);
++
++                                /*
++                                 * Only quit the delete operation and raise an
++                                 * error alert once we have tried to delete each
++                                 * snapshot in the array except the most recent,
++                                 * which is currently the last in the array.
++                                 */
++                                if (stuckSnapshots.length >= excessSnapshots) {
++                                    log.error({
++                                        numberOfStuckSnapshots:
++                                            stuckSnapshots.length,
++                                        stuckSnapshots: stuckSnapshots
++                                    }, 'unable to delete snapshots, exceeding' +
++                                        ' the threshold of snapshots to keep!');
++                                }
++
++                                /*
++                                 * Continue to iterate through snapshots.
++                                 */
++                                next();
++                                return;
+                             }
+-                            barrier.done(snapshot);
++
++                            /*
++                             * Successful removal of a snapshot.
++                             */
++                            deletedCount++;
++                            next();
++
+                         });
+                     }
+-                } else {
+-                    return cb();
+-                }
++                }, function (err) {
++                    if (err)
++                        cb(err);
++                    log.info('completed snapshot deletion');
++                });
+             }
+-        ], arg: {}}, function (err, results) {
++        ], arg: {}}, function onSnapshotterCleanupEnd(err, results) {
+             if (err) {
+-                log.fatal({err: err, results: results},
++                log.error({err: err, results: results},
+                           'unable to maintain snapshots');
+                 /**
+                  * SnapShotter error event.
+@@ -279,10 +341,24 @@ SnapShotter.prototype.start = function start(callback) {
+                  * @type {Error}
+                  */
+                 self.emit('error', err);
+-            } else {
+-                setTimeout(cleanup, self._pollInterval);
+             }
++            log.info('completed snapshot cleanup');
+         });
++
++        /*
++         * The cleanup operation will retry regardless of prior failure if
++         * too few snapshots were deleted to bring the total number of
++         * snapshots for this dataset under the configured threshold. This
++         * is done in case these errors were transient. Even if they were
++         * not, it is better to have more alarms fire than to allow the
++         * system to fill up with old snapshots when retrying continuously
++         * could have, in many cases, easily prevented that.  Though its
++         * true this may produce more logging, which also takes up space,
++         * error messages are likely much smaller than a snapshot of a
++         * production dataset.
++         */
++        setTimeout(cleanup, self._pollInterval);
++
+     })();
+ 
+     log.info('started snapshotter daemon');
+@@ -316,7 +392,11 @@ SnapShotter.prototype.createSnapshot = function createSnapshot(name, callback) {
+             log.info('ZFS snapshot created');
+         }
+ 
+-        // ignore all errors and try again later.
++        /*
++         * These errors are only logged, not passed up to the caller, since the
++         * caller's responsibility is to retry periodically regardless of
++         * failure.
++         */
+         callback();
+     });
+ };
+diff --git a/smf/snapshotter.xml b/smf/snapshotter.xml
+index 37db933..27af456 100644
+--- a/smf/snapshotter.xml
++++ b/smf/snapshotter.xml
+@@ -7,7 +7,7 @@
+ -->
+ 
+ <!--
+-    Copyright (c) 2014, Joyent, Inc.
++    Copyright (c) 2018, Joyent, Inc.
+ -->
+ 
+ <service_bundle type='manifest' name='export'>
+@@ -19,7 +19,8 @@
+     <dependency name='filesystem' grouping='require_all' restart_on='error' type='service'>
+       <service_fmri value='svc:/system/filesystem/local'/>
+     </dependency>
+-    <exec_method name='start' type='method' exec='node snapshotter.js -vvv -f ./etc/snapshotter.json &amp;' timeout_seconds='30'>
++    <exec_method name='start' type='method' exec='node --abort-on-uncaught-exception
++      snapshotter.js -vvv -f ./etc/snapshotter.json &amp;' timeout_seconds='30'>
+       <method_context working_directory='/opt/manatee'>
+         <method_environment>
+           <envvar name='PATH' value='/opt/manatee/build/node/bin:/opt/local/bin:/usr/bin:/usr/sbin:/bin'/>
+diff --git a/snapshotter.js b/snapshotter.js
+index d12c715..dc38466 100644
+--- a/snapshotter.js
++++ b/snapshotter.js
+@@ -118,9 +118,8 @@ function readConfig(options) {
+ 
+     var snapShotter = new SnapShotter(_config);
+ 
+-    snapShotter.on('err', function (err) {
+-        LOG.fatal('got error from snapshotter', err);
+-        throw err;
++    snapShotter.on('error', function (err) {
++        LOG.error('got error from snapshotter', err);
+     });
+ 
+     snapShotter.start(function () {

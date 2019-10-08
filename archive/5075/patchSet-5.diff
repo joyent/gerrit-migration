@@ -1,0 +1,2751 @@
+commit 3089697af67d613a99d4a4057a1631140939b770 (refs/changes/75/5075/5)
+Author: Josh Wilsdon <josh@wilsdon.ca>
+Date:   2018-11-22T13:30:53-08:00 (11 months ago)
+    
+    TRITON-955 dummy cn-agent should support installation of agents
+
+diff --git a/lib/app.js b/lib/app.js
+index 4f2a128..63aa210 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -141,97 +141,29 @@ App.prototype.createCnapiConnection = function createCnapiConnection(callback) {
+ App.prototype.updateAgents = function (callback) {
+     var self = this;
+ 
+-    if (self.config.skip_agents_update) {
+-        self.log.warn('skip_agents_update set, skipping agents update');
+-        callback();
+-        return;
+-    }
+-
+     assert.object(self.cnapiClient, 'self.cnapiClient');
+ 
+-    var agents = self.sysinfo['SDC Agents'];
+-    var agents_dir = '/opt/smartdc/agents/lib/node_modules';
+-
+-    fs.readdir(agents_dir, function (err, files) {
++    self.backend.getAgents({
++        serverUuid: self.uuid,
++        sysinfo: self.sysinfo
++    }, function gotAgents(err, agents) {
+         if (err) {
+-            callback(err);
++            callback(new verror.VError('Cannot get agents image versions'));
+             return;
+         }
+-        async.each(files, function getImageAndUUID(name, cb) {
+-            var uuid_path = '/opt/smartdc/agents/etc/' + name;
+-            var uuidFileExists;
+-            var uuid;
+-            var image_uuid;
+-            async.series([
+-                function getImage(next) {
+-                    var fpath = agents_dir + '/' + name + '/image_uuid';
+-                    fs.readFile(fpath, {
+-                        encoding: 'utf8'
+-                    }, function (er2, img_uuid) {
+-                        if (er2) {
+-                            next(er2);
+-                            return;
+-                        }
+-                        image_uuid = img_uuid.trim();
+-                        next();
+-                    });
+-                },
+-                function agentUuidFileExists(next) {
+-                    fs.exists(uuid_path, function (exists) {
+-                        if (exists) {
+-                            uuidFileExists = true;
+-                        }
+-                        next();
+-                    });
+-                },
+-                function getUUID(next) {
+-                    if (!uuidFileExists) {
+-                        next();
+-                        return;
+-                    }
+-                    fs.readFile(uuid_path, {
+-                        encoding: 'utf8'
+-                    }, function (er2, agent_uuid) {
+-                        if (er2) {
+-                            next(er2);
+-                            return;
+-                        }
+-                        uuid = agent_uuid.trim();
+-                        next();
+-                    });
+-                }
+-            ], function seriesCb(er2, results) {
+-                if (er2) {
+-                    cb(er2);
+-                    return;
+-                }
+-                agents.forEach(function (a) {
+-                    if (a.name === name) {
+-                        a.image_uuid = image_uuid;
+-                        if (uuid) {
+-                            a.uuid = uuid;
+-                        }
+-                    }
+-                });
+-                cb();
+-            });
+-        }, function (er3) {
+-            if (er3) {
+-                callback(new verror.VError('Cannot get agents image versions'));
+-                return;
++
++        self.log.info({ agents: agents }, 'Posting agents');
++        self.cnapiClient.post('/servers/' + self.uuid, {
++            agents: agents
++        }, function (postErr) {
++            if (postErr) {
++                self.log.warn({ error: postErr },
++                    'error posting agents to cnapi');
++            } else {
++                self.log.info('posted agents info to cnapi');
+             }
+-            self.log.info({agents: agents}, 'Posting agents');
+-            self.cnapiClient.post('/servers/' + self.uuid, {
+-                agents: agents
+-            }, function (er4) {
+-                if (er4) {
+-                    self.log.warn({ error: er4 }, 'posting agents to cnapi');
+-                } else {
+-                    self.log.info('posted agents info to cnapi');
+-                }
+-                callback();
+-                return;
+-            });
++
++            callback();
+         });
+     });
+ };
+diff --git a/lib/backends/common.js b/lib/backends/common.js
+new file mode 100644
+index 0000000..eb744c7
+--- /dev/null
++++ b/lib/backends/common.js
+@@ -0,0 +1,494 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2018 Joyent, Inc.
++ */
++
++/*
++ * Common helpers for all backends.
++ *
++ */
++
++var child_process = require('child_process');
++var execFile = child_process.execFile;
++var fs = require('fs');
++var path = require('path');
++
++var assert = require('assert-plus');
++var vasync = require('vasync');
++
++var CURL_CMD = '/usr/bin/curl';
++
++
++//
++// Download an agent image (<uuid>) to <output_prefix>.file and then rename to
++// .tar.gz or .tar.bz2 depending on compression from manifest.
++//
++// Inputs:
++//
++//  imageUuid         -- the image UUID of the agent image to download
++//  opts              -- a configuration object with:
++//  opts.imgapiUrl    -- the URL of imgapi: e.g. http://imgapi.whatever.foo/
++//  opts.log          -- a bunyan logger
++//  opts.outputDir    -- the directory in which to write the downloaded file
++//  opts.outputPrefix -- a filename prefix to use for the downloaded file
++//
++//  Note that opts.imgapiUrl must start with 'http(s)://' and end with a '/'.
++//
++//  The resulting filename will be /<opts.outputDir>/<opts.outputPrefix>.tar.gz
++//  or .tar.bz2 depending on compression used.
++//
++// This function was pulled with minimal modifications from:
++//
++//    lib/backends/smartos/tasks/agent_install.js
++//
++// where it used to live, but could stand a fairly major refactor.
++//
++function getAgentImage(imageUuid, opts, callback) {
++    assert.uuid(imageUuid, 'imageUuid');
++    assert.object(opts, 'opts');
++    assert.string(opts.imgapiUrl, 'opts.imgapiUrl');
++    assert.ok(opts.imgapiUrl.match(/^http.*$/),
++        'imgapiUrl must start with ^http');
++    assert.object(opts.log, 'opts.log');
++    assert.string(opts.outputDir, 'opts.outputDir');
++    assert.string(opts.outputPrefix, 'opts.outputPrefix');
++
++    var agentName;
++    var compression;
++    var fileUrl;
++    var log = opts.log;
++    var manifestUrl;
++    var manifest;
++    var outputFilename;
++    var outputFullBasename = path.join(opts.outputDir, opts.outputPrefix);
++
++    fileUrl = opts.imgapiUrl + '/images/' + imageUuid + '/file';
++    manifestUrl = opts.imgapiUrl + '/images/' + imageUuid;
++
++    vasync.pipeline({funcs: [
++        function getImgapiManifest(_, cb) {
++            var args = ['-f', '-sS', manifestUrl];
++
++            log.debug({cmdline: CURL_CMD + ' ' + args.join(' ')}, 'executing');
++            execFile(CURL_CMD, args, function (err, stdout, stderr) {
++                if (err) {
++                    log.error({
++                        err: err,
++                        stdout: stdout,
++                        stderr: stderr,
++                        url: manifestUrl
++                    }, 'failed to download manifest');
++                    if (err.message.match(/404 Not Found/)) {
++                        cb(new Error('Image not found at ' + manifestUrl));
++                    } else {
++                        cb(err);
++                    }
++                    return;
++                }
++                try {
++                    manifest = JSON.parse(stdout);
++                    agentName = manifest.name;
++                    log.debug({
++                        manifest: manifest,
++                        url: manifestUrl
++                    }, 'got imgapi manifest');
++                } catch (e) {
++                    log.error(e, 'failed to parse manifest');
++                    cb(e);
++                    return;
++                }
++
++                cb();
++            });
++        }, function getImgapiFile(_, cb) {
++            var args = [
++                '-f', '-sS',
++                '-o', outputFullBasename + '.file',
++                fileUrl
++            ];
++
++            log.debug({cmdline: CURL_CMD + ' ' + args.join(' ')}, 'executing');
++            execFile(CURL_CMD, args, function (err, stdout, stderr) {
++                if (err) {
++                    log.error({
++                        err: err,
++                        stdout: stdout,
++                        stderr: stderr,
++                        url: fileUrl
++                    }, 'failed to download file');
++                    if (err.message.match(/404 Not Found/)) {
++                        cb(new Error('Image not found at ' + fileUrl));
++                    } else {
++                        cb(err);
++                    }
++                    return;
++                }
++                log.debug({
++                    filename: outputFullBasename + '.file',
++                    url: fileUrl
++                }, 'got imgapi file');
++                cb();
++            });
++        }, function checkSize(_, cb) {
++            var expected_size = manifest.files[0].size;
++            var filename = outputFullBasename + '.file';
++            var message;
++
++            fs.stat(filename, function (err, stat) {
++                if (err) {
++                    log.error('failed to stat ' + filename);
++                    cb(err);
++                    return;
++                }
++                if (stat.size !== expected_size) {
++                    message = 'unexpected file size (' + expected_size +
++                        ' vs ' + stat.size + ')';
++                    log.error({
++                        actual: stat.size,
++                        expected: expected_size,
++                        filename: filename
++                    }, message);
++                    cb(new Error(message));
++                    return;
++                }
++                log.debug({
++                    actual: stat.size,
++                    expected: expected_size,
++                    filename: filename
++                }, 'file size ok');
++                cb();
++            });
++
++        }, function checkSha1(_, cb) {
++            var args;
++            var cmd = '/usr/bin/openssl';
++            var expected_sha1 = manifest.files[0].sha1;
++            var filename = outputFullBasename + '.file';
++
++            args = ['sha1', filename];
++
++            log.debug({cmdline: cmd + ' ' + args.join(' ')}, 'executing');
++            execFile(cmd, args, function (err, stdout, stderr) {
++                var parts;
++                var sha1;
++
++                if (err) {
++                    log.error({
++                        err: err,
++                        stdout: stdout,
++                        stderr: stderr
++                    }, 'failed to identify sha1');
++                    cb(err);
++                    return;
++                }
++
++                parts = stdout.split(' ');
++                if (parts.length === 2) {
++                    sha1 = parts[1].split(/\s/)[0];
++                } else {
++                    log.error({
++                        stdout: stdout,
++                        stderr: stderr
++                    }, 'unable to parse sha1');
++                    cb(new Error('unable to parse sha1: ' + stdout));
++                    return;
++                }
++
++                if (sha1 !== expected_sha1) {
++                    log.error({
++                        actual_sha1: sha1,
++                        expected_sha1: expected_sha1,
++                        filename: filename
++                    }, 'invalid sha1');
++                    cb(new Error('sha1 does not match: (' + sha1 + ' vs ' +
++                        expected_sha1 + ')'));
++                    return;
++                }
++
++                log.debug({
++                    actual_sha1: sha1,
++                    expected_sha1: expected_sha1,
++                    filename: filename
++                }, 'sha1 ok');
++                cb();
++            });
++        }, function identifyCompression(_, cb) {
++            var args = ['-b', outputFullBasename + '.file'];
++            var cmd = '/usr/bin/file';
++            var expected_compression = manifest.files[0].compression;
++
++            if (expected_compression) {
++                // manifest has a compression type, use that.
++                compression = expected_compression;
++                cb();
++                return;
++            }
++
++            log.debug({cmdline: cmd + ' ' + args.join(' ')}, 'executing');
++            execFile(cmd, args, function (err, stdout, stderr) {
++                if (err) {
++                    log.error({
++                        err: err,
++                        stdout: stdout,
++                        stderr: stderr
++                    }, 'failed to identify file magic');
++                    cb(err);
++                    return;
++                }
++
++                if (stdout.match(/^gzip compressed data/)) {
++                    compression = 'gzip';
++                    cb();
++                } else if (stdout.match(/^bzip2 compressed data/)) {
++                    compression = 'bzip2';
++                    cb();
++                } else {
++                    log.error({
++                        stdout: stdout,
++                        stderr: stderr
++                    }, 'unhandled file type');
++                    cb(new Error('unhandled file type: ' + stdout));
++                }
++            });
++        }, function renameBasedOnFileType(_, cb) {
++            var oldname = outputFullBasename + '.file';
++            var newname;
++
++            if (compression === 'gzip') {
++                newname = outputFullBasename + '.tar.gz';
++            } else if (compression === 'bzip2') {
++                newname = outputFullBasename + '.tar.bz2';
++            } else {
++                log.error('unknown compression: ' + compression);
++                cb(new Error('unknown compression: ' + compression));
++                return;
++            }
++
++            log.debug({oldname: oldname, newname: newname}, 'renaming file');
++            fs.rename(oldname, newname, function (err) {
++                if (err) {
++                    cb(err);
++                    return;
++                }
++                outputFilename = newname;
++                cb();
++            });
++        }, function checkIsAgentImage(_, cb) {
++            // check that image_uuid exists as a heuristic to attempt to
++            // ensure this is an agent image (since we don't have separate type)
++            var args = [];
++            var cmd = '/usr/bin/tar';
++            var filename;
++            var message;
++
++            if (!agentName) {
++                message = 'manifest is missing "name"';
++                log.error({manifest: manifest}, message);
++                cb(new Error(message));
++                return;
++            }
++            filename = agentName + '/image_uuid';
++
++            if (compression === 'gzip') {
++                args.push('-ztf');
++            } else if (compression === 'bzip2') {
++                args.push('-jtf');
++            } else {
++                message = 'invalid compression type: ' + compression;
++                log.error({manifest: manifest, compression: compression},
++                    message);
++                cb(new Error(message));
++                return;
++            }
++
++            args.push(outputFilename);
++            args.push(filename);
++
++            log.debug({cmdline: cmd + ' ' + args.join(' ')}, 'executing');
++            execFile(cmd, args, function (err, stdout) {
++                var trimmed;
++
++                if (err) {
++                    log.error({err: err, file: outputFilename},
++                        'failed to list file from image');
++                    cb(err);
++                    return;
++                }
++
++                trimmed = stdout.replace(new RegExp('[\\s]+$', 'g'), '');
++                if (trimmed === filename) {
++                    log.debug('found ' + filename + ' in ' + outputFilename);
++                    cb();
++                } else {
++                    message = 'could not find ' + filename + ' in ' +
++                        outputFilename;
++                    log.error({stdout: stdout}, message);
++                    cb(new Error(message));
++                }
++            });
++        }
++    ]}, function pipelineCb(err) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        callback(null, outputFilename, agentName);
++    });
++}
++
++
++//
++// "adopt" an agent instance into SAPI.
++//
++// Inputs:
++//
++//   "opts" object that includes:
++//
++//     agentName    -- name of the agent service in SAPI (e.g. 'cn-agent')
++//     instanceUuid -- uuid of the agent instance we're trying to adopt
++//     log          -- bunyan logger object
++//     retries      -- optional number of retries [default: 10]
++//     sapiClient   -- a restify JsonClient object pointed at a SAPI service
++//
++// It will first attempt to determine the service UUID for the specified
++// agentName. It will then use that to build and send a AdoptInstance request to
++// SAPI. If it fails after retrying 'retries' times, it will call:
++//
++//   callback(err);
++//
++// with 'err' being an Error object describing the most recent failure. It will
++// log all failures. On success, the callback will be called with no arguments.
++//
++function adoptInstanceInSapi(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.agentName, 'opts.agentName');
++    assert.uuid(opts.instanceUuid, 'opts.instanceUuid');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalNumber(opts.retries, 'opts.retries');
++    assert.object(opts.sapiClient, 'opts.sapiClient');
++
++    // This code was ported from cn-agent's postinstall.sh script which had 10
++    // retries hardcoded. Whether and how many retries we should do is something
++    // that should probably be revisited at some point.
++    var retries = opts.retries || 10;
++    var sapiClient = opts.sapiClient;
++    var sapiServiceUuid;
++    var skipAdoption = false;
++
++    function attemptAdoption() {
++        vasync.pipeline({funcs: [
++            function findSapiServiceUuid(_, cb) {
++                if (sapiServiceUuid !== undefined) {
++                    cb();
++                    return;
++                }
++
++                sapiClient.get('/services?type=agent&name=' + opts.agentName,
++                    function gotAgentServices(err, req, res, services) {
++                        var service;
++
++                        if (err) {
++                            opts.log.error({
++                                agentName: opts.agentName,
++                                err: err
++                            }, 'failed to get SAPI service');
++
++                            cb(err);
++                            return;
++                        }
++
++                        assert.array(services, 'services');
++
++                        if (services.length === 0) {
++                            opts.log.warn({
++                                agentName: opts.agentName,
++                                sapiServiceUuid: sapiServiceUuid
++                            }, 'SAPI has no service for agent, skipping ' +
++                                'adoption');
++                            skipAdoption = true;
++                            cb();
++                            return;
++                        }
++
++                        // Something's broken if we have more than one service
++                        // for this agent.
++                        assert.equal(services.length, 1,
++                            'expected exactly 1 service');
++
++                        service = services[0];
++
++                        assert.uuid(service.uuid, 'service.uuid');
++
++                        sapiServiceUuid = service.uuid;
++                        opts.log.info({
++                            agentName: opts.agentName,
++                            sapiServiceUuid: sapiServiceUuid
++                        }, 'got SAPI service');
++
++                        cb();
++                    });
++            },
++            function adoptInstance(_, cb) {
++                if (skipAdoption) {
++                    cb();
++                    return;
++                }
++
++                /* JSSTYLED */
++                // See: https://github.com/joyent/sdc-sapi/blob/master/docs/index.md#adoptinstance-post-instances
++                sapiClient.post('/instances', {
++                    exists: true,
++                    name: opts.agentName,
++                    service_uuid: sapiServiceUuid,
++                    uuid: opts.instanceUuid
++                }, function onPost(err, req, res) {
++                    var logLevel = 'info';
++
++                    if (err) {
++                        logLevel = 'error';
++                    }
++
++                    opts.log[logLevel]({
++                        err: err,
++                        instanceUuid: opts.instanceUuid,
++                        name: opts.agentName,
++                        serviceUuid: sapiServiceUuid
++                    }, 'POST /instances');
++
++                    cb(err);
++                });
++            }
++        ]}, function attemptComplete(err) {
++            if (!err) {
++                callback();
++                return;
++            }
++
++            opts.log.warn({
++                retriesRemaining: retries
++            }, 'failed to adopt instance in SAPI');
++
++            if (retries <= 0) {
++                callback(err);
++                return;
++            }
++
++            // Try again in 5s
++            setTimeout(attemptAdoption, 5000);
++            retries--;
++        });
++    }
++
++    // Kick off the first attempt
++    attemptAdoption();
++}
++
++module.exports = {
++    adoptInstanceInSapi: adoptInstanceInSapi,
++    getAgentImage: getAgentImage
++};
+diff --git a/lib/backends/dummy/common.js b/lib/backends/dummy/common.js
+index e64c67c..eb81c3d 100644
+--- a/lib/backends/dummy/common.js
++++ b/lib/backends/dummy/common.js
+@@ -17,9 +17,10 @@
+ var child_process = require('child_process');
+ var execFile = child_process.execFile;
+ var fs = require('fs');
++var path = require('path');
+ 
+ var assert = require('assert-plus');
+-var async = require('async');
++var vasync = require('vasync');
+ 
+ var mockcloudRoot;
+ try {
+@@ -35,6 +36,13 @@ try {
+ }
+ var SERVER_ROOT = mockcloudRoot + '/servers';
+ 
++
++// These are used for caching the results of mdata-get so we don't need to
++// re-run that for every server when we have multiple servers.
++var cachedDatacenterName;
++var cachedDNSDomain;
++
++
+ function mdataGet(key, callback) {
+     assert.string(key, 'key');
+     assert.func(callback, 'callback');
+@@ -69,49 +77,222 @@ function provisionInProgressFile(uuidOrZonename, callback) {
+ }
+ 
+ function ensureProvisionComplete(uuid, callback) {
++    assert.uuid(uuid, 'uuid');
++    assert.func(callback, 'callback');
++
+     var filename = '/var/tmp/machine-provision-' + uuid;
+-    var expiresAt;
+     var timeoutMinutes = 10;
+ 
+-    function checkIfReady() {
+-        fs.exists(filename, function (exists) {
+-            if (!exists) {
+-                return callback();
++    function callbackWhenComplete() {
++        fs.stat(filename, function (err, stats) {
++            var expiresAt;
++            var now;
++
++            if (err) {
++                if (err.code === 'ENOENT') {
++                    // File is gone, provision is complete.
++                    callback();
++                    return;
++                }
++                // We don't know, something is wrong.
++                callback(err);
++                return;
++            }
++
++            expiresAt = timeoutMinutes * 60 * 1000 + stats.ctime;
++            now = Date.now();
++
++            if (now > expiresAt) {
++                // Expired, so consider provision complete and delete file.
++                fs.unlink(filename, function () {
++                    callback();
++                    return;
++                });
++            } else {
++                // Not expired yet, so try again in 1 second.
++                setTimeout(callbackWhenComplete, 1000);
++            }
++        });
++    }
++
++    callbackWhenComplete();
++}
++
++function getSdcConfig(callback) {
++    var config = {};
++
++    if (cachedDatacenterName !== undefined && cachedDNSDomain !== undefined) {
++        callback(null, {
++            datacenter_name: cachedDatacenterName,
++            dns_domain: cachedDNSDomain
++        });
++        return;
++    }
++
++    mdataGet('sdc:datacenter_name', function _onDC(dcErr, datacenter) {
++        if (dcErr) {
++            callback(dcErr);
++            return;
++        }
++
++        config.datacenter_name = datacenter;
++
++        mdataGet('dnsDomain', function _onDomain(domErr, dnsDomain) {
++            if (domErr) {
++                callback(domErr);
++                return;
++            }
++
++            config.dns_domain = dnsDomain;
++
++            // Since we succeeded, cache these values.
++            cachedDatacenterName = datacenter;
++            cachedDNSDomain = dnsDomain;
++
++            callback(null, config);
++        });
++    });
++}
++
++function getAgent(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.agentsDir, 'opts.agentsDir');
++    assert.string(opts.subDir, 'opts.subDir');
++    assert.func(callback, 'callback');
++
++    var agent = {
++        name: opts.subDir // might be replaced if we have a package.json
++    };
++    var agentDir;
++
++    agentDir = path.join(opts.agentsDir, opts.subDir);
++
++    function _getUuidFile(filename, key, cb) {
++        var fn = path.join(agentDir, filename);
++
++        fs.readFile(fn, function _readFile(err, data) {
++            if (err) {
++                if (err.code === 'ENOENT') {
++                    cb();
++                } else {
++                    cb(err);
++                }
++                return;
+             }
+ 
+-            return async.waterfall([
+-                function (wf$callback) {
+-                    if (!expiresAt) {
+-                        fs.stat(filename, function (error, stats) {
+-                            expiresAt =
+-                                timeoutMinutes * 60 * 1000 + stats.ctime;
+-                            return wf$callback(error);
+-                        });
++            agent[key] = data.toString().trim();
++            assert.uuid(agent[key], 'agent.' + key);
++
++            cb();
++        });
++    }
++
++    vasync.pipeline({funcs: [
++        function _getImageUuid(_, cb) {
++            _getUuidFile('image_uuid', 'image_uuid', cb);
++        },
++        function getInstanceUuid(_, cb) {
++            _getUuidFile('instance_uuid', 'uuid', cb);
++        },
++        function getPackageJSON(_, cb) {
++            var fn = path.join(agentDir, 'package.json');
++            var pkgJSON;
++
++            fs.readFile(fn, function _readFile(err, data) {
++                if (err) {
++                    if (err.code === 'ENOENT') {
++                        cb();
++                    } else {
++                        cb(err);
+                     }
+-                    return wf$callback();
++                    return;
+                 }
+-            ],
+-            function (error) {
+-                // Check if we exceeded the timeout duration.
+-                var now = Number(new Date());
+-                if (now > expiresAt) {
+-                    fs.unlink(filename, function () {
+-                        return callback();
+-                    });
+-                } else {
+-                    setTimeout(checkIfReady, 10 * 1000);
++
++                // This might blow up, but that's a programmer error since we
++                // wrote these files. They should be valid JSON.
++                pkgJSON = JSON.parse(data.toString());
++
++                if (pkgJSON.name) {
++                    agent.name = pkgJSON.name;
++                }
++                if (pkgJSON.version) {
++                    agent.version = pkgJSON.version;
+                 }
++
++                cb();
+             });
++        }
++    ]}, function gotAgent(err) {
++        callback(err, agent);
++    });
++}
++
++//
++// getAgents() looks at files in SERVER_ROOT/opts.serverUuid/agents and calls
++// callback with:
++//
++//  callback(err, agents);
++//
++// where err is an error object or null. And when err is null, agents is an
++// array that looks like:
++//
++//  [
++//      {
++//          "image_uuid": "<image_uuid>",
++//          "name": "net-agent",
++//          "uuid": "<instance_uuid>",
++//          "version": "2.2.0"
++//      },
++//      ...
++//  ]
++//
++//
++function getAgents(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.func(callback, 'callback');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++
++    var agents = [];
++    var agentsDir = path.join(SERVER_ROOT, opts.serverUuid, 'agents');
++
++    // Defined here so opts we need are in scope.
++    function _getAgent(dir, cb) {
++        getAgent({
++            agentsDir: agentsDir,
++            subDir: dir
++        }, function _onGetAgent(err, agent) {
++            if (!err) {
++                agents.push(agent);
++            }
++            cb(err);
+         });
+     }
+ 
+-    checkIfReady();
++    fs.readdir(agentsDir, function onReaddir(err, dirs) {
++        if (err) {
++            if (err.code === 'ENOENT') {
++                callback(null, agents);
++            } else {
++                callback(err);
++            }
++            return;
++        }
++
++        vasync.forEachPipeline({
++            func: _getAgent,
++            inputs: dirs
++        }, function gotAgents(getAgentsErr) {
++            callback(getAgentsErr, agents);
++        });
++    });
+ }
+ 
+ 
+ module.exports = {
+     ensureProvisionComplete: ensureProvisionComplete,
++    getAgents: getAgents,
+     getPlatformBuildstamp: getPlatformBuildstamp,
++    getSdcConfig: getSdcConfig,
+     mdataGet: mdataGet,
+     provisionInProgressFile: provisionInProgressFile,
+     SERVER_ROOT: SERVER_ROOT
+diff --git a/lib/backends/dummy/index.js b/lib/backends/dummy/index.js
+index b624127..6d5a790 100644
+--- a/lib/backends/dummy/index.js
++++ b/lib/backends/dummy/index.js
+@@ -12,7 +12,6 @@ var execFile = require('child_process').execFile;
+ var fs = require('fs');
+ var fmt = require('util').format;
+ var os = require('os');
+-var path = require('path');
+ 
+ var assert = require('assert-plus');
+ var jsprim = require('jsprim');
+@@ -62,6 +61,14 @@ var queueDefns = [
+         name: 'nop',
+         tasks: [ 'nop' ]
+     },
++    {
++        name: 'agents_tasks',
++        maxConcurrent: 1,
++        tasks: [
++            'agent_install',
++            'refresh_agents'
++        ]
++    },
+     {
+         name: 'server_tasks',
+         tasks: [
+@@ -91,48 +98,14 @@ function DummyBackend(opts) {
+ DummyBackend.prototype.getAgentConfig =
+ function getAgentConfig(opts, callback) {
+     var config = {
+-        no_rabbit: true,
+-        skip_agents_update: true
++        no_rabbit: true
+     };
+ 
+     callback(null, config);
+ };
+ 
+-
+-DummyBackend.prototype.getSdcConfig = function getSdcConfig(opts, callback) {
+-    var config = {};
+-
+-    if (cachedDatacenterName !== undefined && cachedDNSDomain !== undefined) {
+-        callback(null, {
+-            datacenter_name: cachedDatacenterName,
+-            dns_domain: cachedDNSDomain
+-        });
+-        return;
+-    }
+-
+-    common.mdataGet('sdc:datacenter_name', function _onDC(dcErr, datacenter) {
+-        if (dcErr) {
+-            callback(dcErr);
+-            return;
+-        }
+-
+-        config.datacenter_name = datacenter;
+-
+-        common.mdataGet('dnsDomain', function _onDomain(domErr, dnsDomain) {
+-            if (domErr) {
+-                callback(domErr);
+-                return;
+-            }
+-
+-            config.dns_domain = dnsDomain;
+-
+-            // Since we succeeded, cache these values.
+-            cachedDatacenterName = datacenter;
+-            cachedDNSDomain = dnsDomain;
+-
+-            callback(null, config);
+-        });
+-    });
++DummyBackend.prototype.getSdcConfig = function getSdcConfig(_, callback) {
++    common.getSdcConfig(callback);
+ };
+ 
+ DummyBackend.prototype.getSysinfo = function getSysinfo(opts, callback) {
+@@ -326,6 +299,37 @@ DummyBackend.prototype.loadVms = function loadVms(opts, callback) {
+ };
+ 
+ 
++// Loads information about the agents on this mock CN.
++//
++// opts must contain:
++//
++//  serverUuid -- the UUID of the CN
++//
++// data will be loaded and callback will be called with:
++//
++//  callback(err, agents);
++//
++// where on failure `err` will be an Error object. On success, `err` will be
++// null and `agents` will be an array of agents that looks like:
++//
++//  [
++//      {
++//          "image_uuid": "<image_uuid>",
++//          "name": "net-agent",
++//          "uuid": "<instance_uuid>",
++//          "version": "2.2.0"
++//      },
++//      ...
++//  ]
++//
++DummyBackend.prototype.getAgents = function getAgents(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++
++    common.getAgents(opts, callback);
++};
++
++
+ // Dummy needs no watchers, other backends would start watching whatever they
+ // need in the filesystem/system and whenever they decide something changed that
+ // might cause cn-agent's cache to be dirty, they should call dirtyFn() with no
+diff --git a/lib/backends/dummy/tasks/agent_install.js b/lib/backends/dummy/tasks/agent_install.js
+new file mode 100644
+index 0000000..a7104b6
+--- /dev/null
++++ b/lib/backends/dummy/tasks/agent_install.js
+@@ -0,0 +1,154 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2018 Joyent, Inc.
++ */
++
++/*
++ * This task installs agents on this mock CN. The only parameter accepted is
++ * 'image_uuid' which is expected to be an image that exists in the local
++ * DC's imgapi.
++ *
++ * The task will:
++ *
++ *  * download the manifest (to memory)
++ *  * download the file (to /var/tmp/<server_uuid>/)
++ *  * check vs. the sha1 and size from the manifest
++ *  * name the file according to the compression
++ *  * confirm the file contains image_uuid (it's an agent image)
++ *  * extract image_uuid and package.json into place in
++ *    (SERVER_ROOT/<server_uuid>/agents/<agent>/)
++ *  * delete the temporary file from /var/tmp/<server_uuid>/
++ *  * refresh CNAPI's view of the agents
++ *
++ * if there are errors at any point in this process, it will leave things as
++ * they are for investigation.
++ *
++ * This task should be idempotent as running multiple times with the same
++ * image_uuid should result in that version of the agent being installed.
++ *
++ *  "SELF-UPDATING" cn-agent:
++ *
++ *  Since updating agents here does not actually modify the running cn-agent,
++ *  updating cn-agent works the same as every other agent. In the future we may
++ *  want to make this behave slightly differently with cn-agent in order to
++ *  mimick the real update behavior.
++ *
++ */
++
++
++var child_process = require('child_process');
++var execFile = child_process.execFile;
++var fs = require('fs');
++var path = require('path');
++
++var assert = require('assert-plus');
++var vasync = require('vasync');
++
++var backendCommon = require('../../common');
++var common = require('../common');
++var shared = require('./shared');
++var Task = require('../../../task_agent/task');
++
++var CURL_CMD = '/usr/bin/curl';
++var SERVER_ROOT = common.SERVER_ROOT;
++
++
++function AgentInstallTask(req) {
++    Task.call(this);
++    this.req = req;
++}
++
++
++Task.createTask(AgentInstallTask);
++
++function start() {
++    var self = this;
++
++    assert.object(self.sysinfo, 'self.sysinfo');
++    assert.uuid(self.sysinfo.UUID, 'self.sysinfo.UUID');
++
++    var imgapiUrl;
++    var imageUuid = self.req.params.image_uuid;
++    var tmpdir = path.join('/var/tmp/', self.sysinfo.UUID);
++
++    vasync.pipeline({ arg: { server_uuid: self.sysinfo.UUID }, funcs: [
++        function getImgapiAddress(ctx, cb) {
++            common.getSdcConfig(function onConfig(err, config) {
++                if (!err) {
++                    imgapiUrl = 'http://imgapi.' + config.datacenter_name + '.'
++                        + config.dns_domain;
++                }
++                cb(err);
++            });
++        },
++        function mkTempDir(ctx, cb) {
++            fs.mkdir(tmpdir, function onMkdir(err) {
++                if (err && err.code !== 'EEXIST') {
++                    cb(err);
++                    return;
++                }
++
++                cb();
++            });
++        },
++        function getImage(ctx, cb) {
++            backendCommon.getAgentImage(imageUuid, {
++                imgapiUrl: imgapiUrl,
++                log: self.log,
++                outputDir: tmpdir,
++                outputPrefix: imageUuid
++            }, function _gotAgentImage(err, file, name) {
++                if (err) {
++                    return cb(err);
++                }
++
++                self.log.debug('downloaded agent %s image %s to %s',
++                    name, imageUuid, file);
++
++                ctx.package_file = file;
++                return cb();
++           });
++        },
++        function installAgent(ctx, cb) {
++            shared.installAgent({
++                agentFile: ctx.package_file,
++                log: self.log,
++                serverUuid: self.sysinfo.UUID
++            }, cb);
++        },
++        function sendAgentsToCNAPI(ctx, cb) {
++            // Since the agent has been updated at this point, the task will
++            // return success. So any failure to tell CNAPI is logged only.
++            shared.refreshAgents({
++                log: self.log,
++                serverUuid: self.sysinfo.UUID
++            }, function (err) {
++                if (err) {
++                    self.log.error({
++                        err: err
++                    }, 'Error posting agents to CNAPI');
++                } else {
++                    self.log.info('Agents info updated in CNAPI');
++                }
++                return cb();
++            });
++        }
++    ]}, function agentInstallTaskCb(err) {
++        if (err) {
++            self.fatal('AgentInstall error: ' + err.message);
++            return;
++        }
++
++        self.progress(100);
++        self.finish();
++    });
++}
++
++AgentInstallTask.setStart(start);
++
++module.exports = AgentInstallTask;
+diff --git a/lib/backends/dummy/tasks/refresh_agents.js b/lib/backends/dummy/tasks/refresh_agents.js
+new file mode 100644
+index 0000000..98a26d7
+--- /dev/null
++++ b/lib/backends/dummy/tasks/refresh_agents.js
+@@ -0,0 +1,54 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2018 Joyent, Inc.
++ */
++
++/*
++ * This task updates the information regarding agents installed on this CN
++ * into CNAPI.
++ */
++
++var assert = require('assert-plus');
++
++var refreshAgents = require('./shared').refreshAgents;
++var Task = require('../../../task_agent/task');
++
++function RefreshAgentsTask(req) {
++    Task.call(this);
++    this.req = req;
++}
++
++Task.createTask(RefreshAgentsTask);
++
++function start() {
++    var self = this;
++
++    assert.object(self.log, 'self.log');
++    assert.object(self.sysinfo, 'self.sysinfo');
++    assert.uuid(self.sysinfo.UUID, 'self.sysinfo.UUID');
++
++    // We ignore errors here because the smartos backend does.
++    refreshAgents({
++        log: self.log,
++        serverUuid: self.sysinfo.UUID
++    }, function (err) {
++        if (err) {
++            self.fatal('AgentInstall error: ' + err.message);
++            return;
++        }
++        self.log.info('Agents updated into CNAPI');
++
++        self.progress(100);
++        self.finish();
++    });
++}
++
++
++RefreshAgentsTask.setStart(start);
++
++module.exports = RefreshAgentsTask;
+diff --git a/lib/backends/dummy/tasks/shared.js b/lib/backends/dummy/tasks/shared.js
+new file mode 100644
+index 0000000..eed1e9a
+--- /dev/null
++++ b/lib/backends/dummy/tasks/shared.js
+@@ -0,0 +1,722 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * Functionalities shared between two or more cn-agent tasks.
++ */
++
++var child_process = require('child_process');
++var exec = child_process.exec;
++var execFile = child_process.execFile;
++var fs = require('fs');
++var path = require('path');
++
++var assert = require('assert-plus');
++var restify = require('restify');
++var uuid = require('uuid');
++var vasync = require('vasync');
++
++var backendCommon = require('../../common');
++var common = require('../common');
++
++var SERVER_ROOT = common.SERVER_ROOT;
++
++
++function installAgent(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.agentFile, 'opts.agentFile');
++    assert.object(opts.log, 'opts.log');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++    assert.func(callback, 'callback');
++
++    var agentName; // will be filled in when we read package.json
++    var tmpDir = path.join('/var/tmp/', opts.serverUuid);
++
++    vasync.pipeline({ arg: {
++        server_uuid: opts.serverUuid
++    }, funcs: [
++        function detectTarDir(ctx, cb) {
++            //
++            // Because SmartOS tar lacks nice things such as --wildcards or
++            // --include, we can't figure out directly where package.json is in
++            // this archive. But we have a requirement that all files exist in
++            // the same directory, so we'll just use a pipeline to head -1 and
++            // get the first file and pull the directory out that way.
++            //
++            var cmdline = [
++                '/usr/bin/tar', '-ztf', opts.agentFile,
++                '| /usr/bin/head', '-1'
++            ];
++            var logLevel = 'debug';
++
++            // When we download the file we ensure it's either named .tar.gz or
++            // .tar.bz2. We detect which here so we can make sure we have the
++            // correct tar args.
++            if (opts.agentFile.match(/.tar.bz2$/)) {
++                cmdline[1] = '-jtf';
++            }
++
++            exec(cmdline.join(' '), function onTar(err, stdout, stderr) {
++                if (err) {
++                    logLevel = 'error';
++                }
++
++                opts.log[logLevel]({
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "%s"', cmdline.join(' '));
++
++                if (!err) {
++                    ctx.baseName = stdout.split('/')[0];
++                    if (typeof (ctx.baseName) !== 'string' ||
++                        ctx.baseName.length < 1) {
++
++                        cb(new Error('tarball missing agentName/ directory'));
++                        return;
++                    }
++                }
++
++                opts.log.debug({
++                    agentFile: opts.agentFile,
++                    baseName: ctx.baseName
++                }, 'found baseName from agent tarball');
++
++                cb(err);
++            });
++        },
++        function mkTempDir(ctx, cb) {
++            fs.mkdir(tmpDir, function onMkdir(err) {
++                if (err && err.code !== 'EEXIST') {
++                    cb(err);
++                    return;
++                }
++
++                cb();
++            });
++        },
++        function cleanupPreviousInstallFiles(ctx, cb) {
++            var logLevel = 'debug';
++            var unpackDir = path.join(tmpDir, ctx.baseName);
++
++            ctx.unpackDir = unpackDir;
++            execFile('/bin/rm', [
++                '-rf', unpackDir
++            ], function onRm(err, stdout, stderr) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    dir: unpackDir,
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "rm -rf %s"', unpackDir);
++                cb(err);
++            });
++        },
++        function unpackTar(ctx, cb) {
++            var args = [
++                '-zxvf', opts.agentFile,
++                '-C', tmpDir + '/',
++                ctx.baseName + '/image_uuid',
++                ctx.baseName + '/package.json'
++            ];
++            var logLevel = 'debug';
++
++            // When we download the file we ensure it's either named .tar.gz or
++            // .tar.bz2. We detect which here so we can make sure we have the
++            // correct tar args.
++            if (opts.agentFile.match(/.tar.bz2$/)) {
++                args[0] = '-jxvf';
++            }
++
++            execFile('/usr/bin/tar', args,
++                function onTar(err, stdout, stderr) {
++
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "tar %s"', args.join(' '));
++                cb(err);
++            });
++        },
++        function readPackageJson(ctx, cb) {
++            var packageJson;
++            var packageJsonFile =
++                path.join(tmpDir, ctx.baseName, 'package.json');
++
++            fs.readFile(packageJsonFile, 'utf8',
++                function onFileData(err, data) {
++
++                if (err) {
++                    opts.log.error({
++                        err: err,
++                        packageJsonFile: packageJsonFile
++                    }, 'failed to read package.json');
++                    cb(err);
++                    return;
++                }
++
++                try {
++                    packageJson = JSON.parse(data);
++                } catch (e) {
++                    opts.log.error({
++                        err: err,
++                        packageJsonFile: packageJsonFile
++                    }, 'failed to parse JSON in package.json');
++                    cb(e);
++                    return;
++                }
++
++                // If there's a package.json it needs to have a "name" otherwise
++                // we really have no idea what to do.
++                agentName = packageJson.name;
++                assert.string(agentName, 'package.json:agentName');
++
++                cb();
++            });
++        },
++        function makeTargetDir(ctx, cb) {
++            var logLevel = 'debug';
++
++            ctx.targetDir = path.join(SERVER_ROOT, opts.serverUuid,
++                'agents', agentName);
++
++            execFile('/bin/mkdir', [
++                '-p',
++                ctx.targetDir
++            ], function onMkdir(err, stdout, stderr) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "mkdir -p %s"', ctx.targetDir);
++                cb(err);
++            });
++        },
++        function moveFiles(ctx, cb) {
++            var args = [
++                path.join(ctx.unpackDir, '/image_uuid'),
++                path.join(ctx.unpackDir, '/package.json'),
++                ctx.targetDir + '/'
++            ];
++            var logLevel = 'debug';
++
++            execFile('/bin/mv', args, function onMv(err, stdout, stderr) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "mv %s"', args.join(' '));
++                cb(err);
++            });
++        },
++        function createMissingInstanceUuid(ctx, cb) {
++            var instanceFile = path.join(ctx.targetDir, '/instance_uuid');
++
++            fs.readFile(instanceFile, function onRead(err, data) {
++                if (err) {
++                    if (err.code === 'ENOENT') {
++                        // Here there's no instance_uuid, so we'll create one
++                        // and write it out for next time.
++                        ctx.instanceUuid = uuid.v4();
++                        opts.log.info({
++                            agentName: agentName,
++                            instanceUuid: ctx.instanceUuid,
++                            serverUuid: opts.serverUuid
++                        }, 'created new uuid for agent instance');
++                        fs.writeFile(instanceFile, ctx.instanceUuid + '\n',
++                            'utf8', cb);
++                        return;
++                    } else {
++                        cb(err);
++                        return;
++                    }
++                }
++
++                // No error, means we should have our uuid in data.
++                ctx.instanceUuid = data.toString().trim();
++                assert.uuid(ctx.instanceUuid, 'ctx.instanceUuid');
++                opts.log.debug({
++                    agentName: agentName,
++                    instanceUuid: ctx.instanceUuid,
++                    serverUuid: opts.serverUuid
++                }, 'loaded uuid for agent instance');
++                cb();
++            });
++        },
++        function createSapiClient(ctx, cb) {
++            common.getSdcConfig(function onConfig(err, config) {
++                var sapiUrl;
++
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                sapiUrl = 'http://sapi.' + config.datacenter_name + '.' +
++                    config.dns_domain;
++
++                ctx.sapiClient = restify.createJsonClient({
++                    url: sapiUrl
++                });
++
++                opts.log.debug({
++                    sapiUrl: sapiUrl
++                }, 'created SAPI client');
++
++                cb();
++            });
++        },
++        function adoptIntoSapi(ctx, cb) {
++
++            // TODO: Rather than always adopting into SAPI, can we do that only
++            //       when we create the instance_uuid? However, this is what
++            //       "real" cn-agent does now, so we do the same.
++
++            backendCommon.adoptInstanceInSapi({
++                agentName: agentName,
++                instanceUuid: ctx.instanceUuid,
++                log: opts.log,
++                sapiClient: ctx.sapiClient
++            }, cb);
++        },
++        function cleanupTempBits(ctx, cb) {
++            var args = [
++                '-rf',
++                ctx.unpackDir
++            ];
++            var logLevel = 'debug';
++
++            execFile('/bin/rm', args, function onRm(err, stdout, stderr) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "rm %s"', args.join(' '));
++                cb(err);
++            });
++        }
++    ]}, function onAgentInstall(err) {
++        var logLevel = 'debug';
++        var msg = 'installed agent';
++
++        if (err) {
++            logLevel = 'fatal';
++            msg = 'failed to install agent';
++        }
++
++        opts.log[logLevel]({
++            agentFile: opts.agentFile,
++            agentName: agentName,
++            err: err,
++            serverUuid: opts.serverUuid
++        }, msg);
++
++        callback(err);
++    });
++}
++
++
++function _installAgentIfInstallable(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.dir, 'opts.dir');
++    assert.string(opts.filename, 'opts.filename');
++    assert.object(opts.log, 'opts.log');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++    assert.func(callback, 'callback');
++
++    opts.log.info({
++        dir: opts.dir,
++        filename: opts.filename,
++        serverUuid: opts.serverUuid
++    }, 'trying to install agent');
++
++    if (!opts.filename.match(/\.(tar\.gz|tgz|tar\.bz2)$/)) {
++        opts.log.warn({filename: opts.filename},
++            'File does not look like an agent tarball. Skipping.');
++        callback();
++        return;
++    }
++
++    if (opts.filename.match(/^(cabase|cainstsvc)/)) {
++        opts.log.warn({filename: opts.filename},
++            'Skipping deprecated CA agent.');
++        callback();
++        return;
++    }
++
++    installAgent({
++        agentFile: path.join(opts.dir, opts.filename),
++        log: opts.log,
++        serverUuid: opts.serverUuid
++    }, function onInstall(err) {
++        if (err) {
++            opts.log.error({
++                dir: opts.dir,
++                err: err,
++                filename: opts.filename,
++                serverUuid: opts.serverUuid
++            }, 'failed to install agent');
++        }
++        callback(err);
++    });
++}
++
++
++function installAgentsShar(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++    assert.string(opts.sharFile, 'opts.sharFile');
++    assert.optionalString(opts.tmpDir, 'opts.tmpDir');
++    assert.func(callback, 'callback');
++
++    var serverAgentsDir;
++    var serverDir = path.join(SERVER_ROOT, opts.serverUuid);
++    var tmpAgentsDir;
++    var tmpDir;
++    var tmpServerDir = path.join(opts.tmpDir || '/var/tmp', opts.serverUuid);
++
++    serverAgentsDir = path.join(serverDir, 'agents');
++    tmpDir = path.join(tmpServerDir, 'agentsshar');
++    tmpAgentsDir = path.join(tmpDir, 'agents');
++
++    // NOTE: we expect the caller to do any necessary locking to prevent
++    // multiple simultaneous runs.
++
++    vasync.pipeline({funcs: [
++        function ensureServerDirExists(_, cb) {
++            fs.stat(serverDir, function _onStat(err, stats) {
++                var newErr;
++
++                if (!err && !stats.isDirectory()) {
++                    newErr = new Error(serverDir +
++                        ' exists but is not a directory');
++                    newErr.code = 'ENOTDIR';
++                    cb(newErr);
++                    return;
++                }
++
++                cb(err);
++            });
++        },
++        function ensureSharSupportsUnpack(_, cb) {
++            var chars = 512;  // number of characters to read from the head
++
++            // TRITON-976 added support for AGENTSSHAR_UNPACK_DIR which we need
++            // to be able to install the agents in mockcloud. So we read the
++            // first bit of the file (since the file is big) to ensure this
++            // feature is available in this shar before we attempt to run it.
++            // Running a shar without this, would attempt to run the install.sh
++            // within which wouldn't turn out well.
++
++            fs.open(opts.sharFile, 'r', function onOpen(err, fd) {
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                fs.read(fd, new Buffer(chars), 0, chars, 0,
++                    function onRead(readErr, _bytes, buffer) {
++                        var data = (readErr ? '' : buffer.toString('utf8'));
++
++                        if (readErr) {
++                            fs.close(fd, function _onClose() {
++                                // Ignore close error here.
++                                cb(readErr);
++                            });
++                            return;
++                        }
++
++                        opts.log.debug({
++                            data: data,
++                            sharFile: opts.sharFile
++                        }, 'loaded shar "head" data');
++
++                        // Don't need the file open any more.
++                        fs.close(fd, function onClose(closeErr) {
++                            if (closeErr) {
++                                cb(closeErr);
++                                return;
++                            }
++
++                            if (!data.match(/AGENTSSHAR_UNPACK_DIR/)) {
++                                cb(new Error('shar is missing ' +
++                                    'AGENTSSHAR_UNPACK_DIR, probably too old'));
++                                return;
++                            }
++
++                            cb();
++                        });
++                    });
++            });
++        },
++        function removePreviousTmpDir(_, cb) {
++            var args = [
++                '-rf',
++                tmpDir
++            ];
++            var logLevel = 'debug';
++
++            execFile('/bin/rm', args, function onRm(err, stdout, stderr) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "rm %s"', args.join(' '));
++                cb(err);
++            });
++        },
++        function makeTmpServerDir(_, cb) {
++            var logLevel = 'debug';
++
++            fs.mkdir(tmpServerDir, function onMkdir(err) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err
++                }, 'ran "fs.mkdir(%s)"', tmpServerDir);
++                cb(err);
++            });
++        },
++        function makeTmpDir(_, cb) {
++            var logLevel = 'debug';
++
++            fs.mkdir(tmpDir, function onMkdir(err) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err
++                }, 'ran "fs.mkdir(%s)"', tmpDir);
++                cb(err);
++            });
++        },
++        function unpackShar(_, cb) {
++            // This should unpack the shar such that <tmpDir>/agents will be
++            // created and contain the individual agents' tarballs.
++            var args = [
++                opts.sharFile
++            ];
++            var logLevel = 'debug';
++            var execOpts = {
++                env: {
++                    AGENTSSHAR_UNPACK_DIR: tmpDir,
++                    AGENTSSHAR_UNPACK_ONLY: 'true'
++                }
++            };
++
++            execFile('/bin/bash', args, execOpts,
++                function onUnpack(err, stdout, stderr) {
++                    if (err) {
++                        logLevel = 'error';
++                    }
++                    opts.log[logLevel]({
++                        err: err,
++                        sharFile: opts.sharFile,
++                        stderr: stderr,
++                        stdout: stdout,
++                        tmpDir: tmpDir
++                    }, 'ran shar to unpack');
++                    cb(err);
++                });
++        },
++        function ensureTmpAgentsDirCreated(_, cb) {
++            // <tmpDir>/agents should have been created when we unpacked above.
++            fs.stat(tmpAgentsDir, function _onStat(err, stats) {
++                var newErr;
++
++                if (!err && !stats.isDirectory()) {
++                    newErr = new Error(tmpAgentsDir +
++                        ' exists but is not a directory');
++                    newErr.code = 'ENOTDIR';
++                    cb(newErr);
++                    return;
++                }
++
++                cb(err);
++            });
++        },
++        function ensureServerAgentsDir(_, cb) {
++            // Create <serverDir>/agents if it's missing. The agents will be
++            // installed here.
++            fs.mkdir(serverAgentsDir, function onMkdir(err) {
++                if (err) {
++                    if (err.code === 'EEXIST') {
++                        // Fine, no need to create;
++                        cb();
++                        return;
++                    }
++                    cb(err);
++                    return;
++                }
++
++                // Ok, we created it.
++                opts.log.info({serverAgentsDir: serverAgentsDir},
++                    'created agents dir for server');
++                cb();
++            });
++        },
++        function installAgents(_, cb) {
++            fs.readdir(tmpAgentsDir, function onReaddir(err, files) {
++                opts.log.debug({
++                    err: err,
++                    files: files,
++                    tmpAgentsDir: tmpAgentsDir
++                }, 'readdir(tmpAgentsDir)');
++
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                // TODO: in the future, it might be possible to do this in
++                // parallel. However the "real" install.sh does it serially, so
++                // we do too for now.
++                vasync.forEachPipeline({
++                    func: function _installIfInstallable(filename, next) {
++                        _installAgentIfInstallable({
++                            dir: tmpAgentsDir,
++                            filename: filename,
++                            log: opts.log,
++                            serverUuid: opts.serverUuid
++                        }, next);
++                    },
++                    inputs: files
++                }, cb);
++            });
++        },
++        function cleanupTmpDir(_, cb) {
++            var args = [
++                '-rf',
++                tmpDir
++            ];
++            var logLevel = 'debug';
++
++            execFile('/bin/rm', args, function onRm(err, stdout, stderr) {
++                if (err) {
++                    logLevel = 'error';
++                }
++                opts.log[logLevel]({
++                    err: err,
++                    stderr: stderr,
++                    stdout: stdout
++                }, 'ran "rm %s"', args.join(' '));
++                cb(err);
++            });
++        }
++    ]}, function onSharInstall(err) {
++        var logLevel = 'debug';
++
++        if (err) {
++            logLevel = 'error';
++        }
++
++        opts.log[logLevel]({
++            err: err,
++            serverUuid: opts.serverUuid,
++            sharFile: opts.sharFile,
++            tmpDir: opts.tmpDir
++        }, 'finished shar install');
++
++        callback(err);
++    });
++}
++
++
++function refreshAgents(opts, callback) {
++    var log = opts.log;
++
++    assert.object(opts, 'opts');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++    assert.func(callback, 'callback');
++
++    var agents;
++    var cnapiUrl;
++    var serverUuid = opts.serverUuid;
++
++    vasync.pipeline({funcs: [
++        function findCnapiUrl(_, cb) {
++            common.getSdcConfig(function onConfig(err, config) {
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                cnapiUrl = 'http://cnapi.' + config.datacenter_name + '.' +
++                    config.dns_domain;
++
++                log.info({
++                    cnapiUrl: cnapiUrl
++                }, 'cnapi URL');
++
++                cb();
++            });
++        },
++        function getAgents(_, cb) {
++            common.getAgents({
++                serverUuid: serverUuid
++            }, function gotAgents(err, _agents) {
++                if (!err) {
++                    agents = _agents;
++                    log.debug({
++                        agents: agents,
++                        serverUuid: serverUuid
++                    }, 'loaded agents');
++                }
++                cb(err);
++            });
++        },
++        function postAgentsToCnapi(_, cb) {
++            var client;
++            var url = cnapiUrl;
++
++            var restifyOptions = {
++                url: url,
++                connectTimeout: 5000,
++                requestTimeout: 5000
++            };
++
++            log.info(restifyOptions, 'cnapi URL was %s', cnapiUrl);
++
++            client = restify.createJsonClient(restifyOptions);
++
++            client.post('/servers/' + serverUuid, {
++                agents: agents
++            }, cb);
++        }
++    ]}, callback);
++}
++
++
++module.exports = {
++    installAgent: installAgent,
++    installAgentsShar: installAgentsShar,
++    refreshAgents: refreshAgents
++};
+diff --git a/lib/backends/dummy/tools/create-server.js b/lib/backends/dummy/tools/create-server.js
+index e8e8ec1..b5abeca 100644
+--- a/lib/backends/dummy/tools/create-server.js
++++ b/lib/backends/dummy/tools/create-server.js
+@@ -36,6 +36,7 @@
+ var fs = require('fs');
+ 
+ var assert = require('assert-plus');
++var bunyan = require('bunyan');
+ var child_process = require('child_process');
+ var jsprim = require('jsprim');
+ var NAPI = require('sdc-clients').NAPI;
+@@ -43,7 +44,12 @@ var uuid = require('uuid');
+ var vasync = require('vasync');
+ 
+ var common = require('../common');
++var shared = require('../tasks/shared');
+ 
++var logger = bunyan.createLogger({
++    level: 'debug',
++    name: 'create-server.js'
++});
+ var SERVER_ROOT = common.SERVER_ROOT;
+ var TEMPLATE = {
+     'System Type': 'Virtual',
+@@ -72,7 +78,7 @@ var TEMPLATE = {
+         'boot_args': '',
+         'bootargs': ''
+     },
+-    'SDC Agents': [],
++    'SDC Agents': [], // This is something we're trying to remove from Triton
+     'Network Interfaces': {
+         'dnet0': {'ip4addr': '', 'Link Status': 'up', 'NIC Names': ['admin']},
+         'dnet1': {'ip4addr': '', 'Link Status': 'up', 'NIC Names': []}
+@@ -293,6 +299,49 @@ function writeSysinfo(ctx, callback) {
+     });
+ }
+ 
++
++function installAgents(ctx, callback) {
++    assert.object(ctx, 'ctx');
++    assert.object(ctx.serverObj, 'ctx.serverObj');
++    assert.uuid(ctx.serverObj.UUID, 'ctx.serverObj.UUID');
++
++    var agentsShar = '/var/tmp/agentsshar-latest.sh';
++    var serverUuid = ctx.serverObj.UUID;
++
++    //
++    // TODO: for now, we just assume someone else has installed the shar to
++    //       /var/tmp/agentsshar-latest.sh for us. In the future, we should
++    //       probably learn to download it ourselves when it's missing.
++    //
++    fs.access(agentsShar, fs.constants.F_OK, function onAccess(err) {
++        var exists = (err ? false : true);
++
++        if (!exists) {
++            logger.warn({
++                agentsShar: agentsShar,
++                err: err
++            }, 'unable to access agentsshar, skipping agents install');
++            callback();
++            return;
++        }
++
++        shared.installAgentsShar({
++            log: logger,
++            serverUuid: serverUuid,
++            sharFile: agentsShar
++        }, function onInstall(installErr) {
++            if (installErr) {
++                logger.warn({
++                    agentsShar: agentsShar,
++                    err: installErr
++                }, 'failed to install agentsshar');
++            }
++            callback(installErr);
++        });
++    });
++}
++
++
+ function createServer(callback) {
+     var ctx = {};
+ 
+@@ -310,7 +359,8 @@ function createServer(callback) {
+             addDisks,
+             getPlatformBuildstamp,
+             fillInBlanks,
+-            writeSysinfo
++            writeSysinfo,
++            installAgents
+         ]
+     }, function _pipelineComplete(err) {
+         callback(err, ctx.serverObj);
+diff --git a/lib/backends/dummy/tools/install-agent.js b/lib/backends/dummy/tools/install-agent.js
+new file mode 100644
+index 0000000..692eb76
+--- /dev/null
++++ b/lib/backends/dummy/tools/install-agent.js
+@@ -0,0 +1,60 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++//
++// Important: This is not intended to be run by humans. Use at your own risk.
++//
++// Usage: install-agent.js <serverUuid> <filename.[tgz|tar.gz|tar.bz2]>
++//
++
++var fs = require('fs');
++
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
++
++var shared = require('../tasks/shared');
++
++
++function main() {
++    var serverUuid = process.argv[2];
++    var filename = process.argv[3];
++
++    var logger = bunyan.createLogger({
++        level: 'debug',
++        name: 'install-agent.js'
++    });
++
++    // This is not for human use, so we'll do only the bare minimum of
++    // validation.
++
++    assert.uuid(serverUuid, 'serverUuid');
++    assert.string(filename, 'filename');
++    assert.equal(process.argv[4], undefined); // to ensure no extra args
++
++    console.error('# Server: ' + serverUuid);
++    console.error('# Filename: ' + filename);
++
++    shared.installAgent({
++        agentFile: filename,
++        log: logger,
++        serverUuid: serverUuid
++    }, function onInstall(err) {
++        if (err) {
++            console.error('Failed to install agent: ' + err.message);
++            console.log('FAILED');
++            process.exitCode = 1;
++            return;
++        }
++
++        console.log('SUCCESS');
++    });
++}
++
++main();
+diff --git a/lib/backends/dummy/tools/install-agentsshar.js b/lib/backends/dummy/tools/install-agentsshar.js
+new file mode 100644
+index 0000000..5bfb6af
+--- /dev/null
++++ b/lib/backends/dummy/tools/install-agentsshar.js
+@@ -0,0 +1,60 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++//
++// Important: This is not intended to be run by humans. Use at your own risk.
++//
++// Usage: install-agentsshar.js <serverUuid> <agentsSharFilename>
++//
++
++var fs = require('fs');
++
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
++
++var shared = require('../tasks/shared');
++
++
++function main() {
++    var serverUuid = process.argv[2];
++    var filename = process.argv[3];
++
++    var logger = bunyan.createLogger({
++        level: 'debug',
++        name: 'install-agentsshar.js'
++    });
++
++    // This is not for human use, so we'll do only the bare minimum of
++    // validation.
++
++    assert.uuid(serverUuid, 'serverUuid');
++    assert.string(filename, 'filename');
++    assert.equal(process.argv[4], undefined); // to ensure no extra args
++
++    console.error('# Server: ' + serverUuid);
++    console.error('# Filename: ' + filename);
++
++    shared.installAgentsShar({
++        log: logger,
++        serverUuid: serverUuid,
++        sharFile: filename
++    }, function onInstall(err) {
++        if (err) {
++            console.error('Failed to install agentsshar: ' + err.message);
++            console.log('FAILED');
++            process.exitCode = 1;
++            return;
++        }
++
++        console.log('SUCCESS');
++    });
++}
++
++main();
+diff --git a/lib/backends/smartos/index.js b/lib/backends/smartos/index.js
+index b5f27c1..cc622de 100644
+--- a/lib/backends/smartos/index.js
++++ b/lib/backends/smartos/index.js
+@@ -25,6 +25,7 @@ var async = require('async');
+ var kstat = require('kstat');
+ var sprintf = require('sprintf').sprintf;
+ var vasync = require('vasync');
++var verror = require('verror');
+ var vmadm = require('vmadm');
+ var zfs = require('zfs').zfs;
+ var zpool = require('zfs').zpool;
+@@ -709,6 +710,117 @@ SmartosBackend.prototype.loadVms = function loadVms(opts, callback) {
+ };
+ 
+ 
++//
++// Loads information about the agents on this CN
++//
++// opts must contain:
++//
++//  serverUuid -- the UUID of the CN
++//  sysinfo    -- the sysinfo object for this CN
++//
++// data will be loaded and callback will be called with:
++//
++//  callback(err, agents);
++//
++// where on failure `err` will be an Error object. On success, `err` will be
++// null and `agents` will be an array of agents that looks like:
++//
++//  [
++//      {
++//          "image_uuid": "<image_uuid>",
++//          "name": "net-agent",
++//          "uuid": "<instance_uuid>",
++//          "version": "2.2.0"
++//      },
++//      ...
++//  ]
++//
++SmartosBackend.prototype.getAgents = function getAgents(opts, callback) {
++
++    assert.object(opts, 'opts');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++
++    var agents = opts.sysinfo['SDC Agents'];
++    var agents_dir = '/opt/smartdc/agents/lib/node_modules';
++
++    fs.readdir(agents_dir, function (err, files) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        async.each(files, function getImageAndUUID(name, cb) {
++            var uuid_path = '/opt/smartdc/agents/etc/' + name;
++            var uuidFileExists;
++            var uuid;
++            var image_uuid;
++
++            async.series([
++                function getImage(next) {
++                    var fpath = agents_dir + '/' + name + '/image_uuid';
++
++                    fs.readFile(fpath, {
++                        encoding: 'utf8'
++                    }, function (er2, img_uuid) {
++                        if (er2) {
++                            next(er2);
++                            return;
++                        }
++                        image_uuid = img_uuid.trim();
++                        next();
++                    });
++                },
++                function agentUuidFileExists(next) {
++                    fs.exists(uuid_path, function (exists) {
++                        if (exists) {
++                            uuidFileExists = true;
++                        }
++                        next();
++                    });
++                },
++                function getUUID(next) {
++                    if (!uuidFileExists) {
++                        next();
++                        return;
++                    }
++                    fs.readFile(uuid_path, {
++                        encoding: 'utf8'
++                    }, function (er2, agent_uuid) {
++                        if (er2) {
++                            next(er2);
++                            return;
++                        }
++                        uuid = agent_uuid.trim();
++                        next();
++                    });
++                }
++            ], function seriesCb(er2, results) {
++                if (er2) {
++                    cb(er2);
++                    return;
++                }
++                agents.forEach(function (a) {
++                    if (a.name === name) {
++                        a.image_uuid = image_uuid;
++                        if (uuid) {
++                            a.uuid = uuid;
++                        }
++                    }
++                });
++                cb();
++            });
++        }, function (er3) {
++            if (er3) {
++                callback(new verror.VError('Cannot get agents image versions'));
++                return;
++            }
++
++            callback(null, agents);
++        });
++    });
++};
++
++
+ SmartosBackend.prototype.getZpoolInfo = function _getZpoolInfo(_, callback) {
+     var self = this;
+ 
+diff --git a/lib/backends/smartos/tasks/agent_install.js b/lib/backends/smartos/tasks/agent_install.js
+index 158bf89..6a306fe 100644
+--- a/lib/backends/smartos/tasks/agent_install.js
++++ b/lib/backends/smartos/tasks/agent_install.js
+@@ -72,7 +72,6 @@
+  */
+ 
+ 
+-var assert = require('assert');
+ var child_process = require('child_process');
+ var execFile = child_process.execFile;
+ var fs = require('fs');
+@@ -82,11 +81,11 @@ var bunyan = require('bunyan');
+ var restify = require('restify');
+ 
+ var APM = require('../../../apm').APM;
++var backendCommon = require('../../common');
+ var refreshAgents = require('./shared').refreshAgents;
+ var smartdc_config = require('../smartdc-config');
+ var Task = require('../../../task_agent/task');
+ 
+-var CURL_CMD = '/usr/bin/curl';
+ 
+ function AgentInstallTask(req) {
+     Task.call(this);
+@@ -100,294 +99,6 @@ var logger = bunyan.createLogger({
+     serializers: bunyan.stdSerializers
+ });
+ 
+-function getAgentImage(uuid, options, callback) {
+-    var imgapi_domain = options.imgapi_domain;
+-    var log = options.log;
+-    var output_prefix = options.output_prefix;
+-
+-    // Ensure required options were passed
+-    assert(imgapi_domain, 'missing imgapi_domain');
+-    assert(log, 'missing log');
+-    assert(output_prefix, 'missing output_prefix');
+-
+-    var compression;
+-    var file_url;
+-    var manifest_url;
+-    var manifest;
+-    var output_file;
+-    var agent_name;
+-
+-    file_url = 'http://' + imgapi_domain + '/images/' + uuid + '/file';
+-    manifest_url = 'http://' + imgapi_domain + '/images/' + uuid;
+-
+-    async.waterfall([
+-        function getImgapiManifest(cb) {
+-            var args = ['-f', '-sS', manifest_url];
+-
+-            log.debug({cmdline: CURL_CMD + ' ' + args.join(' ')}, 'executing');
+-            execFile(CURL_CMD, args, function (err, stdout, stderr) {
+-                if (err) {
+-                    log.error({
+-                        err: err,
+-                        stdout: stdout,
+-                        stderr: stderr,
+-                        url: manifest_url
+-                    }, 'failed to download manifest');
+-                    if (err.message.match(/404 Not Found/)) {
+-                        cb(new Error('Image not found at ' + manifest_url));
+-                    } else {
+-                        cb(err);
+-                    }
+-                    return;
+-                }
+-                try {
+-                    manifest = JSON.parse(stdout);
+-                    agent_name = manifest.name;
+-                    log.debug({
+-                        manifest: manifest,
+-                        url: manifest_url
+-                    }, 'got imgapi manifest');
+-                } catch (e) {
+-                    log.error(e, 'failed to parse manifest');
+-                    cb(e);
+-                    return;
+-                }
+-
+-                cb();
+-            });
+-        }, function getImgapiFile(cb) {
+-            var args = ['-f', '-sS', '-o', output_prefix + '.file', file_url];
+-
+-            log.debug({cmdline: CURL_CMD + ' ' + args.join(' ')}, 'executing');
+-            execFile(CURL_CMD, args, function (err, stdout, stderr) {
+-                if (err) {
+-                    log.error({
+-                        err: err,
+-                        stdout: stdout,
+-                        stderr: stderr,
+-                        url: file_url
+-                    }, 'failed to download file');
+-                    if (err.message.match(/404 Not Found/)) {
+-                        cb(new Error('Image not found at ' + file_url));
+-                    } else {
+-                        cb(err);
+-                    }
+-                    return;
+-                }
+-                log.debug({
+-                    filename: output_prefix + '.file',
+-                    url: file_url
+-                }, 'got imgapi file');
+-                cb();
+-            });
+-        }, function checkSize(cb) {
+-            var expected_size = manifest.files[0].size;
+-            var filename = output_prefix + '.file';
+-            var message;
+-
+-            fs.stat(filename, function (err, stat) {
+-                if (err) {
+-                    log.error('failed to stat ' + filename);
+-                    cb(err);
+-                    return;
+-                }
+-                if (stat.size !== expected_size) {
+-                    message = 'unexpected file size (' + expected_size +
+-                        ' vs ' + stat.size + ')';
+-                    log.error({
+-                        actual: stat.size,
+-                        expected: expected_size,
+-                        filename: filename
+-                    }, message);
+-                    cb(new Error(message));
+-                    return;
+-                }
+-                log.debug({
+-                    actual: stat.size,
+-                    expected: expected_size,
+-                    filename: filename
+-                }, 'file size ok');
+-                cb();
+-            });
+-
+-        }, function checkSha1(cb) {
+-            var args;
+-            var cmd = '/usr/bin/openssl';
+-            var expected_sha1 = manifest.files[0].sha1;
+-            var filename = output_prefix + '.file';
+-
+-            args = ['sha1', filename];
+-
+-            log.debug({cmdline: cmd + ' ' + args.join(' ')}, 'executing');
+-            execFile(cmd, args, function (err, stdout, stderr) {
+-                var parts;
+-                var sha1;
+-
+-                if (err) {
+-                    log.error({
+-                        err: err,
+-                        stdout: stdout,
+-                        stderr: stderr
+-                    }, 'failed to identify sha1');
+-                    cb(err);
+-                    return;
+-                }
+-
+-                parts = stdout.split(' ');
+-                if (parts.length === 2) {
+-                    sha1 = parts[1].split(/\s/)[0];
+-                } else {
+-                    log.error({
+-                        stdout: stdout,
+-                        stderr: stderr
+-                    }, 'unable to parse sha1');
+-                    cb(new Error('unable to parse sha1: ' + stdout));
+-                    return;
+-                }
+-
+-                if (sha1 !== expected_sha1) {
+-                    log.error({
+-                        actual_sha1: sha1,
+-                        expected_sha1: expected_sha1,
+-                        filename: filename
+-                    }, 'invalid sha1');
+-                    cb(new Error('sha1 does not match: (' + sha1 + ' vs ' +
+-                                    expected_sha1 + ')'));
+-                    return;
+-                }
+-
+-                log.debug({
+-                    actual_sha1: sha1,
+-                    expected_sha1: expected_sha1,
+-                    filename: filename
+-                }, 'sha1 ok');
+-                cb();
+-            });
+-        }, function identifyCompression(cb) {
+-            var args = ['-b', output_prefix + '.file'];
+-            var cmd = '/usr/bin/file';
+-            var expected_compression = manifest.files[0].compression;
+-
+-            if (expected_compression) {
+-                // manifest has a compression type, use that.
+-                compression = expected_compression;
+-                cb();
+-                return;
+-            }
+-
+-            log.debug({cmdline: cmd + ' ' + args.join(' ')}, 'executing');
+-            execFile(cmd, args, function (err, stdout, stderr) {
+-                if (err) {
+-                    log.error({
+-                        err: err,
+-                        stdout: stdout,
+-                        stderr: stderr
+-                    }, 'failed to identify file magic');
+-                    cb(err);
+-                    return;
+-                }
+-
+-                if (stdout.match(/^gzip compressed data/)) {
+-                    compression = 'gzip';
+-                    cb();
+-                } else if (stdout.match(/^bzip2 compressed data/)) {
+-                    compression = 'bzip2';
+-                    cb();
+-                } else {
+-                    log.error({
+-                        stdout: stdout,
+-                        stderr: stderr
+-                    }, 'unhandled file type');
+-                    cb(new Error('unhandled file type: ' + stdout));
+-                }
+-            });
+-        }, function renameBasedOnFileType(cb) {
+-            var oldname = output_prefix + '.file';
+-            var newname;
+-
+-            if (compression === 'gzip') {
+-                newname = output_prefix + '.tar.gz';
+-            } else if (compression === 'bzip2') {
+-                newname = output_prefix + '.tar.bz2';
+-            } else {
+-                log.error('unknown compression: ' + compression);
+-                cb(new Error('unknown compression: ' + compression));
+-                return;
+-            }
+-
+-            log.debug({oldname: oldname, newname: newname}, 'renaming file');
+-            fs.rename(oldname, newname, function (err) {
+-                if (err) {
+-                    cb(err);
+-                    return;
+-                }
+-                output_file = newname;
+-                cb();
+-            });
+-        }, function checkIsAgentImage(cb) {
+-            // check that image_uuid exists as a heuristic to attempt to
+-            // ensure this is an agent image (since we don't have separate type)
+-            var args = [];
+-            var cmd = '/usr/bin/tar';
+-            var filename;
+-            var message;
+-
+-            if (!agent_name) {
+-                message = 'manifest is missing "name"';
+-                log.error({manifest: manifest}, message);
+-                cb(new Error(message));
+-                return;
+-            }
+-            filename = agent_name + '/image_uuid';
+-
+-            if (compression === 'gzip') {
+-                args.push('-ztf');
+-            } else if (compression === 'bzip2') {
+-                args.push('-jtf');
+-            } else {
+-                message = 'invalid compression type: ' + compression;
+-                log.error({manifest: manifest, compression: compression},
+-                    message);
+-                cb(new Error(message));
+-                return;
+-            }
+-
+-            args.push(output_file);
+-            args.push(filename);
+-
+-            log.debug({cmdline: cmd + ' ' + args.join(' ')}, 'executing');
+-            execFile(cmd, args, function (err, stdout, _) {
+-                var trimmed;
+-
+-                if (err) {
+-                    log.error({err: err, file: output_file},
+-                        'failed to list file from image');
+-                    cb(err);
+-                    return;
+-                }
+-
+-                trimmed = stdout.replace(new RegExp('[\\s]+$', 'g'), '');
+-                if (trimmed === filename) {
+-                    log.debug('found ' + filename + ' in ' + output_file);
+-                    cb();
+-                } else {
+-                    message = 'could not find ' + filename + ' in ' +
+-                        output_file;
+-                    log.error({stdout: stdout}, message);
+-                    cb(new Error(message));
+-                }
+-            });
+-        }
+-    ], function waterfallCb(err) {
+-        if (err) {
+-            callback(err);
+-            return;
+-        }
+-
+-        callback(null, output_file, agent_name);
+-    });
+-}
+-
+ 
+ Task.createTask(AgentInstallTask);
+ 
+@@ -395,10 +106,7 @@ function start() {
+     var self = this;
+     var apm = new APM({log: self.log});
+     var image_uuid = self.req.params.image_uuid;
+-    var opts = {
+-        log: self.log,
+-        output_prefix: '/var/tmp/' + image_uuid
+-    };
++    var imgapiUrl;
+     var package_file;
+     var package_name;
+     var self_update = process.env.PORT &&
+@@ -416,6 +124,7 @@ function start() {
+     // If install/update fails we want to remove the new agent directory and
+     // eventually restore a previous backup
+     var install_failed = false;
++
+     // Also, on these cases we want to return the original install error
+     // instead of any eventual errors removing the failed agent directory
+     // or restoring the backup:
+@@ -437,7 +146,7 @@ function start() {
+                     return;
+                 }
+ 
+-                opts.imgapi_domain = config.imgapi_domain;
++                imgapiUrl = 'http://' + config.imgapi_domain;
+                 cb();
+             });
+         },
+@@ -445,11 +154,19 @@ function start() {
+             // If we already got these from cn-agent sending the task to
+             // cn-agent-update, we can safely skip this step:
+             if (package_file && package_name) {
+-                return cb();
++                cb();
++                return;
+             }
+-            return getAgentImage(image_uuid, opts, function (err, file, name) {
++
++            backendCommon.getAgentImage(image_uuid, {
++                imgapiUrl: imgapiUrl,
++                log: self.log,
++                outputDir: '/var/tmp',
++                outputPrefix: image_uuid
++            }, function _onAgentImage(err, file, name) {
+                 if (err) {
+-                    return cb(err);
++                    cb(err);
++                    return;
+                 }
+ 
+                 self.log.debug('downloaded agent %s image %s to %s',
+@@ -457,18 +174,20 @@ function start() {
+ 
+                 package_file = file;
+                 package_name = name;
+-                return cb();
++                cb();
+             });
+         },
+         function enableCNAgentUpdate(cb) {
++            var args = ['enable', 'cn-agent-update'];
++            var cmd = '/usr/sbin/svcadm';
++
+             do_update = (package_name !== 'cn-agent') ||
+                 ((package_name === 'cn-agent') && self_update);
+ 
+             if (do_update) {
+                 return cb();
+             }
+-            var args = ['enable', 'cn-agent-update'];
+-            var cmd = '/usr/sbin/svcadm';
++
+             self.log.debug({cmdline: cmd + ' ' + args.join(' ')}, 'executing');
+             return execFile(cmd, args, function (err, stdout, stderr) {
+                 if (err) {
+@@ -521,7 +240,7 @@ function start() {
+         },
+         function isUpdate(cb) {
+             var agent_dir = '/opt/smartdc/agents/lib/node_modules/' +
+-                            package_name;
++                package_name;
+             fs.stat(agent_dir, function (er) {
+                 if (er && er.code === 'ENOENT') {
+                     is_update = false;
+@@ -531,7 +250,7 @@ function start() {
+         },
+         function cleanupPreviousBackup(cb) {
+             var backup_dir = '/opt/smartdc/agents/lib/node_modules/' +
+-                    package_name + '.updating-to.' + image_uuid;
++                package_name + '.updating-to.' + image_uuid;
+             fs.stat(backup_dir, function (er) {
+                 if (er) {
+                     if (er.code === 'ENOENT') {
+diff --git a/package.json b/package.json
+index 9bf9ac9..b9301e2 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "cn-agent",
+   "description": "Triton Compute Node Agent",
+-  "version": "2.4.0",
++  "version": "2.5.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {

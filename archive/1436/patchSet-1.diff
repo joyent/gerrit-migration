@@ -1,0 +1,616 @@
+commit 37ab548b31b96d526e9af54db5050cfaed5d7dcc (refs/changes/36/1436/1)
+Author: Joshua M. Clulow <jmc@joyent.com>
+Date:   2017-02-04T08:05:28+00:00 (2 years, 8 months ago)
+    
+    MANTA-3140 moray_gc could work both smarter and harder
+
+diff --git a/bin/moray_gc.js b/bin/moray_gc.js
+index 84bacc7..7e95637 100755
+--- a/bin/moray_gc.js
++++ b/bin/moray_gc.js
+@@ -7,16 +7,30 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
++/*
++ * The maximum number of concurrent HTTP(S) connections that Node will
++ * make has historically been quite low.  This program streams one object
++ * at a time per shard, up to a limit.  We need to allow at least one,
++ * and perhaps several, concurrent HTTP connections.  This must be
++ * done before the Manta client library is imported, due to the
++ * way the restify client interacts with these essentially global values.
++ */
++var SHARD_PARALLELISM = 32;
++require('http').globalAgent.maxSockets = SHARD_PARALLELISM * 4;
++require('https').globalAgent.maxSockets = SHARD_PARALLELISM * 4;
++
++
++var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var exec = require('child_process').exec;
+ var fs = require('fs');
+-var getopt = require('posix-getopt');
+ var lib = require('../lib');
+ var manta = require('manta');
+-var path = require('path');
++var vasync = require('vasync');
++var VE = require('verror').VError;
+ 
+ 
+ ///--- Globals
+@@ -24,7 +38,8 @@ var path = require('path');
+ var LOG = bunyan.createLogger({
+         level: (process.env.LOG_LEVEL || 'info'),
+         name: 'moray_gc',
+-        stream: process.stdout
++        stream: process.stdout,
++        serializers: bunyan.stdSerializers
+ });
+ var MANTA_CONFIG = (process.env.MANTA_CONFIG ||
+                     '/opt/smartdc/common/etc/config.json');
+@@ -33,7 +48,7 @@ var MANTA_USER = MANTA_CLIENT.user;
+ var MORAY_CLEANUP_PATH = '/' + MANTA_USER + '/stor/manta_gc/moray';
+ var PID_FILE = '/var/tmp/moray_gc.pid';
+ var CRON_START = new Date();
+-var MORAY_CLEANER = lib.createMorayCleaner({ log: LOG });
++var MORAY_CLEANER = lib.createMorayCleaner({ log: LOG, batchSize: 1000 });
+ MORAY_CLEANER.on('error', function (err) {
+         LOG.fatal(err);
+         var returnCode = auditCron(err);
+@@ -52,54 +67,68 @@ function morayCleanShard(shard, obj, cb) {
+ 
+         MANTA_CLIENT.get(o, {}, function (err, stream) {
+                 if (err) {
+-                        cb(err);
++                        cb(VE(err, 'get(%s)', o));
+                         return;
+                 }
+ 
+-                //The Moray Cleaner will unpause.
+-                stream.pause();
+-
+-                MORAY_CLEANER.clean({
++                var mcs = MORAY_CLEANER.cleanStream({
+                         shard: shard,
+-                        stream: stream,
+                         object: o
+-                }, function () {
++                });
++
++                mcs.once('error', function (mcsErr) {
++                        cb(VE(mcsErr, 'cleanStream(%s)', o));
++                });
++                mcs.once('workComplete', function () {
+                         MANTA_CLIENT.unlink(o, {}, function (err2) {
+                                 if (err2) {
+-                                        cb(err2);
++                                        cb(VE(err2, 'unlink(%s)', o));
+                                         return;
+                                 }
+                                 LOG.info({ obj: o }, 'Done with obj.');
+                                 cb();
+                         });
+                 });
++
++                stream.pipe(mcs);
+         });
+ }
+ 
+-function morayCleanObjects(shard, objects, cb) {
+-        if (objects.length < 1) {
+-                cb();
+-                return;
+-        }
+ 
+-        var obj = objects.shift();
+-        LOG.info({ shard: shard, obj: obj }, 'Going to clean shard.');
+-        morayCleanShard(shard, obj, function (err) {
+-                if (err) {
+-                        cb(err);
+-                        return;
++function cleanEachShardObject(log, shard, objects, done) {
++        assert.object(log, 'log');
++        assert.string(shard, 'shard');
++        assert.arrayOfObject(objects, 'objects');
++        assert.func(done, 'done');
++
++        vasync.forEachPipeline({
++                inputs: objects,
++                func: function (object, next) {
++                        log.info({ obj: object }, 'cleaning shard object');
++
++                        morayCleanShard(shard, object, function (err) {
++                                if (err) {
++                                        next(VE(err, 'morayCleanShard' +
++                                            '(%s, %s)', shard, object));
++                                        return;
++                                }
++
++                                next();
++                        });
+                 }
+-                morayCleanObjects(shard, objects, cb);
+-        });
++        }, done);
+ }
+ 
+ 
+ function cleanShard(shard, cb) {
+         var dir = MORAY_CLEANUP_PATH + '/' + shard;
+-        LOG.info({ shard: shard, dir: dir }, 'Cleaning up shard.');
++        var log = LOG.child({ shard: shard, dir: dir });
++
++        log.info('cleaning shard');
++
+         MANTA_CLIENT.ls(dir, function (err, res) {
+                 if (err) {
+-                        cb(err);
++                        cb(VE(err, 'ls(%s)', dir));
+                         return;
+                 }
+ 
+@@ -110,38 +139,58 @@ function cleanShard(shard, cb) {
+                 });
+ 
+                 res.on('error', function (err2) {
+-                        cb(err2);
++                        cb(VE(err2, 'ls(%s) async', dir));
+                 });
+ 
+                 res.on('end', function () {
+                         if (objects.length === 0) {
+-                                LOG.info({ shard: shard },
++                                log.info({ shard: shard },
+                                          'Shard already clean, ' +
+                                          'no objects found.');
+                                 cb();
+                                 return;
+                         }
+-                        morayCleanObjects(shard, objects, function (err3) {
+-                                cb(err3);
+-                        });
++
++                        log.info({ count: objects.length }, 'found %d ' +
++                            'cleanup objects', objects.length);
++
++                        cleanEachShardObject(log, shard, objects, cb);
+                 });
+         });
+ }
+ 
+ 
+ function cleanShards(shards, cb) {
+-        if (shards.length < 1) {
+-                cb();
+-                return;
+-        }
++        var taskErr = null;
++        var q = vasync.queuev({
++                worker: function (shard, next) {
++                        cleanShard(shard, function (err) {
++                                if (err) {
++                                        next(VE(err, 'cleanShard(%s)', shard));
++                                        return;
++                                }
+ 
+-        var shard = shards.shift();
+-        cleanShard(shard, function (err) {
++                                next();
++                        });
++                },
++                concurrency: SHARD_PARALLELISM
++        });
++
++        q.push(shards, function (err) {
+                 if (err) {
+-                        cb(err);
+-                        return;
++                        if (taskErr === null) {
++                                taskErr = err;
++                        }
++                        LOG.error({
++                                err: err
++                        }, 'cleanShards error; draining already issued tasks');
++                        q.kill();
+                 }
+-                cleanShards(shards, cb);
++        });
++        q.close();
++
++        q.on('end', function () {
++                cb(taskErr);
+         });
+ }
+ 
+@@ -186,7 +235,7 @@ function checkAlreadyRunning(cb) {
+                 fs.writeFileSync(PID_FILE, process.pid, 'utf8');
+                 startGc(function (err) {
+                         cleanupPidFile(function () {
+-                                cb(err);
++                                cb(VE(err, 'startGc'));
+                         });
+                 });
+         }
+diff --git a/lib/batch_stream.js b/lib/batch_stream.js
+new file mode 100644
+index 0000000..909cbd3
+--- /dev/null
++++ b/lib/batch_stream.js
+@@ -0,0 +1,80 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var util = require('util');
++var stream = require('stream');
++
++
++function BatchStream(opts) {
++        var self = this;
++
++        assert.object(opts, 'opts');
++        assert.number(opts.batchSize, 'opts.batchSize');
++        assert.ok(opts.batchSize >= 1 && opts.batchSize < 100000,
++            'opts.batchSize must be in the range [1, 100000)');
++
++        stream.Transform.call(this, {
++                objectMode: true,
++                highWaterMark: 0
++        });
++
++        self.bs_batchSize = opts.batchSize;
++        self.bs_batch = [];
++        self.bs_batchId = 0;
++        self.bs_objectCount = 0;
++}
++util.inherits(BatchStream, stream.Transform);
++
++BatchStream.prototype.bsCommit = function bsCommit(done) {
++        var self = this;
++
++        if (self.bs_batch.length > 0) {
++                var batch = {
++                        batchId: self.bs_batchId++,
++                        entries: self.bs_batch
++                };
++
++                self.bs_batch = [];
++
++                self.push(batch);
++        }
++
++        setImmediate(done);
++};
++
++BatchStream.prototype._transform = function bsTransform(obj, _, done) {
++        var self = this;
++
++        /*
++         * Collect a batch of input objects.  We only pass objects on
++         * once we have assembled a full batch.  If there is a final,
++         * short batch, it will be emitted by our _flush() routine.
++         */
++        self.bs_batch.push(obj);
++        self.bs_objectCount++;
++        if (self.bs_batch.length < self.bs_batchSize) {
++                setImmediate(done);
++                return;
++        }
++
++        self.bsCommit(done);
++};
++
++BatchStream.prototype._flush = function bsFlush(done) {
++        var self = this;
++
++        self.bsCommit(done);
++};
++
++
++module.exports = {
++        BatchStream: BatchStream
++};
+diff --git a/lib/moray_cleaner.js b/lib/moray_cleaner.js
+index 5838643..18b5d73 100644
+--- a/lib/moray_cleaner.js
++++ b/lib/moray_cleaner.js
+@@ -5,21 +5,27 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+-var carrier = require('carrier');
++var assert = require('assert-plus');
+ var events = require('events');
+ var moray = require('moray');
+ var util = require('util');
+ var vasync = require('vasync');
++var stream = require('stream');
++var lstream = require('lstream');
++var vstream = require('vstream');
++var VE = require('verror').VError;
++
++var BatchStream = require('./batch_stream').BatchStream;
+ 
+ 
+ 
+ ///--- Globals
+ 
+ var MORAY_BUCKET = 'manta_delete_log';
+-var MORAY_CONNECT_TIMEOUT = 1000;
++var MORAY_CONNECT_TIMEOUT = 10000;
+ var MORAY_PORT = 2020;
+ 
+ 
+@@ -31,8 +37,13 @@ var MORAY_PORT = 2020;
+  * manta_delete_log table.
+  */
+ function MorayCleaner(opts, listener) {
++        assert.object(opts, 'opts');
++        assert.object(opts.log, 'opts.log');
++        assert.number(opts.batchSize, 'opts.batchSize');
++
+         var self = this;
+         this.log = opts.log;
++        this.batchSize = opts.batchSize;
+         this.morayClients = {};
+         this.rowsDeleted = 0;
+         this.rowsAlreadyDeleted = 0;
+@@ -66,7 +77,9 @@ function deleteFromMoray(opts, cb) {
+                         log.error({
+                                 line: line
+                         }, 'Is supposed to be a moray gc line,');
+-                        cb({ name: 'BadLine', message: 'Bad Line' });
++                        cb(VE({ info: { line: line, shard: expectedShard }},
++                            'malformed input line'));
++                        return;
+                 }
+ 
+                 var type = parts[0];
+@@ -176,72 +189,153 @@ MorayCleaner.prototype.close = function close(cb) {
+ };
+ 
+ 
+-/**
+- * Given a stream of lines like so:
+- *   moray + [TAB] + [moray hostname] + [TAB] + [objectId] + [TAB] +
+- *     [delete time]
++function MorayCleanerStream(opts) {
++        var self = this;
++
++        assert.object(opts, 'opts');
++        assert.object(opts.log, 'opts.log');
++        assert.string(opts.shard, 'opts.shard');
++        assert.string(opts.object, 'opts.object');
++        assert.object(opts.parent, 'opts.parent');
++
++        stream.Writable.call(this, {
++                objectMode: true,
++                highWaterMark: 0
++        });
++
++        self.mcs_log = opts.log;
++        self.mcs_shard = opts.shard;
++        self.mcs_object = opts.object;
++        self.mcs_parent = opts.parent;
++        self.mcs_client = null;
++
++        self.mcs_inputComplete = false;
++        self.mcs_inCommit = false;
++        self.mcs_pendingCommit = null;
++
++        self.on('finish', function () {
++                self.mcs_inputComplete = true;
++
++                self.mcs_log.debug('finish event');
++
++                setImmediate(self.emit.bind(self, 'workComplete'));
++        });
++
++        self.mcs_parent.getMorayClient(self.mcs_shard, function (client) {
++                self.mcs_log.debug('getMorayClient ok');
++                self.mcs_client = client;
++
++                if (self.mcs_pendingCommit !== null) {
++                        var pc = self.mcs_pendingCommit;
++                        self.mcs_pendingCommit = null;
++
++                        self.mcsCommit(pc.pc_batch, pc.pc_callback);
++                }
++        });
++}
++util.inherits(MorayCleanerStream, stream.Writable);
++
++MorayCleanerStream.prototype.mcsCommit = function mcsCommit(batch, done) {
++        var self = this;
++
++        assert.object(batch, 'batch');
++        assert.ok(Array.isArray(batch.entries), 'batch.entries');
++        assert.func(done, 'done');
++
++        if (batch.entries.length < 1) {
++                setImmediate(done);
++                return;
++        }
++
++        if (self.mcs_client === null) {
++                /*
++                 * We need to wait for the Moray client before we try to
++                 * perform any database operations.
++                 */
++                assert.strictEqual(self.mcs_pendingCommit, null,
++                    'a commit is already pending!');
++                self.mcs_pendingCommit = {
++                        pc_batch: batch,
++                        pc_callback: done
++                };
++                return;
++        }
++
++        assert.strictEqual(self.mcs_inCommit, false, 'mcsCommit re-entry');
++        self.mcs_inCommit = true;
++
++        deleteFromMoray({
++                self: self.mcs_parent,
++                lines: batch.entries,
++                expectedShard: self.mcs_shard,
++                client: self.mcs_client
++        }, function (err) {
++                if (err) {
++                        done(VE(err, 'deleteFromMoray("%s", "%s")',
++                            self.mcs_shard, self.mcs_object));
++                        return;
++                }
++
++                self.mcs_inCommit = false;
++
++                done();
++        });
++};
++
++MorayCleanerStream.prototype._write = function mcsWrite(batch, _, done) {
++        var self = this;
++
++        self.mcsCommit(batch, done);
++};
++
++/*
++ * Accepts a stream of newline delimited records of the form:
++ *
++ *   moray + [TAB] + [moray hostname] + [TAB] + [objectId] +
++ *       [TAB] + [delete time]
+  *
+- * Will clean the relevant lines from the manta_delete_log table of the Moray
+- * shard.
++ * For each line, delete the matching object (if it exists) from the
++ * "manta_delete_log" table of the Moray shard.
+  */
+-MorayCleaner.prototype.clean = function clean(opts, cb) {
++MorayCleaner.prototype.cleanStream = function cleanStream(opts) {
+         var self = this;
+-        var log = self.log;
+-        var shard = opts.shard;
+-        var stream = opts.stream;
+-        var object = opts.object;
+-        var maxInBatch = 100;
+-
+-        log.debug({ object: object }, 'Moray Cleaner Object Entering.');
+-
+-        var queue = vasync.queue(function (opts2, cb2) {
+-                var lines = opts2.lines;
+-                var client = opts2.client;
+-
+-                deleteFromMoray({
+-                        self: self,
+-                        lines: lines,
+-                        expectedShard: shard,
+-                        client: client
+-                }, function (err) {
+-                        if (err) {
+-                                self.emit('error', err);
+-                        }
+-                        cb2();
+-                });
+-        }, 1);
+-
+-        queue.on('end', cb);
+-
+-        self.getMorayClient(shard, function (client) {
+-                var car = carrier.carry(stream);
+-
+-                var lines = [];
+-                car.on('line', function (line) {
+-                        lines.push(line);
+-                        if (lines.length === maxInBatch) {
+-                                queue.push.call(queue, {
+-                                        lines: lines,
+-                                        client: client
+-                                });
+-                                lines = [];
+-                        }
+-                });
+-
+-                car.on('error', function (err) {
+-                        self.emit('error', err);
+-                });
+-
+-                car.on('end', function () {
+-                        log.debug({ object: object },
+-                                 'Carrier for object ended.');
+-                        queue.push.call(queue, {
+-                                lines: lines,
+-                                client: client
+-                        });
+-                        queue.close();
+-                });
+-
+-                stream.resume();
++        var log = self.log.child({
++                object: opts.object
++        });
++
++        log.debug('creating moray cleaner stream');
++
++        var cleaner = new MorayCleanerStream({
++                shard: opts.shard,
++                object: opts.object,
++                parent: self,
++                log: log
++        });
++
++        /*
++         * Use PipelineStream to return a combination of several processing
++         * stages: chunking lines in the input into per-line strings, then
++         * collecting those strings into batches, then finally cleaning them
++         * via batched Moray requests.
++         */
++        var mcs = new vstream.PipelineStream({
++                streams: [
++                        new lstream({ highWaterMark: 0 }),
++                        new BatchStream({ batchSize: self.batchSize }),
++                        cleaner
++                ],
++                streamOpts: {
++                        highWaterMark: 0,
++                        objectMode: true
++                }
+         });
++
++        /*
++         * Forward the "workComplete" event from the internal
++         * MorayCleanerStream to the consumer of the combined PipelineStream
++         * we return.
++         */
++        cleaner.on('workComplete', mcs.emit.bind(mcs, 'workComplete'));
++
++        return (mcs);
+ };
+diff --git a/package.json b/package.json
+index 0e85f05..b9d7f0e 100644
+--- a/package.json
++++ b/package.json
+@@ -22,7 +22,9 @@
+                 "moray": "git+ssh://git@github.com:joyent/node-moray.git#fd5781bc25a9bfe2ba82167664639753fb9f0ca5",
+                 "posix-getopt": "1.0.0",
+                 "sprintf-js": "0.0.7",
+-                "vasync": "1.6.1"
++                "vasync": "1.6.1",
++                "verror": "^1.9.0",
++                "vstream": "0.1.0"
+         },
+         "devDependencies": {
+                 "nodeunit": "0.7.4"

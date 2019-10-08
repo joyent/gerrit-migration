@@ -1,0 +1,733 @@
+commit 94392ef709beefb4b0433431bd8fafa722fb44b2 (refs/changes/08/2908/3)
+Author: Nick Zivkovic <nick.zivkovic@joyent.com>
+Date:   2017-11-04T00:26:53+00:00 (1 year, 11 months ago)
+    
+    NAPI-434 Want way to automatically generate unused subnets
+
+diff --git a/lib/models/network.js b/lib/models/network.js
+index 972de8d..a293601 100644
+--- a/lib/models/network.js
++++ b/lib/models/network.js
+@@ -130,15 +130,18 @@ var CREATE_SCHEMA = {
+         nic_tag: function _nicTagExists(opts, name, tags, callback) {
+             mod_nicTag.validateExists(true, opts, name, tags, callback);
+         },
+-        provision_end_ip: validate.IP,
+-        provision_start_ip: validate.IP,
+-        subnet: validate.subnet,
+         vlan_id: validate.VLAN
+     },
+     optional: {
+         description: validate.string,
+         // XXX: allow this?
+         fabric: validate.bool,
++        subnet_alloc: validate.bool,
++        addr_family: validate.addrFamily,
++        subnet_prefix: validate.subnetPrefix,
++        subnet: validate.subnet,
++        provision_end_ip: validate.IP,
++        provision_start_ip: validate.IP,
+         fields: validate.fieldsArray(VALID_FIELDS),
+         gateway: validateGateway,
+         internet_nat: validate.bool,
+@@ -150,6 +153,7 @@ var CREATE_SCHEMA = {
+         vnet_id: validate.VxLAN
+     },
+     after: [
++        validateSubnetAlloc,
+         validateProvisionRange,
+         validateNicTagMTU
+     ]
+@@ -600,6 +604,35 @@ function validateProvisionRangeUpdate(opts, params, parsed, cb) {
+     }, null, toValidate, cb);
+ }
+ 
++/*
++ * Validates that these two sets of params do not overlap:
++ *
++ *    [subnet, provision_start_ip, provision_end_ip]
++ *    [subnet_alloc, addr_family, subnet_prefix]
++ *
++ * Also validates that params.fabric = true and vnet_id = defined for
++ * subnet_alloc path.
++ */
++function validateSubnetAlloc(_opts, _, parsedParams, callback) {
++    if ((parsedParams.subnet || parsedParams.provision_start_ip ||
++        parsedParams.provision_end_ip) && (parsedParams.subnet_alloc ||
++        parsedParams.addr_family || parsedParams.subnet_prefix)) {
++
++        callback(new Error('Should not mix subnet-allocation and ' +
++            'subnet params'));
++        return;
++    }
++    if ((parsedParams.subnet && !(parsedParams.subnet &&
++        parsedParams.provision_start_ip && parsedParams.provision_end_ip)) ||
++        (parsedParams.subnet_alloc && !(parsedParams.subnet_alloc &&
++        parsedParams.addr_family && parsedParams.subnet_prefix &&
++        parsedParams.fabric && parsedParams.vnet_id))) {
++
++        callback(new Error('Params missing.'));
++        return;
++    }
++    callback();
++}
+ 
+ /**
+  * Validates that:
+@@ -608,7 +641,8 @@ function validateProvisionRangeUpdate(opts, params, parsed, cb) {
+  * * that end doesn't come before start.
+  */
+ function validateProvisionRange(opts, _, parsedParams, callback) {
+-    if (!parsedParams.subnet_start || !parsedParams.subnet_bits) {
++    if (parsedParams.subnet_alloc || !parsedParams.subnet_start ||
++        !parsedParams.subnet_bits) {
+         return callback();
+     }
+ 
+@@ -1381,6 +1415,434 @@ Network.prototype.matches = function matchesIntersection(intersection) {
+     return true;
+ };
+ 
++/*
++ * Hits the napi_networks bucket, and filters the results according to 'filter'
++ * which is a string.
++ */
++function listFilteredNetworks(opts, filter, attr, callback) {
++    var app = opts.app;
++    var log = opts.log;
++    var offset, limit;
++
++    mod_moray.listObjs({
++        defaultFilter: '(uuid=*)',
++        filter: filter,
++        limit: limit,
++        log: log,
++        offset: offset,
++        bucket: BUCKET,
++        model: Network,
++        moray: app.moray,
++        sort: {
++            attribute: attr,
++            order: 'ASC'
++        }
++    }, callback);
++}
++
++/*
++ * Add an additionaly boolean expression to the filter, that includes only all
++ * subnets that appear after 'marker'.
++ */
++function addSubnetMarkerToFilter(filter, marker) {
++    if (marker) {
++        return '(&' + filter + '!(subnet<=' + marker + '))';
++    }
++    return filter;
++}
++
++/*
++ * Wraps listFilteredNetworks in a LOMStream. Looks at 10 networks at a time.
++ */
++function listFilteredNetworksStream(opts, base_filter, marker, attr, callback) {
++    var dupOpts = jsprim.deepCopy(opts);
++    var filter;
++
++    var s = new lomstream.LOMStream({
++        fetch: function (opts2, lobj, _datacb, cb) {
++            var copyOpts = jsprim.deepCopy(opts2);
++            copyOpts.params.limit = lobj.limit;
++            filter = addSubnetMarkerToFilter(base_filter, lobj.marker);
++
++            listFilteredNetworks(opts2, filter, attr, function (err, nets) {
++                var done = false;
++
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                if (nets.length === 0) {
++                    done = true;
++                }
++                cb(null, { done: done, results: nets });
++                return;
++            });
++        },
++        marker: marker,
++        limit: 10,
++        fetcharg: dupOpts
++    });
++    callback(null, s);
++}
++
++/*
++ * Walks all subnets in sorted order, such that walker() is called on a sliding
++ * pair of subnets. Callback gets called when we've walked all pairs.
++ * NOTE: there is no canonical way to bail out of walking a stream, so we just
++ * walk it to the end, and don't offer the caller any capability to abort.
++ */
++function subnetPairs(opts, walker, callback) {
++    var filters = ['(&(subnet>=10.0.0.0/8)(subnet<=10.255.255.255/32))',
++                   '(&(subnet>=172.16.0.0/12)(subnet<=172.31.255.255/32))',
++                   '(&(subnet>=192.168.0.0/16)(subnet<=192.168.255.255/32))'
++                  ];
++
++    var filter = '(|';
++    filter += '(vnet_id=' + opts.params.vnet_id + ')';
++    filter += filters[0];
++    if (opts.params.subnet_prefix >= 12) {
++        filter += filters[1];
++    }
++    if (opts.params.subnet_prefix >= 16) {
++        filter += filters[2];
++    }
++    filter += ')';
++
++    function markerFn(net_obj) {
++        return (net_obj.subnet);
++    }
++
++    // Sliding window of 2 subnets
++    var pair = [];
++
++    function updatePair(sub) {
++        if (pair.length === 2) {
++            pair[0] = pair[1];
++            pair[1] = sub;
++        }
++        if (pair.length === 1) {
++            pair[1] = sub;
++        }
++        if (pair.length === 0) {
++            pair[0] = sub;
++        }
++    }
++
++    listFilteredNetworksStream(opts, filter, markerFn, 'subnet',
++        function (_cerr, stream) {
++
++        stream.on('error', callback);
++
++        stream.on('readable', function () {
++            var network = stream.read(1);
++            updatePair(network.subnet);
++            // We sometimes have duplicates
++            if (pair.length === 2 &&
++                ipaddr.compareCIDR(pair[0], pair[1]) !== 0) {
++                walker(pair);
++            }
++        });
++
++        stream.on('end', function () {
++            if (pair.length < 2) {
++                walker(pair);
++            }
++            callback();
++        });
++    });
++}
++
++function allocProvisionRange(subnet) {
++    if (typeof (subnet) === 'string') {
++        subnet = ipaddr.createCIDR(subnet);
++    }
++    var first;
++    var last;
++    first = subnet.first();
++    last = subnet.last();
++    return [first.toString(), last.toString()];
++}
++
++/* Subnets overlap if s1.maximum >= s2.minimum */
++function subnetsOverlap(sn1, sn2, plen) {
++    assert.ok(ipaddr.compareCIDR(sn1, sn2) < 0);
++    var s1;
++    var s2;
++    if (sn1.prefixLength() !== plen) {
++        s1 = ipaddr.createCIDR(sn1.address().toString() + '/' + plen);
++    } else {
++        s1 = sn1;
++    }
++    if (sn2.prefixLength() !== plen) {
++        s2 = ipaddr.createCIDR(sn1.address().toString() + '/' + plen);
++    } else {
++        s2 = sn2;
++    }
++    var range1_max = s1.last();
++    var range2_min = s2.first();
++
++    return (ipaddr.compare(range1_max, range2_min) > 0);
++}
++
++/*
++ * Subnets adjacent if first (N - 1) bytes are the same, Nth bytes differ by 1.
++ * Or if they are the max and min possible subnets of their particular classes
++ * (i.e. 10.255.255.255 and 172.16.0.0 are adjacent).
++ */
++function subnetsAdjacent(sn1, sn2, plen) {
++    assert.ok(ipaddr.compareCIDR(sn1, sn2) < 0);
++    var s1;
++    var s2;
++    if (sn1.prefixLength() !== plen) {
++        s1 = ipaddr.createCIDR(sn1.address().toString() + '/' + plen);
++    } else {
++        s1 = sn1;
++    }
++    if (sn2.prefixLength() !== plen) {
++        s2 = ipaddr.createCIDR(sn1.address().toString() + '/' + plen);
++    } else {
++        s2 = sn2;
++    }
++    var range1_max = s1.last();
++    var range2_min = s2.first();
++    var r1_str = range1_max.toString();
++    var r2_str = range2_min.toString();
++    if ((r1_str === '10.255.255.255' && r2_str === '172.16.0.0') ||
++        (r1_str === '172.31.255.255' && r2_str === '192.168.0.0')) {
++        return true;
++    }
++    var buf1 = range1_max.toString().split('.');
++    var buf2 = range2_min.toString().split('.');
++    if (buf1.length !== buf2.length) {
++        return false;
++    }
++    var i = 0;
++    while (i < buf1.length - 2) {
++        if (buf1[i] !== buf2[i]) {
++            return false;
++        }
++        i++;
++    }
++
++    return ((parseInt(buf2[i], 10) - parseInt(buf1[i], 10)) === 1);
++}
++
++/*
++ * We percieve a gap between two subnets is they don't overlap and are not
++ * adjacent.
++ */
++function haveGapBetweenSubnets(s1, s2, plen) {
++    // XXX TODO even if we have a gap we might not be able to allocate from it
++    // because the prefix-length might not allow it.
++    // i.e.
++    //      There is a gap between 10.0.10.0/24 and 10.2.1.0/24
++    //      But if we need /12, we can get a non-verlapping 10.X,
++    //      from that gap.
++    //      IOW: There is a gap between 10.0/24 and 10.2/24, but between
++    //      10.0/12 and 10.2/12 i.e.:  10.[000000|00] and 10.[000000|10]
++    return (!subnetsOverlap(s1, s2, plen) && !subnetsAdjacent(s1, s2, plen));
++}
++
++/*
++ * We decrement a subnet's prefix by one, starting from leftmost possible byte.
++ * Return NULL if we can't.
++ */
++function decSubImpl(buf, plen) {
++    var bytes_covered = plen / 8;
++    var n1 = buf[0];
++    var n2 = buf[1];
++    var n3 = buf[2];
++    switch (buf[0]) {
++    case '10':
++        if (parseInt(n2, 10) > 0 && bytes_covered >= 2) {
++            n2--;
++        } else if (parseInt(n3, 10) > 0 && bytes_covered >= 3) {
++            n3--;
++        } else {
++            return null;
++        }
++        break;
++    case '172':
++        if (parseInt(n2, 10) > 0 && bytes_covered >= 2) {
++            n2--;
++        } else if (parseInt(n3, 10) > 0 && bytes_covered >= 3) {
++            n3--;
++        } else {
++            n1 = 10;
++            n2 = 255;
++            n3 = 255;
++        }
++        break;
++    case '192':
++        if (parseInt(n3, 10) > 0 && bytes_covered >= 3) {
++            n3--;
++        } else {
++            n1 = 172;
++            n2 = 31;
++            n3 = 255;
++        }
++        break;
++    default:
++        assert.ok(null, 'Should never get here');
++        break;
++    }
++    return [n1, n2, n3, 0];
++}
++
++/*
++ * We increment a subnet's prefix by one, starting from left-most possible byte.
++ * Return NULL if we can't.
++ * XXX, currently we can's increment any component that's not a full-sized byte.
++ * For example, if we have 10.224.0.0/12, we can't increment the first 4 bits of
++ * 224 to be 240. However, we should eventually gain this capability in the
++ * future. Bitwise operation in JS are error prone.
++ */
++function incSubImpl(buf, plen) {
++    var bytes_covered = plen / 8;
++    var n1 = buf[0];
++    var n2 = buf[1];
++    var n3 = buf[2];
++    switch (buf[0]) {
++    case '10':
++        if (parseInt(n2, 10) < 255 && bytes_covered >= 2) {
++            n2++;
++        } else if (parseInt(n3, 10) < 255 && bytes_covered >= 3) {
++            n3++;
++        } else {
++            n1 = 172;
++            n2 = 16;
++            n3 = 0;
++        }
++        break;
++    case '172':
++        if (parseInt(n2, 10) < 31 && bytes_covered >= 2) {
++            n2++;
++        } else if (parseInt(n3, 10) < 255 && bytes_covered >= 3) {
++            n3++;
++        } else {
++            n1 = 192;
++            n2 = 168;
++            n3 = 0;
++        }
++        break;
++    case '192':
++        if (parseInt(n3, 10) < 255 && bytes_covered >= 3) {
++            n3++;
++        } else {
++            return null;
++        }
++        break;
++    default:
++        assert.ok(null, 'Should never get here');
++        break;
++    }
++    return [n1, n2, n3, 0];
++}
++
++/*
++ * Increment a subnet's prefix, but restrict the prefix length of the resulting
++ * subnet to 'desired_plen'-bits.
++ *
++ *  10.88.0.0/16 ===> 10.89.0.0/'desired_plen'
++ */
++function incrementSubnet(subnet, desired_plen) {
++    var cidr = subnet;
++    var addr = cidr.address();
++    var plen = cidr.prefixLength();
++    var nlen = desired_plen;
++    assert.ok(typeof (nlen) !== 'undefined');
++    assert.ok(nlen !== null);
++    var buf = addr.toString().split('.');
++    var nbuf = incSubImpl(buf, Math.min(plen, nlen));
++    nbuf[0] = nbuf[0].toString();
++    nbuf[1] = nbuf[1].toString();
++    nbuf[2] = nbuf[2].toString();
++    nbuf[3] = nbuf[3].toString();
++    return (nbuf.join('.') + '/' + nlen);
++}
++
++/*
++ * Same as above but decrements.
++ */
++function decrementSubnet(subnet, desired_plen) {
++    var cidr = subnet;
++    var addr = cidr.address();
++    var plen = cidr.prefixLength();
++    var nlen = desired_plen;
++    assert.ok(typeof (nlen) !== 'undefined');
++    assert.ok(nlen !== null);
++    var buf = addr.toString().split('.');
++    var nbuf = decSubImpl(buf, Math.min(plen, nlen));
++    nbuf[0] = nbuf[0].toString();
++    nbuf[1] = nbuf[1].toString();
++    nbuf[2] = nbuf[2].toString();
++    nbuf[3] = nbuf[3].toString();
++    return (nbuf.join('.') + '/' + nlen);
++}
++
++/*
++ * Try to get a subnet from the gap between subnet1 and subnet2 by either
++ * incremnet subnet1 or decrementing subnet2. If there is no gap, or the subnets
++ * overlap the results are undefined.
++ */
++function getInbetweenSubnet(subnet1, subnet2, plen) {
++    var r = incrementSubnet(subnet1, plen);
++    if (r === null) {
++        r = decrementSubnet(subnet2, plen);
++    }
++    assert.ok(r !== null);
++    return (r);
++}
++
++function allocateSubnet(opts, callback) {
++    var new_sub = null;
++    var first_seen = null;
++    var last_seen = null;
++    var plen = opts.params.subnet_prefix;
++    subnetPairs(opts, function (pair) {
++        if (first_seen === null) {
++            first_seen = pair[0];
++        }
++
++        last_seen = pair[(pair.length - 1)];
++        assert.ok(pair.length <= 2);
++        if (pair.length === 1 ||
++            haveGapBetweenSubnets(pair[0], pair[1], plen)) {
++            if (new_sub === null) {
++                new_sub = getInbetweenSubnet(pair[0], pair[1], plen);
++            }
++        } else if (pair.length === 0) {
++            new_sub = '10.0.0.0/' + plen;
++        }
++    }, function (err) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        if (new_sub) {
++            callback(null, new_sub);
++            return;
++        }
++
++        if (!err && !new_sub) {
++            // We have not found a gap, but there may be space before or after
++            // the stream of subnets we've just walked. We try to increment or
++            // decrement the last_seen and first_seen subnets respectively.
++            new_sub = incrementSubnet(last_seen, plen);
++            if (new_sub === null) {
++                new_sub = decrementSubnet(first_seen, plen);
++            }
++
++            if (new_sub !== null) {
++                callback(null, new_sub);
++                return;
++            }
++        }
++
++        callback(new Error('Out of subnets'));
++    });
++}
+ 
+ 
+ // --- Exported functions
+@@ -1409,11 +1871,50 @@ function createNetwork(opts, callback) {
+     var log = opts.log;
+     var network;
+     var params = opts.params;
++    var copts = {
++        app: app,
++        fabric: opts.fabric,
++        log: log,
++        owner_uuid: opts.owner_uuid
++    };
+ 
+     log.debug(params, 'createNetwork: entry');
+ 
+     vasync.pipeline({
+         funcs: [
++        function _validateHttpParams(_, cb) {
++            validate.params(CREATE_SCHEMA, copts, opts.params,
++                function (err, _validatedParams) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++                    cb();
++            });
++        },
++        function _allocateSubnet(_, cb) {
++            if (!params.subnet_alloc) {
++                cb();
++                return;
++            }
++            allocateSubnet(opts, function (err, res) {
++                if (err) {
++                    cb(err);
++                    return;
++                }
++                opts.params.subnet = res;
++                var provrange = allocProvisionRange(res);
++                opts.params.provision_start_ip = provrange[0];
++                opts.params.provision_end_ip = provrange[1];
++                // We zero these out, because they would cause the object
++                // construction to fail in the next pipeline-pass.
++                delete opts.params.subnet_alloc;
++                delete opts.params.addr_family;
++                delete opts.params.subnet_prefix;
++                cb();
++            });
++        },
++
+         function _createNetObj(_, cb) {
+             createValidNetwork(opts, function (err, res) {
+                 if (err) {
+@@ -1425,6 +1926,7 @@ function createNetwork(opts, callback) {
+             });
+         },
+ 
++
+         function _createNet(_, cb) {
+             var raw = network.raw();
+             log.debug({ uuid: network.uuid, raw: raw },
+@@ -1682,6 +2184,7 @@ function validateListNetworks(params, callback) {
+ }
+ 
+ 
++
+ /**
+  * Lists networks, filtering by parameters
+  */
+diff --git a/lib/util/validate.js b/lib/util/validate.js
+index b7b0131..f33e1de 100644
+--- a/lib/util/validate.js
++++ b/lib/util/validate.js
+@@ -59,6 +59,33 @@ function validateBoolean(_, name, val, callback) {
+     return callback(new errors.invalidParam(name, 'must be a boolean value'));
+ }
+ 
++function validateAddrFamily(_, name, val, callback) {
++    // Currently validates that family is 'ipv4', but will validate 'ipv6' when
++    // SDC grows support for that.
++    console.log('AddrFamily: ' + val);
++    if (val === 'ipv4') {
++        callback(null, val);
++        return;
++    }
++
++    callback(new errors.invalidParam(name, 'must be ipv4 not ' + val));
++}
++
++function validateSubnetPrefix(_, name, val, callback) {
++    // Currently validates that prefix is 24, but will validate (8,32) when SDC
++    // grows support for that.
++    if (typeof (val) === 'string') {
++        val = parseInt(val, 10);
++        return;
++    }
++
++    if (val !== 24) {
++        callback(new errors.invalidParam(name, 'Only /24 is supported'));
++        return;
++    }
++
++    callback(null, val);
++}
+ 
+ /**
+  * Validates that a value is one of the values present in an array that
+@@ -403,6 +430,8 @@ function validateVxlanID(_, name, vlan_id, callback) {
+ 
+ module.exports = {
+     bool: validateBoolean,
++    addrFamily: validateAddrFamily,
++    subnetPrefix: validateSubnetPrefix,
+     enum: validateEnum,
+     fieldsArray: warden.fieldsArray,
+     IP: validateIP,
+diff --git a/test/integration/fabrics.test.js b/test/integration/fabrics.test.js
+index a75110a..f70ceb1 100644
+--- a/test/integration/fabrics.test.js
++++ b/test/integration/fabrics.test.js
+@@ -41,6 +41,7 @@ var extend = mod_jsprim.mergeObjects;
+ var ADMIN_OWNER;    // Loaded in setup below
+ var CREATED = {};
+ var OWNERS = [
++    mod_uuid.v4(),
+     mod_uuid.v4(),
+     mod_uuid.v4(),
+     mod_uuid.v4()
+@@ -74,8 +75,15 @@ var VLANS = [
+         name: mod_vlan.randomName(),
+         owner_uuid: OWNERS[2],
+         vlan_id: 44
++    },
++
++    {
++        name: mod_vlan.randomName(),
++        owner_uuid: OWNERS[3],
++        vlan_id: 45
+     }
+ ];
++
+ // Real (non-fabric networks):
+ var REAL_NETS = [
+     h.validNetworkParams({ nic_tag: UNDERLAY_NIC_TAG }),
+@@ -159,9 +167,22 @@ var NETS = [
+         owner_uuid: VLANS[3].owner_uuid,
+         provision_start_ip: '172.16.1.1',
+         provision_end_ip: '172.16.3.254'
++    },
++
++    // 5: Used for testing subnet alloc
++    {
++        vlan_id: VLANS[4].vlan_id,
++        subnet_alloc: true,
++        subnet_prefix: 24,
++        addr_family: 'ipv4',
++        // Also double-check that the MTU is correct:
++        mtu: OVERLAY_MTU,
++        name: mod_fabric_net.generateName(),
++        owner_uuid: VLANS[4].owner_uuid
+     }
+ 
+ ];
++
+ var VMS = [
+     mod_uuid.v4(),
+     mod_uuid.v4(),
+@@ -333,6 +354,20 @@ test('create VLANs', function (t) {
+         });
+     });
+ 
++    t.test('create vlan: 4', function (t2) {
++        mod_vlan.createAndGet(t2, {
++            params: extend(VLANS[4], {
++                // Specify at least owner_uuid and vlan_id - these are required
++                // by mod_vlan.delAllCreated() in the test teardown.
++                fields: [ 'name', 'owner_uuid', 'vlan_id' ]
++            }),
++            exp: {
++                name: VLANS[4].name,
++                owner_uuid: VLANS[4].owner_uuid,
++                vlan_id: VLANS[4].vlan_id
++            }
++        });
++    });
+ });
+ 
+ 
+@@ -559,6 +594,25 @@ test('create network', function (t) {
+         });
+     });
+ 
++    t.test('create network: 5', function (t2) {
++        mod_fabric_net.createAndGet(t2, {
++            params: extend(NETS[5], {
++                // mod_fabric_net.delAllCreated() needs uuid, owner_uuid and
++                // vlan_id in order to delete the network:
++                fields: [ 'name', 'owner_uuid', 'subnet', 'uuid', 'vlan_id' ]
++            }),
++            partialExp: {
++                name: NETS[5].name,
++                owner_uuid: NETS[5].owner_uuid,
++                // uuid gets filled in by createAndGet()
++                vlan_id: NETS[5].vlan_id
++            }
++        }, function (_err, res) {
++            t.ok(typeof (res.subnet) !== 'undefined', 'Subnet present');
++            t.end();
++        });
++    });
++
+ });
+ 
+ 

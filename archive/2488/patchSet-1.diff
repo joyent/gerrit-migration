@@ -1,0 +1,325 @@
+commit 9d2813302652a8ddf227aba567bc74454d2d4987 (refs/changes/88/2488/1)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2017-09-01T11:41:45-07:00 (2 years, 1 month ago)
+    
+    DOCKER-1094 docker rmi can remove referenced docker build layers
+
+diff --git a/lib/backends/sdc/images.js b/lib/backends/sdc/images.js
+index 9bc1cc2..f2cf4dd 100644
+--- a/lib/backends/sdc/images.js
++++ b/lib/backends/sdc/images.js
+@@ -1931,6 +1931,16 @@ function _deleteImageV2(opts, callback) {
+         });
+     }
+ 
++    function summaryFromImg(img) {
++        return {
++            config_digest: img.config_digest,
++            created: img.created,
++            head: img.head,
++            image_uuid: img.image_uuid,
++            owner_uuid: img.owner_uuid
++        };
++    }
++
+     vasync.pipeline({arg: opts, funcs: [
+         getImgTags,
+         checkTagReferences,
+@@ -1939,6 +1949,7 @@ function _deleteImageV2(opts, callback) {
+         verifyNotInUse,
+         getImgsToDelete,
+         deleteDockerTags,
++        checkDependentAncestorImages,
+         deleteDockerImages,
+         deleteImgapiLayers
+     ]}, function (err) {
+@@ -2104,16 +2115,6 @@ function _deleteImageV2(opts, callback) {
+     }
+ 
+     function getImgsToDelete(ctx, cb) {
+-        function summaryFromImg(img) {
+-            return {
+-                config_digest: img.config_digest,
+-                created: img.created,
+-                head: img.head,
+-                image_uuid: img.image_uuid,
+-                owner_uuid: img.owner_uuid
+-            };
+-        }
+-
+         getImageAncestry({
+             app: app,
+             log: log,
+@@ -2125,6 +2126,13 @@ function _deleteImageV2(opts, callback) {
+                 return;
+             }
+ 
++            if (log.debug()) {
++                log.debug(
++                    {config_digests: ancestry.map(function (img) {
++                        return img.config_digest;
++                    })}, 'deleteImage: ancestor config_digests');
++            }
++
+             // Note: Don't delete an ancestor that is a head image.
+             var headFound = false;
+             ctx.imgsToDelete = [ancestry[0]].concat(ancestry.slice(1).
+@@ -2141,11 +2149,6 @@ function _deleteImageV2(opts, callback) {
+                     return true;
+                 }
+             ));
+-
+-            if (log.debug()) {
+-                log.debug({imgsToDelete: ctx.imgsToDelete.map(summaryFromImg)},
+-                    'deleteImage: imgsToDelete');
+-            }
+             cb();
+         });
+     }
+@@ -2174,7 +2177,56 @@ function _deleteImageV2(opts, callback) {
+         }, cb);
+     }
+ 
++    function checkDependentAncestorImages(ctx, cb) {
++        // Verify that no other images use these image(s) as a parent.
++        // Note that we skip the check on the first image, as it's already been
++        // checked in the checkDependentImages function above.
++        var dependentImageIdx = 1;
++        var imageHasDependentErrorMarker = true;
++
++        vasync.forEachPipeline({
++            inputs: ctx.imgsToDelete.slice(1),
++            func: function checkImgReferences(ancestorImg, nextImg) {
++                var filter = [ {
++                    parent: ancestorImg.config_digest,
++                    owner_uuid: opts.account.uuid
++                } ];
++                ImageV2.list(opts.app, log, filter,
++                        function (err, dependentImgs) {
++                    if (err) {
++                        nextImg(err);
++                        return;
++                    }
++                    if (dependentImgs.length > 1) {
++                        log.debug(
++                            {
++                                ancestorImg: summaryFromImg(ancestorImg),
++                                referenceCount: dependentImgs.length
++                            },
++                            'deleteImage: do not delete referenced ancestor');
++                        nextImg(imageHasDependentErrorMarker);
++                        return;
++                    }
++                    dependentImageIdx += 1;
++                    nextImg();
++                });
++            }
++        }, function _checkImgReferencesCb(err) {
++            if (err === imageHasDependentErrorMarker) {
++                // Only delete up to (but not including) the dependent image.
++                ctx.imgsToDelete = ctx.imgsToDelete.slice(0, dependentImageIdx);
++                err = null;
++            }
++            cb(err);
++        });
++    }
++
+     function deleteDockerImages(ctx, cb) {
++        if (log.debug()) {
++            log.debug({imgsToDelete: ctx.imgsToDelete.map(summaryFromImg)},
++                'deleteImage: imgsToDelete');
++        }
++
+         vasync.forEachPipeline({
+             inputs: ctx.imgsToDelete,
+             func: deleteOneImg
+diff --git a/test/integration/api-build.test.js b/test/integration/api-build.test.js
+index 5e43e1a..c5daabd 100644
+--- a/test/integration/api-build.test.js
++++ b/test/integration/api-build.test.js
+@@ -703,8 +703,6 @@ test('api: build and rmi', function (tt) {
+                 var parentId = matchingImages[0].parent;
+                 DOCKER_ALICE.del('/images/' + parentId, function (err) {
+                     t.ok(err, 'expect an error for docker rmi parentId');
+-                    console.log('err:', err);
+-                    console.log('err.message:', err.message);
+                     if (!err) {
+                         next(new Error('docker rmi parentId succeeded - '
+                             + 'when it should have failed'));
+@@ -746,6 +744,176 @@ test('api: build and rmi', function (tt) {
+ });
+ 
+ 
++test('api: build and rmi of intermediate layers', function (tt) {
++    tt.test('docker build 2 relating images', function (t) {
++        vasync.pipeline({ arg: {}, funcs: [
++
++            function createTar1(ctx, next) {
++                var fileAndContents = {
++                    'Dockerfile': 'FROM busybox\n'
++                                + 'ADD file.txt /file1.txt\n'
++                                + 'ADD file.txt /file2.txt\n'
++                                + 'LABEL sdcdockertest=true\n',
++                    'file.txt': 'File contents'
++                };
++                ctx.tarStream1 = createTarStream(fileAndContents);
++                next();
++            },
++
++            function buildContainer1(ctx, next) {
++                h.buildDockerContainer({
++                    dockerClient: DOCKER_ALICE_HTTP,
++                    params: {'rm': 'true'}, // remove container after build
++                    test: t,
++                    tarball: ctx.tarStream1
++                }, onbuild);
++
++                function onbuild(err, result) {
++                    t.ifError(err, 'build1 created without error');
++
++                    if (!result || !result.body) {
++                        next(new Error('build1 generated no output!?'));
++                        return;
++                    }
++
++                    var output = result.body;
++                    var hasSuccess = output.indexOf('Successfully built') >= 0;
++                    t.ok(hasSuccess, 'output contains Successfully built');
++
++                    if (!hasSuccess) {
++                        next(new Error('build1 failed - no success marker'));
++                        return;
++                    }
++
++                    var reg = new RegExp('Successfully built (\\w+)');
++                    ctx.dockerImageId1 = output.match(reg)[1];
++                    next();
++                }
++            },
++
++            function createTar2(ctx, next) {
++                var fileAndContents = {
++                    'Dockerfile': 'FROM busybox\n'
++                                + 'ADD file.txt /file1.txt\n'
++                                + 'ADD file.txt /CHANGED.txt\n'
++                                + 'LABEL sdcdockertest=CHANGED\n',
++                    'file.txt': 'File contents'
++                };
++                ctx.tarStream2 = createTarStream(fileAndContents);
++                next();
++            },
++
++            function buildContainer2(ctx, next) {
++                h.buildDockerContainer({
++                    dockerClient: DOCKER_ALICE_HTTP,
++                    params: {'rm': 'true'}, // remove container after build
++                    test: t,
++                    tarball: ctx.tarStream2
++                }, onbuild);
++
++                function onbuild(err, result) {
++                    t.ifError(err, 'build2 created without error');
++
++                    if (!result || !result.body) {
++                        next(new Error('build2 generated no output!?'));
++                        return;
++                    }
++
++                    var output = result.body;
++                    var hasSuccess = output.indexOf('Successfully built') >= 0;
++                    t.ok(hasSuccess, 'output contains Successfully built');
++
++                    if (!hasSuccess) {
++                        next(new Error('build2 failed - no success marker'));
++                        return;
++                    }
++
++                    var reg = new RegExp('Successfully built (\\w+)');
++                    ctx.dockerImageId2 = output.match(reg)[1];
++                    next();
++                }
++            },
++
++            function getImageHistory1(ctx, next) {
++                DOCKER_ALICE.get('/images/' + ctx.dockerImageId1 + '/history',
++                        function (err, req, res, history) {
++                    t.ifErr(err, 'get image1/history should not error');
++                    t.ok(history, 'image1/history returned a valid result');
++                    ctx.history1 = history;
++                    next();
++                });
++            },
++
++            function getImageHistory2(ctx, next) {
++                DOCKER_ALICE.get('/images/' + ctx.dockerImageId2 + '/history',
++                        function (err, req, res, history) {
++                    t.ifErr(err, 'get image2/history should not error');
++                    t.ok(history, 'image2/history returned a valid result');
++                    ctx.history2 = history;
++                    next();
++                });
++            },
++
++            function verifyImagesShareLayers(ctx, next) {
++                var layerIds1 = (ctx.history1 || []).map(function (hist) {
++                    return hist.Id;
++                }).filter(function (id) {
++                    return id !== '<missing>';
++                });
++
++                var layerIds2 = (ctx.history2 || []).map(function (hist) {
++                    return hist.Id;
++                }).filter(function (id) {
++                    return id !== '<missing>';
++                });
++
++                t.equal(layerIds1.length, layerIds2.length,
++                    'Number of image history layers should be equal');
++
++                // Note that the (oldest) base layer is the last layer.
++                var sharedLayers = [];
++                for (var i = layerIds1.length - 1; i >= 0; i--) {
++                    if (layerIds1[i] !== layerIds2[i]) {
++                        break;
++                    }
++                    sharedLayers.push(layerIds1[i]);
++                }
++                t.ok(sharedLayers.length > 1,
++                    'Number of shared layers should be >= 1, got '
++                    + sharedLayers.length);
++                t.ok(sharedLayers.length < layerIds1.length,
++                    'Number of shared layers should be < '
++                    + layerIds1.length);
++
++                next();
++            },
++
++            function removeBuiltImage2(ctx, next) {
++                DOCKER_ALICE.del('/images/' + ctx.dockerImageId2, next);
++            },
++
++            function checkImageHistory1(ctx, next) {
++                DOCKER_ALICE.get('/images/' + ctx.dockerImageId1 + '/history',
++                        function (err, req, res, history) {
++                    t.ok(history, 'image1/history returned a valid result');
++                    t.deepEqual(history, ctx.history1,
++                        'Image1 history should not have changed');
++                    next();
++                });
++            },
++
++            function removeBuiltImage1(ctx, next) {
++                DOCKER_ALICE.del('/images/' + ctx.dockerImageId1, next);
++            }
++
++        ]}, function allDone(err) {
++            t.ifErr(err);
++            t.end();
++        });
++    });
++});
++
++
+ test('teardown', function (tt) {
+     if (imgapiClient) {
+         imgapiClient.close();

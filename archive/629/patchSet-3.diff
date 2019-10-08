@@ -1,0 +1,4666 @@
+commit dbacbde8314402e8e6098231d7d9e94773a72c1a (refs/changes/29/629/3)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2016-10-11T12:36:24-07:00 (3 years ago)
+    
+    ZAPI-747 Support updating VMAPI's moray buckets' indexes at VMAPI's startup
+
+diff --git a/Makefile b/Makefile
+index ddb62e3..d392c34 100644
+--- a/Makefile
++++ b/Makefile
+@@ -42,7 +42,7 @@ NODEUNIT  := ./node_modules/.bin/nodeunit
+ DOC_FILES	 = index.md
+ RESTDOWN_FLAGS   = --brand-dir=deps/restdown-brand-remora
+ EXTRA_DOC_DEPS += deps/restdown-brand-remora/.git
+-JS_FILES	:= $(shell find lib test -name '*.js')
++JS_FILES	:= $(shell find tools lib test -name '*.js')
+ JSL_CONF_NODE	 = tools/jsl.node.conf
+ JSL_FILES_NODE   = server.js $(JS_FILES)
+ JSSTYLE_FILES	 = server.js $(JS_FILES)
+diff --git a/lib/apis/wfapi.js b/lib/apis/wfapi.js
+index 3399d90..366052e 100644
+--- a/lib/apis/wfapi.js
++++ b/lib/apis/wfapi.js
+@@ -5,18 +5,18 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+ /*
+  * This contains the functions for talking to the workflow API.
+  */
+ 
+-
++var assert = require('assert-plus');
++var async = require('async');
+ var sprintf = require('sprintf').sprintf;
+ var uuid = require('libuuid');
+ var WfClient = require('wf-client');
+-var async = require('async');
+ 
+ var common = require('./../common');
+ var clone = common.clone;
+@@ -37,6 +37,7 @@ function Wfapi(options) {
+ 
+     this.client = new WfClient(options);
+     this.connected = false;
++    this.url = options.url;
+ }
+ 
+ 
+@@ -44,7 +45,9 @@ function Wfapi(options) {
+ /*
+  * Wait until wfapi is online before proceeding to create workflows
+  */
+-Wfapi.prototype.connect = function () {
++Wfapi.prototype.connect = function connect(callback) {
++    assert.func(callback, 'callback');
++
+     var self = this;
+     self.log.debug('Loading the WFAPI workflows...');
+ 
+@@ -62,8 +65,11 @@ Wfapi.prototype.connect = function () {
+                     if (error) {
+                         self.log.error(error, 'Error initializing workflows');
+                         init();
++                    } else {
++                        self.log.info('All workflows have been loaded');
++
++                        callback();
+                     }
+-                    self.log.info('All workflows have been loaded');
+                 });
+             });
+     }
+diff --git a/lib/common/validation.js b/lib/common/validation.js
+index 2794c0c..4f0085b 100644
+--- a/lib/common/validation.js
++++ b/lib/common/validation.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+ /*
+@@ -454,13 +454,15 @@ var validators = {
+  * It can be removed if the validations are refactored into a more typical
+  * object returned from a constructor function.
+  */
+-function init(config) {
+-    if (config.triton_tag_re) {
+-        TRITON_TAG_RE = new RegExp(config.triton_tag_re);
++function init(options) {
++    assert.optionalObject(options, 'options');
++
++    if (options && options.triton_tag_re) {
++        TRITON_TAG_RE = new RegExp(options.triton_tag_re);
+     }
+ 
+-    if (config.docker_tag_re) {
+-        DOCKER_TAG_RE = new RegExp(config.docker_tag_re);
++    if (options && options.docker_tag_re) {
++        DOCKER_TAG_RE = new RegExp(options.docker_tag_re);
+     }
+ }
+ 
+diff --git a/lib/endpoints/ping.js b/lib/endpoints/ping.js
+index f638e79..72ceaeb 100644
+--- a/lib/endpoints/ping.js
++++ b/lib/endpoints/ping.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+ /*
+@@ -14,12 +14,16 @@
+  */
+ 
+ var restify = require('restify');
+-var assert = require('assert');
+-var async = require('async');
++var assert = require('assert-plus');
++var vasync = require('vasync');
+ 
+ var common = require('../common');
+ 
++var ONLINE_STATUS = 'online';
++var OFFLINE_STATUS = 'offline';
+ 
++var UNITIALIZED_STATUS = 'uninitialized';
++var INITIALIZED_STATUS = 'initialized';
+ 
+ /*
+  * For now just ping moray
+@@ -30,59 +34,134 @@ function pingMoray(req, callback) {
+ 
+         if (err) {
+             req.log.error(err, 'Error while pinging moray');
+-            status = 'offline';
++            status = OFFLINE_STATUS;
+         } else {
+-            status = 'online';
++            status = ONLINE_STATUS;
+         }
+ 
+-        return callback({ status: status, error: err && err.toString() });
++        return callback(err, status);
+     });
+ }
+ 
+-
+-
+ /*
+  * GET /ping
+  */
+ function ping(req, res, next) {
+-    pingMoray(req, function (results) {
+-        var wfapi = (req.app.wfapi.connected === true) ? 'online' : 'offline';
++    var morayClientConnectivity;
++    var morayInitialization;
++    var wfapiServiceStatus = OFFLINE_STATUS;
++    var overallHealthy = true;
++    var overallStatus = 'OK';
++    var response = {};
++    var responseCode = 200;
++
++    vasync.parallel({funcs: [
++        function getMorayConnectivity(done) {
++            req.log.debug('pinging moray...');
++
++            var morayServiceStatus = OFFLINE_STATUS;
++            var morayServiceError;
++
++            pingMoray(req, function onMorayPinged(err, status) {
++                req.log.debug({
++                    error: err,
++                    status: status
++                }, 'moray ping results');
++
++                if (!err) {
++                    morayServiceStatus = ONLINE_STATUS;
++                } else {
++                    overallHealthy = false;
++                    morayServiceError = err;
++                }
++
++                morayClientConnectivity = {
++                    status: morayServiceStatus,
++                    error: morayServiceError
++                };
++
++                done();
++            });
++        },
++        function getMorayInitialization(done) {
++            req.log.debug('checking moray initialization status...');
++
++            var morayInitStatus = UNITIALIZED_STATUS;
++            var morayInitError;
++
++            if (req.app.moray.initialized() === true) {
++                morayInitStatus = INITIALIZED_STATUS;
++            }
+ 
+-        var services = {
+-            moray: results.status,
+-            wfapi: wfapi
+-        };
++            morayInitError = req.app.moray.lastInitError();
++            assert.optionalObject(morayInitError, 'morayInitError');
++            if (morayInitError) {
++                morayInitError = morayInitError.toString();
++            }
++
++            if (morayInitError || morayInitStatus === UNITIALIZED_STATUS) {
++                overallHealthy = false;
++            }
++
++            req.log.debug({
++                error: morayInitError,
++                status: morayInitStatus
++            }, 'moray initialization check results');
++
++            morayInitialization = {
++                status: morayInitStatus
++            };
++
++            if (morayInitError) {
++                morayInitialization.error = morayInitError;
++            }
+ 
+-        var healthy = true;
+-        var response = {};
+-        var status = 'OK';
++            done();
++        },
++        function getWfApiConnectivity(done) {
++            req.log.debug({wfapi: req.app.wfapi},
++                'checking wfapi connectivity...');
+ 
+-        for (var name in services) {
+-            if (services[name] === 'offline') {
+-                healthy = false;
+-                status = 'some services are not connected';
+-                break;
++            if (req.app.wfapi && req.app.wfapi.connected === true) {
++                wfapiServiceStatus = ONLINE_STATUS;
++            } else {
++                overallHealthy = false;
+             }
++
++            req.log.debug({
++                status: wfapiServiceStatus
++            }, 'wfapi connectivity check results');
++
++            done();
+         }
++    ]}, function allStatusInfoRetrieved(err) {
++        req.log.debug('all status info retrieved');
+ 
+-        if (services.moray === 'offline') {
+-            response.pingErrors = { moray: results.error };
+-        } else {
+-            response.pingErrors = {};
++        var services = {
++            moray: {
++                connectivity: morayClientConnectivity,
++                initialization: morayInitialization
++            },
++            wfapi: {
++                status: wfapiServiceStatus
++            }
++        };
++
++        if (overallHealthy === false) {
++            responseCode = 503;
++            overallStatus = 'some services are not ready';
+         }
+ 
+         response.pid = process.pid;
+-        response.status = status;
+-        response.healthy = healthy;
++        response.status = overallStatus;
++        response.healthy = overallHealthy;
+         response.services = services;
+ 
+-        res.send(200, response);
++        res.send(responseCode, response);
+         return next();
+     });
+ }
+ 
+-
+-
+ /*
+  * Mounts job actions as server routes
+  */
+@@ -90,7 +169,6 @@ function mount(server) {
+     server.get({ path: '/ping', name: 'Ping' }, ping);
+ }
+ 
+-
+ // --- Exports
+ 
+ module.exports = {
+diff --git a/lib/endpoints/vms.js b/lib/endpoints/vms.js
+index 1183343..e153122 100644
+--- a/lib/endpoints/vms.js
++++ b/lib/endpoints/vms.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+ /*
+@@ -351,7 +351,7 @@ function getVm(req, res, next) {
+ 
+ function handleUpdateVMResponse(req, res, next, juuid) {
+     // Allow clients to know the location of WFAPI
+-    res.header('workflow-api', req.app.config.wfapi.url);
++    res.header('workflow-api', req.app.wfapi.url);
+ 
+     var sync = req.params.sync;
+     if (sync) {
+@@ -786,7 +786,7 @@ function deleteVm(req, res, next) {
+     // It's faster, and uses far less resources of the overall system.
+     if (req.vm.server_uuid === undefined || req.vm.server_uuid === null) {
+         _destroyVm(req.vm, {
+-            publisher: req.app.publisher,
++            publisher: req.app.changefeedPublisher,
+             moray: req.app.moray
+         }, function (err, destroyedVm) {
+             if (err) {
+@@ -806,7 +806,7 @@ function deleteVm(req, res, next) {
+ 
+                 if (serverNotFoundError) {
+                     _destroyVm(req.vm, {
+-                        publisher: req.app.publisher,
++                        publisher: req.app.changefeedPublisher,
+                         moray: req.app.moray
+                     }, function (destroyErr, destroyedVm) {
+                         if (destroyErr) {
+@@ -903,7 +903,7 @@ function createVm(req, res, next) {
+             return next(err);
+         }
+ 
+-        common.setDefaultValues(req.params, {config: req._config});
++        common.setDefaultValues(req.params, {config: req.app.options});
+ 
+         if (sync && ['true', 'false'].indexOf(sync) === -1) {
+             var error = [ errors.invalidParamErr('sync') ];
+@@ -1149,7 +1149,7 @@ function putVms(req, res, next) {
+             },
+             function _pub(diffs, cb2) {
+                 if (diffs && diffs.length != 0) {
+-                    var publisher = req.app.publisher;
++                    var publisher = req.app.changefeedPublisher;
+                     common.publishChange(publisher, VM, diffs, uuid, cb2);
+                 } else {
+                     cb2(null);
+@@ -1186,11 +1186,11 @@ function putVm(req, res, next) {
+ 
+     // Parse whatever is needed before putting a raw object from vm-agent
+     var vm = common.translateVm(req.params, false);
+-    var publisher = req.app.publisher;
++    var publisher = req.app.changefeedPublisher;
+ 
+     if (vm.state === 'destroyed') {
+         _destroyVm(vm, {
+-            publisher: req.app.publisher,
++            publisher: req.app.changefeedPublisher,
+             moray: req.app.moray
+         }, function vmDestroyed(err, destroyedVm) {
+             if (err) {
+diff --git a/lib/interceptors.js b/lib/interceptors.js
+index 510d7eb..306cdff 100644
+--- a/lib/interceptors.js
++++ b/lib/interceptors.js
+@@ -12,7 +12,9 @@
+  * A brief overview of this source file: what is its purpose.
+  */
+ 
++var assert = require('assert-plus');
+ var restify = require('restify');
++
+ var common = require('./common');
+ 
+ 
+@@ -64,3 +66,26 @@ exports.loadVm = function loadVm(req, res, next) {
+         }
+     }
+ };
++
++exports.checkMorayInitialized = function morayInitialized(req, res, next) {
++    assert.object(req, 'req');
++    assert.object(req.app, 'req.app');
++    assert.object(res, 'res');
++    assert.func(next, 'next');
++
++    var lastMorayInitError;
++    var err;
++
++    if (!req.app.moray.initialized()) {
++        lastMorayInitError = req.app.moray.lastInitError();
++
++        if (lastMorayInitError) {
++            err = new Error('Moray failed to initialize, last error was: '
++                + lastMorayInitError);
++        } else {
++            err = new Error('Moray is not yet initialized');
++        }
++    }
++
++    next(err);
++};
+diff --git a/lib/storage/moray/moray-buckets-config.js b/lib/storage/moray/moray-buckets-config.js
+new file mode 100644
+index 0000000..cc7a0fe
+--- /dev/null
++++ b/lib/storage/moray/moray-buckets-config.js
+@@ -0,0 +1,54 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++var VMS_BUCKET_CONFIG = {
++    name: 'vmapi_vms',
++    schema: {
++        index: {
++            uuid: { type: 'string', unique: true},
++            owner_uuid: { type: 'string' },
++            image_uuid: { type: 'string' },
++            billing_id: { type: 'string' },
++            server_uuid: { type: 'string' },
++            package_name: { type: 'string' },
++            package_version: { type: 'string' },
++            tags: { type: 'string' },
++            brand: { type: 'string' },
++            state: { type: 'string' },
++            alias: { type: 'string' },
++            max_physical_memory: { type: 'number' },
++            create_timestamp: { type: 'number' },
++            docker: { type: 'boolean' }
++        },
++        options: {
++            version: 1
++        }
++    }
++};
++
++var SERVER_VMS_MORAY_BUCKET_CONFIG = {
++    name: 'vmapi_server_vms',
++    schema: {}
++};
++
++var ROLE_TAGS_MORAY_BUCKET_CONFIG = {
++    name: 'vmapi_vm_role_tags',
++    schema: {
++        index: {
++            role_tags: { type: '[string]' }
++        }
++    }
++};
++
++module.exports = {
++    vms: VMS_BUCKET_CONFIG,
++    server_vms: SERVER_VMS_MORAY_BUCKET_CONFIG,
++    vm_role_tags: ROLE_TAGS_MORAY_BUCKET_CONFIG
++};
+diff --git a/lib/storage/moray/moray-buckets-initializer.js b/lib/storage/moray/moray-buckets-initializer.js
+new file mode 100644
+index 0000000..a1e33e3
+--- /dev/null
++++ b/lib/storage/moray/moray-buckets-initializer.js
+@@ -0,0 +1,163 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var backoff = require('backoff');
++var bunyan = require('bunyan');
++var events = require('events');
++var restify = require('restify');
++var util = require('util');
++var verror = require('verror');
++
++/*
++ * MorayBucketsInitializer instances drive the process that sets up the moray
++ * buckets that need to be present for VMAPI to function properly. They take an
++ * instance of the "Moray" constructor and an object that represents the desired
++ * configuration of moray buckets used by VMAPI as input.
++ *
++ * Once an instance of MorayBucketsInitializer has been created, its "start"
++ * method can be called to actually start the process.
++ *
++ * If the process completes successfully, a 'done' event is emitted by a
++ * MorayBucketsInitializer instance. If the process encounters an unrecoverable
++ * error, it emits an 'error' event.
++ */
++
++/*
++ * The MorayBucketsInitializer function is a constructor that can be used to
++ * create instances of MorayBucketsInitializer. It derives from
++ * events.EventEmitter.
++ *
++ * Its parameters are:
++ *
++ * - "options": an object with properties and values that can be used to tweak
++ * the behavior of the initializer. The following properties are supported:
++ *
++ *   * "maxAttempts": the number of attempts before an 'error' event is emitted.
++ *     Its default value is "undefined" and it causes the process to be retried
++ *     indefinitely, unless a non-tranient error is encountered.
++ */
++function MorayBucketsInitializer(options) {
++    assert.optionalObject(options, 'options');
++    if (options) {
++        assert.optionalNumber(options.maxAttempts, 'options.maxAttempts');
++        this._maxAttempts = options.maxAttempts;
++
++        assert.optionalObject(options.log, 'options.log');
++        this._log = options.log;
++    }
++
++    if (!this._log) {
++        this._log = new bunyan({
++            name: 'moray-buckets-initializer',
++            level: 'info',
++            serializers: restify.bunyan.serializers
++        });
++    }
++}
++
++util.inherits(MorayBucketsInitializer, events.EventEmitter);
++
++/*
++ * The "start" method can be used to actually start the process of setting up
++ * VMAPI's moray buckets.
++ *
++ * Its parameters are:
++ *
++ * * - "morayStorage": an instance of the Moray constructor use to actually
++ * perform operations against the moray key/values store.
++ *
++ * - "morayBucketsConfig": an object that represents the configuration of the
++ * buckets that need to be setup in moray for VMAPI to be able to function
++ * properly.
++ *
++ * When the process completes successfully, the 'done' event is emitted on the
++ * MorayBucketsInitializer instance.
++ *
++ * When the process encounters an error, it emits an 'error' event if the error
++ * is considered to be unrecoverable. If the error is considered to be
++ * recoverable, it restarts the process until it succeeds, or until the maximum
++ * number of retries has been reached.
++ *
++ * If the maximum number of retries has been reached, the 'error' event is
++ * emitted.
++ *
++ * Transient moray setup errors are considered to be recoverable and
++ * non-transient errors (such as bad bucket configuration errors) are considered
++ * to be unrecoverable.
++ */
++MorayBucketsInitializer.prototype.start =
++    function start(morayStorage, morayBucketsConfig) {
++    assert.object(morayStorage, 'morayStorage');
++    assert.object(morayBucketsConfig, 'morayBucketsConfig');
++
++    var self = this;
++
++    var INITIAL_SETUP_BUCKET_BACKOFF_DELAY_MS = 10;
++    var MAX_SETUP_BUCKET_BACKOFF_DELAY_MS = 5000;
++
++    var setupMorayBucketsBackoff = backoff.exponential({
++        initialDelay: INITIAL_SETUP_BUCKET_BACKOFF_DELAY_MS,
++        maxDelay: MAX_SETUP_BUCKET_BACKOFF_DELAY_MS
++    });
++
++    if (self._maxAttempts !== undefined) {
++        setupMorayBucketsBackoff.failAfter(self._maxAttempts);
++    }
++
++    function onBucketsSetup(bucketsSetupErr) {
++        var errTransient = true;
++
++        if (bucketsSetupErr) {
++            errTransient =
++                morayStorage.isBucketsSetupErrorTransient(bucketsSetupErr);
++            if (!errTransient) {
++                self._log.error({error: bucketsSetupErr},
++                    'Non-transient error encountered, stopping buckets setup ' +
++                        'backoff');
++                setupMorayBucketsBackoff.reset();
++
++                self.emit('error', new verror.VError({
++                    cause: bucketsSetupErr
++                }, 'Non transient error encountered when setting up moray ' +
++                    'buckets'));
++            } else {
++                self._log.warn({error: bucketsSetupErr},
++                    'Transient error encountered, backing off');
++                setupMorayBucketsBackoff.backoff();
++            }
++        } else {
++            self._log.info('Moray buckets initialization done!');
++            setupMorayBucketsBackoff.reset();
++            self.emit('done');
++        }
++    }
++
++    setupMorayBucketsBackoff.on('ready', function onSetupBucketsBackoffReady() {
++        morayStorage.setupBuckets(morayBucketsConfig, onBucketsSetup);
++    });
++
++    setupMorayBucketsBackoff.on('backoff',
++        function onSetupBucketsBackoff(number, delay) {
++            self._log.warn({
++                number: number,
++                delay: delay
++            }, 'Moray buckets setup backed off');
++        });
++
++    setupMorayBucketsBackoff.on('fail', function onSetupBucketsFail() {
++        self.emit('error', new Error('Maximum number of tries reached when ' +
++            'initializing moray buckets'));
++    });
++
++    setupMorayBucketsBackoff.backoff();
++};
++
++module.exports = MorayBucketsInitializer;
+\ No newline at end of file
+diff --git a/lib/apis/moray.js b/lib/storage/moray/moray.js
+similarity index 60%
+rename from lib/apis/moray.js
+rename to lib/storage/moray/moray.js
+index 179559f..029aca3 100644
+--- a/lib/apis/moray.js
++++ b/lib/storage/moray/moray.js
+@@ -5,27 +5,38 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+ /*
+- * Functions for dealing with the Moray datastore.
++ * This module implements a "Moray" class that can be used to create objects
++ * that act as an abstraction layer on top of the moray key/values store used to
++ * store data about VMs.
++ *
++ * Instead of directly using a moray client and having to know the
++ * implementation details about how VMAPI objects are stored, one can use
++ * instances of the Moray object and use a simpler API that handles these
++ * implementation details when reading and writing VMAPI objects to the moray
++ * database.
++ *
++ * VMAPI uses one instance of Moray, and so most of the time it is used as a
++ * singleton, even though any number instances of the Moray constructor can be
++ * created.
+  */
+ 
+-
+-var EventEmitter = require('events').EventEmitter;
+-var sprintf = require('sprintf').sprintf;
+ var assert = require('assert-plus');
+-var restify = require('restify');
+-var util = require('util');
+-var Logger = require('bunyan');
+-var async = require('async');
++var EventEmitter = require('events').EventEmitter;
+ var jsprint = require('jsprim');
+ var ldapjs = require('ldapjs');
++var Logger = require('bunyan');
++var once = require('once');
++var restify = require('restify');
++var sprintf = require('sprintf').sprintf;
++var util = require('util');
++var vasync = require('vasync');
+ 
+-var errors = require('../errors');
+-var common = require('./../common');
+-var moray = require('moray');
++var errors = require('../../errors');
++var common = require('../../common');
+ 
+ var SELECT_ALL_FILTER = '(uuid=*)';
+ var PARAM_FILTER = '(%s=%s)';
+@@ -33,23 +44,6 @@ var PARAM_FILTER_GE = '(%s>=%s)';
+ var PARAM_FILTER_LE = '(%s<=%s)';
+ var PARAM_FILTER_NE = '(!(%s=%s))';
+ 
+-// Only indexed columns can be searched
+-var SEARCHABLE_FIELDS = [
+-    'uuid',
+-    'owner_uuid',
+-    'image_uuid',
+-    'billing_id',
+-    'server_uuid',
+-    'package_name',
+-    'package_version',
+-    'brand',
+-    'state',
+-    'alias',
+-    'max_physical_memory',
+-    'ram',
+-    'create_timestamp'
+-];
+-
+ // Fields that are deprecated that we're going to remove from VMs as we put
+ var DEPRECATED_VM_FIELDS = [
+     'package_name',
+@@ -57,119 +51,159 @@ var DEPRECATED_VM_FIELDS = [
+ ];
+ 
+ /*
+- * Basically the VMs table
++ * The constructor that can be used to create instances of the Moray class.
++ *
++ * Parameters:
++ *
++ * - options: an object with the following properties:
++ *
++ * * morayClient (required): the instance of a moray client that will be used by
++ * this Moray instance to perform all operations on the moray database.
++ *
++ * * log (optional): an instance of a bunyan logger that will be used to log
++ * messages.
+  */
+-var VMS_BUCKET_NAME = 'vmapi_vms';
+-var VMS_BUCKET = {
+-    index: {
+-        uuid: { type: 'string', unique: true},
+-        owner_uuid: { type: 'string' },
+-        image_uuid: { type: 'string' },
+-        billing_id: { type: 'string' },
+-        server_uuid: { type: 'string' },
+-        package_name: { type: 'string' },
+-        package_version: { type: 'string' },
+-        tags: { type: 'string' },
+-        brand: { type: 'string' },
+-        state: { type: 'string' },
+-        alias: { type: 'string' },
+-        max_physical_memory: { type: 'number' },
+-        create_timestamp: { type: 'number' },
+-        docker: { type: 'boolean' }
+-    }
+-};
++function Moray(morayClient, options) {
++    EventEmitter.call(this);
+ 
++    assert.object(morayClient, 'morayClient');
++    this._morayClient = morayClient;
+ 
+-/*
+- * This table allows us to keep track of VMs on a server so VMAPI
+- * can detect if a VM has been destroyed
+- */
+-var SERVER_VMS_BUCKET_NAME = 'vmapi_server_vms';
+-var SERVER_VMS_BUCKET = {};
++    assert.optionalObject(options, 'options');
++    options = options || {};
+ 
++    assert.optionalObject(options.log, 'options.log');
++    this.log = options.log || new Logger({
++        name: 'moray-storage',
++        level: options.logLevel || 'info',
++        serializers: restify.bunyan.serializers
++    });
++
++    this._initialized = false;
++    this._settingUpBuckets = false;
++}
+ 
+ /*
+- * This table allows us to store role_tags for VMs
++ * Returns true if the "err" error object represents a transient error, that is
++ * an error that could be solved after retrying the same action.
+  */
+-var VM_ROLE_TAGS_BUCKET_NAME = 'vmapi_vm_role_tags';
+-var VM_ROLE_TAGS_BUCKET = {
+-    index: {
+-        role_tags: { type: '[string]' }
+-    }
+-};
+-
++Moray.prototype.isBucketsSetupErrorTransient =
++    function isBucketsSetupErrorTransient(err) {
++        assert.object(err, 'err');
++        assert.string(err.name, 'err.name');
++
++        var NON_TRANSIENT_ERROR_NAMES = [
++            /* Errors sent by the moray server */
++            'InvalidBucketConfigError',
++            'InvalidBucketNameError',
++            'InvalidIndexDefinitionError',
++            'NotFunctionError',
++            'BucketVersionError',
++            /* Custom errors generated by this Moray abstraction layer */
++            'InvalidIndexesRemovalError'
++        ];
++
++        return NON_TRANSIENT_ERROR_NAMES.indexOf(err.name) === -1;
++    };
+ 
+ /*
+- * Moray constructor
++ * Initializes VMAPI's moray buckets, including creating them if they're
++ * missing, or adding indexes that do not need reindexing. Calls the 'callback'
++ * function when that setup completed.
++ *
++ * If the setup results in an error, the first argument of the 'callback'
++ * function is an Error object. The
++ * 'Moray.prototype.isBucketsSetupErrorNonTransient' can be used to determine
++ * whether that error is non transient, and how to act on it depending on the
++ * program's expectations and behavior.
++ *
++ * This method can be called more than once per instance of the Moray
++ * constructor, as long as each call is made after the previous setup process
++ * terminated, either successfully or with an error, by calling the 'callback'
++ * function passed as a parameter. Calling this method while a previous call is
++ * still in flight will throw an error.
+  */
+-function Moray(options) {
+-    EventEmitter.call(this);
+-    // this.log = options.log;
+-    // this.log.level(options.logLevel || 'info');
+-    this.log = new Logger({
+-        name: 'moray',
+-        level: options.logLevel || 'info',
+-        serializers: restify.bunyan.serializers
+-    });
+-    this.options = options;
+-}
++Moray.prototype.setupBuckets = function setupBuckets(bucketsConfig, callback) {
++    assert.object(bucketsConfig, 'bucketsConfig');
++    assert.object(bucketsConfig.vms, 'bucketsConfig.vms');
++    assert.object(bucketsConfig.server_vms, 'bucketsConfig.server_vms');
++    assert.object(bucketsConfig.vm_role_tags, 'bucketsConfig.vm_role_tags');
++
++    var self = this;
++    var bucketsList = [];
++    var bucketConfig;
+ 
+-util.inherits(Moray, EventEmitter);
++    self.log.info({bucketsConfig: bucketsConfig},
++        'Setting up moray buckets...');
+ 
++    self._VMS_BUCKET_NAME = bucketsConfig.vms.name;
++    self._VM_ROLE_TAGS_BUCKET_NAME = bucketsConfig.vm_role_tags.name;
+ 
++    for (bucketConfig in bucketsConfig) {
++        bucketsList.push(bucketsConfig[bucketConfig]);
++    }
+ 
+-/*
+- * Attempts to connect to moray, retrying until connection is established. After
+- * connection is established buckets get initialized
+- */
+-Moray.prototype.connect = function () {
+-    var self = this;
+-    var log = this.log;
+-    var retry = this.options.retry || {};
+-    this.log.debug('Connecting to moray...');
+-
+-    var connection = this.connection = moray.createClient({
+-        connectTimeout: this.options.connectTimeout || 200,
+-        log: this.log,
+-        host: this.options.host,
+-        port: this.options.port,
+-        reconnect: true,
+-        retry: (this.options.retry === false ? false : {
+-            retries: Infinity,
+-            minTimeout: retry.minTimeout || 1000,
+-            maxTimeout: retry.maxTimeout || 16000
+-        })
+-    });
++    if (self._settingUpBuckets === true) {
++        throw new Error('setupBuckets cannot be called when a setup ' +
++            'process is in progress');
++    }
+ 
+-    connection.on('connect', function () {
+-        log.info({ moray: connection.toString() }, 'moray: connected');
+-        self.emit('moray-connected');
++    self._settingUpBuckets = true;
+ 
+-        connection.on('error', function (err) {
+-            // not much more to do because the moray client should take
+-            // care of reconnecting, etc.
+-            log.error(err, 'moray client error');
+-        });
++    self._trySetupBuckets(bucketsList, function (setupBucketsErr) {
++        self._settingUpBuckets = false;
++        self._lastInitError = setupBucketsErr;
+ 
+-        self._setupBuckets(function (err) {
+-            if (err) {
+-                self.log.error({ err: err }, 'Buckets were not loaded');
+-            } else {
+-                self.emit('moray-ready');
+-                self.log.info('Buckets have been loaded');
+-            }
+-        });
++        if (setupBucketsErr) {
++            self.log.error({ error: setupBucketsErr },
++                'Error when setting up moray buckets');
++        } else {
++            self.log.info('Buckets have been setup successfully');
++            self._initialized = true;
++        }
++
++        callback(setupBucketsErr);
+     });
+ };
+ 
++/*
++ * Returns true if VMAPI's moray buckets have been setup successfully, false
++ * otherwise.
++ */
++Moray.prototype.initialized = function initialized() {
++    return this._initialized;
++};
++
++/*
++ * Returns an object representing the latest error encountered when setting up
++ * VMAPI's moray buckets, null otherwise.
++ */
++Moray.prototype.lastInitError = function lastInitError() {
++    return this._lastInitError;
++};
++
++/*
++ * Returns a string representing an error message to signal that the Moray layer
++ * wasn't initialized.
++ */
++Moray.prototype._createMorayNotInitialzedErrMsg =
++    function _createMorayNotInitialzedErrMsg() {
++        var errMsg = 'Moray is not initialized';
++        var lastError = this.lastInitError();
+ 
++        if (lastError !== null) {
++            errMsg += ', reason: ' + lastError;
++        }
++
++        return errMsg;
++    };
+ 
+ /*
+  * Pings Moray by calling its ping method
+  */
+ Moray.prototype.ping = function (callback) {
+     // Default ping timeout is 1 second
+-    return this.connection.ping({ log: this.log }, callback);
++    return this._morayClient.ping({ log: this.log }, callback);
+ };
+ 
+ 
+@@ -184,6 +218,11 @@ Moray.prototype.getVm = function (params, cb) {
+     var filter = '';
+     var error;
+ 
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     if (!common.validUUID(uuid)) {
+         error = [ errors.invalidUuidErr('uuid') ];
+         return cb(new errors.ValidationFailedError('Invalid Parameters',
+@@ -205,7 +244,7 @@ Moray.prototype.getVm = function (params, cb) {
+ 
+ 
+     var vm;
+-    var req = this.connection.findObjects(VMS_BUCKET_NAME, filter);
++    var req = this._morayClient.findObjects(this._VMS_BUCKET_NAME, filter);
+ 
+     req.once('error', function (err) {
+         return cb(err);
+@@ -230,13 +269,18 @@ Moray.prototype.getVms = function (uuids, cb) {
+     var filter = '';
+     var i;
+ 
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     for (i = 0; i < uuids.length; i++) {
+         filter += sprintf(PARAM_FILTER, 'uuid', uuids[i]);
+     }
+ 
+     filter = '(|' + filter + ')';
+     var vms = [];
+-    var req = this.connection.findObjects(VMS_BUCKET_NAME, filter);
++    var req = this._morayClient.findObjects(this._VMS_BUCKET_NAME, filter);
+ 
+     req.once('error', function (err) {
+         return cb(err);
+@@ -361,13 +405,19 @@ Moray.prototype._vmsListParams = function (params, cb) {
+  * For this one we need exactly the VM that has the provided UUID
+  */
+ Moray.prototype._getVmObject = function (uuid, cb) {
+-    this.connection.getObject(VMS_BUCKET_NAME, uuid, function (err, obj) {
+-        if (err) {
+-            cb(err);
+-        } else {
+-            cb(null, obj.value);
+-        }
+-    });
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
++    this._morayClient.getObject(this._VMS_BUCKET_NAME, uuid,
++        function onGetObject(err, obj) {
++            if (err) {
++                cb(err);
++            } else {
++                cb(null, obj.value);
++            }
++        });
+ };
+ 
+ 
+@@ -473,10 +523,16 @@ Moray.prototype.listVmsForServer = function listVmsForServer(uuid, cb) {
+     var vms = {};
+     var vm;
+     var filter = sprintf(PARAM_FILTER, 'server_uuid', uuid);
++
++    if (!self.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     filter += sprintf(PARAM_FILTER_NE, 'state', 'destroyed');
+     filter = '(&' + filter + ')';
+ 
+-    var req = self.connection.findObjects(VMS_BUCKET_NAME, filter);
++    var req = self._morayClient.findObjects(self._VMS_BUCKET_NAME, filter);
+ 
+     req.once('error', function (error) {
+         return cb(error);
+@@ -506,6 +562,11 @@ Moray.prototype.listVms = function listVms(params, raw, cb) {
+         raw = false;
+     }
+ 
++    if (!self.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     self._createSearch(params, function (err, ldapFilter) {
+         if (err) {
+             return cb(err);
+@@ -516,7 +577,7 @@ Moray.prototype.listVms = function listVms(params, raw, cb) {
+         var vm;
+         var vms = [];
+         var filterOptions = _addPaginationOptions(params, ldapFilter);
+-        var req = self.connection.findObjects(VMS_BUCKET_NAME,
++        var req = self._morayClient.findObjects(self._VMS_BUCKET_NAME,
+             filterOptions.ldapFilter, filterOptions.morayOptions);
+ 
+         req.once('error', function (error) {
+@@ -559,6 +620,11 @@ Moray.prototype.listVms = function listVms(params, raw, cb) {
+ Moray.prototype.countVms = function countVms(params, cb) {
+     var self = this;
+ 
++    if (!self.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     self._createSearch(params, function (err, string) {
+         if (err) {
+             return cb(err);
+@@ -569,7 +635,8 @@ Moray.prototype.countVms = function countVms(params, cb) {
+         };
+ 
+         self.log.info({ filter: string }, 'countVms filter');
+-        var req = self.connection.findObjects(VMS_BUCKET_NAME, string, options);
++        var req = self._morayClient.findObjects(self._VMS_BUCKET_NAME, string,
++            options);
+         var count = 0;
+ 
+         req.on('record', function (r) {
+@@ -596,7 +663,13 @@ Moray.prototype.countVms = function countVms(params, cb) {
+  */
+ Moray.prototype.putVm = function (uuid, vm, cb) {
+     var object = this._toMorayVm(vm);
+-    this.connection.putObject(VMS_BUCKET_NAME, uuid, object, cb);
++
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
++    this._morayClient.putObject(this._VMS_BUCKET_NAME, uuid, object, cb);
+ };
+ 
+ /*
+@@ -606,8 +679,13 @@ Moray.prototype.putVm = function (uuid, vm, cb) {
+ Moray.prototype.delVms = function delVms(params, cb) {
+     assert.object(params, 'params');
+     assert.func(cb, 'cb');
+-
+     var self = this;
++
++    if (!self.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     self._createSearch(params, function (err, filter) {
+         if (err) {
+             return cb(err);
+@@ -616,7 +694,8 @@ Moray.prototype.delVms = function delVms(params, cb) {
+         // Make sure that the filter is not the filter that selects all VMs.
+         // We don't want to allow deletion of all VMs via this API.
+         assert.notEqual(filter, SELECT_ALL_FILTER);
+-        return self.connection.deleteMany(VMS_BUCKET_NAME, filter, params, cb);
++        return self._morayClient.deleteMany(self._VMS_BUCKET_NAME, filter,
++            params, cb);
+     });
+ };
+ 
+@@ -626,6 +705,11 @@ Moray.prototype.delVms = function delVms(params, cb) {
+ Moray.prototype.markAsDestroyed = function (vm, callback) {
+     var self = this;
+ 
++    if (!self.initialized()) {
++        callback(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     var state = (vm.state === 'provisioning') ? 'failed' : 'destroyed';
+ 
+     vm.state = state;
+@@ -839,65 +923,214 @@ Moray.prototype._addTagsFilter = function (params, filter) {
+ 
+ 
+ /*
+- * Sets up the VMAPI buckets.
++ * Tries to setup VMAPI's moray buckets as specified by the array "buckets".
++ * Calls the function "cb" when done. If there was an error, the "cb" function
++ * is called with an error object as its first parameter, otherwise it is called
++ * without passing any parameter.
+  */
+-Moray.prototype._setupBuckets = function (cb) {
++Moray.prototype._trySetupBuckets = function _trySetupBuckets(buckets, cb) {
++    assert.arrayOfObject(buckets, 'buckets');
++    assert.func(cb, 'cb');
++
+     var self = this;
+-    var buckets = [ {
+-        name: VMS_BUCKET_NAME,
+-        indices: VMS_BUCKET
+-    }, {
+-        name: SERVER_VMS_BUCKET_NAME,
+-        indices: SERVER_VMS_BUCKET
+-    }, {
+-        name: VM_ROLE_TAGS_BUCKET_NAME,
+-        indices: VM_ROLE_TAGS_BUCKET
+-    } ];
+-
+-    async.mapSeries(buckets, function (bucket, next) {
+-        self._getBucket(bucket.name, function (err, bck) {
+-            if (err) {
+-                if (err.name === 'BucketNotFoundError') {
+-                    self._createBucket(bucket.name, bucket.indices, next);
+-                } else {
+-                    next(err);
++
++    vasync.forEachPipeline({
++        func: function setupEachBucket(newBucketConfig, done) {
++            assert.object(newBucketConfig, 'newBucketConfig');
++            var bucketName = newBucketConfig.name;
++            assert.string(bucketName, 'bucketName');
++
++            self._trySetupBucket(bucketName, newBucketConfig, done);
++        },
++        inputs: buckets
++    }, cb);
++};
++
++function InvalidIndexesRemovalError(indexes) {
++    Error.call(this);
++
++    assert.arrayOfString(indexes, 'indexes');
++    this.name = this.constructor.name;
++    this.message = 'Invalid removal of indexes: ' + indexes.join(', ');
++}
++util.inherits(InvalidIndexesRemovalError, Error);
++
++/*
++ * Returns true if the updating a moray bucket from the bucket schema
++ * "oldBucketSchema" to "newBucketSchema" would imply removing at least one
++ * index. Returns false otherwise.
++ */
++function indexesRemovedBySchemaChange(oldBucketSchema, newBucketSchema) {
++    assert.object(oldBucketSchema, 'oldBucketSchema');
++    assert.object(newBucketSchema, 'newBucketSchema');
++
++    var oldBucketIndexNames = Object.keys(oldBucketSchema.index);
++    var newBucketIndexNames = Object.keys(newBucketSchema.index);
++
++    var indexesRemoved =
++        oldBucketIndexNames.filter(function indexMissingInNewSchema(indexName) {
++            return newBucketIndexNames.indexOf(indexName) === -1;
++        });
++
++    return indexesRemoved;
++}
++
++/*
++ * Tries to set up bucket with name "bucketName" to have configuration
++ * "bucketConfig". The setup process includes, in that order:
++ *
++ *  1. creating the bucket if it does not exist.
++ *
++ *  2. updating the bucket's indexes to add indexes. Indexes cannot be removed
++ * because it's a backward incompitble change: if a code rollback is performed,
++ * older code that would rely on the deleted indexes wouldn't be able to work
++ * properly, and removing indexes will generate an error.
++ *
++ * Reindexing is not performed. It's a process that can take a significant
++ * amount of time, and since VMAPI's API is not considered to be healthy until
++ * the buckets setup is complete, it would potentially make the service
++ * unavailable for too long.
++ */
++function _trySetupBucket(bucketName, bucketConfig, cb) {
++    assert.string(bucketName, 'bucketName');
++    assert.object(bucketConfig, 'bucketConfig');
++    assert.object(bucketConfig.schema, 'bucketConfig.schema');
++    assert.optionalObject(bucketConfig.schema.options,
++        'bucketConfig.schema.options');
++    if (bucketConfig.schema.options) {
++        assert.optionalNumber(bucketConfig.schema.options.version,
++            'bucketConfig.schema.options.version');
++    }
++
++    assert.func(cb, 'cb');
++
++    var self = this;
++    var newBucketSchema = bucketConfig.schema;
++
++    vasync.waterfall([
++        function loadBucket(next) {
++            self._getBucket(bucketName, function (err, oldBucketSchema) {
++                if (err && err.name === 'BucketNotFoundError') {
++                    err = null;
++                 }
++
++                next(err, oldBucketSchema);
++            });
++        },
++        function createBucket(oldBucketSchema, next) {
++            if (!oldBucketSchema) {
++                self.log.info('Bucket ' + bucketName +
++                    ' not found, creating it...');
++                self._createBucket(bucketName, bucketConfig.schema,
++                    function createDone(createErr) {
++                        if (createErr) {
++                            self.log.error({err: createErr},
++                                'Error when creating bucket ' +
++                                    bucketName);
++                        } else {
++                            self.log.info('Bucket ' +
++                                bucketName +
++                                    ' created successfully');
++                        }
++
++                        next(createErr, oldBucketSchema);
++                    });
++             } else {
++                /* bucket already exists, nothing to do in this step. */
++                self.log.info('Bucket ' + bucketName + ' already exists, not ' +
++                    'creating it.');
++                next(null, oldBucketSchema);
++            }
++        },
++        function updateBucketSchema(oldBucketSchema, next) {
++            assert.optionalObject(oldBucketSchema, 'oldBucketSchema');
++
++            var oldVersion = 0;
++            var newVersion = 0;
++            var removedIndexes = [];
++
++            if (oldBucketSchema && oldBucketSchema.options &&
++                oldBucketSchema.options.version) {
++                oldVersion = oldBucketSchema.options.version;
++            }
++
++            if (newBucketSchema.options && newBucketSchema.options.version) {
++                newVersion = newBucketSchema.options.version;
++            }
++
++            /*
++             * If the bucket's version was bumped, update the bucket, otherwise:
++             *
++             * 1. the version number wasn't bumped because no change was made
++             * and there's nothing to do.
++             *
++             * 2. the version number is lower than the current version number in
++             * moray. This can be the result of a code rollback. Since we make
++             * only backward compatible changes for moray buckets, and
++             * decrementing a bucket's version number is an error, it's ok to
++             * not change the bucket.
++             */
++            if (newVersion > oldVersion) {
++                removedIndexes = indexesRemovedBySchemaChange(oldBucketSchema,
++                    newBucketSchema);
++                if (removedIndexes.length > 0) {
++                    next(new InvalidIndexesRemovalError(removedIndexes));
++                    return;
+                 }
++
++                self.log.info('Updating bucket ' + bucketName + ' from ' +
++                    'version ' + oldVersion + ' to version ' + newVersion +
++                    '...');
++
++                return self._updateBucket(bucketName, newBucketSchema,
++                    function updateDone(updateErr) {
++                        if (updateErr) {
++                            self.log.error({err: updateErr},
++                                'Error when updating bucket ' +
++                                    bucketName);
++                        } else {
++                            self.log.info('Bucket ' + bucketName +
++                                ' updated successfully');
++                        }
++
++                        next(updateErr);
++                    });
+             } else {
++                self.log.info('Bucket ' + bucketName + ' already at version ' +
++                    newVersion + ', no need to update it');
+                 next(null);
+             }
+-        });
+-    }, function (err) {
+-        cb(err);
+-    });
+-};
+-
+-
++        }
++    ], cb);
++}
++Moray.prototype._trySetupBucket = _trySetupBucket;
+ 
+ /*
+  * Gets a bucket
+  */
+ Moray.prototype._getBucket = function (name, cb) {
+-    this.connection.getBucket(name, cb);
++    this._morayClient.getBucket(name, cb);
+ };
+ 
+ 
+-
+ /*
+  * Creates a bucket
+  */
+ Moray.prototype._createBucket = function (name, config, cb) {
+-    this.connection.createBucket(name, config, cb);
++    this._morayClient.createBucket(name, config, cb);
+ };
+ 
+ 
+-
+ /*
+  * Deletes a bucket
+  */
+ Moray.prototype._deleteBucket = function (name, cb) {
+-    this.connection.delBucket(name, cb);
++    this._morayClient.delBucket(name, cb);
+ };
+ 
++Moray.prototype._updateBucket = function (name, schema, cb) {
++    this._morayClient.updateBucket(name, schema, cb);
++};
+ 
+ 
+ /*
+@@ -970,13 +1203,19 @@ Moray.prototype._toMorayVm = function (vm) {
+ Moray.prototype.getRoleTags = function (roleTags, cb) {
+     var filter = '';
+ 
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
+     roleTags.forEach(function (roleTag) {
+         filter += sprintf(PARAM_FILTER, 'role_tags', roleTag);
+     });
+ 
+     filter = '(|' + filter + ')';
+     var uuids = [];
+-    var req = this.connection.findObjects(VM_ROLE_TAGS_BUCKET_NAME, filter);
++    var req = this._morayClient.findObjects(this._VM_ROLE_TAGS_BUCKET_NAME,
++        filter);
+ 
+     req.once('error', function (err) {
+         return cb(err);
+@@ -996,7 +1235,12 @@ Moray.prototype.getRoleTags = function (roleTags, cb) {
+  * Get all role_tags for a VM
+  */
+ Moray.prototype.getVmRoleTags = function (uuid, cb) {
+-    this.connection.getObject(VM_ROLE_TAGS_BUCKET_NAME, uuid,
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
++    this._morayClient.getObject(this._VM_ROLE_TAGS_BUCKET_NAME, uuid,
+         function (err, obj) {
+         if (err) {
+             if (err.name === 'ObjectNotFoundError') {
+@@ -1016,7 +1260,14 @@ Moray.prototype.getVmRoleTags = function (uuid, cb) {
+  */
+ Moray.prototype.putVmRoleTags = function (uuid, roleTags, cb) {
+     var object = { role_tags: roleTags };
+-    this.connection.putObject(VM_ROLE_TAGS_BUCKET_NAME, uuid, object, cb);
++
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
++    this._morayClient.putObject(this._VM_ROLE_TAGS_BUCKET_NAME, uuid, object,
++        cb);
+ };
+ 
+ 
+@@ -1024,13 +1275,19 @@ Moray.prototype.putVmRoleTags = function (uuid, roleTags, cb) {
+  * Deletes all role_tags for a VM
+  */
+ Moray.prototype.delVmRoleTags = function (uuid, cb) {
+-    this.connection.delObject(VM_ROLE_TAGS_BUCKET_NAME, uuid, function (err) {
+-        if (!err || (err && err.name === 'ObjectNotFoundError')) {
+-            cb(null);
+-        } else {
+-            cb(err);
+-        }
+-    });
++    if (!this.initialized()) {
++        cb(new Error(this._createMorayNotInitialzedErrMsg()));
++        return;
++    }
++
++    this._morayClient.delObject(this._VM_ROLE_TAGS_BUCKET_NAME, uuid,
++        function (err) {
++            if (!err || (err && err.name === 'ObjectNotFoundError')) {
++                cb(null);
++            } else {
++                cb(err);
++            }
++        });
+ };
+ 
+ module.exports = Moray;
+diff --git a/lib/vmapi.js b/lib/vmapi.js
+index e3da883..682c52b 100644
+--- a/lib/vmapi.js
++++ b/lib/vmapi.js
+@@ -12,116 +12,96 @@
+  * Main entry-point for the VMs API.
+  */
+ 
+-var restify = require('restify');
+-var Logger = require('bunyan');
+-var util = require('util');
++
++
+ var assert = require('assert-plus');
+ var async = require('async');
+-var trace_event = require('trace-event');
+ var changefeed = require('changefeed');
+-
+ var EffluentLogger = require('effluent-logger');
++var EventEmitter = require('events').EventEmitter;
++var Logger = require('bunyan');
++var once = require('once');
++var restify = require('restify');
++var util = require('util');
++var trace_event = require('trace-event');
+ 
+ var curlUserAgent = require('./restify-plugins/curl-user-agent');
+ var interceptors = require('./interceptors');
+-
+ var jobs = require('./endpoints/jobs');
+ var metadata = require('./endpoints/metadata');
+ var ping = require('./endpoints/ping');
+ var roleTags = require('./endpoints/role-tags');
+ var statuses = require('./endpoints/statuses');
+ var vms = require('./endpoints/vms');
+-
+-var CNAPI = require('./apis/cnapi');
+-var IMGAPI = require('./apis/imgapi');
+-var MORAY = require('./apis/moray');
+-var NAPI = require('./apis/napi');
+-var PAPI = require('./apis/papi');
+-var WFAPI = require('./apis/wfapi');
+-
+ var validations = require('./common/validation');
+ 
+-var EventEmitter = require('events').EventEmitter;
+-
+ var os = require('os');
+ var crypto = require('crypto');
+ var http = require('http');
+ var https = require('https');
+ 
+ var request_seq_id = 0;
+-
++var API_SERVER_DEFAULT_PORT = 80;
+ 
+ /*
+  * VMAPI constructor
+  */
+ function VMAPI(options) {
+-    this.validateConfig(options);
+-    this.config = options;
+-
+     EventEmitter.call(this);
+ 
+-    http.globalAgent.maxSockets = this.config.maxSockets || 100;
+-    https.globalAgent.maxSockets = this.config.maxSockets || 100;
++    assert.object(options, 'options');
++    assert.optionalObject(options.log, 'options.log');
+ 
+-    validations.init(options);
++    assert.optionalObject(options.apiClients, 'options.apiClients');
++    if (options.apiClients) {
++        assert.optionalObject(options.apiClients.wfapi,
++            'options.apiClients.wfapi');
++        this.wfapi = options.apiClients.wfapi;
+ 
+-    this._initApis();
+-}
++        assert.optionalObject(options.apiClients.cnapi,
++            'options.apiClients.cnapi');
++        this.cnapi = options.apiClients.cnapi;
+ 
+-util.inherits(VMAPI, EventEmitter);
++        assert.optionalObject(options.apiClients.imgapi,
++            'options.apiClients.imgapi');
++        this.imgapi = options.apiClients.imgapi;
+ 
++        assert.optionalObject(options.apiClients.napi,
++            'options.apiClients.napi');
++        this.napi = options.apiClients.napi;
+ 
++        assert.optionalObject(options.apiClients.papi,
++            'options.apiClients.papi');
++        this.papi = options.apiClients.papi;
++    }
+ 
+-/*
+- * Validates that the minimum configuration values are present
+- */
+-VMAPI.prototype.validateConfig = function (options) {
+-    assert.object(options, 'VMAPI configuration');
+-    assert.object(options.api, 'VMAPI config.api');
+-
+-    // WFAPI
+-    assert.object(options.wfapi, 'VMAPI config.wfapi');
+-    assert.string(options.wfapi.url, 'VMAPI config.wfapi.url');
+-    assert.arrayOfString(options.wfapi.workflows,
+-        'VMAPI config.wfapi.workflows');
+-
+-    // CNAPI
+-    assert.object(options.cnapi, 'VMAPI config.cnapi');
+-    assert.string(options.cnapi.url, 'VMAPI config.cnapi.url');
+-
+-    // IMGAPI
+-    assert.object(options.imgapi, 'VMAPI config.imgapi');
+-    assert.string(options.imgapi.url, 'VMAPI config.imgapi.url');
+-
+-    // NAPI
+-    assert.object(options.napi, 'VMAPI config.napi');
+-    assert.string(options.napi.url, 'VMAPI config.napi.url');
+-
+-    // PAPI
+-    assert.object(options.papi, 'VMAPI config.papi');
+-    assert.string(options.papi.url, 'VMAPI config.papi.url');
+-
+-    // Moray
+-    assert.object(options.moray, 'Moray config.host');
+-    assert.string(options.moray.host, 'Moray config.moray.host');
+-    assert.number(options.moray.port, 'Moray config.moray.port');
+-
+-    // Changefeed
+-    assert.object(options.changefeed,
+-        'Changefeed config.changefeed');
+-    assert.object(options.changefeed.moray,
+-        'Changefeed config.changefeed.moray');
+-    assert.string(options.changefeed.moray.bucketName,
+-        'Changefeed config.changefeed.moray.bucketName');
+-    assert.string(options.changefeed.moray.host,
+-        'Changefeed config.changefeed.moray.host');
+-    assert.number(options.changefeed.moray.port,
+-        'Changefeed config.changefeed.moray.port');
+-    assert.number(options.changefeed.maxAge,
+-        'Changefeed config.changefeed.maxAge');
+-    assert.arrayOfObject(options.changefeed.resources,
+-        'Changefeed config.Changefeed.resources');
+-};
++    /*
++     * options.storage is mandatory because we consider VMAPI cannot provide
++     * even its most basic functionality without some kind of storage (not
++     * necessarily persistent)
++     */
++    assert.object(options.storage, 'options.storage');
++    this.moray = options.storage;
++
++    assert.optionalObject(options.changefeed, 'options.changefeed');
++
++    if (options.log === undefined) {
++        this.log = new Logger({
++            name: 'vmapi',
++            level: 'debug',
++            serializers: restify.bunyan.serializers
++        });
++    } else {
++        this.log = options.log;
++    }
++
++    this.changefeedOptions = options.changefeed;
++
++    validations.init(options);
++    this._initApis(options);
++}
++
++util.inherits(VMAPI, EventEmitter);
+ 
+ function addFluentdHost(log, host) {
+     var evtLogger = new EffluentLogger({
+@@ -152,29 +132,24 @@ function responseIndicatesSuccess(res) {
+ /*
+  * VMAPI API objects initialization code
+  */
+-VMAPI.prototype._initApis = function () {
+-    var config = this.config;
+-    config.api.url = 'http://' + this.serverIp();
++VMAPI.prototype._initApis = function _initApis(options) {
++    assert.object(options, 'options');
+ 
+-    // Init logger
++    var apiVersion = options.version;
+ 
+-    var log = this.log = new Logger({
+-        name: 'vmapi',
+-        level: config.logLevel,
+-        serializers: restify.bunyan.serializers
+-    });
++    var log = this.log;
++    assert.object(log, 'log');
+ 
+     // EXPERIMENTAL
+-    if (config.fluentd_host) {
+-        addFluentdHost(log, config.fluentd_host);
++    if (options.fluentd_host) {
++        addFluentdHost(log, options.fluentd_host);
+     }
+ 
+     // Init VMAPI server
+-
+     this.server = restify.createServer({
+         name: 'VMAPI',
+         log: log.child({ component: 'api' }, true),
+-        version: config.version,
++        version: apiVersion,
+         serverName: 'SmartDataCenter',
+         formatters: {
+             'application/json': formatJSON,
+@@ -236,61 +211,55 @@ VMAPI.prototype._initApis = function () {
+         res.send(new restify.InternalError('Internal Server Error'));
+     });
+ 
+-    config.napi.log = log.child({ component: 'napi' }, true);
+-    config.cnapi.log = log.child({ component: 'cnapi' }, true);
+-    config.wfapi.log = log.child({ component: 'wfapi' }, true);
+-    config.moray.log = log.child({ component: 'moray' }, true);
+-    config.changefeed.log = log.child({ component: 'changefeed' }, true);
+-
+-    // Init Moray
+-
+-    this.moray = new MORAY(config.moray);
+-
+-    // Add restify server to changefeed config so that it can add routes
+-    config.changefeed.restifyServer = this.server;
+-
+-    // Init APIs
+-
+-    this.cnapi = new CNAPI(config.cnapi);
+-    this.imgapi = new IMGAPI(config.imgapi);
+-    this.napi = new NAPI(config.napi);
+-    this.papi = new PAPI(config.papi);
+-    this.wfapi = new WFAPI(config.wfapi);
+-
+     // Init Server middleware
+-
+     this.setMiddleware();
+     this.setStaticRoutes();
+     this.setRoutes();
+ };
+ 
++VMAPI.prototype.init = function init(callback) {
++    assert.func(callback, 'callback');
+ 
++    var callbackOnce = once(callback);
++    var changefeedPublisher;
+ 
+-/*
+- * Starts each of its services in order
+- */
+-VMAPI.prototype.init = function () {
+-    var self = this;
++    if (this.changefeedOptions) {
++        /*
++         * Add restify server to changefeed config so that it can
++         * add routes.
++         */
++        this.changefeedOptions.restifyServer = this.server;
+ 
+-    self.moray.connect();
+-    self.wfapi.connect();
++        changefeedPublisher =
++        changefeed.createPublisher(this.changefeedOptions);
+ 
+-    self.publisher = changefeed.createPublisher(self.config.changefeed);
+-    self.publisher.once('moray-ready', function __listen() {
+-        self.listen(function () {
+-            self.publisher.start();
+-            self.emit('ready');
+-        });
+-    });
++        changefeedPublisher.on('moray-ready',
++            function onChangefeedReady() {
++                callbackOnce();
++            });
++
++        changefeedPublisher.start();
++
++        this.changefeedPublisher = changefeedPublisher;
++    } else {
++        callback();
++    }
+ };
+ 
++VMAPI.prototype.close = function close() {
++    if (this.server) {
++        this.server.close();
++    }
+ 
++    if (this.changefeedPublisher) {
++        this.changefeedPublisher.close();
++    }
++};
+ 
+ /*
+  * Sets custom middlewares to use for the API
+  */
+ VMAPI.prototype.setMiddleware = function () {
+-    var self = this;
+     var server = this.server;
+     server.use(function (req, res, next) {
+         res.on('header', function onHeader() {
+@@ -302,7 +271,7 @@ VMAPI.prototype.setMiddleware = function () {
+             res.header('x-response-time', t);
+             res.header('x-server-name', os.hostname());
+         });
+-        req._config = self.config;
++
+         next();
+     });
+ 
+@@ -358,12 +327,24 @@ VMAPI.prototype.setRoutes = function () {
+         return next();
+     });
+ 
++    ping.mount(this.server);
++
++    /*
++     * All endpoints _but_ the ping endpoint first check if moray was properly
++     * initialized before running their route handler, as there's no way for
++     * most endpoints to be able to work reliably if it's not the case.
++     *
++     * The ping endpoint has some custom code to handle problems with moray
++     * initialization, mostly because it needs to response with some context so
++     * that the client can better understand the nature of the problem.
++     */
++    this.server.use(interceptors.checkMorayInitialized);
++
+     vms.mount(this.server);
+     jobs.mount(this.server);
+     roleTags.mount(this.server);
+     metadata.mount(this.server);
+     statuses.mount(this.server);
+-    ping.mount(this.server);
+ };
+ 
+ 
+@@ -390,13 +371,32 @@ VMAPI.prototype.serverIp = function () {
+ 
+ 
+ /*
+- * Starts listening on the port given specified by config.api.port. Takes a
+- * callback as an argument. The callback is called with no arguments
++ * Starts listening on the port given by options.port or config.api.port. Takes
++ * options and a callback function as arguments. The callback is called with no
++ * arguments.
+  */
+-VMAPI.prototype.listen = function (callback) {
++VMAPI.prototype.listen = function (options, callback) {
+     var self = this;
++    var bind_addr = '0.0.0.0';
++    var port = API_SERVER_DEFAULT_PORT;
++
++    if (typeof (options) === 'function') {
++        callback = options;
++        options = undefined;
++    }
++
++    assert.optionalObject(options, 'options');
++    if (options) {
++        assert.optionalNumber(options.port, 'options.port');
++    }
++
++    assert.optionalFunc(callback, 'callback');
++
++    if (options && options.port !== undefined) {
++        port = options.port;
++    }
+ 
+-    this.server.listen(this.config.api.port || 80, '0.0.0.0', function () {
++    self.server.listen(port, bind_addr, function () {
+         self.log.info({ url: self.server.url },
+                       '%s listening', self.server.name);
+ 
+diff --git a/package.json b/package.json
+index df1b8e3..924719b 100644
+--- a/package.json
++++ b/package.json
+@@ -7,8 +7,10 @@
+   "dependencies": {
+     "assert-plus": "0.2.0",
+     "async": "0.2.6",
++    "backoff": "2.5.0",
+     "bunyan": "1.3.4",
+     "changefeed": "1.1.8",
++    "dashdash": "1.14.0",
+     "deep-diff": "0.3.3",
+     "effluent-logger": "git+https://github.com/joshwilsdon/effluent-logger.git#d662f161a07f94045ad2afb45442931511c40e51",
+     "filed": "0.0.5",
+@@ -19,12 +21,13 @@
+     "nodeunit": "0.9.1",
+     "once": "^1.3.3",
+     "restify": "2.7.0",
+-    "sdc-clients": "git+ssh://git@github.com:joyent/node-sdc-clients.git#c962959",
++    "sdc-clients": "git+ssh://git@github.com:joyent/node-sdc-clients.git#09ab686d8009503b8a9ccc8947a617d80c038bc8",
+     "sigyan": "0.2.0",
+     "sprintf": "0.1.1",
+     "strsplit": "1.0.0",
+     "trace-event": "1.3.0",
+     "vasync": "^1.6.3",
++    "verror": "1.8.1",
+     "wf-client": "git+ssh://git@github.com:joyent/sdc-wf-client.git#469fc74"
+   },
+   "sdcDependencies": {
+diff --git a/server.js b/server.js
+index 4165d10..e715c66 100644
+--- a/server.js
++++ b/server.js
+@@ -12,16 +12,34 @@
+  * Main entry-point for the VMs API.
+  */
+ 
+-var path = require('path');
++var assert = require('assert-plus');
++var backoff = require('backoff');
+ var fs = require('fs');
++var http = require('http');
++var https = require('https');
++var jsprim = require('jsprim');
++var Logger = require('bunyan');
++var moray = require('moray');
++var path = require('path');
++var restify = require('restify');
++var sigyan = require('sigyan');
++var vasync = require('vasync');
+ 
+-var VMAPI = require('./lib/vmapi');
+-var configLoader = require('./lib/config-loader');
++var CNAPI = require('./lib/apis/cnapi');
++var IMGAPI = require('./lib/apis/imgapi');
++var NAPI = require('./lib/apis/napi');
++var PAPI = require('./lib/apis/papi');
++var vmapi = require('./lib/vmapi');
++var WFAPI = require('./lib/apis/wfapi');
+ 
++var configLoader = require('./lib/config-loader');
++var mod_morayStorage = require('./lib/storage/moray/moray');
++var morayBucketsConfig = require('./lib/storage/moray/moray-buckets-config');
++var MorayBucketsInitializer =
++    require('./lib/storage/moray/moray-buckets-initializer');
+ var VERSION = false;
+ 
+-
+-/**
++/*
+  * Returns the current semver version stored in CloudAPI's package.json.
+  * This is used to set in the API versioning and in the Server header.
+  *
+@@ -36,31 +54,208 @@ function version() {
+     return VERSION;
+ }
+ 
+-var configFilePath = path.join(__dirname, 'config.json');
+-var config = configLoader.loadConfig(configFilePath);
+-config.version = version() || '7.0.0';
++/*
++ * Creates instances of objects providing abstractions to various Triton APIs
++ * that are used by VMAPI. It returns an object of the following form:
++ *
++ * {
++ *   cnapi: cnapiClientInstance,
++ *   imgapi: imgapiClientInstance,
++ *   ...
++ * }
++ *
++ * with each property named after these APIs, and each value being set to an
++ * instance of each corresponding abstraction layer for these APIs.
++ */
++function createApiClients(config, parentLog) {
++    assert.object(config, 'config');
++    assert.object(parentLog, 'parentLog');
++
++    assert.object(config.cnapi, 'config.cnapi');
++    var cnapiClientOpts = jsprim.deepCopy(config.cnapi);
++    cnapiClientOpts.log = parentLog.child({ component: 'cnapi' }, true);
++    var cnapiClient = new CNAPI(cnapiClientOpts);
++
++    assert.object(config.imgapi, 'config.imgapi');
++    var imgapiClientOpts = jsprim.deepCopy(config.imgapi);
++    imgapiClientOpts.log = parentLog.child({ component: 'imgapi' }, true);
++    var imgapiClient = new IMGAPI(imgapiClientOpts);
++
++    assert.object(config.napi, 'config.napi');
++    var napiClientOpts = jsprim.deepCopy(config.napi);
++    napiClientOpts.log = parentLog.child({ component: 'napi' }, true);
++    var napiClient = new NAPI(napiClientOpts);
+ 
++    assert.object(config.papi, 'config.papi');
++    var papiClient = new PAPI(config.papi);
+ 
+-var vmapi;
++    assert.object(config.wfapi, 'config.wfapi');
++    var wfapiClientOpts = jsprim.deepCopy(config.wfapi);
++    wfapiClientOpts.log = parentLog.child({ component: 'wfapi' }, true);
++    var wfapiClient = new WFAPI(wfapiClientOpts);
+ 
+-try {
+-    vmapi = new VMAPI(config);
+-    vmapi.init();
+-} catch (e) {
+-    console.error('Error produced when initializing VMAPI services');
+-    console.error(e.message);
+-    console.error(e.stack);
++    return {
++        cnapi: cnapiClient,
++        imgapi: imgapiClient,
++        napi: napiClient,
++        papi: papiClient,
++        wfapi: wfapiClient
++    };
+ }
+ 
+-vmapi.once('ready', function () {
+-    vmapi.log.info('All services are up');
+-});
++/*
++ * Creates and returns an object that represents the appropriate options to pass
++ * when calling moray.createClient to create an instance of a moray client.
++ */
++function createMorayClientOpts(config, parentLog) {
++    assert.object(config, 'config');
++    assert.object(parentLog, 'parentLog');
+ 
+-process.on('uncaughtException', function (err) {
+-    vmapi.log.error(err, 'Uncaught Exception');
+-});
++    assert.object(config.moray, 'config.moray');
+ 
++    var morayClientOpts = jsprim.deepCopy(config.moray);
++    morayClientOpts.log = parentLog.child({ component: 'moray-client' }, true);
+ 
+-// Increase/decrease loggers levels using SIGUSR2/SIGUSR1:
+-var sigyan = require('sigyan');
+-sigyan.add([vmapi.log]);
++    var DEFAULT_MORAY_CONNECTION_RETRY_MIN_TIMEOUT = 1000;
++    var morayConnectionMinTimeout = DEFAULT_MORAY_CONNECTION_RETRY_MIN_TIMEOUT;
++
++    var DEFAULT_MORAY_CONNECTION_RETRY_MAX_TIMEOUT = 16000;
++    var morayConnectionMaxTimeout = DEFAULT_MORAY_CONNECTION_RETRY_MAX_TIMEOUT;
++
++    if (config.moray.retry && config.moray.retry.minTimeout !== undefined) {
++        assert.number(config.moray.retry.minTimeout,
++            'config.moray.retry.minTimeout');
++        morayConnectionMinTimeout = config.moray.retry.minTimeout;
++    }
++
++    if (config.moray.retry && config.moray.retry.maxTimeout !== undefined) {
++        assert.number(config.moray.retry.maxTimeout,
++            'config.moray.retry.maxTimeout');
++        morayConnectionMaxTimeout = config.moray.retry.maxTimeout;
++    }
++
++    var morayConnectTimeout;
++    if (config.moray.connectTimeout !== undefined) {
++        assert.number(config.moray.connectTimeout,
++            'config.moray.connectTimeout');
++        morayConnectTimeout = config.moray.connectTimeout;
++    }
++
++    morayClientOpts.connectTimeout = morayConnectTimeout;
++
++    /*
++     * The VMAPI server is meant to stay up regardless of its ability to connect
++     * to a moray server so that it can respond to requests on its status
++     * endpoint. It should not restart in order to, e.g, retry connecting to a
++     * moray server after a certain number of tries. Instead, we setup the moray
++     * client to retry connecting to a moray server indefinitely.
++     */
++    morayClientOpts.retry = {
++        retries: Infinity,
++        minTimeout: morayConnectionMinTimeout,
++        maxTimeout: morayConnectionMaxTimeout
++    };
++
++    return morayClientOpts;
++}
++
++function startVmapiService() {
++    var configFilePath = path.join(__dirname, 'config.json');
++    var config = configLoader.loadConfig(configFilePath);
++    config.version = version() || '7.0.0';
++
++    var vmapiLog = new Logger({
++        name: 'vmapi',
++        level: config.logLevel,
++        serializers: restify.bunyan.serializers
++    });
++
++    // Increase/decrease loggers levels using SIGUSR2/SIGUSR1:
++    sigyan.add([vmapi.log]);
++
++    http.globalAgent.maxSockets = config.maxSockets || 100;
++    https.globalAgent.maxSockets = config.maxSockets || 100;
++
++    var changefeedOptions = jsprim.deepCopy(config.changefeed);
++    changefeedOptions.log =
++        vmapiLog.child({ component: 'changefeed' }, true);
++
++    var morayClientOpts = createMorayClientOpts(config, vmapiLog);
++    var morayClient;
++
++    var apiClients = createApiClients(config, vmapiLog);
++
++    vasync.parallel({funcs: [
++        function connectToMoray(done) {
++            morayClient = moray.createClient(morayClientOpts);
++
++            morayClient.on('connect', function onMorayClientConnected() {
++                done();
++            });
++
++            morayClient.on('error', function onMorayClientConnectionError(err) {
++                /*
++                 * The current semantics of the underlying node-moray client
++                 * connection means that it can emit 'error' events for errors
++                 * that the client can actually recover from and that don't
++                 * prevent it from establishing a connection. See MORAY-309 for
++                 * more info.
++                 *
++                 * Since in the case of the VMAPI server, we want to retry
++                 * establishing a connection indefinitely, this 'error' event
++                 * handler should not do anything, but it needs to be added so
++                 * that the process doesn't exit due to an unhandled error
++                 * event.
++                 */
++            });
++        },
++        apiClients.wfapi.connect.bind(apiClients.wfapi)
++    ]}, function dependenciesInitDone(err) {
++        if (err) {
++            vmapi.log.error({
++                error: err
++            }, 'failed to initialize VMAPI\'s dependencies');
++
++            morayClient.close();
++        } else {
++            var morayStorage = new mod_morayStorage(morayClient);
++
++            var morayBucketsInitializer =
++                new MorayBucketsInitializer({
++                    log: vmapiLog.child({
++                        component: 'moray-buckets-initializer'
++                    }, true)
++                });
++            morayBucketsInitializer.start(morayStorage, morayBucketsConfig);
++
++            /*
++             * We don't want to wait for the storage layer to be ready before
++             * creating the HTTP server that will provide VMAPI's API endpoints,
++             * as:
++             *
++             * 1. some endpoints can function properly without using storage.
++             *
++             * 2. some endpoints are needed to provide status information,
++             * including status information about the storage layer.
++             */
++            var vmapiService = new vmapi({
++                version: config.version,
++                log: vmapiLog.child({ component: 'http-api' }, true),
++                serverConfig: {
++                    bindPort: config.api.port
++                },
++                apiClients: apiClients,
++                storage: morayStorage,
++                changefeed: changefeedOptions,
++                overlay: config.overlay,
++                reserveKvmStorage: config.reserveKvmStorage
++            });
++
++            vmapiService.init(function onVmapiInitialized() {
++                vmapiService.listen();
++            });
++        }
++    });
++}
++
++startVmapiService();
+diff --git a/test/lib/vm.js b/test/lib/vm.js
+index 563cc5e..172a629 100644
+--- a/test/lib/vm.js
++++ b/test/lib/vm.js
+@@ -1,3 +1,13 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
+ var assert = require('assert-plus');
+ 
+ var libuuid = require('libuuid');
+diff --git a/test/vms.delete_non_existing_no_workflow.test.js b/test/vms.delete_non_existing_no_workflow.test.js
+index 0c1e6ae..bb6896c 100644
+--- a/test/vms.delete_non_existing_no_workflow.test.js
++++ b/test/vms.delete_non_existing_no_workflow.test.js
+@@ -13,12 +13,17 @@
+ // represent a CN that actually exists, a destroy workflow is not started and
+ // instead the VM's state is set to destroyed immediately.
+ 
+-var libuuid = require('libuuid');
+ var assert = require('assert-plus');
++var jsprim = require('jsprim');
++var libuuid = require('libuuid');
++var Logger = require('bunyan');
++var restify = require('restify');
++var moray = require('moray');
+ 
+ var common = require('./common');
+ var vmTest = require('./lib/vm');
+-var moray = require('../lib/apis/moray');
++var morayStorage = require('../lib/storage/moray/moray');
++var morayBucketsConfig = require('../lib/storage/moray/moray-buckets-config');
+ 
+ var client;
+ var TEST_VM_UUID = libuuid.create();
+@@ -114,14 +119,57 @@ exports.delete_provisioning_vm = function (t) {
+ };
+ 
+ exports.cleanup_test_vms = function (t) {
+-    var morayClient = new moray(common.config.moray);
+-    morayClient.connect();
++    var morayClientConfig = jsprim.deepCopy(common.config.moray);
+ 
+-    morayClient.once('moray-ready', function () {
+-        vmTest.deleteTestVMs(morayClient, {}, function testVmDeleted(err) {
+-            morayClient.connection.close();
+-            t.ifError(err, 'Deleting the test VM should not error');
+-            t.done();
+-        });
++    morayClientConfig.retry = {
++        retries: Infinity,
++        minTimeout: 100,
++        maxTimeout: 1000
++    };
++
++    morayClientConfig.log = new Logger({
++        name: 'moray-client',
++        level: 'info',
++        serializers: restify.bunyan.serializers
+     });
++
++    var morayClient = moray.createClient(morayClientConfig);
++    var storage = new morayStorage(morayClient);
++
++    morayClient.on('connect', function onMorayClientConnected() {
++        t.ok(true, 'moray client should connect succesfully');
++
++        storage.setupBuckets(morayBucketsConfig,
++            function onMorayBucketsSetup(morayBucketsSetupErr) {
++                t.ok(!morayBucketsSetupErr,
++                    'moray buckets setup should be successful');
++
++                vmTest.deleteTestVMs(storage, {},
++                    function testVmDeleted(deleteVmsErr) {
++                        morayClient.close();
++
++                        t.ok(!deleteVmsErr,
++                            'Deleting test VMs should not error');
++                        t.done();
++                    });
++            });
++    });
++
++    morayClient.on('error',
++        function onMorayClientConnectionError(morayClientConnectionErr) {
++            /*
++             * The current semantics of the underlying node-moray client
++             * connection means that it can emit 'error' events for errors that
++             * the client can actually recover from and that don't prevent it
++             * from establishing a connection. See MORAY-309 for more info.
++             *
++             * Since it's expected that, at least in some testing environments,
++             * the moray client will fail to connect a certain number of times,
++             * aborting tests in that case would mean that tests VMS wouldn't be
++             * cleaned up most of the time. Instead, we explicitly ignore errors
++             * and retry connecting indefinitely. If the moray client is not
++             * able to connect, then the process will hang or time out. At least
++             * we'll be able to know the source of the problem.
++             */
++        });
+ };
+diff --git a/test/vms.list.test.js b/test/vms.list.test.js
+index 17aefb1..f5996a8 100644
+--- a/test/vms.list.test.js
++++ b/test/vms.list.test.js
+@@ -9,16 +9,21 @@
+  */
+ 
+ var assert = require('assert-plus');
+-
+ var async = require('async');
++var jsprim = require('jsprim');
++var Logger = require('bunyan');
++var moray = require('moray');
++var restify = require('restify');
+ 
+ var common = require('./common');
+-
++var morayStorage = require('../lib/storage/moray/moray');
++var morayBucketsConfig = require('../lib/storage/moray/moray-buckets-config');
+ var validation = require('../lib/common/validation');
+ var vmTest = require('./lib/vm');
+ 
+ var client;
+-var MORAY = require('../lib/apis/moray');
++var storage;
++var morayClient;
+ 
+ var VALID_UUID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+ var INVALID_UUID = 'invalid_uuid';
+@@ -34,6 +39,54 @@ exports.setUp = function (callback) {
+     });
+ };
+ 
++exports.init_storage_layer = function (t) {
++    var morayClientConfig = jsprim.deepCopy(common.config.moray);
++
++    morayClientConfig.retry = {
++        retries: Infinity,
++        minTimeout: 100,
++        maxTimeout: 1000
++    };
++
++    morayClientConfig.log = new Logger({
++        name: 'moray-client',
++        level: 'info',
++        serializers: restify.bunyan.serializers
++    });
++
++    morayClient = moray.createClient(morayClientConfig);
++    storage = new morayStorage(morayClient);
++
++    morayClient.on('connect', function onMorayClientConnected() {
++        t.ok(true, 'moray client should connect successfully');
++
++        storage.setupBuckets(morayBucketsConfig,
++            function onMorayBucketsSetup(morayBucketsSetupErr) {
++                t.ok(!morayBucketsSetupErr,
++                    'moray buckets setup should succeed');
++                t.done();
++            });
++    });
++
++    morayClient.on('error',
++        function onMorayClientConnectionError(morayClientConnectionErr) {
++            /*
++             * The current semantics of the underlying node-moray client
++             * connection means that it can emit 'error' events for errors that
++             * the client can actually recover from and that don't prevent it
++             * from establishing a connection. See MORAY-309 for more info.
++             *
++             * Since it's expected that, at least in some testing environments,
++             * the moray client will fail to connect a certain number of times,
++             * aborting tests in that case would mean that tests would fail most
++             * of the time, when they could have succeeded. Instead, we
++             * explicitly ignore errors and retry connecting indefinitely. If
++             * the moray client is not able to connect, then the process will
++             * hang or time out.
++             */
++        });
++};
++
+ exports.list_invalid_param = function (t) {
+     var expectedError = {
+         code: 'ValidationFailed',
+@@ -309,59 +362,52 @@ function testValidLimit(limit, t, callback) {
+         EXPECTED_NB_VMS_RETURNED = NB_TEST_VMS_TO_CREATE;
+     }
+ 
+-    var moray = new MORAY(common.config.moray);
+-    moray.connect();
+-
+-    moray.once('moray-ready', function () {
+-        async.series([
+-            // Delete test VMs leftover from previous tests run
+-            function deleteTestVms(next) {
+-                vmTest.deleteTestVMs(moray, {}, function vmsDeleted(err) {
++    async.series([
++        // Delete test VMs leftover from previous tests run
++        function deleteTestVms(next) {
++            vmTest.deleteTestVMs(storage, {},
++                function vmsDeleted(err) {
+                     t.ifError(err, 'deleting test VMs should not error');
+                     return next(err);
+                 });
+-            },
+-            function createFakeVms(next) {
+-                vmTest.createTestVMs(NB_TEST_VMS_TO_CREATE, moray,
+-                    {concurrency: 100}, {},
+-                    function fakeVmsCreated(err, vmsUuid) {
+-                        moray.connection.close();
+-
+-                        t.equal(vmsUuid.length,
+-                            NB_TEST_VMS_TO_CREATE,
+-                            NB_TEST_VMS_TO_CREATE
+-                            + ' vms should have been created');
+-
+-                        t.ifError(err, NB_TEST_VMS_TO_CREATE
+-                            + ' vms should be created successfully');
+-                        return next(err);
+-                    });
+-            },
+-            function listVmsWithLimit(next) {
+-                var listVmsQuery = '/vms?limit=' + limit + '&alias='
+-                + vmTest.TEST_VMS_ALIAS;
+-
+-                client.get(listVmsQuery, function (err, req, res, body) {
+-                    t.ifError(err);
+-                    if (err)
+-                        return next(err);
+-
+-                    t.equal(res.headers['x-joyent-resource-count'],
++        },
++        function createFakeVms(next) {
++            vmTest.createTestVMs(NB_TEST_VMS_TO_CREATE, storage,
++                {concurrency: 100}, {},
++                function fakeVmsCreated(err, vmsUuid) {
++                    t.equal(vmsUuid.length,
+                         NB_TEST_VMS_TO_CREATE,
+-                        'x-joyent-resource-count header should be equal to '
+-                        + NB_TEST_VMS_TO_CREATE);
+-                    t.equal(body.length, EXPECTED_NB_VMS_RETURNED,
+-                        EXPECTED_NB_VMS_RETURNED
+-                        + ' vms should be returned from list vms');
++                        NB_TEST_VMS_TO_CREATE
++                        + ' vms should have been created');
+ 
+-                    return next(null);
++                    t.ifError(err, NB_TEST_VMS_TO_CREATE
++                        + ' vms should be created successfully');
++                    return next(err);
+                 });
+-            }
+-        ], function allDone(err, results) {
+-            t.ifError(err);
+-            moray.connection.close();
+-            return callback();
+-        });
++        },
++        function listVmsWithLimit(next) {
++            var listVmsQuery = '/vms?limit=' + limit + '&alias='
++            + vmTest.TEST_VMS_ALIAS;
++
++            client.get(listVmsQuery, function (err, req, res, body) {
++                t.ifError(err);
++                if (err)
++                    return next(err);
++
++                t.equal(res.headers['x-joyent-resource-count'],
++                    NB_TEST_VMS_TO_CREATE,
++                    'x-joyent-resource-count header should be equal to '
++                    + NB_TEST_VMS_TO_CREATE);
++                t.equal(body.length, EXPECTED_NB_VMS_RETURNED,
++                    EXPECTED_NB_VMS_RETURNED
++                    + ' vms should be returned from list vms');
++
++                return next(null);
++            });
++        }
++    ], function allDone(err, results) {
++        t.ifError(err);
++        return callback();
+     });
+ }
+ 
+@@ -380,15 +426,9 @@ exports.list_vms_valid_limit = function (t) {
+  * (list_vms_valid_limit).
+  */
+ exports.delete_list_vms_valid_limit = function (t) {
+-    var moray = new MORAY(common.config.moray);
+-    moray.connect();
+-
+-    moray.once('moray-ready', function () {
+-        vmTest.deleteTestVMs(moray, {}, function testVmsDeleted(err) {
+-            moray.connection.close();
+-            t.ifError(err, 'deleting fake VMs should not error');
+-            t.done();
+-        });
++    vmTest.deleteTestVMs(storage, {}, function testVmsDeleted(err) {
++        t.ifError(err, 'deleting fake VMs should not error');
++        t.done();
+     });
+ };
+ 
+@@ -524,3 +564,8 @@ exports.list_param_invalid_offset = function (t) {
+         t.done();
+     });
+ };
++
++exports.close_moray_client = function (t) {
++    morayClient.close();
++    t.done();
++};
+\ No newline at end of file
+diff --git a/test/vms.marker.test.js b/test/vms.marker.test.js
+index bbe7bf6..db644ea 100644
+--- a/test/vms.marker.test.js
++++ b/test/vms.marker.test.js
+@@ -8,20 +8,28 @@
+  * Copyright (c) 2016, Joyent, Inc.
+  */
+ 
+-var url = require('url');
+ 
+ var assert = require('assert-plus');
+ var async = require('async');
++var jsprim = require('jsprim');
+ var libuuid = require('libuuid');
++var Logger = require('bunyan');
++var moray = require('moray');
++var restify = require('restify');
++var url = require('url');
+ 
+ var common = require('./common');
+ var vmTest = require('./lib/vm');
+ 
+-var MORAY = require('../lib/apis/moray');
++var morayStorage = require('../lib/storage/moray/moray');
++var morayBucketsConfig = require('../lib/storage/moray/moray-buckets-config');
++
+ var sortValidation = require('../lib/validation/sort.js');
+ var vmCommon = require('../lib/common/vm-common.js');
+ 
+ var client;
++var storage;
++var morayClient;
+ 
+ exports.setUp = function (callback) {
+     common.setUp(function (err, _client) {
+@@ -73,9 +81,6 @@ function testMarkerPagination(options, t, callback) {
+     var NB_TEST_VMS_TO_CREATE = options.nbTestVms || 200;
+     var LIMIT = NB_TEST_VMS_TO_CREATE / 2;
+ 
+-    var moray = new MORAY(common.config.moray);
+-    moray.connect();
+-
+     var vmsCreationParams = options.vmsCreationParams || {};
+     assert.object(vmsCreationParams,
+         'options.vmsCreationParams must be an object');
+@@ -100,132 +105,175 @@ function testMarkerPagination(options, t, callback) {
+     assert.arrayOfString(markerKeys,
+         'options.markerKeys must be an array of strings');
+ 
+-    moray.once('moray-ready', function () {
+-        var firstVmsChunk;
+-        var secondVmsChunk;
+-        async.waterfall([
+-            // Delete test VMs leftover from previous tests run
+-            function deleteTestVms(next) {
+-                vmTest.deleteTestVMs(moray, {}, function vmsDeleted(err) {
++    var firstVmsChunk;
++    var secondVmsChunk;
++    async.waterfall([
++        // Delete test VMs leftover from previous tests run
++        function deleteTestVms(next) {
++            vmTest.deleteTestVMs(storage, {},
++                function vmsDeleted(err) {
+                     t.ifError(err, 'deleting test VMs should not error');
+                     return next(err);
+                 });
+-            },
+-            function createFakeVms(next) {
+-                vmTest.createTestVMs(NB_TEST_VMS_TO_CREATE, moray,
+-                    {concurrency: 100}, vmsCreationParams,
+-                    function fakeVmsCreated(err, vmsUuid) {
+-                        moray.connection.close();
+-
+-                        t.equal(vmsUuid.length,
+-                            NB_TEST_VMS_TO_CREATE,
+-                            NB_TEST_VMS_TO_CREATE
+-                            + ' vms should have been created');
+-
+-                        t.ifError(err, NB_TEST_VMS_TO_CREATE
+-                            + ' vms should be created successfully');
+-                        return next(err);
+-                    });
+-            },
+-            function listFirstVmsChunk(next) {
+-                var listVmsQuery = url.format({pathname: '/vms',
+-                    query: queryStringObject});
+-
+-                client.get(listVmsQuery, function (err, req, res, body) {
+-                    var lastItem;
+-
+-                    t.ifError(err);
+-                    if (err)
+-                        return next(err);
+-
+-                    t.equal(res.headers['x-joyent-resource-count'],
++        },
++        function createFakeVms(next) {
++            vmTest.createTestVMs(NB_TEST_VMS_TO_CREATE, storage,
++                {concurrency: 100}, vmsCreationParams,
++                function fakeVmsCreated(err, vmsUuid) {
++                    t.equal(vmsUuid.length,
+                         NB_TEST_VMS_TO_CREATE,
+-                        'x-joyent-resource-count header should be equal to '
+-                        + NB_TEST_VMS_TO_CREATE);
+-                    t.equal(body.length, LIMIT,
+-                        LIMIT + ' vms should be returned from first list vms');
++                        NB_TEST_VMS_TO_CREATE
++                        + ' vms should have been created');
+ 
+-                    lastItem = body[body.length - 1];
+-                    var marker = buildMarker(lastItem, markerKeys);
+-
+-                    firstVmsChunk = body;
+-                    return next(null, JSON.stringify(marker));
++                    t.ifError(err, NB_TEST_VMS_TO_CREATE
++                        + ' vms should be created successfully');
++                    return next(err);
+                 });
+-            },
+-            function listNextVmsChunk(marker, next) {
+-                assert.string(marker, 'marker');
+-                queryStringObject.marker = marker;
++        },
++        function listFirstVmsChunk(next) {
++            var listVmsQuery = url.format({pathname: '/vms',
++                query: queryStringObject});
+ 
+-                var listVmsQuery = url.format({pathname: '/vms',
+-                    query: queryStringObject});
++            client.get(listVmsQuery, function (err, req, res, body) {
++                var lastItem;
+ 
+-                client.get(listVmsQuery, function (err, req, res, body) {
+-                    var lastItem;
++                t.ifError(err);
++                if (err)
++                    return next(err);
+ 
+-                    t.ifError(err);
+-                    if (err)
+-                        return next(err);
++                t.equal(res.headers['x-joyent-resource-count'],
++                    NB_TEST_VMS_TO_CREATE,
++                    'x-joyent-resource-count header should be equal to '
++                    + NB_TEST_VMS_TO_CREATE);
++                t.equal(body.length, LIMIT,
++                    LIMIT + ' vms should be returned from first list vms');
+ 
+-                    t.equal(res.headers['x-joyent-resource-count'],
+-                        NB_TEST_VMS_TO_CREATE,
+-                        'x-joyent-resource-count header should be equal to '
+-                        + NB_TEST_VMS_TO_CREATE);
+-                    t.equal(body.length, LIMIT,
+-                        'second vms list request should return ' + LIMIT
+-                        + ' vms');
++                lastItem = body[body.length - 1];
++                var marker = buildMarker(lastItem, markerKeys);
+ 
+-                    lastItem = body[body.length - 1];
+-                    var nextMarker = buildMarker(lastItem, markerKeys);
++                firstVmsChunk = body;
++                return next(null, JSON.stringify(marker));
++            });
++        },
++        function listNextVmsChunk(marker, next) {
++            assert.string(marker, 'marker');
++            queryStringObject.marker = marker;
+ 
+-                    secondVmsChunk = body;
++            var listVmsQuery = url.format({pathname: '/vms',
++                query: queryStringObject});
+ 
+-                    return next(null, JSON.stringify(nextMarker));
+-                });
+-            },
+-            function listLastVmsChunk(marker, next) {
+-                assert.string(marker, 'marker must be a string');
+-                queryStringObject.marker = marker;
++            client.get(listVmsQuery, function (err, req, res, body) {
++                var lastItem;
+ 
+-                var listVmsQuery = url.format({pathname: '/vms',
+-                    query: queryStringObject});
++                t.ifError(err);
++                if (err)
++                    return next(err);
+ 
+-                client.get(listVmsQuery, function (err, req, res, body) {
+-                    t.ifError(err);
+-                    if (err)
+-                        return next(err);
++                t.equal(res.headers['x-joyent-resource-count'],
++                    NB_TEST_VMS_TO_CREATE,
++                    'x-joyent-resource-count header should be equal to '
++                    + NB_TEST_VMS_TO_CREATE);
++                t.equal(body.length, LIMIT,
++                    'second vms list request should return ' + LIMIT
++                    + ' vms');
+ 
+-                    t.equal(res.headers['x-joyent-resource-count'],
+-                        NB_TEST_VMS_TO_CREATE,
+-                        'x-joyent-resource-count header should be equal to '
+-                        + NB_TEST_VMS_TO_CREATE);
+-                    t.equal(body.length, 0,
+-                        'last vms list request should return no vm');
+-                    return next();
+-                });
+-            },
+-            function checkNoOverlap(next) {
+-                function getVmUuid(vm) {
+-                    assert.object(vm, 'vm must be an object');
+-                    return vm.uuid;
+-                }
+-
+-                var firstVmsChunkUuids = firstVmsChunk.map(getVmUuid);
+-                var secondVmsChunkUuids = secondVmsChunk.map(getVmUuid);
+-                var chunksOverlap = firstVmsChunkUuids.some(function (vmUuid) {
+-                    return secondVmsChunkUuids.indexOf(vmUuid) !== -1;
+-                });
++                lastItem = body[body.length - 1];
++                var nextMarker = buildMarker(lastItem, markerKeys);
+ 
+-                t.equal(chunksOverlap, false,
+-                    'subsequent responses should not overlap');
++                secondVmsChunk = body;
++
++                return next(null, JSON.stringify(nextMarker));
++            });
++        },
++        function listLastVmsChunk(marker, next) {
++            assert.string(marker, 'marker must be a string');
++            queryStringObject.marker = marker;
++
++            var listVmsQuery = url.format({pathname: '/vms',
++                query: queryStringObject});
++
++            client.get(listVmsQuery, function (err, req, res, body) {
++                t.ifError(err);
++                if (err)
++                    return next(err);
++
++                t.equal(res.headers['x-joyent-resource-count'],
++                    NB_TEST_VMS_TO_CREATE,
++                    'x-joyent-resource-count header should be equal to '
++                    + NB_TEST_VMS_TO_CREATE);
++                t.equal(body.length, 0,
++                    'last vms list request should return no vm');
+                 return next();
++            });
++        },
++        function checkNoOverlap(next) {
++            function getVmUuid(vm) {
++                assert.object(vm, 'vm must be an object');
++                return vm.uuid;
+             }
+-        ], function allDone(err, results) {
+-            t.ifError(err);
+-            return callback();
+-        });
++
++            var firstVmsChunkUuids = firstVmsChunk.map(getVmUuid);
++            var secondVmsChunkUuids = secondVmsChunk.map(getVmUuid);
++            var chunksOverlap = firstVmsChunkUuids.some(function (vmUuid) {
++                return secondVmsChunkUuids.indexOf(vmUuid) !== -1;
++            });
++
++            t.equal(chunksOverlap, false,
++                'subsequent responses should not overlap');
++            return next();
++        }
++    ], function allDone(err, results) {
++        t.ifError(err);
++        return callback();
+     });
+ }
+ 
++exports.init_storage_layer = function (t) {
++    var morayClientConfig = jsprim.deepCopy(common.config.moray);
++
++    morayClientConfig.retry = {
++        retries: Infinity,
++        minTimeout: 100,
++        maxTimeout: 1000
++    };
++
++    morayClientConfig.log = new Logger({
++        name: 'moray-client',
++        level: 'info',
++        serializers: restify.bunyan.serializers
++    });
++
++    morayClient = moray.createClient(morayClientConfig);
++    storage = new morayStorage(morayClient);
++
++    morayClient.on('connect', function onMorayClientConnected() {
++        storage.setupBuckets(morayBucketsConfig,
++            function onMorayBucketsSetup(morayBucketsSetupErr) {
++                t.ok(!morayBucketsSetupErr,
++                    'moray buckets setup should succeed');
++                t.done();
++            });
++    });
++
++    morayClient.on('error',
++        function onMorayClientConnectionError(morayClientConnectionErr) {
++            /*
++             * The current semantics of the underlying node-moray client
++             * connection means that it can emit 'error' events for errors that
++             * the client can actually recover from and that don't prevent it
++             * from establishing a connection. See MORAY-309 for more info.
++             *
++             * Since it's expected that, at least in some testing environments,
++             * the moray client will fail to connect a certain number of times,
++             * aborting tests in that case would mean that tests would fail most
++             * of the time, when they could have succeeded. Instead, we
++             * explicitly ignore errors and retry connecting indefinitely. If
++             * the moray client is not able to connect, then the process will
++             * hang or time out.
++             */
++        });
++};
++
+ /*
+  * Checks that invalid markers result in the response containing
+  * the proper error status code and error message.
+@@ -298,15 +346,9 @@ exports.list_vms_marker_ok = function (t) {
+  * Cleanup test VMs created by the previous test (list_vms_marker_ok).
+  */
+ exports.delete_test_vms_marker_ok = function (t) {
+-    var moray = new MORAY(common.config.moray);
+-    moray.connect();
+-
+-    moray.once('moray-ready', function () {
+-        vmTest.deleteTestVMs(moray, {}, function testVmsDeleted(err) {
+-            moray.connection.close();
+-            t.ifError(err, 'deleting fake VMs should not error');
+-            t.done();
+-        });
++    vmTest.deleteTestVMs(storage, {}, function testVmsDeleted(err) {
++        t.ifError(err, 'deleting fake VMs should not error');
++        t.done();
+     });
+ };
+ 
+@@ -328,15 +370,9 @@ exports.list_vms_marker_and_sort_on_uuid_asc_ok = function (t) {
+  * (list_vms_marker_and_sort_on_uuid_asc_ok).
+  */
+ exports.delete_test_vms_marker_and_sort_on_uuid_asc_ok = function (t) {
+-    var moray = new MORAY(common.config.moray);
+-    moray.connect();
+-
+-    moray.once('moray-ready', function () {
+-        vmTest.deleteTestVMs(moray, {}, function testVmsDeleted(err) {
+-            moray.connection.close();
+-            t.ifError(err, 'deleting fake VMs should not error');
+-            t.done();
+-        });
++    vmTest.deleteTestVMs(storage, {}, function testVmsDeleted(err) {
++        t.ifError(err, 'deleting fake VMs should not error');
++        t.done();
+     });
+ };
+ 
+@@ -358,15 +394,9 @@ exports.list_vms_marker_and_sort_on_uuid_desc_ok = function (t) {
+  * (list_vms_marker_and_sort_on_uuid_desc_ok).
+  */
+ exports.delete_test_vms_marker_and_sort_on_uuid_desc_ok = function (t) {
+-    var moray = new MORAY(common.config.moray);
+-    moray.connect();
+-
+-    moray.once('moray-ready', function () {
+-        vmTest.deleteTestVMs(moray, {}, function testVmsDeleted(err) {
+-            moray.connection.close();
+-            t.ifError(err, 'deleting fake VMs should not error');
+-            t.done();
+-        });
++    vmTest.deleteTestVMs(storage, {}, function testVmsDeleted(err) {
++        t.ifError(err, 'deleting fake VMs should not error');
++        t.done();
+     });
+ };
+ 
+@@ -481,16 +511,11 @@ function createDeleteVMsTest(sortKey, sortOrder, exports) {
+     var clearVmsTestName = 'delete_test_vms_marker_with_identical_' + sortKey +
+             '_' + sortOrder + '_ok';
+     exports[clearVmsTestName] = function (t) {
+-        var moray = new MORAY(common.config.moray);
+-        moray.connect();
+-
+-        moray.once('moray-ready', function () {
+-            vmTest.deleteTestVMs(moray, {}, function testVmsDeleted(err) {
+-                moray.connection.close();
++        vmTest.deleteTestVMs(storage, {},
++            function testVmsDeleted(err) {
+                 t.ifError(err, 'deleting fake VMs should not error');
+                 t.done();
+             });
+-        });
+     };
+ }
+ 
+@@ -564,3 +589,8 @@ function createNoStrictTotalOrderKeyInMarkerTest(sortKey, sortOrder, exports) {
+ Object.keys(NON_STRICT_TOTAL_ORDER_SORT_KEYS).forEach(function (sortKey) {
+     createMarkerTests(sortKey, exports);
+ });
++
++exports.close_moray_client = function (t) {
++    morayClient.close();
++    t.done();
++};
+\ No newline at end of file
+diff --git a/test/vms.update-moray-bucket-non-transient-error.test.js b/test/vms.update-moray-bucket-non-transient-error.test.js
+new file mode 100644
+index 0000000..74b88c4
+--- /dev/null
++++ b/test/vms.update-moray-bucket-non-transient-error.test.js
+@@ -0,0 +1,201 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++/*
++ * This test is about making sure that, when a non transient error is
++ * encountered while setting up moray buckets, the MorayBucketsInitializer
++ * instance emits an error event. Not handling that error event would make the
++ * process exit , which is what we want to happen when running the VMAPI
++ * service.
++ */
++
++var jsprim = require('jsprim');
++var Logger = require('bunyan');
++var moray = require('moray');
++var path = require('path');
++var restify = require('restify');
++var vasync = require('vasync');
++var mod_vmapiClient = require('sdc-clients').VMAPI;
++
++var configLoader = require('..//lib/config-loader');
++var mod_morayStorage = require('../lib/storage/moray/moray');
++var MorayBucketsInitializer =
++    require('../lib/storage/moray/moray-buckets-initializer');
++var vmapi = require('../lib/vmapi');
++
++var configFilePath = path.join(__dirname, '../config.json');
++var config = configLoader.loadConfig(configFilePath);
++
++var VMS_BUCKET_CONFIG_WITH_ERROR = {
++    name: 'vmapi_vms_test_non_transient_error',
++    schema: {
++        index: {
++            uuid: { type: 'string', unique: true},
++            owner_uuid: { type: 'string' },
++            image_uuid: { type: 'string' },
++            billing_id: { type: 'string' },
++            server_uuid: { type: 'string' },
++            package_name: { type: 'string' },
++            package_version: { type: 'string' },
++            tags: { type: 'string' },
++            brand: { type: 'string' },
++            state: { type: 'string' },
++            alias: { type: 'string' },
++            max_physical_memory: { type: 'number' },
++            create_timestamp: { type: 'number' },
++            /*
++             * The typo in "booleaan" is intentional: it is used to trigger what
++             * we consider to be a non-transient error when setting up VMAPI's
++             * moray buckets, and test that the moray buckets setup process
++             * handles this error appropriately, in that case by emitting an
++             * 'erorr' event.
++             */
++            docker: { type: 'booleaan' }
++        },
++        options: {
++            version: 1
++        }
++    }
++};
++
++var SERVER_VMS_MORAY_BUCKET_CONFIG = {
++    name: 'vmapi_server_vms_test_non_transient_error',
++    schema: {}
++};
++
++var ROLE_TAGS_MORAY_BUCKET_CONFIG = {
++    name: 'vmapi_vm_role_tags_test_non_transient_error',
++    schema: {
++        index: {
++            role_tags: { type: '[string]' }
++        }
++    }
++};
++
++var morayBucketsConfigWithError = {
++    vms: VMS_BUCKET_CONFIG_WITH_ERROR,
++    server_vms: SERVER_VMS_MORAY_BUCKET_CONFIG,
++    vm_role_tags: ROLE_TAGS_MORAY_BUCKET_CONFIG
++};
++
++exports.moray_init_non_transient_error = function (t) {
++    var morayClient;
++    var morayStorage;
++    var vmapiService;
++
++    var mockedWfapiClient = {
++        connected: true,
++        connect: function mockedWfapiConnect(callback) {
++            callback();
++        }
++    };
++
++    var vmapiClient;
++
++    vasync.pipeline({funcs: [
++        function connectToMoray(arg, next) {
++            var morayClientConfig = jsprim.deepCopy(config.moray);
++            morayClientConfig.retry = {
++                retries: Infinity,
++                minTimeout: 100,
++                maxTimeout: 1000
++            };
++
++            morayClientConfig.log = new Logger({
++                name: 'moray-client',
++                level: config.logLevel,
++                serializers: restify.bunyan.serializers
++            });
++
++            morayClient = moray.createClient(morayClientConfig);
++
++            morayClient.on('connect', function onMorayClientConnected() {
++                next();
++            });
++
++            morayClient.on('error', function onMorayClientConnectionError(err) {
++                /*
++                 * The current semantics of the underlying node-moray client
++                 * connection means that it can emit 'error' events for errors
++                 * that the client can actually recover from and that don't
++                 * prevent it from establishing a connection. See MORAY-309 for
++                 * more info.
++                 *
++                 * Since it's expected that, at least in some testing
++                 * environments, the moray client will fail to connect a certain
++                 * number of times, aborting tests in that case would mean that
++                 * tests would fail most of the time, even though they should
++                 * pass. Instead, we explicitly ignore errors and retry
++                 * connecting indefinitely. If the moray client is not able to
++                 * connect, then the process will hang or time out.
++                 */
++            });
++        },
++        function initVmapi(arg, next) {
++            morayStorage = new mod_morayStorage(morayClient);
++
++            vmapiService = new vmapi({
++                apiClients: {
++                    wfapi: mockedWfapiClient
++                },
++                storage: morayStorage
++            });
++
++            vmapiService.init(next);
++        },
++        function listenOnVmapiServer(arg, next) {
++            vmapiService.listen({
++                port: 0
++            }, next);
++        }
++    ]}, function onVmapiServiceReady(initErr) {
++        var vmapiServerAddress = vmapiService.server.address();
++        var vmapiServerUrl = 'http://' + vmapiServerAddress.address +
++            ':' + vmapiServerAddress.port;
++
++        vmapiClient = new mod_vmapiClient({
++            url: vmapiServerUrl
++        });
++
++        var morayBucketsInitializer = new MorayBucketsInitializer();
++        morayBucketsInitializer.start(morayStorage,
++            morayBucketsConfigWithError);
++
++        morayBucketsInitializer.on('error',
++            function onMorayBucketsInitError(morayErr) {
++                t.ok(morayErr, 'moray initialization should error');
++
++                vmapiClient.ping(function onVmapiPing(pingErr, obj) {
++                    var errBody = pingErr.body;
++                    var expectedStatus = 'some services are not ready';
++                    var expectedHealthiness = false;
++                    var expectedErrString =
++                        'InvalidBucketConfigError: docker.type is invalid';
++
++                    t.equal(errBody.status,
++                        expectedStatus, 'status property of the error ' +
++                            'message should be equal to "' + expectedStatus +
++                            '"');
++                    t.equal(errBody.healthy, expectedHealthiness,
++                        'healthy property of the error message should be "' +
++                            expectedHealthiness + '"');
++                    t.equal(errBody.services.moray.initialization.error,
++                        expectedErrString,
++                        'Error string for moray initialization error should ' +
++                            'be: "' + expectedErrString + '"');
++
++                    vmapiClient.close();
++                    vmapiService.close();
++                    morayClient.close();
++                    t.done();
++                });
++            });
++    });
++};
+diff --git a/test/vms.update-moray-bucket-removes-index-fails.test.js b/test/vms.update-moray-bucket-removes-index-fails.test.js
+new file mode 100644
+index 0000000..2494e1b
+--- /dev/null
++++ b/test/vms.update-moray-bucket-removes-index-fails.test.js
+@@ -0,0 +1,199 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++/*
++ * This test is about making sure that, when a moray bucket is changed in a way
++ * that an index is removed, which is a backward incompatible change, the
++ * MorayBucketsInitializer instance emits an error event.
++ */
++
++var jsprim = require('jsprim');
++var Logger = require('bunyan');
++var moray = require('moray');
++var path = require('path');
++var restify = require('restify');
++var vasync = require('vasync');
++var mod_vmapiClient = require('sdc-clients').VMAPI;
++
++var configLoader = require('..//lib/config-loader');
++var mod_morayStorage = require('../lib/storage/moray/moray');
++var MorayBucketsInitializer =
++    require('../lib/storage/moray/moray-buckets-initializer');
++var vmapi = require('../lib/vmapi');
++
++var configFilePath = path.join(__dirname, '../config.json');
++var config = configLoader.loadConfig(configFilePath);
++
++var VMS_BUCKET_CONFIG_V0 = {
++    name: 'vmapi_vms_test_invalid_index_removal',
++    schema: {
++        index: {
++            uuid: { type: 'string', unique: true},
++            some_index: { type: 'string' }
++        }
++    }
++};
++
++var VMS_BUCKET_CONFIG_V1 = {
++    name: 'vmapi_vms_test_invalid_index_removal',
++    schema: {
++        index: {
++            uuid: { type: 'string', unique: true}
++        },
++        options: {
++            version: 1
++        }
++    }
++};
++
++var SERVER_VMS_MORAY_BUCKET_CONFIG = {
++    name: 'vmapi_server_vms_test_invalid_index_removal',
++    schema: {}
++};
++
++var ROLE_TAGS_MORAY_BUCKET_CONFIG = {
++    name: 'vmapi_vm_role_tags_test_invalid_index_removal',
++    schema: {
++        index: {
++            role_tags: { type: '[string]' }
++        }
++    }
++};
++
++var morayBucketsConfigV0 = {
++    vms: VMS_BUCKET_CONFIG_V0,
++    server_vms: SERVER_VMS_MORAY_BUCKET_CONFIG,
++    vm_role_tags: ROLE_TAGS_MORAY_BUCKET_CONFIG
++};
++
++var morayBucketsConfigV1 = {
++    vms: VMS_BUCKET_CONFIG_V1,
++    server_vms: SERVER_VMS_MORAY_BUCKET_CONFIG,
++    vm_role_tags: ROLE_TAGS_MORAY_BUCKET_CONFIG
++};
++
++exports.moray_init_invalid_index_removal = function (t) {
++    var morayClient;
++    var morayStorage;
++    var vmapiService;
++
++    var mockedWfapiClient = {
++        connected: true,
++        connect: function mockedWfapiConnect(callback) {
++            callback();
++        }
++    };
++
++    var vmapiClient;
++
++    vasync.pipeline({funcs: [
++        function connectToMoray(arg, next) {
++            var morayClientConfig = jsprim.deepCopy(config.moray);
++            morayClientConfig.retry = {
++                retries: Infinity,
++                minTimeout: 100,
++                maxTimeout: 1000
++            };
++
++            morayClientConfig.log = new Logger({
++                name: 'moray-client',
++                level: config.logLevel,
++                serializers: restify.bunyan.serializers
++            });
++
++            morayClient = moray.createClient(morayClientConfig);
++
++            morayClient.on('connect', function onMorayClientConnected() {
++                next();
++            });
++
++            morayClient.on('error', function onMorayClientConnectionError(err) {
++                /*
++                 * The current semantics of the underlying node-moray client
++                 * connection means that it can emit 'error' events for errors
++                 * that the client can actually recover from and that don't
++                 * prevent it from establishing a connection. See MORAY-309 for
++                 * more info.
++                 *
++                 * Since it's expected that, at least in some testing
++                 * environments, the moray client will fail to connect a certain
++                 * number of times, aborting tests in that case would mean that
++                 * tests would fail most of the time, even though they should
++                 * pass. Instead, we explicitly ignore errors and retry
++                 * connecting indefinitely. If the moray client is not able to
++                 * connect, then the process will hang or time out.
++                 */
++            });
++        },
++        function setupMorayBucketsFirstVersion(arg, next) {
++            morayStorage = new mod_morayStorage(morayClient);
++            morayStorage.setupBuckets(morayBucketsConfigV0, next);
++        },
++        function initVmapi(arg, next) {
++
++            vmapiService = new vmapi({
++                apiClients: {
++                    wfapi: mockedWfapiClient
++                },
++                storage: morayStorage
++            });
++
++            vmapiService.init(next);
++        },
++        function listenOnVmapiServer(arg, next) {
++            vmapiService.listen({
++                port: 0
++            }, next);
++        }
++    ]}, function onVmapiServiceReady(initErr) {
++        var vmapiServerAddress = vmapiService.server.address();
++        var vmapiServerUrl = 'http://' + vmapiServerAddress.address +
++            ':' + vmapiServerAddress.port;
++
++        vmapiClient = new mod_vmapiClient({
++            url: vmapiServerUrl
++        });
++
++        var morayBucketsInitializer = new MorayBucketsInitializer();
++        morayBucketsInitializer.start(morayStorage,
++            morayBucketsConfigV1);
++
++        morayBucketsInitializer.on('error',
++            function onMorayBucketsInitError(morayErr) {
++                t.ok(morayErr, 'moray initialization should error');
++
++                vmapiClient.ping(function onVmapiPing(pingErr, obj) {
++                    var errBody = pingErr.body;
++                    var expectedStatus = 'some services are not ready';
++                    var expectedHealthiness = false;
++                    var expectedErrString =
++                        'InvalidIndexesRemovalError: Invalid removal of ' +
++                            'indexes: some_index';
++
++                    t.equal(errBody.status,
++                        expectedStatus, 'status property of the error ' +
++                            'message should be equal to "' + expectedStatus +
++                            '"');
++                    t.equal(errBody.healthy, expectedHealthiness,
++                        'healthy property of the error message should be "' +
++                            expectedHealthiness + '"');
++                    t.equal(errBody.services.moray.initialization.error,
++                        expectedErrString,
++                        'Error string for moray initialization error should ' +
++                            'be: "' + expectedErrString + '"');
++
++                    vmapiClient.close();
++                    vmapiService.close();
++                    morayClient.close();
++                    t.done();
++                });
++            });
++    });
++};
+diff --git a/test/vms.update-moray-bucket-transient-error.test.js b/test/vms.update-moray-bucket-transient-error.test.js
+new file mode 100644
+index 0000000..a5b961e
+--- /dev/null
++++ b/test/vms.update-moray-bucket-transient-error.test.js
+@@ -0,0 +1,277 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++/*
++ * This test is about making sure that, when a transient error is encountered by
++ * the moray buckets setup process, the process is retried until that error is
++ * resolved and that, in the meantime, VMAPI's /ping endpoint responds with the
++ * proper status error.
++ */
++
++var assert = require('assert-plus');
++var jsprim = require('jsprim');
++var Logger = require('bunyan');
++var moray = require('moray');
++var path = require('path');
++var restify = require('restify');
++var vasync = require('vasync');
++var mod_vmapiClient = require('sdc-clients').VMAPI;
++
++var configLoader = require('..//lib/config-loader');
++var morayStorage = require('../lib/storage/moray/moray');
++var morayBucketsConfig = require('../lib/storage/moray/moray-buckets-config');
++var MorayBucketsInitializer =
++    require('../lib/storage/moray/moray-buckets-initializer');
++var vmapi = require('../lib/vmapi');
++
++var configFilePath = path.join(__dirname, '../config.json');
++var config = configLoader.loadConfig(configFilePath);
++
++var TRANSIENT_ERROR_MSG = 'Mocked transient error';
++
++exports.moray_init_transient_error = function (t) {
++    var morayClient;
++    var mockedMorayStorage;
++    var morayBucketsInitializer;
++    var origMorayClientGetBucket;
++
++    var mockedWfapiClient = {
++        connected: true,
++        connect: function mockedWfapiConnect(callback) {
++            callback();
++        }
++    };
++
++    var vmapiService;
++    var vmapiClient;
++
++    vasync.pipeline({funcs: [
++        function connectToMoray(arg, next) {
++            var morayClientConfig = jsprim.deepCopy(config.moray);
++            morayClientConfig.retry = {
++                retries: Infinity,
++                minTimeout: 100,
++                maxTimeout: 1000
++            };
++
++            morayClientConfig.log = new Logger({
++                name: 'moray-client',
++                level: config.logLevel,
++                serializers: restify.bunyan.serializers
++            });
++
++            morayClient = moray.createClient(morayClientConfig);
++            origMorayClientGetBucket = morayClient.getBucket;
++
++            morayClient.on('connect', function onMorayClientConnected() {
++                next();
++            });
++
++            morayClient.on('error', function onMorayClientConnectionError(err) {
++                /*
++                 * The current semantics of the underlying node-moray client
++                 * connection means that it can emit 'error' events for errors
++                 * that the client can actually recover from and that don't
++                 * prevent it from establishing a connection. See MORAY-309 for
++                 * more info.
++                 *
++                 * Since it's expected that, at least in some testing
++                 * environments, the moray client will fail to connect a certain
++                 * number of times, aborting tests in that case would mean that
++                 * tests would fail most of the time, even though they should
++                 * pass. Instead, we explicitly ignore errors and retry
++                 * connecting indefinitely. If the moray client is not able to
++                 * connect, then the process will hang or time out.
++                 */
++            });
++        },
++        function initVmapi(arg, next) {
++            mockedMorayStorage = new morayStorage(morayClient);
++
++            morayBucketsInitializer =
++                new MorayBucketsInitializer();
++
++             vmapiService = new vmapi({
++                apiClients: {
++                    wfapi: mockedWfapiClient
++                },
++                storage: mockedMorayStorage
++            });
++
++            vmapiService.init(next);
++        },
++        function listenOnVmapiServer(arg, next) {
++            vmapiService.listen({
++                port: 0
++            }, function onVmapiListen() {
++                var vmapiServerAddress = vmapiService.server.address();
++                var vmapiServerUrl = 'http://' + vmapiServerAddress.address +
++                    ':' + vmapiServerAddress.port;
++
++                vmapiClient = new mod_vmapiClient({
++                    url: vmapiServerUrl
++                });
++
++                next();
++            });
++        },
++        function initMorayWithTransientError(arg, next) {
++            /*
++             * Monkey patch moray client's getBucket method to inject a
++             * transient error, so that we can test that the moray initializer
++             * and the VMAPI API behave correctly in that case.
++             */
++            morayClient.getBucket =
++                function mockedGetBucket(bucketName, callback) {
++                    callback(new Error(TRANSIENT_ERROR_MSG));
++                };
++
++            morayBucketsInitializer.start(mockedMorayStorage,
++                morayBucketsConfig);
++
++            morayBucketsInitializer.once('done', onMorayBucketsInitDone);
++            morayBucketsInitializer.once('error', onMorayBucketsInitError);
++
++            function onMorayBucketsInitDone() {
++                t.ok(false, 'moray buckets init should not complete when ' +
++                    'transient error injected');
++                morayBucketsInitializer.removeAllListeners('error');
++            }
++
++            function onMorayBucketsInitError(morayBucketsInitError) {
++                t.ok(false, 'moray buckets init should not error when ' +
++                    'transient error injected');
++                MorayBucketsInitializer.removeAllListeners('done');
++            }
++
++            next();
++        },
++        function checkMorayStatusWithTransientErr(arg, next) {
++            var nbVmapiStatusCheckSoFar = 0;
++            var MAX_NB_VMAPI_STATUS_CHECKS = 10;
++            var VMAPI_STATUS_CHECKS_DELAY = 1000;
++
++            function checkPingTransientErr(callback) {
++                vmapiClient.ping(function onVmapiPing(pingErr, obj) {
++                    var errBody = pingErr.body;
++                    var expectedStatus = 'some services are not ready';
++                    var expectedHealthiness = false;
++                    var expectedErrString = 'Error: ' + TRANSIENT_ERROR_MSG;
++
++                    if (errBody.status === expectedStatus &&
++                        errBody.healthy === expectedHealthiness &&
++                        errBody.services.moray.initialization.error ===
++                            expectedErrString) {
++                        callback(true);
++                    } else {
++                        callback(false);
++                    }
++                });
++            }
++
++            function scheduleVmapiCheckTransientErr() {
++                if (nbVmapiStatusCheckSoFar <
++                    MAX_NB_VMAPI_STATUS_CHECKS) {
++                    ++nbVmapiStatusCheckSoFar;
++
++                    function transientErrChecked(gotTransientErr) {
++                        if (!gotTransientErr) {
++                            setTimeout(scheduleVmapiCheckTransientErr,
++                                VMAPI_STATUS_CHECKS_DELAY);
++                        } else {
++                            t.ok(true, 'Status endpoint did respond with ' +
++                                'expected  status');
++                            next();
++                        }
++                    }
++
++                    checkPingTransientErr(transientErrChecked);
++                } else {
++                    t.ok(false, 'Status endpoint did not respond with ' +
++                        'expected  status');
++                    next();
++                }
++            }
++
++            scheduleVmapiCheckTransientErr();
++        },
++        function listVmsWithMorayTransientErr(arg, next) {
++            vmapiClient.listVms({
++                limit: 1
++            }, function onListVms(listVmsErr, vms) {
++                var listVmsErrMsg;
++
++                if (listVmsErr) {
++                    listVmsErrMsg = listVmsErr.toString();
++                }
++
++                t.ok(listVmsErr,
++                    'listing VMs when moray not initialized should error');
++                t.notEqual(listVmsErrMsg.indexOf(TRANSIENT_ERROR_MSG), -1,
++                    'error message should include "' + TRANSIENT_ERROR_MSG +
++                        '"');
++
++                next();
++            });
++        },
++        function pingWithMorayInitOK(arg, next) {
++            /*
++             * Now, we're restoring the original function that we had modified
++             * to introduce a transient error. As a result, the
++             * MorayBucketsInitializer instance should be able to complete the
++             * initialization of moray buckets, and the 'done' or 'error' events
++             * will be emitted. Thus, we need to clear any listener that were
++             * previously added for these events before adding new ones that
++             * perform the tests that we want to perform now that the transient
++             * error is not injected anymore.
++             */
++            morayBucketsInitializer.removeAllListeners('error');
++            morayBucketsInitializer.removeAllListeners('done');
++
++            morayBucketsInitializer.once('done', onMockedMorayBucketsSetup);
++            morayBucketsInitializer.once('error',
++                onMockedMorayBucketsSetupFailed);
++
++            morayClient.getBucket = origMorayClientGetBucket;
++
++            function onMockedMorayBucketsSetup() {
++                vmapiClient.ping(function onVmapiPing(pingErr, obj) {
++                    t.equal(pingErr, null, 'ping endpoint should not ' +
++                        'error when no error injected in moray ' +
++                        'initialization');
++                    morayBucketsInitializer.removeAllListeners('error');
++                    next();
++                });
++            }
++
++            function onMockedMorayBucketsSetupFailed(morayBucketsSetupErr) {
++                t.equal(morayBucketsSetupErr, undefined,
++                    'moray buckets setup should be successful');
++                morayBucketsInitializer.removeAllListeners('done');
++                next();
++            }
++        },
++        function listVmsWithMorayInitOK(arg, next) {
++            vmapiClient.listVms({
++                limit: 1
++            }, function onListVms(listVmsErr, vms) {
++                t.ok(!listVmsErr,
++                    'listing VMs when moray initialized should succeed');
++                next();
++            });
++        }
++    ]}, function onAllTestsDone(err) {
++        vmapiClient.close();
++        vmapiService.close();
++        morayClient.close();
++
++        t.done();
++    });
++};
+diff --git a/test/vms.update-moray-bucket-versioning.test.js b/test/vms.update-moray-bucket-versioning.test.js
+new file mode 100644
+index 0000000..2eac900
+--- /dev/null
++++ b/test/vms.update-moray-bucket-versioning.test.js
+@@ -0,0 +1,294 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var jsprim = require('jsprim');
++var Logger = require('bunyan');
++var moray = require('moray');
++var path = require('path');
++var restify = require('restify');
++var vasync = require('vasync');
++var verror = require('verror');
++var mod_vmapiClient = require('sdc-clients').VMAPI;
++
++var configLoader = require('..//lib/config-loader');
++var morayStorage = require('../lib/storage/moray/moray');
++var vmapi = require('../lib/vmapi');
++
++var configFilePath = path.join(__dirname, '../config.json');
++var config = configLoader.loadConfig(configFilePath);
++
++var MOCKED_WFAPI_CLIENT = {
++    connected: true,
++    connect: function mockedWfapiConnect(callback) {
++        callback();
++    }
++};
++
++var VMS_BUCKET_NAME = 'vmapi_vms_test_versioning';
++var SERVER_VMS_BUCKET_NAME = 'vmapi_server_vms_test_versioning';
++var ROLE_TAGS_BUCKET_NAME = 'vmapi_vm_role_tags_test_versioning';
++
++/*
++ * Initial buckets configuration, version 0.
++ */
++var VMS_BUCKET_CONFIG_V0 = {
++    name: VMS_BUCKET_NAME,
++    schema: {
++    }
++};
++
++var SERVER_VMS_MORAY_BUCKET_CONFIG_V0 = {
++    name: SERVER_VMS_BUCKET_NAME,
++    schema: {}
++};
++
++var ROLE_TAGS_MORAY_BUCKET_CONFIG_V0 = {
++    name: ROLE_TAGS_BUCKET_NAME,
++    schema: {
++    }
++};
++
++/*
++ * Buckets configuration at version 1: an index is added on the property named
++ * "some_property". The upgrade from version 0 to version 1 is valid.
++ */
++var VMS_BUCKET_CONFIG_V1 = {
++    name: VMS_BUCKET_NAME,
++    schema: {
++        index: {
++            some_property: { type: 'boolean' }
++        },
++        options: {
++            version: 1
++        }
++    }
++};
++
++var SERVER_VMS_MORAY_BUCKET_CONFIG_V1 = {
++    name: SERVER_VMS_BUCKET_NAME,
++    schema: {}
++};
++
++var ROLE_TAGS_MORAY_BUCKET_CONFIG_V1 = {
++    name: ROLE_TAGS_BUCKET_NAME,
++    schema: {
++        index: {
++            role_tags: { type: '[string]' }
++        }
++    }
++};
++
++var testBucketsConfigV0 = {
++    vms: VMS_BUCKET_CONFIG_V0,
++    server_vms: SERVER_VMS_MORAY_BUCKET_CONFIG_V0,
++    vm_role_tags: ROLE_TAGS_MORAY_BUCKET_CONFIG_V0
++};
++
++var testBucketsConfigV1 = {
++    vms: VMS_BUCKET_CONFIG_V1,
++    server_vms: SERVER_VMS_MORAY_BUCKET_CONFIG_V1,
++    vm_role_tags: ROLE_TAGS_MORAY_BUCKET_CONFIG_V1
++};
++
++function filterBucketNotFoundErr(err) {
++    assert.object(err, 'err');
++    return err.name !== 'BucketNotFoundError';
++}
++
++function testMigrationToBucketsConfig(bucketsConfig, options, t, callback) {
++    assert.object(bucketsConfig, 'bucketsConfig');
++    assert.object(options, 'options');
++    assert.object(options.morayClient, 'options.morayClient');
++    assert.number(options.expectedResultingVersion,
++        'options.expectedResultingVersion');
++    assert.object(t, 't');
++    assert.func(callback, 'callback');
++
++    var morayClient = options.morayClient;
++    var storage = new morayStorage(morayClient);
++
++    var vmapiService;
++
++    vasync.pipeline({funcs: [
++        function initMorayBuckets(arg, next) {
++            storage.setupBuckets(bucketsConfig, next);
++        },
++        function initVmapi(arg, next) {
++            vmapiService = new vmapi({
++                apiClients: {
++                    wfapi: MOCKED_WFAPI_CLIENT
++                },
++                storage: storage
++            });
++
++            vmapiService.init(next);
++        },
++        function listenOnVmapiServer(arg, next) {
++            vmapiService.listen({
++                port: 0
++            }, next);
++        },
++        function testPingEndpoint(arg, next) {
++            var vmapiClient;
++
++            var vmapiServerAddress = vmapiService.server.address();
++            var vmapiServerUrl = 'http://' + vmapiServerAddress.address +
++                ':' + vmapiServerAddress.port;
++
++            vmapiClient = new mod_vmapiClient({
++                url: vmapiServerUrl
++            });
++
++            vmapiClient.ping(function onVmapiPing(pingErr, obj) {
++                var expectedStatus = 'OK';
++                var expectedHealthiness = true;
++                var expectedErrValue = null;
++
++                t.equal(pingErr, undefined, 'ping endpoint should not error');
++                t.equal(obj.status,
++                    expectedStatus, 'status property of the response ' +
++                        'message should be equal to "' +
++                        expectedStatus + '"');
++                t.equal(obj.healthy, expectedHealthiness,
++                    'healthy property of the response message should ' +
++                        ' be"' + expectedHealthiness + '"');
++                t.equal(obj.services.moray.initialization.error,
++                    expectedErrValue,
++                    'Error string for moray initialization error ' +
++                        'should be: "' + expectedErrValue + '"');
++
++                vmapiClient.close();
++
++                next();
++            });
++        },
++        function checkExpectedVersion(arg, next) {
++            var expectedVersion = options.expectedResultingVersion;
++
++            morayClient.getBucket(bucketsConfig.vms.name,
++                function onVMsBucket(err, vmsBucket) {
++                    t.equal(vmsBucket.options.version, expectedVersion,
++                        'Bucket with name ' + bucketsConfig.vms.name +
++                            ' should be at version ' + expectedVersion);
++
++                    next();
++                });
++        }
++    ]}, function allMigrationTestsDone(migrationTestsErr) {
++        t.equal(migrationTestsErr, undefined,
++            'migration test should not error');
++
++        if (vmapiService) {
++            vmapiService.close();
++        }
++
++        callback();
++    });
++}
++
++exports.moray_init_bucket_versioning = function (t) {
++    var morayClient;
++
++    vasync.pipeline({funcs: [
++        function connectToMoray(arg, next) {
++            var morayClientOpts = jsprim.deepCopy(config.moray);
++            morayClientOpts.retry = {
++                retries: Infinity,
++                minTimeout: 100,
++                maxTimeout: 1000
++            };
++
++            morayClientOpts.log = new Logger({
++                name: 'moray-client',
++                level: config.logLevel,
++                serializers: restify.bunyan.serializers
++            });
++
++             morayClient = moray.createClient(morayClientOpts);
++
++             morayClient.on('connect', function onMorayClientConnected() {
++                next();
++            });
++
++            morayClient.on('error', function onMorayClientConnectionError(err) {
++                /*
++                 * The current semantics of the underlying node-moray client
++                 * connection means that it can emit 'error' events for errors
++                 * that the client can actually recover from and that don't
++                 * prevent it from establishing a connection. See MORAY-309 for
++                 * more info.
++                 *
++                 * Since it's expected that, at least in some testing
++                 * environments, the moray client will fail to connect a certain
++                 * number of times, aborting tests in that case would mean that
++                 * tests would fail most of the time, even though they should
++                 * pass. Instead, we explicitly ignore errors and retry
++                 * connecting indefinitely. If the moray client is not able to
++                 * connect, then the process will hang or time out.
++                 */
++            });
++        },
++        function cleanupLeftoverBuckets(arg, next) {
++            vasync.forEachParallel({
++                func: function deleteVmBucket(bucketName, done) {
++                    morayClient.delBucket(bucketName, done);
++                },
++                inputs: [
++                    VMS_BUCKET_NAME,
++                    SERVER_VMS_BUCKET_NAME,
++                    ROLE_TAGS_BUCKET_NAME
++                ]
++            }, function onAllLeftoverBucketsDeleted(deleteErrs) {
++                var unexpectedErrs;
++                var forwardedMultiErr;
++
++                if (deleteErrs) {
++                    unexpectedErrs =
++                        deleteErrs.ase_errors.filter(filterBucketNotFoundErr);
++
++                    if (unexpectedErrs && unexpectedErrs.length > 0) {
++                        forwardedMultiErr =
++                            new verror.MultiError(unexpectedErrs);
++                    }
++                }
++
++                next(forwardedMultiErr);
++            });
++        },
++        function setupOriginalMorayBuckets(arg, next) {
++            testMigrationToBucketsConfig(testBucketsConfigV0, {
++                morayClient: morayClient,
++                expectedResultingVersion: 0
++            }, t, next);
++        },
++        function migrateFromV0ToV1(arg, next) {
++            testMigrationToBucketsConfig(testBucketsConfigV1, {
++                morayClient: morayClient,
++                expectedResultingVersion: 1
++            }, t, next);
++        },
++        function migrateFromV1ToV0(arg, next) {
++            testMigrationToBucketsConfig(testBucketsConfigV0, {
++                morayClient: morayClient,
++                expectedResultingVersion: 1
++            }, t, next);
++        }
++    ]}, function allMigrationsDone(allMigrationsErr) {
++        t.equal(allMigrationsErr, undefined,
++            'versioning test should not error');
++
++        if (morayClient) {
++            morayClient.close();
++        }
++
++        t.done();
++    });
++};
+diff --git a/tools/add-test-vms.js b/tools/add-test-vms.js
+index 346d1ba..2e68afa 100755
+--- a/tools/add-test-vms.js
++++ b/tools/add-test-vms.js
+@@ -18,18 +18,20 @@
+  * Run node add-test-vms.js -h for usage.
+  */
+ 
+-var path = require('path');
+-var fs = require('fs');
+-
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
+ var dashdash = require('dashdash');
++var fs = require('fs');
++var jsprim = require('jsprim');
++var moray = require('moray');
+ var libuuid = require('libuuid');
+-var bunyan = require('bunyan');
++var path = require('path');
+ var restify = require('restify');
+-var assert = require('assert-plus');
+ 
+ var testVm = require('../test/lib/vm');
+ var configFileLoader = require('../lib/config-loader');
+-var MORAY = require('../lib/apis/moray');
++var mod_morayStorage = require('../lib/storage/moray/moray');
++var morayBucketsConfig = require('../lib/storage/moray/moray-buckets-config');
+ 
+ var DEFAULT_NB_TEST_VMS_TO_CREATE = 60;
+ var DEFAULT_CONCURRENCY = 10;
+@@ -37,15 +39,12 @@ var DEFAULT_CONCURRENCY = 10;
+ var configFilePath = path.join(__dirname, '..', 'config.json');
+ var config = configFileLoader.loadConfig(configFilePath);
+ 
+-log = this.log = new bunyan({
++var log = this.log = new bunyan({
+     name: 'add-test-vms',
+     level: process.env.LOG_LEVEL || config.logLevel || 'debug',
+     serializers: restify.bunyan.serializers
+ });
+ 
+-config.moray.reconnect = true;
+-var moray = new MORAY(config.moray);
+-
+ var cmdlineOptions = [
+     {
+         names: ['help', 'h'],
+@@ -85,17 +84,47 @@ function addTestVms(nbVms, concurrency, data) {
+     assert.optionalObject(data, 'data must be an optional object');
+     data = data || {};
+ 
+-    moray.connect();
+-    moray.once('moray-ready', function () {
+-        log.debug('Moray ready!');
++    var morayClientConfig = jsprim.deepCopy(config.moray);
++    morayClientConfig.log = log.child({component: 'moray-client'}, true);
+ 
+-        log.debug('Number of test VMs to create:', nbTestVmsToCreate);
+-        assert.number(nbTestVmsToCreate);
++    var morayClient = moray.createClient(morayClientConfig);
++    var morayStorage = new mod_morayStorage({
++            morayClient: morayClient
++        });
++
++    morayClient.on('connect', function onMorayClientConnected() {
++
++        morayStorage.setupBuckets(morayBucketsConfig,
++            function onMorayBucketsSetup(morayBucketsSetupErr) {
++                if (morayBucketsSetupErr) {
++                    log.error({error: morayBucketsSetupErr},
++                        'Error when setting up moray buckets');
++                    morayClient.close();
++                    process.exitCode = 1;
++                } else {
++                    onMorayStorageReady();
++                }
++            });
++    });
++
++    morayClient.on('error', function onMorayClientConnectionError(err) {
++        /*
++         * The current semantics of the underlying node-moray client
++         * connection means that it can emit 'error' events for errors
++         * that the client can actually recover from and that don't
++         * prevent it from establishing a connection. See MORAY-309 for
++         * more info.
++         */
++    });
++
++    function onMorayStorageReady() {
++        log.debug('Number of test VMs to create:', nbVms);
++        assert.number(nbVms);
+ 
+         log.debug('concurrency:', concurrency);
+         assert.number(concurrency);
+ 
+-        testVm.createTestVMs(nbTestVmsToCreate, moray, {
++        testVm.createTestVMs(nbVms, morayStorage, {
+             concurrency: concurrency,
+             log: log
+         }, data, function allVmsCreated(err) {
+@@ -106,15 +135,15 @@ function addTestVms(nbVms, concurrency, data) {
+             }
+ 
+             log.debug('Closing moray connection');
+-            moray.connection.close();
++            morayClient.close();
+         });
+-    });
++    }
+ }
+ 
+ var cmdlineOptionsParser = dashdash.createParser({options: cmdlineOptions});
+-var nbTestVmsToCreate;
+-var concurrency;
+-var testVmsData;
++var nbVmsParam;
++var concurrencyParam;
++var vmsDataParam;
+ var parsedCmdlineOpts;
+ 
+ try {
+@@ -123,17 +152,17 @@ try {
+     if (parsedCmdlineOpts.help) {
+         printUsage(cmdlineOptionsParser);
+     } else {
+-        nbTestVmsToCreate = Number(parsedCmdlineOpts.n) ||
++        nbVmsParam = Number(parsedCmdlineOpts.n) ||
+             DEFAULT_NB_TEST_VMS_TO_CREATE;
+ 
+-        concurrency = Number(parsedCmdlineOpts.c) ||
++        concurrencyParam = Number(parsedCmdlineOpts.c) ||
+             DEFAULT_CONCURRENCY;
+ 
+         if (parsedCmdlineOpts.d) {
+-            testVmsData = JSON.parse(parsedCmdlineOpts.d);
++            vmsDataParam = JSON.parse(parsedCmdlineOpts.d);
+         }
+ 
+-        addTestVms(nbTestVmsToCreate, concurrency, testVmsData);
++        addTestVms(nbVmsParam, concurrencyParam, vmsDataParam);
+     }
+ } catch (err) {
+     console.error('Could not parse command line options');
+diff --git a/tools/fix-no-owner.js b/tools/fix-no-owner.js
+index bedfdda..40d7227 100644
+--- a/tools/fix-no-owner.js
++++ b/tools/fix-no-owner.js
+@@ -9,55 +9,63 @@
+  */
+ 
+ // Backfill image_uuid for KVM VMs
++var async = require('async');
++var bunyan = require('bunyan');
+ var path = require('path');
+ var fs = require('fs');
++var jsprim = require('jsprim');
++var moray = require('moray');
++var restify = require('restify');
+ var util = require('util');
+-var MORAY = require('../lib/apis/moray');
+-var WFAPI = require('../lib/apis/wfapi');
++
+ var common = require('../lib/common');
++var configLoader = require('../lib/config-loader');
++var mod_morayStorage = require('../lib/storage/moray/moray');
++var morayBucketsConfig = require('../lib/storage/moray/moray-buckets-config');
++var WFAPI = require('../lib/apis/wfapi');
+ 
+-var config_file = path.resolve(__dirname, '..', 'config.json');
+-var bunyan = require('bunyan');
+-var restify = require('restify');
+-var async = require('async');
+ var levels = [bunyan.TRACE, bunyan.DEBUG, bunyan.INFO,
+               bunyan.WARN, bunyan.ERROR, bunyan.FATAL];
+-var config;
+-var log;
++
++var configFilePath = path.join(__dirname, '..', 'config.json');
++var config = configLoader.loadConfig(configFilePath);
+ 
+ // If you don't pass this flag the script will read in test mode
+ var force = (process.argv[2] === '-f' ? true : false);
+ 
+-/*
+- * Loads and parse the configuration file at config.json
+- */
+-function loadConfig() {
+-    var configPath = path.join(__dirname, '..', 'config.json');
+-
+-    if (!fs.existsSync(configPath)) {
+-        console.error('Config file not found: ' + configPath +
+-          ' does not exist. Aborting.');
+-        process.exit(1);
+-    }
+-
+-    var theConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+-    return theConfig;
+-}
+-
+-var config = loadConfig();
+-
+-log = this.log = new bunyan({
++var log = this.log = new bunyan({
+     name: 'fix-now-owner',
+     level: config.logLevel || 'debug',
+     serializers: restify.bunyan.serializers
+ });
+ config.wfapi.log = log;
+ 
+-var moray = new MORAY(config.moray);
+-var wfapi = new WFAPI(config.wfapi);
++var morayClientConfig = jsprim.deepCopy(config.moray);
++morayClientConfig.log = log.child({component: 'moray-client'}, true);
++
++var morayClient = moray.createClient(morayClientConfig);
++
++morayClient.on('connect', function onMorayClientConnected() {
++    var morayStorage = new mod_morayStorage({
++        morayClient: morayClient
++    });
++
++    morayStorage.setupBuckets(morayBucketsConfig,
++        function onMorayBucketsSetup(morayBucketsSetupErr) {
++            if (morayBucketsSetupErr) {
++                log.error({error: morayBucketsSetupErr},
++                    'Error when setting up moray buckets');
++                morayClient.close();
++                process.exitCode = 1;
++            } else {
++                fixVMsWithoutOwner();
++            }
++        });
++});
++
++function fixVMsWithoutOwner() {
++    var wfapi = new WFAPI(config.wfapi);
+ 
+-moray.connect();
+-moray.once('moray-ready', function () {
+     wfapi.connect(onWfapi);
+ 
+     function onWfapi() {
+@@ -116,5 +124,4 @@ moray.once('moray-ready', function () {
+             });
+         });
+     }
+-});
+-
++}
+diff --git a/tools/kvm-backfill.js b/tools/kvm-backfill.js
+index 87ad57a..da25636 100644
+--- a/tools/kvm-backfill.js
++++ b/tools/kvm-backfill.js
+@@ -9,17 +9,23 @@
+  */
+ 
+ // Backfill image_uuid for KVM VMs
+-var path = require('path');
++var bunyan = require('bunyan');
+ var fs = require('fs');
++var jsprim = require('jsprim');
++var moray = require('moray');
++var path = require('path');
+ var util = require('util');
+-var MORAY = require('../lib/apis/moray');
+ 
+-var config_file = path.resolve(__dirname, '..', 'config.json');
+-var bunyan = require('bunyan');
++var configLoader = require('../lib/config-loader');
++var mod_morayStorage = require('../lib/storage/moray/moray');
++var morayBucketsConfig = require('../lib/storage/moray/moray-buckets-config');
++
++var configFilePath = path.resolve(__dirname, '..', 'config.json');
++var config = configLoader.loadConfig(configFilePath);
++
+ var levels = [bunyan.TRACE, bunyan.DEBUG, bunyan.INFO,
+               bunyan.WARN, bunyan.ERROR, bunyan.FATAL];
+-var config;
+-var log;
++
+ var VMS_LIMIT = (process.env.VMS_LIMIT) ? Number(process.env.VMS_LIMIT) : 10;
+ 
+ // Total number of VMs
+@@ -27,153 +33,163 @@ var TOTAL = 0;
+ // Number of VMs we've finished with:
+ var PROCESSED = 0;
+ 
+-fs.readFile(config_file, 'utf8', function (err, data) {
+-    if (err) {
+-        console.error('Error reading config file:');
+-        console.dir(err);
+-        process.exit(1);
+-    } else {
+-        try {
+-            config = JSON.parse(data);
+-        } catch (e) {
+-            console.error('Error parsing config file JSON:');
+-            console.dir(e);
+-            process.exit(1);
+-        }
+-    }
++var morayStorage;
++
++var log = new bunyan({
++    name: 'kvm-backfill',
++    streams: [ {
++        level: config.logLevel || 'info',
++        stream: process.stdout
++    }]
++});
++
++var morayClientConfig = jsprim.deepCopy(config.moray);
++morayClientConfig.log = log.child({component: 'moray-client'}, true);
+ 
+-    log = new bunyan({
+-        name: 'kvm-backfill',
+-        streams: [ {
+-            level: config.logLevel || 'info',
+-            stream: process.stdout
+-        }]
++var morayClient = moray.createClient(morayClientConfig);
++
++morayClient.on('connect', function onMorayClientConnected() {
++    morayStorage = new mod_morayStorage({
++        morayClient: morayClient
+     });
+ 
+-    var moray = new MORAY(config.moray);
+-    moray.connect();
+-    moray.once('moray-ready', onMoray);
++    morayStorage.setupBuckets(morayBucketsConfig,
++        function onMorayBucketsSetup(morayBucketsSetupErr) {
++            if (morayBucketsSetupErr) {
++                log.error({error: morayBucketsSetupErr},
++                    'Error when setting up moray buckets');
++                morayClient.close();
++                process.exitCode = 1;
++            } else {
++                startProcessingVMs();
++            }
++        });
++});
+ 
+-    function onMoray() {
+-        processVms(0, VMS_LIMIT, processCb);
++morayClient.on('error', function onMorayClientConnectionError(err) {
++    /*
++     * The current semantics of the underlying node-moray client
++     * connection means that it can emit 'error' events for errors
++     * that the client can actually recover from and that don't
++     * prevent it from establishing a connection. See MORAY-309 for
++     * more info.
++     */
++});
+ 
+-        function processVms(offset, limit, cb) {
+-            var done = 0;
++function startProcessingVMs() {
++    processVms(0, VMS_LIMIT, processCb);
+ 
+-            function wait() {
+-                log.info('inside wait %d %d', done, limit);
++    function processVms(offset, limit, cb) {
++        var done = 0;
+ 
+-                if (done === limit) {
+-                    return cb();
+-                } else {
+-                    return setTimeout(wait, 1000);
+-                }
++        function wait() {
++            log.info('inside wait %d %d', done, limit);
++
++            if (done === limit) {
++                return cb();
++            } else {
++                return setTimeout(wait, 1000);
+             }
++        }
+ 
+-            moray.countVms({ brand: 'kvm' }, onCount);
++        morayStorage.countVms({ brand: 'kvm' }, onCount);
++
++        function onCount(countVmsErr, count) {
++            if (countVmsErr) {
++                log.error({err: countVmsErr}, 'Could not get count of vms');
++                process.exit(1);
++            }
+ 
+-            function onCount(cerr, count) {
+-                if (cerr) {
+-                    log.error({err: err}, 'Could not get count of vms');
+-                    process.exit(1);
++            var query = { brand: 'kvm', offset: offset, limit: limit };
++            morayStorage.listVms(query, true, function (err, vms) {
++                if (err) {
++                    log.error({err: err}, 'Error fetching VMs');
++                    return processCb(err);
++                }
++                // Should happen just on first pass
++                if (TOTAL === 0) {
++                    TOTAL = count;
++                }
++                if (count < limit) {
++                    limit = count;
+                 }
+ 
+-                var query = { brand: 'kvm', offset: offset, limit: limit };
+-                moray.listVms(query, true, function (err, vms) {
+-                    if (err) {
+-                        log.error({err: err}, 'Error fetching VMs');
+-                        return processCb(err);
+-                    }
+-                    // Should happen just on first pass
+-                    if (TOTAL === 0) {
+-                        TOTAL = count;
++                vms.forEach(processVm);
++                function processVm(vm) {
++                    var disks = vm.disks;
++
++                    // If VM has a value here then it's already good
++                    if (vm.image_uuid) {
++                        PROCESSED += 1;
++                        done += 1;
++                        log.info('VM %d of %d already processed',
++                                    PROCESSED, TOTAL);
++                        return;
+                     }
+-                    if (count < limit) {
+-                        limit = count;
++
++                    try {
++                        if (typeof (disks) == 'string') {
++                            disks = JSON.parse(disks);
++                        }
++                    } catch (e) {
++                        PROCESSED += 1;
++                        done += 1;
++
++                        log.error({
++                            err: e,
++                            vm_uuid: vm.uuid
++                        }, 'Error parsing VM disks, skipping.');
++                        return;
+                     }
+ 
+-                    vms.forEach(processVm);
+-                    function processVm(vm) {
+-                        var disks = vm.disks;
++                    if (disks && disks[0] && disks[0].image_uuid) {
++                        vm.image_uuid = disks[0].image_uuid;
+ 
+-                        // If VM has a value here then it's already good
+-                        if (vm.image_uuid) {
++                        morayStorage.putVm(vm.uuid, vm, function (perr) {
+                             PROCESSED += 1;
+                             done += 1;
+-                            log.info('VM %d of %d already processed',
+-                                        PROCESSED, TOTAL);
+-                            return;
+-                        }
+ 
+-                        try {
+-                            if (typeof (disks) == 'string') {
+-                                disks = JSON.parse(disks);
++                            if (perr) {
++                                log.error({
++                                    err: perr,
++                                    vm_uuid: vm.uuid
++                                }, 'Error updating VM');
++                            } else {
++                                log.info({
++                                    vm_uuid: vm.uuid,
++                                    server_uuid: vm.server_uuid
++                                },
++                                util.format('VM %d of %d updated',
++                                    PROCESSED, TOTAL));
+                             }
+-                        } catch (e) {
+-                            PROCESSED += 1;
+-                            done += 1;
+-
+-                            log.error({
+-                                err: e,
+-                                vm_uuid: vm.uuid
+-                            }, 'Error parsing VM disks, skipping.');
+-                            return;
+-                        }
+-
+-                        if (disks && disks[0] && disks[0].image_uuid) {
+-                            vm.image_uuid = disks[0].image_uuid;
+-
+-                            moray.putVm(vm.uuid, vm, function (perr) {
+-                                PROCESSED += 1;
+-                                done += 1;
+-
+-                                if (perr) {
+-                                    log.error({
+-                                        err: perr,
+-                                        vm_uuid: vm.uuid
+-                                    }, 'Error updating VM');
+-                                } else {
+-                                    log.info({
+-                                        vm_uuid: vm.uuid,
+-                                        server_uuid: vm.server_uuid
+-                                    },
+-                                    util.format('VM %d of %d updated',
+-                                        PROCESSED, TOTAL));
+-                                }
+-                            });
+-
+-                        // This should never happen
+-                        } else {
+-                            PROCESSED += 1;
+-                            done += 1;
+-                            log.warn({ vm_uuid: vm.uuid }, 'Error does not ' +
+-                            'have standard disks array, skipping.');
+-                        }
++                        });
++
++                    // This should never happen
++                    } else {
++                        PROCESSED += 1;
++                        done += 1;
++                        log.warn({ vm_uuid: vm.uuid }, 'Error does not ' +
++                        'have standard disks array, skipping.');
+                     }
++                }
+ 
+-                    return wait();
+-                });
+-            }
++                return wait();
++            });
+         }
++    }
+ 
+-        function processCb(err) {
+-            if (err) {
+-                console.log(err.message);
+-                if (err.message ===
+-                        'the underlying connection has been closed') {
+-                    log.warn('Waiting for moray to reconnect');
+-                    moray.once('moray-connected', function () {
+-                        processVms(PROCESSED, VMS_LIMIT, processCb);
+-                    });
+-                }
+-                return (false);
+-            } else if (PROCESSED < TOTAL) {
+-                log.info('% %d', PROCESSED, TOTAL);
+-                return processVms(PROCESSED, VMS_LIMIT, processCb);
+-            } else {
+-                log.info('%d VMS PROCESSED. DONE!', TOTAL);
+-                return (true);
+-            }
++    function processCb(err) {
++        if (err) {
++            console.log(err.message);
++        }
++
++        if (PROCESSED < TOTAL) {
++            log.info('% %d', PROCESSED, TOTAL);
++            return processVms(PROCESSED, VMS_LIMIT, processCb);
++        } else {
++            log.info('%d VMS PROCESSED. DONE!', TOTAL);
++            morayClient.close();
++            return (true);
+         }
+     }
+-});
++}
+diff --git a/tools/migrations/add-docker-index.js b/tools/migrations/add-docker-index.js
+index a45719f..2c62a03 100644
+--- a/tools/migrations/add-docker-index.js
++++ b/tools/migrations/add-docker-index.js
+@@ -64,7 +64,7 @@ function getMorayClient(callback) {
+ 
+ function updateBucket(callback) {
+     getMorayClient(function (mclient) {
+-        morayClient = mclient;
++        var morayClient = mclient;
+         morayClient.getBucket(BUCKET.name, function (err, bck) {
+             if (err) {
+                 return callback(err);
+@@ -91,4 +91,3 @@ updateBucket(function (updateErr) {
+     log.info('"docker" index has been successfully added');
+     process.exit(0);
+ });
+-
+diff --git a/tools/npmfreeze.js b/tools/npmfreeze.js
+deleted file mode 100755
+index da0a6dc..0000000
+--- a/tools/npmfreeze.js
++++ /dev/null
+@@ -1,93 +0,0 @@
+-#!/usr/bin/env node
+-// -*- mode: js -*-
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- */
+-
+-/*
+- * Copyright (c) 2014, Joyent, Inc.
+- */
+-
+-//
+-//
+-// Generate a 'dependencies' block for a top-level package.json that includes
+-// the explicit versions for all recursive npm modules. See 'Method 3' in
+-// <https://head.no.de/docs/eng> for why this is interesting.
+-//
+-// Usage:
+-//      find . -name 'package.json' | xargs ./tools/npmfreeze.js
+-//
+-// If two parts of the node_modules tree includes separate versions of a
+-// particular module, then the greater version is used.
+-
+-var fs = require('fs');
+-var semver = require('semver');
+-var spawn = require('child_process').spawn;
+-
+-
+-// --- Globals
+-var deps = {};
+-
+-
+-// --- Helpers
+-
+-function done() {
+-    console.log(JSON.stringify(deps, null, 2));
+-}
+-
+-
+-function waitForDone() {
+-    process.nextTick(function () {
+-        if (wait === 0)
+-            return done();
+-
+-        return waitForDone();
+-    });
+-}
+-
+-
+-// --- Main
+-
+-process.argv.slice(2).forEach(function (fname) {
+-    var pkg = JSON.parse(fs.readFileSync(fname, 'utf8'));
+-    if (!pkg.dependencies)
+-        return;
+-
+-    var tmp = pkg.dependencies;
+-    Object.keys(tmp).forEach(function (dep) {
+-        if (!deps[dep] || semver.gt(tmp[dep], deps[dep]))
+-            deps[dep] = semver.clean(tmp[dep]) || '*';
+-    });
+-});
+-
+-// Make a pass and clean up all the '*'
+-var wait = 0;
+-Object.keys(deps).forEach(function (k) {
+-    if (deps[k] !== '*')
+-        return;
+-
+-    wait++;
+-    var npm = spawn('npm', ['info', k]);
+-    var json = '';
+-    npm.stdout.on('data', function (data) {
+-        if (data)
+-            json += data;
+-    });
+-
+-    npm.stdout.on('end', function (code) {
+-        if (code) {
+-            console.error('npm info %s exited: %d', k, code);
+-            process.exit(code);
+-        }
+-
+-        var val;
+-        eval('val = ' + json);
+-
+-        deps[k] = val['dist-tags'].latest;
+-        wait--;
+-    });
+-});
+-
+-return (wait === 0 ? done() : waitForDone());
+diff --git a/tools/perf/profile.js b/tools/perf/profile.js
+index bce7764..a38bc31 100755
+--- a/tools/perf/profile.js
++++ b/tools/perf/profile.js
+@@ -1,4 +1,3 @@
+-#!/usr//bin/env node
+ /*
+  * This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+@@ -19,7 +18,7 @@
+ var cp = require('child_process');
+ var exec = cp.exec;
+ var sprintf = require('sprintf').sprintf;
+-var fs = require("fs");
++var fs = require('fs');
+ 
+ var FILE = './dtrace.out';
+ var LINES = [];
+@@ -53,7 +52,7 @@ function parseLines(cb) {
+         cb();
+     });
+ 
+-    stream.on('data', function(chunk) {
++    stream.on('data', function onData(chunk) {
+         var lines, i;
+         lines = (lastLine + chunk).split('\n');
+ 
+@@ -69,7 +68,7 @@ function parseLines(cb) {
+ 
+ 
+ function processLine(line) {
+-    var reqLine, fields, latency, statusCode, success, serverName;
++    var reqLine, fields, latency, statusCode, success;
+ 
+     fields = line.split(' ');
+     reqLine = fields.slice(0, 2).join(' ');
+@@ -125,7 +124,7 @@ function printSummary() {
+         avgRounded = Math.round((req.total / req.count) * 100) / 100;
+ 
+         console.log(sprintf('%50s %10s %10s %10s %10s %10s',
+-            reqLine.substr(0,50), req.count, req.min, avgRounded,
++            reqLine.substr(0, 50), req.count, req.min, avgRounded,
+             req.max, req.statusCodes.join(', ')));
+     });
+ }
+diff --git a/tools/perf/random-load.js b/tools/perf/random-load.js
+index 12e0c00..b5af083 100644
+--- a/tools/perf/random-load.js
++++ b/tools/perf/random-load.js
+@@ -17,7 +17,6 @@ var config_file = path.resolve(__dirname, '..', '..', 'config.json');
+ var bunyan = require('bunyan');
+ var restify = require('restify');
+ var async = require('async');
+-var log;
+ 
+ var VMAPI = require('sdc-clients').VMAPI;
+ var log = new bunyan({
+@@ -39,7 +38,7 @@ var REQUESTS = [
+     [ 'snapshotVm', 0.07, true, true ]
+ ];
+ 
+-vmapi = new VMAPI({
++var vmapi = new VMAPI({
+     url: 'localhost',
+     retry: {
+         retries: 1,
+@@ -107,7 +106,7 @@ function randomLoad() {
+ }
+ 
+ 
+-process.on('SIGINT', function() {
++process.on('SIGINT', function onSigInt() {
+     console.log('Received CTRL-C. Exiting...');
+     vmapi.client.close();
+ });

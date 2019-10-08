@@ -1,0 +1,666 @@
+commit 9edc1e2a94827637167ffb37fd6d14e603e36627 (refs/changes/64/3364/2)
+Author: Dylan Yep <dyep49@gmail.com>
+Date:   2018-02-16T13:49:13-08:00 (1 year, 8 months ago)
+    
+    TRITON-98 Add artedi metrics collection to IMGAPI
+
+diff --git a/CHANGES.md b/CHANGES.md
+index 171c5d9..6aac617 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,5 +1,9 @@
+ # IMGAPI changelog
+ 
++## 4.2.0
++
++- TRITON-98 Add artedi metrics collection to IMGAPI
++
+ ## 4.1.1
+ 
+ - TRITON-134 imgapi docker push allows insecure docker pushes
+diff --git a/docs/operator-guide.md b/docs/operator-guide.md
+index 4bc1502..2714ca8 100644
+--- a/docs/operator-guide.md
++++ b/docs/operator-guide.md
+@@ -444,6 +444,10 @@ For example: if providing `manta`, one must provide the whole `manta` object.
+ | maxSockets                   | Number        | 100               | Maximum number of sockets for external API calls |
+ | mode                         | String        | public            | One of 'public' (default, running as a public server e.g. images.joyent.com), 'private' (a ironically "public" server that only houses images marked `public=false`), or 'dc' (running as the IMGAPI in a Triton DataCenter). |
+ | datacenterName               | String        | -                 | Name of the Triton DataCenter on which IMGAPI is running. Only relevant if `mode === "dc"`. |
++| serviceName                  | String        | -                 | The name of the service. Only relevant if `mode === "dc"`. |
++| instanceUuid                 | String        | -                 | The instance UUID. Only relevant if `mode === "dc"`. |
++| serverUuid                   | String        | -                 | The server (CN) UUID on which the instance is running. Only relevant if `mode === "dc"`. |
++| adminIp                      | String        | -                 | The admin IP address. The metrics server will be exposed on this network. Only relevant if `mode === "dc"`. |
+ | adminUuid                    | String        | -                 | The UUID of the admin user in this Triton DataCenter. Only relevant if `mode === "dc"`. |
+ | channels                     | Array         | -                 | Set this make this IMGAPI server support [channels](#channels). It must be an array of channel definition objects of the form `{"name": "<name>", "description": "<desc>"[, "default": true]}`. |
+ | placeholderImageLifespanDays | Number        | 7                 | The number of days after which a "placeholder" image (one with state 'failed' or 'creating') is purged from the database. |
+@@ -716,3 +720,38 @@ facility](https://github.com/trentm/node-bunyan/#runtime-log-snooping-via-dtrace
+ to tail *trace*-level logs of the imgapi service:
+ 
+     bunyan -p imgapi
++
++# Metrics
++
++IMGAPI exposes metrics via [node-artedi](https://github.com/joyent/node-artedi).  For development, it is probably easiest to use `curl` to scrape metrics:
++
++```
++$ curl http://<ADMIN_IP>:8881/metrics
++```
++The metrics are returned in Prometheus v0.0.4 text format.
++
++The following metrics are collected:
++
++- http_requests_completed
++- http_request_duration_seconds
++
++Each of the metrics returned include the following metadata labels:
++
++- datacenter (Datacenter name e.g. us-east-1)
++- service (Service name e.g. vmapi)
++- instance (Instance UUID)
++- server (Server UUID)
++- method (e.g. 'PUT')
++- status_code (e.g. 200)
++- route (e.g. 'listvms')
++- user_agent (only the first token e.g. restify/1.5.2)
++
++The metric collection facility provided is intended to be consumed by a monitoring service like a Prometheus or InfluxDB server.
++
++Notably, some metadata labels are not being collected due to their potential for
++high cardinality. Metadata labels that have a large number of unique values 
++cause memory strain on metric client processes (imgapi) as well as metric 
++servers (Prometheus). It's important to understand what kind of an effect on 
++the entire system the addition of metrics and metadata labels can have before 
++adding them. This is an issue that would likely not appear in a development or 
++staging environment.
+diff --git a/lib/app.js b/lib/app.js
+index 4aaae72..b5b4c0c 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -29,8 +29,10 @@ var MemoryStream = require('memorystream');
+ var trace_event = require('trace-event');
+ var UFDS = require('ufds');
+ var moray = require('moray');
++var vasync = require('vasync');
+ 
+ var channels = require('./channels');
++var createMetricsManager = require('./metrics').createMetricsManager;
+ var database = require('./database');
+ var authkeys = require('./authkeys');
+ var storage = require('./storage');
+@@ -283,8 +285,28 @@ function App(config, log) {
+         this.channelFromName = info[1];
+     }
+ 
++    // Until we decide how to handle metrics collection for standalone
++    // instances, metrics collection will only be enabled in DC-mode
++    if (this.mode === 'dc') {
++        var metricsLog = this.log.child({component: 'metrics'});
++        var metricsConfig = {
++            address: config.adminIp,
++            log: metricsLog,
++            labels: {
++                datacenter: config.datacenterName,
++                instance: config.instanceUuid,
++                server: config.serverUuid,
++                service: config.serviceName
++            },
++            port: 8881
++        };
++
++        var metricsManager = createMetricsManager(metricsConfig);
++        this.metricsManager = metricsManager;
++    }
++
+     // Server response caches. This is centralized on the app
+-    // because it allows the interdependant cache-invalidation to be
++    // because it allows the interdependent cache-invalidation to be
+     // centralized.
+     this._cacheFromScope = {
+         ImageGet: new Cache({
+@@ -311,6 +333,7 @@ function App(config, log) {
+         version: ['1.0.0', '2.0.0']
+     });
+ 
++
+     server.pre(function pauseReqStreamEtc(req, res, next) {
+         /**
+          * If the client does not set Accept-Version, then we assume old clients
+@@ -381,6 +404,11 @@ function App(config, log) {
+         allowDots: false,
+         plainObjects: false
+     }));
++
++    if (this.mode === 'dc') {
++        server.on('after', metricsManager.update.bind(metricsManager));
++    }
++
+     server.on('after', function (req, res, route, err) {
+         // Skip logging some high frequency or unimportant endpoints to key
+         // log noise down.
+@@ -391,6 +419,7 @@ function App(config, log) {
+                 return;
+             }
+         }
++
+         // Successful GET res bodies are uninteresting and *big*.
+         var body = !(method === 'GET' &&
+             Math.floor(res.statusCode / 100) === 2);
+@@ -545,35 +574,50 @@ App.prototype.setup = function (callback) {
+         });
+     }
+ 
+-    this.db.setup(self, function (dbErr) {
+-        if (dbErr) {
+-            return callback(dbErr);
+-        }
++    vasync.parallel({
++        funcs: [
++            function startMetricsServer(next) {
++                if (self.mode === 'dc') {
++                    self.metricsManager.listen(function metricsServerStarted() {
++                        next();
++                    });
++                } else {
++                    next();
++                }
++            },
++            function setupDB(next) {
++                self.db.setup(self, function (dbErr) {
++                    if (dbErr) {
++                        return next(dbErr);
++                    }
+ 
+-        self.storage = {};
+-        for (var i = 0; i < self.config.storageTypes.length; i++) {
+-            var type = self.config.storageTypes[i];
+-            var StorageClass = storage[type];
+-            log.info({type: type}, 'create storage handler');
+-            try {
+-                self.storage[type] = new StorageClass({
+-                    log: log,
+-                    config: self.config
++                    self.storage = {};
++                    for (var i = 0; i < self.config.storageTypes.length; i++) {
++                        var type = self.config.storageTypes[i];
++                        var StorageClass = storage[type];
++                        log.info({type: type}, 'create storage handler');
++                        try {
++                            self.storage[type] = new StorageClass({
++                                log: log,
++                                config: self.config
++                            });
++                        } catch (ctorErr) {
++                            return next(ctorErr);
++                        }
++                    }
++
++                    async.forEach(
++                        Object.keys(self.storage),
++                        function setupOneStorage(aType, next_) {
++                            log.info({type: aType}, 'setup storage');
++                            self.storage[aType].setup(next_);
++                        },
++                        next
++                    );
+                 });
+-            } catch (ctorErr) {
+-                return callback(ctorErr);
+             }
+-        }
+-
+-        async.forEach(
+-            Object.keys(self.storage),
+-            function setupOneStorage(aType, next) {
+-                log.info({type: aType}, 'setup storage');
+-                self.storage[aType].setup(next);
+-            },
+-            callback
+-        );
+-    });
++        ]
++    }, callback);
+ 
+     /*
+      * If using "signature" auth, then a mapping of usernames to SSH keys
+diff --git a/lib/metrics.js b/lib/metrics.js
+new file mode 100644
+index 0000000..9d15183
+--- /dev/null
++++ b/lib/metrics.js
+@@ -0,0 +1,125 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * Artedi metrics.
++ */
++
++var artedi = require('artedi');
++var assert = require('assert-plus');
++var restify = require('restify');
++var VError = require('verror');
++
++function getMetricsHandler(collector) {
++    function getMetrics(req, res, next) {
++        /*
++         * Restify GET requests will keep socket open until entire request
++         * body is read. req.resume() is used to prevent connection leaks.
++         *
++         * More information at:
++         * https://jira.joyent.us/browse/MANTA-3338
++         * https://cr.joyent.us/#/c/2823/1/lib/other.js
++         */
++        req.on('end', function collectMetrics() {
++            collector.collect(artedi.FMT_PROM,
++                function sendMetrics(err, metrics) {
++                if (err) {
++                    next(new VError(err, 'error retrieving metrics'));
++                    return;
++                }
++                /* BEGIN JSSTYLED */
++                /*
++                 * Content-Type header is set to indicate the Prometheus
++                 * exposition format version
++                 *
++                 * More information at:
++                 * https://github.com/prometheus/docs/blob/master/content/docs/instrumenting/exposition_formats.md#format-version-004
++                 */
++                /* END JSSTYLED */
++                res.setHeader('Content-Type', 'text/plain; version=0.0.4');
++                res.send(metrics);
++                next();
++            });
++        });
++        req.resume();
++    }
++    var chain = [ getMetrics ];
++    return chain;
++}
++
++function MetricsManager(config) {
++    assert.object(config, 'config');
++    assert.object(config.log, 'config.log');
++    assert.object(config.labels, 'config.labels');
++    assert.string(config.address, 'config.address');
++    assert.number(config.port, 'config.port');
++
++    var collector = artedi.createCollector({ labels: config.labels });
++    this.collector = collector;
++
++    this.requestCounter = this.collector.counter({
++        name: 'http_requests_completed',
++        help: 'count of requests completed'
++    });
++
++    this.timeHistogram = this.collector.histogram({
++        name: 'http_request_duration_seconds',
++        help: 'total time to process requests'
++    });
++
++    this.address = config.address;
++    this.log = config.log;
++    this.port = config.port;
++    this.server = restify.createServer({ severName: 'Metrics' });
++    this.server.get('/metrics', getMetricsHandler(collector));
++}
++
++MetricsManager.prototype.listen = function startMetricsServer(callback) {
++    var self = this;
++
++    self.server.listen(self.port, self.address, function serverStarted() {
++        self.log.info('metrics server started on port %d', self.port);
++        callback();
++    });
++};
++
++MetricsManager.prototype.update = function updateMetrics(req, res, route, err) {
++
++    var routeName = route ? (route.name || route) : 'unknown';
++    var userAgent = req.userAgent();
++
++    // Only the first token is added to the label to prevent cardinality issues
++    var shortUserAgent = userAgent ? userAgent.split(' ')[0] : 'unknown';
++
++    var labels = {
++        route: routeName,
++        method: req.method,
++        user_agent: shortUserAgent,
++        status_code: res.statusCode
++    };
++
++    var latency = res.getHeader('X-Response-Time');
++    if (typeof (latency) !== 'number') {
++        latency = Date.now() - req._time;
++    }
++
++    var latencySeconds = latency / 1000;
++
++    this.requestCounter.increment(labels);
++    this.timeHistogram.observe(latencySeconds, labels);
++};
++
++function createMetricsManager(options) {
++    return new MetricsManager(options);
++}
++
++module.exports = {
++    createMetricsManager: createMetricsManager
++};
+diff --git a/package.json b/package.json
+index 0ef299f..2a658f2 100644
+--- a/package.json
++++ b/package.json
+@@ -1,10 +1,11 @@
+ {
+   "name": "imgapi",
+   "description": "Image API to manage images for SDC 7",
+-  "version": "4.1.1",
++  "version": "4.2.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
++    "artedi": "1.3.0",
+     "assert-plus": "1.0.0",
+     "async": "0.7.0",
+     "buffer-peek-stream": "1.0.1",
+diff --git a/sapi_manifests/imgapi/template b/sapi_manifests/imgapi/template
+index e54da9e..ef9a862 100644
+--- a/sapi_manifests/imgapi/template
++++ b/sapi_manifests/imgapi/template
+@@ -4,6 +4,10 @@
+     "logLevel": "info",
+     "mode": "dc",
+     "datacenterName": "{{{datacenter_name}}}",
++    "serviceName": "{{SERVICE_NAME}}",
++    "instanceUuid": "{{auto.ZONENAME}}",
++    "serverUuid": "{{auto.SERVER_UUID}}",
++    "adminIp": "{{auto.ADMIN_IP}}",
+     "adminUuid": "{{{ufds_admin_uuid}}}",
+     {{#IMGAPI_ALLOW_LOCAL_CREATE_IMAGE_FROM_VM}}
+     "allowLocalCreateImageFromVm": {{{IMGAPI_ALLOW_LOCAL_CREATE_IMAGE_FROM_VM}}},
+diff --git a/test/metrics.dc-test.js b/test/metrics.dc-test.js
+new file mode 100644
+index 0000000..2d7a4a1
+--- /dev/null
++++ b/test/metrics.dc-test.js
+@@ -0,0 +1,203 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var loadConfig = require('../lib/config').loadConfig;
++var format = require('util').format;
++var imgapi = require('sdc-clients/lib/imgapi');
++var restify = require('restify');
++var url = require('url');
++var vasync = require('vasync');
++
++// node-tap API
++if (require.cache[__dirname + '/tap4nodeunit.js']) {
++    delete require.cache[__dirname + '/tap4nodeunit.js'];
++}
++
++var tap4nodeunit = require('./tap4nodeunit.js');
++var after = tap4nodeunit.after;
++var before = tap4nodeunit.before;
++var test = tap4nodeunit.test;
++
++function ifError(t, err) {
++    t.ok(!err, err ? ('error: ' + err.message) : 'no error');
++}
++
++var config;
++var imgapiClient;
++var metricsClient;
++var promLabels;
++
++function createMetricsClient(adminIp) {
++    var imgapiUrl = 'http://' + adminIp;
++    var parsedUrl = url.parse(imgapiUrl);
++    parsedUrl.port = 8881;
++    parsedUrl.host = null;
++
++    var metricsUrl = url.format(parsedUrl);
++    var client = restify.createStringClient({
++        connectTimeout: 250,
++        rejectUnauthorized: false,
++        retry: false,
++        url: metricsUrl
++    });
++
++    return client;
++}
++
++/*
++ * The metrics endpoint returns metrics in the Prometheus v0.0.4 format.
++ * This function takes the metrics response and a metric to match the metric
++ * line you want to match as input and returns the count of that metric.
++ */
++function getMetricCount(metricsRes, metricsLabels) {
++    var labels = promLabels.concat(metricsLabels);
++    var metricsLines = metricsRes.split('\n');
++    var metricLine = metricsLines.filter(function (line) {
++        var match = true;
++        labels.forEach(function (label) {
++            var lineMatch = line.indexOf(label);
++            if (lineMatch === -1) {
++                match = false;
++            }
++        });
++
++        return match;
++    });
++    var count = Number(metricLine[0].split('} ')[1]);
++    return count;
++}
++
++function fetchMetricCount(metricsLabels, callback) {
++    metricsClient.get('/metrics', function getMetrics(err, req, res, data) {
++        var count = getMetricCount(data, metricsLabels);
++        callback(err, count);
++    });
++}
++
++function incrementPingCount(_, callback) {
++    imgapiClient.ping(callback);
++}
++
++before(function (next) {
++    var options = { url: process.env.IMGAPI_URL };
++    if (process.env.IMGAPI_URL === 'https://images.joyent.com') {
++        assert.ok(process.env.JOYENT_IMGADM_USER,
++            'JOYENT_IMGADM_USER envvar is not set');
++        assert.ok(process.env.JOYENT_IMGADM_IDENTITY,
++            'JOYENT_IMGADM_IDENTITY envvar is not set');
++        options.user = process.env.JOYENT_IMGADM_USER;
++        options.sign = imgapi.cliSigner({
++            keyId: process.env.JOYENT_IMGADM_IDENTITY,
++            user: process.env.JOYENT_IMGADM_USER
++        });
++    }
++
++    imgapiClient = imgapi.createClient(options);
++
++    loadConfig({}, function (err, _config) {
++        assert.ifError(err);
++        assert.equal(_config.mode, 'dc', 'DC Mode');
++        config = _config;
++
++        metricsClient = createMetricsClient(config.adminIp);
++
++        var shortUserAgent = imgapiClient.client.headers['user-agent']
++            .split(' ')[0];
++        promLabels = [
++            format('datacenter="%s"', config.datacenterName),
++            format('instance="%s"', config.instanceUuid),
++            format('route="%s"', 'ping'),
++            format('server="%s"', config.serverUuid),
++            format('service="%s"', config.serviceName),
++            format('status_code="%d"', 200),
++            format('user_agent="%s"', shortUserAgent)
++        ];
++        next();
++    });
++});
++
++test('metrics handler', function (t) {
++    metricsClient.get('/metrics', function getMetrics(err, req, res, data) {
++        ifError(t, err);
++        t.ok(res, 'The response should exist');
++        t.equal(res.statusCode, 200, 'The status code should be 200');
++        t.ok(data, 'The data should exist');
++        t.end();
++    });
++});
++
++test('metrics counter', function (t) {
++    var pingCount;
++    var updatedPingCount;
++
++    var metricsLabels = [ 'http_requests_completed' ];
++
++    vasync.pipeline({
++        funcs: [
++            incrementPingCount,
++            function getPingCount(ctx, next) {
++                fetchMetricCount(metricsLabels, function (err, count) {
++                    pingCount = count;
++                    next();
++                });
++            },
++            incrementPingCount,
++            function getPingVmCount(ctx, next) {
++                fetchMetricCount(metricsLabels, function (err, count) {
++                    updatedPingCount = count;
++                    next();
++                });
++            }
++        ]
++    }, function (err, results) {
++        ifError(t, err);
++        t.ok(updatedPingCount, 'updated ping count');
++        t.ok(pingCount < updatedPingCount,
++                'ping count should increase');
++        t.end();
++    });
++});
++
++test('metrics histogram counter', function (t) {
++    var pingDurationCount;
++    var updatedPingDurationCount;
++
++    var metricsLabels = [
++        format('le="%s"', '+Inf'),
++        'http_request_duration_seconds'
++    ];
++
++    vasync.pipeline({
++        funcs: [
++            incrementPingCount,
++            function getPingDurationCount(ctx, next) {
++                fetchMetricCount(metricsLabels, function (err, count) {
++                    pingDurationCount = count;
++                    next();
++                });
++            },
++            incrementPingCount,
++            function getUpdatedPingDurationCount(ctx, next) {
++                fetchMetricCount(metricsLabels, function (err, count) {
++                    updatedPingDurationCount = count;
++                    next();
++                });
++            }
++        ]
++    }, function (err, results) {
++        ifError(t, err);
++        t.ok(pingDurationCount, 'ping duration count');
++        t.ok(updatedPingDurationCount, 'updated ping duration count');
++        t.ok(pingDurationCount < updatedPingDurationCount,
++                'ping duration count should increase');
++        t.end();
++    });
++});
+diff --git a/test/metrics.public-test.js b/test/metrics.public-test.js
+new file mode 100644
+index 0000000..2b73936
+--- /dev/null
++++ b/test/metrics.public-test.js
+@@ -0,0 +1,55 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var restify = require('restify');
++var url = require('url');
++
++// node-tap API
++if (require.cache[__dirname + '/tap4nodeunit.js']) {
++    delete require.cache[__dirname + '/tap4nodeunit.js'];
++}
++
++var tap4nodeunit = require('./tap4nodeunit.js');
++var after = tap4nodeunit.after;
++var before = tap4nodeunit.before;
++var test = tap4nodeunit.test;
++
++var metricsClient;
++
++function createMetricsClient(adminIp) {
++    var imgapiUrl = adminIp ? 'http://' + adminIp : 'http://localhost';
++    var parsedUrl = url.parse(imgapiUrl);
++    parsedUrl.port = 8881;
++    parsedUrl.host = null;
++
++    var metricsUrl = url.format(parsedUrl);
++    var client = restify.createStringClient({
++        connectTimeout: 250,
++        rejectUnauthorized: false,
++        retry: false,
++        url: metricsUrl
++    });
++
++    return client;
++}
++
++before(function (next) {
++    metricsClient = createMetricsClient();
++    next();
++});
++
++test('metrics handler', function (t) {
++    metricsClient.get('/metrics', function getMetrics(err, req, res, data) {
++       t.ok(err, 'Metrics error');
++       t.notOk(data, 'data');
++       t.equal(err.code, 'ECONNREFUSED', 'Metrics server not running');
++       t.end();
++    });
++});

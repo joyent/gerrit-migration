@@ -1,0 +1,259 @@
+commit 6bc1986057225b6906d887985def0af068ee01fe (refs/changes/98/2798/1)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2017-10-17T14:06:14-04:00 (2 years ago)
+    
+    joyent/node-vmadm#2 want support for `vmadm events`
+
+diff --git a/lib/index.js b/lib/index.js
+index 8a8b59b..38cf3b0 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -5,15 +5,17 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+ var cp = require('child_process');
+ var fs = require('fs');
++var LineStream = require('lstream');
+ var path = require('path');
+ var spawn = cp.spawn;
+-
++var stream = require('stream');
++var util = require('util');
+ 
+ var VMADM_PATH = '/usr/sbin/vmadm';
+ 
+@@ -1154,4 +1156,214 @@ vmadm.stop = function vmStop(opts, callback) {
+     }, callback);
+ };
+ 
++/*
++ * Wrapper around `vmadm events -jr [uuid]`
++ */
++vmadm.events = function vmEvents(opts, handler, callback) {
++    var vs;
++    var log;
++
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.uuid, 'opts.uuid');
++    assert.optionalString(opts.name, 'opts.name');
++
++    log = opts.log;
++    vs = new VminfodCLIEventStream(opts);
++
++    vs.once('ready', function (err, ready_ev) {
++        log.debug({err: err}, 'vmadm event stream ready event');
++        callback(err, ready_ev);
++    });
++
++    vs.on('readable', function () {
++        var ev;
++        while ((ev = vs.read()) !== null) {
++            processVmadmEvent(ev);
++        }
++    });
++
++    function processVmadmEvent(ev) {
++        log.trace({ev: ev}, 'vmadm event');
++
++        if (opts.uuid && opts.uuid !== ev.uuid) {
++            return;
++        }
++
++        handler(ev);
++    }
++
++    function vmadmEventsStop() {
++        log.debug('vmadm events stop called');
++        vs.stop();
++    }
++
++    return vmadmEventsStop;
++};
++
++function VminfodCLIEventStream(opts) {
++    var self = this;
++
++    var args = ['events', '-rj'];
++    var execOpts = {};
++
++    stream.Transform.call(self, {objectMode: true});
++
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.optionalString(opts.name, 'opts.name');
++
++    self.stopped = false;
++    self.log = opts.log;
++
++    self.log.info({args: args}, 'calling %s %s',
++        VMADM_PATH, args.join(' '));
++
++    execOpts.env = process.env;
++    if (opts.req_id) {
++        self.log.info('setting req_id to %s', opts.req_id);
++        execOpts.env.REQ_ID = opts.req_id;
++    }
++    if (opts.name) {
++        self.log.info('setting name to %s', opts.name);
++        execOpts.env.VMADM_IDENT = opts.name;
++    }
++
++    // fork vmadm
++    self.child = cp.spawn(VMADM_PATH, args);
++    self.child.stdout.setEncoding('utf8');
++    self.child.stderr.setEncoding('utf8');
++
++    // Any child error will be logged and re-emitted
++    self.child.on('error', function (e) {
++        self.log.error({err: e}, 'child process error');
++        self.emit('error', e);
++    });
++
++    // The child dying is either an info or error message depending
++    // on if it was intentional (ie. .stop() was called)
++    self.child.on('close', function (code, signal) {
++        if (self.stopped) {
++            self.log.info({code: code, signal: signal},
++                'vmadm events stopped');
++            return;
++        }
++
++        var e = new Error('child exited');
++        self.log.error({err: e, code: code, signal: signal},
++            'vmadm events child process closed');
++        self.emit('error', e);
++    });
++
++    // stdin is not needed
++    self.child.stdin.end();
++
++    // Parse stdout line by line by piping to ourselves
++    self.child.stdout.pipe(new LineStream()).pipe(self);
++
++    /*
++     * Parse stderr line by line - any stderr produced is a fatal error
++     * unexpected by the child process, so we log the error and abort the child
++     * process to generate a core dump.
++     *
++     * The only exception to this rule is if "events" has not been implemented
++     * yet by `vmadm`.
++     */
++    var stderrls = new LineStream();
++    self.child.stderr.pipe(stderrls).on('readable', function () {
++        var lines = [];
++        var line;
++        while ((line = stderrls.read()) !== null)
++            lines.push(line);
++
++        // If we have already been stopped don't abort the process
++        if (self.stopped)
++            return;
++
++        self.log.error({stderr: lines.join('\n')}, 'stderr produced');
++
++        /*
++         * Check if the `vmadm events` command is unimplemented.  If so, emit
++         * an error object through the "ready" event.
++         */
++        var invalidCmd = lines.some(function (_line) {
++            return (_line === 'Invalid command: "events".');
++        });
++        if (invalidCmd) {
++            self.emit('ready', new Error('`vmadm events` not implemented'));
++            self.stop();
++            return;
++        }
++
++        // If we are here, we didn't expect this stderr so abort the process.
++        self._abort();
++    });
++}
++util.inherits(VminfodCLIEventStream, stream.Transform);
++
++/*
++ * The transform method to process vmadm stdout line-by-line
++ */
++VminfodCLIEventStream.prototype._transform =
++    function _transform(chunk, encoding, cb) {
++
++    var self = this;
++
++    var line = chunk.toString('utf8');
++    var ev;
++    try {
++        ev = JSON.parse(line);
++        assert.object(ev, 'ev');
++        assert.string(ev.type, 'ev.type');
++        assert.string(ev.date, 'ev.date');
++
++        ev.date = new Date(ev.date);
++        assert.ok(isFinite(ev.date), 'invalid ev.date');
++    } catch (e) {
++        /*
++         * Any JSON parse failure is a fatal error where we abort the child
++         * process to generate a core dump
++         */
++        self.log.error({err: e, line: line},
++            'failed to parse output line');
++        self._abort();
++        return;
++    }
++
++    switch (ev.type) {
++    case 'ready':
++        self.emit('ready', null, ev);
++        break;
++    default:
++        self.push(ev);
++        break;
++    }
++    cb();
++};
++
++/*
++ * Cleanly stop the stream by killing the child process with a SIGTERM
++ */
++VminfodCLIEventStream.prototype.stop = function stop() {
++    var self = this;
++
++    self.stopped = true;
++    self.child.kill();
++};
++
++/*
++ * Stop the stream and have it dump core.
++ */
++VminfodCLIEventStream.prototype._abort = function _abort() {
++    var self = this;
++
++    self.stopped = true;
++    self.log.error({child: self.child.pid},
++        '_abort() called - sending SIGABRT');
++    self.child.kill('SIGABRT');
++    var e = new Error('vmadm aborted');
++    self.emit('error', e);
++};
++
+ module.exports = vmadm;
+diff --git a/package.json b/package.json
+index 1f19ca1..fec47ec 100644
+--- a/package.json
++++ b/package.json
+@@ -7,7 +7,8 @@
+     "test": "echo \"Error: no test specified\" && exit 1"
+   },
+   "dependencies": {
+-    "assert-plus": "0.1.5"
++    "assert-plus": "0.1.5",
++    "lstream": "0.0.4"
+   },
+   "author": "Joyent (joyent.com)",
+   "directories": {

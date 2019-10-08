@@ -1,0 +1,1302 @@
+commit 1ff0c70ac430f6f408fe710941470503e0146e50 (refs/changes/29/2529/20)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2017-11-11T00:11:07+00:00 (1 year, 11 months ago)
+    
+    TOOLS-1421 `sdcadm experimental volapi` to setup Volumes API service
+    VOLAPI-11 Move upgrade to tritonnfs images of core services from sdcadm  to VOLAPI
+    TOOLS-1482 sdcadm experimental volapi fails to download VOLAPI's image if SAPI's sdc application's metadata has update_channel set to a value != 'experimental'
+    TOOLS-1611 sdcadm experimental volapi does not create new volapi instance if associated VM was deleted
+    TOOLS-1504 set experimental_nfs_shared_volumes in sdc application's metadata instead of sdc-docker's service's metadata
+    TOOLS-1697 sdcadm fails to create volapi service if it doesn't exist
+    TOOLS-1821 Remove useless code from sdcadm experimental volapi that polls sdc-docker
+    TOOLS-1824 sdcadm update-other should not do anything for VOLAPI
+    TOOLS-1823 split sdcadm experimental volapi into sdcadm postsetup and sdcadm experimental commands
+    TOOLS-1822 sdcadm experimental volapi should check that images of required core services support NFS volumes
+    TOOLS-1830 replace sdcadm experimental nfs-volumes with cloudapi-nfs-volumes/docker-nfs-volumes subcommands
+    TOOLS-1829 add sdcadm experimental docker-nfs-volumes-automount
+    VOLAPI-74 set zfs_io_priority to 100 for all storage VM packages
+    PUBAPI-1420 Add ability to mount NFS volumes with CreateMachine endpoint
+    TOOLS-1919 sdcadm experimental nfs-volumes doesn't handle branch names that include hyphens
+    Reviewed by: Trent Mick <trentm@gmail.com>
+    Approved by: Trent Mick <trentm@gmail.com>
+
+diff --git a/CHANGES.md b/CHANGES.md
+index b5cb59d..289b400 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -10,6 +10,12 @@
+ 
+ # sdcadm Changelog
+ 
++## 1.17.0
++
++- Add `sdcadm post-setup volapi` to setup a core VOLAPI service.
++- Add `sdcadm experimental nfs-volumes` command to enable or disable various
++  feature flags related to NFS volumes support for CloudAPI and sdc-docker.
++
+ ## 1.16.3
+ 
+ - TOOLS-1899 Update to using node v4.
+diff --git a/etc/defaults.json b/etc/defaults.json
+index fa10bb6..b49f01e 100644
+--- a/etc/defaults.json
++++ b/etc/defaults.json
+@@ -44,7 +44,8 @@
+         "vm-agent": "vm-agent",
+         "net-agent": "net-agent",
+         "config-agent": "config-agent",
+-        "dockerlogger": "dockerlogger"
++        "dockerlogger": "dockerlogger",
++        "volapi": "volapi"
+     },
+     "svcMinImages": {
+         "binder": "20140731T211135Z",
+diff --git a/lib/cli/do_nfs_volumes.js b/lib/cli/do_nfs_volumes.js
+new file mode 100644
+index 0000000..4bd8bd0
+--- /dev/null
++++ b/lib/cli/do_nfs_volumes.js
+@@ -0,0 +1,607 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * The 'sdcadm experimental nfs-volumes' CLI subcommand.
++ *
++ * Currently, NFS shared volumes are still at the prototype stage, and
++ * their associated features must be enabled/disabled by setting various SAPI
++ * configuration flags.
++ */
++
++var assert = require('assert-plus');
++var https = require('https');
++var once = require('once');
++var util = require('util'),
++    format = util.format;
++var vasync = require('vasync');
++
++var common = require('../common');
++var errors = require('../errors');
++var shared = require('../procedures/shared');
++
++var FEATURE_NAME_TO_SAPI_FLAG = {
++    'cloudapi': 'experimental_cloudapi_nfs_shared_volumes',
++    'cloudapi-automount': 'experimental_cloudapi_automount_nfs_shared_volumes',
++    'docker': 'experimental_docker_nfs_shared_volumes',
++    'docker-automount': 'experimental_docker_automount_nfs_shared_volumes'
++};
++
++function getImagesVersions(coreServicesNames, options, callback) {
++    assert.arrayOfString(coreServicesNames, 'coreServicesNames');
++    assert.object(options, 'options');
++    assert.object(options.sdcadm, 'options.sdcadm');
++    assert.func(callback, 'callback');
++
++    var sdcadm = options.sdcadm;
++
++    vasync.forEachParallel({
++        func: function doGetCoreServiceImageVersion(coreServiceName, next) {
++            sdcadm.getImgsForSvcVms({
++                svc: coreServiceName
++            }, function onGetImgForSvcVms(getErr, imgsForVms) {
++                var res;
++
++                if (!getErr) {
++                    res = {
++                        serviceName: coreServiceName,
++                        images: imgsForVms.imgs,
++                        vms: imgsForVms.vms
++                    };
++                }
++
++                next(getErr, res);
++            });
++        },
++        inputs: coreServicesNames
++    }, function onImagesVersions(err, results) {
++        var idx = 0;
++        var image;
++        var serviceVersionInfo = [];
++        var vm;
++
++        if (!err) {
++            results.successes.forEach(function flattenResults(result) {
++                assert.arrayOfObject(result.images, 'result.images');
++                assert.arrayOfObject(result.vms, 'result.vms');
++
++                for (idx = 0; idx < result.images.length; ++idx) {
++                    image = result.images[idx];
++                    vm = result.vms[idx];
++
++                    serviceVersionInfo.push({
++                        serviceName: result.serviceName,
++                        version: image.version,
++                        vmUuid: vm.uuid
++                    });
++                }
++            });
++        }
++
++        callback(err, serviceVersionInfo);
++    });
++}
++
++function updateSdcFlagInSapi(flagName, desiredValue, options, callback) {
++    assert.string(flagName, 'flagName');
++    assert.bool(desiredValue, 'desiredValue');
++    assert.object(options, 'options');
++    assert.object(options.sdcApp, 'options.sdcApp');
++    assert.object(options.sapiClient, 'options.sapiClient');
++    assert.func(callback, 'callback');
++
++    var metadata = {};
++    var sapiClient = options.sapiClient;
++    var sdcApp = options.sdcApp;
++
++    metadata[flagName] = desiredValue;
++
++    sapiClient.updateApplication(sdcApp.uuid, {metadata: metadata},
++        function onSdcAppUpdated(sapiErr, updatedSdcAdpp) {
++            callback(sapiErr,
++                updatedSdcAdpp.metadata[flagName]);
++        });
++}
++
++function validFeatureName(featureName) {
++    assert.string(featureName, 'featureName');
++
++    var VALID_FEATURE_NAMES =
++        [ 'cloudapi', 'cloudapi-automount', 'docker', 'docker-automount'];
++    if (VALID_FEATURE_NAMES.indexOf(featureName) !== -1) {
++        return true;
++    }
++
++    return false;
++}
++
++function validateArgs(args) {
++    assert.optionalArrayOfString(args, 'args');
++
++    if (!args || args.length < 1) {
++        return new errors.UsageError('one argument is required');
++    } else if (args.length > 1) {
++        return new errors.UsageError('too many args: ' + args);
++    } else if (!validFeatureName(args[0])) {
++        return new errors.UsageError('invalid feature name: ' + args[0]);
++    } else {
++        return undefined;
++    }
++}
++
++function versionSeemsGreaterOrEqualThan(actualVersion, candidateVersions) {
++    var candidateVersion;
++    var idx;
++
++    assert.object(actualVersion, 'actualVersion');
++    assert.string(actualVersion.branch, 'actualVersion.branch');
++    assert.string(actualVersion.timestamp, 'actualVersion.timestamp');
++    assert.string(actualVersion.commit, 'actualVersion.commit');
++    assert.arrayOfObject(candidateVersions, 'candidateVersions');
++
++    for (idx = 0; idx < candidateVersions.length; ++idx) {
++        candidateVersion = candidateVersions[idx];
++        assert.object(candidateVersion, 'candidateVersion');
++        assert.regexp(candidateVersion.branch, 'candidateVersion.branch');
++        assert.string(candidateVersion.timestamp, 'candidateVersion.timestamp');
++        assert.string(candidateVersion.commit, 'candidateVersion.commit');
++
++        if (candidateVersion.branch.test(actualVersion.branch) &&
++            (candidateVersion.timestamp < actualVersion.timestamp ||
++            (candidateVersion.timestamp === actualVersion.timestamp &&
++                candidateVersion.commit === actualVersion.commit))) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++function versionsInfoToString(versionsInfo) {
++    assert.arrayOfObject(versionsInfo, 'versionsInfo');
++
++    return versionsInfo.map(function renderVersion(versionInfo) {
++        assert.object(versionInfo, 'versionInfo');
++        assert.regexp(versionInfo.branch, 'versionInfo.branch');
++        assert.string(versionInfo.timestamp, 'versionInfo.timestamp');
++        assert.string(versionInfo.commit, 'versionInfo.commit');
++
++        return [
++            versionInfo.branch.toString(),
++            versionInfo.timestamp,
++            'g' + versionInfo.commit
++        ].join('-');
++    }).join(' or ');
++}
++
++function do_nfs_volumes(subcmd, opts, args, cb) {
++    var self = this;
++    var argsErr;
++
++    if (opts.help) {
++        this.do_help('help', {}, [subcmd], cb);
++        return;
++    } else {
++        argsErr = validateArgs(args);
++        if (argsErr) {
++            cb(argsErr);
++            return;
++        }
++    }
++
++    var context = {
++        didSomething: false
++    };
++    var featureDeps;
++    var featureName = args[0];
++    var imageDeps = {};
++    var platformVersionDep;
++    var sapiFlagName = FEATURE_NAME_TO_SAPI_FLAG[featureName];
++
++    /*
++     * When this is submitted to be merged in master, the /tritonnfs/ tests
++     * below will be updated to a different test that checks that "version"
++     * represents a version that is at least as recent as the first build of the
++     * corresponding service with NFS volumes support.
++     */
++    if (featureName === 'docker' || featureName === 'cloudapi') {
++        imageDeps = {
++            cnapi: [
++                {
++                    branch: /^master$/,
++                    timestamp: '20171010T220701Z',
++                    commit: '6e83bc4'
++                },
++                {
++                    branch: /^release-\d{8}$/,
++                    timestamp: '20171012T160959Z',
++                    commit: '6e83bc4'
++                }
++            ],
++            vmapi: [
++                {
++                    branch: /^master$/,
++                    timestamp: '20171110T184239Z',
++                    commit: 'a60a380'
++                }
++            ],
++            volapi: [
++                {
++                    branch: /^master$/,
++                    timestamp: '20171107T034233Z',
++                    commit: '51006d1'
++                },
++                {
++                    branch: /^release-\d{8}$/,
++                    timestamp: '20171109T014437Z',
++                    commit: '51006d1'
++                }
++            ],
++            workflow: [
++                {
++                    branch: /^master$/,
++                    timestamp: '20171104T214713Z',
++                    commit: 'd02606a'
++                },
++                {
++                    branch: /^release-\d{8}$/,
++                    timestamp: '20171109T015544Z',
++                    commit: 'd02606a'
++                }
++            ]
++        };
++
++        if (featureName === 'docker') {
++            imageDeps.docker = [
++                {
++                    branch: /^master$/,
++                    timestamp: '20171110T202313Z',
++                    commit: '9d39e1b'
++                }
++            ];
++        } else {
++            imageDeps.cloudapi = [
++                {
++                    branch: /^master$/,
++                    timestamp: '20171110T191649Z',
++                    commit: '788a08f'
++                }
++            ];
++        }
++    }
++
++    if (featureName === 'docker-automount') {
++        platformVersionDep = '20160613T123039Z';
++        /*
++         * It doesn't make sense to enable the docker automount feature if NFS
++         * volumes are not enabled for the docker service.
++         */
++        featureDeps = ['docker'];
++    }
++
++    if (featureName === 'cloudapi-automount') {
++        // first version with smartos-live changes for automounting LX + SmartOS
++        platformVersionDep = '20170925T211846Z';
++        /*
++         * It doesn't make sense to enable the cloudapi automount feature if NFS
++         * volumes are not enabled for the cloudapi service.
++         */
++        featureDeps = ['cloudapi'];
++    }
++
++    vasync.pipeline({arg: context, funcs: [
++        function checkFeatureDeps(ctx, next) {
++            var err;
++            var missingFeatureDeps;
++            var sdcApp = self.sdcadm.sdc;
++
++            if (opts.disable === true) {
++                next();
++                return;
++            }
++
++            if (featureDeps === undefined) {
++                next();
++                return;
++            }
++
++            missingFeatureDeps =
++                featureDeps.filter(function checkSapiFlagDep(featureDepName) {
++                    var depSapiFlagName =
++                        FEATURE_NAME_TO_SAPI_FLAG[featureDepName];
++
++                    return sdcApp.metadata[depSapiFlagName] !== true;
++                });
++
++            if (missingFeatureDeps.length > 0) {
++                err = new Error('Missing NFS volumes feature deps: ' +
++                    missingFeatureDeps.join(', '));
++            }
++
++            next(err);
++        },
++
++        function getDependenciesImageVersions(ctx, next) {
++            var imgDepsNames = Object.keys(imageDeps);
++
++            if (opts.disable === true) {
++                next();
++                return;
++            }
++
++            if (!imgDepsNames || imgDepsNames.length === 0) {
++                self.progress('Feature ' + featureName + ' has no image ' +
++                    'dependencies');
++                next();
++                return;
++            }
++
++            self.progress('Getting versions for image dependencies: ' +
++                imgDepsNames.join(', '));
++
++            getImagesVersions(imgDepsNames, {
++                sdcadm: self.sdcadm
++            }, function onGotImagesVersions(getImgVersErr, imagesVersions) {
++                var outdatedVersionsErr;
++                var outdatedVersions = [];
++
++                if (getImgVersErr) {
++                    next(getImgVersErr);
++                    return;
++                }
++
++                assert.arrayOfObject(imagesVersions, 'imagesVersions');
++
++                self.progress('Checking dependencies are up to date');
++
++                imagesVersions.forEach(function checkOutdated(versionInfo) {
++                    /*
++                     * We consider an image version string to have the following
++                     * format:
++                     *
++                     * $branchname-$timestamp-g$commitsha
++                     *
++                     * where $branchname is composed of alphanumeric characters
++                     * and hyphens, $timestamp is a ISO 8601 timestamp and
++                     * $commitsha is an alphanumeric lower-case string.
++                     */
++                    var IMG_VERSION_RE =
++                        /^([A-Za-z0-9\-]+)-(\d{8}T\d{6}Z)-g([a-z0-9]+)$/;
++
++                    assert.object(versionInfo, 'versionInfo');
++
++                    var requiredVersionsInfo;
++                    var serviceName = versionInfo.serviceName;
++                    var versionBranch;
++                    var versionCommit;
++                    var versionComponents;
++                    var versionTimestamp;
++                    var vmUuid = versionInfo.vmUuid;
++
++                    assert.string(serviceName, 'serviceName');
++                    requiredVersionsInfo = imageDeps[serviceName];
++
++                    assert.arrayOfObject(requiredVersionsInfo,
++                        'requiredVersionsInfo');
++                    assert.string(versionInfo.version,
++                            'versionInfo.version');
++
++                    versionComponents =
++                        versionInfo.version.match(IMG_VERSION_RE);
++                    assert.ok(versionComponents, 'versionComponents');
++
++                    versionBranch = versionComponents[1];
++                    versionTimestamp = versionComponents[2];
++                    versionCommit = versionComponents[3];
++
++                    assert.string(vmUuid, 'vmUuid');
++
++                    if (!versionSeemsGreaterOrEqualThan({
++                        branch: versionBranch,
++                        timestamp: versionTimestamp,
++                        commit: versionCommit
++                    }, requiredVersionsInfo)) {
++                        outdatedVersions.push('VM ' + versionInfo.vmUuid +
++                            ' for service ' + versionInfo.serviceName +
++                            ' at version ' + versionInfo.version + ' is ' +
++                            'outdated. Minimum required versions are: ' +
++                            versionsInfoToString(requiredVersionsInfo));
++                    }
++                });
++
++                if (outdatedVersions && outdatedVersions.length > 0) {
++                    outdatedVersionsErr =
++                        new Error('Found outdated core services: ' +
++                            outdatedVersions.join(', '));
++                }
++
++                next(outdatedVersionsErr);
++            });
++        },
++
++        function checkPlatformDep(ctx, next) {
++            var cnapi = self.sdcadm.cnapi;
++
++            if (opts.disable === true) {
++                next();
++                return;
++            }
++
++            self.progress('Checking platform version dependencies');
++
++            if (platformVersionDep === undefined) {
++                self.progress('Enabling ' + featureName +
++                    ' has no platform dependency');
++                next();
++                return;
++            }
++
++            self.progress('Getting servers list');
++            cnapi.listServers({
++                reserved: false,
++                setup: true
++            }, function onlistServers(listServersErr, servers) {
++                var nbOutdatedServers;
++                var nbServers;
++                var outdatedServers;
++
++                if (listServersErr) {
++                    next(listServersErr);
++                    return;
++                }
++
++                if (servers) {
++                    nbServers = servers.length;
++                    outdatedServers =
++                        servers.filter(function filterOutdated(server) {
++                            return server.boot_platform < platformVersionDep;
++                        });
++                    nbOutdatedServers = outdatedServers.length;
++                } else {
++                    nbServers = 0;
++                    nbOutdatedServers = 0;
++                }
++
++                if (nbOutdatedServers > 0) {
++                    self.progress('Found %d outdated servers: ' +
++                        outdatedServers.map(renderServerInfo) +
++                        '. Minimum required platform is: ' +
++                        platformVersionDep, nbOutdatedServers);
++                }
++
++                if (nbServers === 0 || nbServers - nbOutdatedServers === 0) {
++                    self.progress('No server matches platform requirements, ' +
++                        'feature flag is enabled but functionality will not' +
++                        'be available');
++                } else if (outdatedServers > 0) {
++                    self.progress('Some servers do not match platform ' +
++                        'requirements, feature flag is enabled but capacity ' +
++                        'might fill up quickly');
++                }
++
++                next();
++
++                function renderServerInfo(server) {
++                    return 'uuid ' + server.uuid + ' boot platform version ' +
++                        server.boot_platform;
++                }
++            });
++        },
++
++        function updateSapiFlag(ctx, next) {
++            var desiredSapiFlagValue = true;
++            if (opts.disable === true) {
++                desiredSapiFlagValue = false;
++            }
++
++            self.progress('Checking if ' + sapiFlagName + '=' +
++                desiredSapiFlagValue + ' in SDC app...');
++
++            if (self.sdcadm.sdc.metadata[sapiFlagName] !==
++                desiredSapiFlagValue) {
++                ctx.didSomething = true;
++
++                self.progress('Setting ' + sapiFlagName + ' to ' +
++                    desiredSapiFlagValue + ' in SDC app...');
++
++                updateSdcFlagInSapi(sapiFlagName, desiredSapiFlagValue, {
++                    sdcApp: self.sdcadm.sdc,
++                    sapiClient: self.sdcadm.sapi
++                }, function _nfsSharedVolumesUpdated(err, result) {
++                    var errMsg;
++
++                    if (!err) {
++                        if (result === desiredSapiFlagValue) {
++                            self.progress(sapiFlagName + ' set to ' +
++                                desiredSapiFlagValue + ' on SDC app');
++                        } else {
++                            errMsg = 'Could not set ' + sapiFlagName + ' to ' +
++                                desiredSapiFlagValue + ' on SDC app';
++                            self.progress(errMsg);
++                            err = new Error(errMsg);
++                        }
++                    }
++
++                    next(err);
++                });
++            } else {
++                self.progress(sapiFlagName + ' already set to ' +
++                    desiredSapiFlagValue + ', nothing to do');
++
++                next();
++            }
++        },
++
++        function done(ctx, next) {
++            if (ctx.didSomething) {
++                if (opts.disable) {
++                    self.progress('Disabled ' + featureName +
++                        ' NFS volumes support');
++                } else {
++                    self.progress('Enabled ' + featureName +
++                        ' NFS volumes support');
++                }
++            } else {
++                if (opts.disable) {
++                    self.progress(featureName +
++                        ' NFS volumes support already disabled');
++                } else {
++                    self.progress(featureName +
++                        ' NFS volumes support already enabled');
++                }
++            }
++
++            next();
++        }
++    ]}, cb);
++}
++
++do_nfs_volumes.options = [
++    {
++        names: ['help', 'h'],
++        type: 'bool',
++        help: 'Show this help.'
++    },
++    {
++        names: ['disable', 'd'],
++        type: 'bool',
++        help: 'Disable a given NFS volume feature instead of enabling it'
++    }
++];
++
++do_nfs_volumes.help = (
++    'Enables/disables support for various NFS volumes features.\n' +
++    '\n' +
++    'Usage:\n' +
++    '     # Enable NFS volume support for sdc-docker\n' +
++    '     {{name}} nfs-volumes docker\n\n' +
++    '     # Disable NFS volume support for sdc-docker\n' +
++    '     {{name}} nfs-volumes docker -d\n\n' +
++    '     # Enable NFS volume support for CloudAPI\n' +
++    '     {{name}} nfs-volumes cloudapi\n\n' +
++    '     # Disable NFS volume support for CloudAPI\n' +
++    '     {{name}} nfs-volumes cloudapi -d\n\n' +
++    '     # Enable docker containers automatically mounting NFS volumes\n' +
++    '     {{name}} nfs-volumes docker-automount\n\n' +
++    '     # Disable docker containers automatically mounting NFS volumes\n' +
++    '     {{name}} nfs-volumes docker-automount -d\n\n' +
++    '     # Enable CloudAPI containers automatically mounting NFS volumes\n' +
++    '     {{name}} nfs-volumes cloudapi-automount\n\n' +
++    '     # Disable CloudAPI containers automatically mounting NFS volumes\n' +
++    '     {{name}} nfs-volumes cloudapi-automount -d\n\n' +
++    '\n' +
++    '{{options}}'
++);
++
++// --- exports
++
++module.exports = {
++    do_nfs_volumes: do_nfs_volumes
++};
+diff --git a/lib/cli/experimental.js b/lib/cli/experimental.js
+index acdb5f8..4d1d73c 100644
+--- a/lib/cli/experimental.js
++++ b/lib/cli/experimental.js
+@@ -80,7 +80,8 @@ require('./do_install_docker_cert').do_install_docker_cert;
+ // Deprecated: TOOLS-1667
+ ExperimentalCLI.prototype.do_cns = require('../post-setup/cns').do_cns;
+ 
+-
++ExperimentalCLI.prototype.do_nfs_volumes =
++require('./do_nfs_volumes').do_nfs_volumes;
+ 
+ //---- exports
+ 
+diff --git a/lib/logging.js b/lib/logging.js
+index a2febfa..6a7f2ca 100644
+--- a/lib/logging.js
++++ b/lib/logging.js
+@@ -65,7 +65,7 @@ var events = require('events');
+ var fs = require('fs');
+ var mkdirp = require('mkdirp');
+ var mod_uuid = require('node-uuid');
+-var restifyClients = require('sdc-clients/node_modules/restify-clients');
++var restifyClients = require('restify-clients');
+ var sprintf = require('extsprintf').sprintf;
+ var util = require('util');
+ 
+diff --git a/lib/post-setup/index.js b/lib/post-setup/index.js
+index 443fca0..75733f6 100644
+--- a/lib/post-setup/index.js
++++ b/lib/post-setup/index.js
+@@ -74,6 +74,7 @@ PostSetupCLI.prototype.do_dev_sample_data =
+ PostSetupCLI.prototype.do_docker = require('./docker').do_docker;
+ PostSetupCLI.prototype.do_cmon = require('./cmon').do_cmon;
+ PostSetupCLI.prototype.do_cns = require('./cns').do_cns;
++PostSetupCLI.prototype.do_volapi = require('./volapi').do_volapi;
+ 
+ //---- exports
+ 
+diff --git a/lib/post-setup/volapi.js b/lib/post-setup/volapi.js
+new file mode 100644
+index 0000000..4fd2ee3
+--- /dev/null
++++ b/lib/post-setup/volapi.js
+@@ -0,0 +1,487 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * The 'sdcadm post-setup volapi' CLI subcommand.
++ */
++
++var assert = require('assert-plus');
++var https = require('https');
++var once = require('once');
++var util = require('util'),
++    format = util.format;
++var vasync = require('vasync');
++
++
++var common = require('../common');
++var errors = require('../errors');
++var DownloadImages = require('../procedures/download-images').DownloadImages;
++var shared = require('../procedures/shared');
++var steps = require('../steps');
++
++var MBS_IN_GB = 1024;
++var NFS_SHARED_VOLUMES_PACKAGES_NAME_PREFIX = 'sdc_volume_nfs';
++// Sizes are in GBs
++var NFS_SHARED_VOLUMES_PKG_SIZES = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
++    200, 300, 400, 500, 600, 700, 800, 900, 1000];
++
++/**
++ * This is the template used for creating package objects for NFS shared
++ * volumes. The size and owners' uuid are setup at runtime.
++ */
++var NFS_SHARED_VOLUMES_PACKAGE_TEMPLATE = {
++    active: true,
++    cpu_cap: 100,
++    max_lwps: 1000,
++    max_physical_memory: 256,
++    max_swap: 256,
++    vcpus: 1,
++    version: '1.0.0',
++    zfs_io_priority: 100,
++    default: false
++};
++
++/**
++ * Adds a package using PAPI client "papiClient" for shared NFS volumes of size
++ * "size" GBs. Calls "callback" when done with an error object and the newly
++ * created package as parameters.
++ */
++function addSharedVolumePackage(cli, packageSettings, callback) {
++    assert.object(cli, 'cli');
++    assert.object(packageSettings, 'packageSettings');
++    assert.number(packageSettings.size, 'size');
++    assert.arrayOfUuid(packageSettings.owner_uuids,
++        'packageSettings.owner_uuids');
++    assert.func(callback, 'callback');
++
++    var papiClient = cli.sdcadm.papi;
++
++    var packageName = [
++        NFS_SHARED_VOLUMES_PACKAGES_NAME_PREFIX,
++        packageSettings.size
++    ].join('_');
++
++    var context = {
++        foundPackage: false
++    };
++
++    vasync.pipeline({
++        funcs: [
++            function _findPackage(ctx, next) {
++                papiClient.list({name: packageName}, {},
++                    function onPackagesListed(err, pkgs) {
++                        if (!err && pkgs && pkgs.length > 0) {
++                            ctx.foundPackage = true;
++                        }
++
++                        next(err);
++                    });
++            },
++            function _addPackage(ctx, next) {
++                if (ctx.foundPackage) {
++                    next();
++                    return;
++                }
++
++                var newPackage = {
++                    name: packageName,
++                    quota: packageSettings.size * MBS_IN_GB,
++                    owner_uuids: packageSettings.owner_uuids
++                };
++
++                common.objCopy(NFS_SHARED_VOLUMES_PACKAGE_TEMPLATE, newPackage);
++                cli.log.info({pkg: newPackage}, 'Adding package');
++
++                papiClient.add(newPackage, function onPackageAdded(err, pkg) {
++                    if (!err && pkg) {
++                        ctx.pkgAdded = pkg;
++                        cli.log.info({pkg: pkg}, 'Package added');
++                    }
++
++                    next(err);
++                });
++            }
++        ],
++        arg: context
++    }, function _addSharedVolumePackageDone(err) {
++        callback(err, context.pkgAdded);
++    });
++}
++
++function do_volapi(subcmd, opts, args, cb) {
++    var self = this;
++    if (opts.help) {
++        this.do_help('help', {}, [subcmd], cb);
++        return;
++    } else if (args.length > 0) {
++        return cb(new errors.UsageError('too many args: ' + args));
++    }
++
++    var start = Date.now();
++    var svcData = {
++        name: 'volapi',
++        params: {
++            package_name: 'sdc_1024',
++            billing_id: 'TO_FILL_IN', // filled in from 'package_name'
++            image_uuid: 'TO_FILL_IN',
++            archive_on_delete: true,
++            maintain_resolvers: true,
++            networks: [
++                {name: 'admin'}
++            ],
++            firewall_enabled: false,
++            tags: {
++                smartdc_role: 'volapi',
++                smartdc_type: 'core'
++            }
++        },
++        metadata: {
++            SERVICE_NAME: 'volapi',
++            SERVICE_DOMAIN: 'TO_FILL_IN',
++            'user-script': 'TO_FILL_IN'
++        }
++    };
++
++
++    var context = {
++        sdcadm: self.sdcadm,
++        devImgsToDownload: [],
++        didSomething: false
++    };
++
++    assert.string(self.sdcadm.sdc.metadata.datacenter_name,
++        'SDC application\'s metadata must have a "datacenter_name" property');
++    assert.string(self.sdcadm.sdc.metadata.dns_domain,
++        'SDC application\'s metadata must have a "dns_domain" property');
++
++    var VOLAPI_DOMAIN = svcData.name + '.' +
++        self.sdcadm.sdc.metadata.datacenter_name + '.' +
++        self.sdcadm.sdc.metadata.dns_domain;
++
++    vasync.pipeline({arg: context, funcs: [
++        steps.sapiAssertFullMode,
++
++        function getVolApiPkg(ctx, next) {
++            var filter = {name: svcData.params.package_name,
++                active: true};
++            self.sdcadm.papi.list(filter, {}, function (err, pkgs) {
++                if (err) {
++                    return next(err);
++                } else if (pkgs.length !== 1) {
++                    return next(new errors.InternalError({
++                        message: format('%d "%s" active packages found',
++                            pkgs.length, svcData.params.package_name)
++                    }));
++                }
++                ctx.volapiPkg = pkgs[0];
++                next();
++            });
++        },
++
++        // First, update VOLAPI
++
++        function getLatestVolApiImage(ctx, next) {
++            var filter = {name: 'volapi'};
++            self.sdcadm.updates.listImages(filter, function (err, images) {
++                if (err) {
++                    next(err);
++                } else if (images && images.length) {
++                    // TODO presuming sorted
++                    ctx.volapiImg = images[images.length - 1];
++                    next();
++                } else {
++                    next(new errors.UpdateError('no "volapi" image found'));
++                }
++            });
++        },
++
++        function haveLatestVolApiImageAlready(ctx, next) {
++            self.progress('Latest "volapi" image is: ' + ctx.volapiImg.uuid);
++
++            self.sdcadm.imgapi.getImage(ctx.volapiImg.uuid,
++                    function (err, img) {
++                if (err && err.body && err.body.code !== 'ResourceNotFound') {
++                    next(err);
++                    return;
++                }
++
++                if ((err && err.body && err.body.code === 'ResourceNotFound') ||
++                    img === undefined || img === null) {
++                    self.progress('Latest "volapi" image not found, ' +
++                        'scheduling import');
++                    ctx.volapiImgToDownload = ctx.volapiImg;
++                } else {
++                    self.progress('Latest "volapi" image already imported');
++                }
++
++                next();
++            });
++        },
++
++        function importVolapiImage(ctx, next) {
++            if (ctx.volapiImgToDownload === undefined) {
++                return next();
++            }
++
++            var proc = new DownloadImages({
++                images: [ctx.volapiImgToDownload]
++            });
++
++            proc.execute({
++                sdcadm: self.sdcadm,
++                log: self.log,
++                progress: self.progress,
++                source: 'https://updates.joyent.com'
++            }, next);
++        },
++
++        // Get the content for the user-script metadata entry used to create
++        // instances of the VOLAPI service below in createVolApiSvc.
++        shared.getUserScript,
++
++        function getVolApiSvc(ctx, next) {
++            self.progress('Getting volapi service...');
++
++            self.sdcadm.sapi.listServices({
++                name: 'volapi',
++                application_uuid: self.sdcadm.sdc.uuid
++            }, function (svcErr, svcs) {
++                if (svcErr) {
++                    next(svcErr);
++                    return;
++                } else if (svcs && svcs.length > 0) {
++                    ctx.volapiSvc = svcs[0];
++                }
++                next();
++            });
++        },
++
++        function updateVolApiSvc(ctx, next) {
++            if (ctx.volapiSvc === undefined) {
++                self.progress('volapi service doesn\'t exist');
++                next();
++                return;
++            }
++
++            self.progress('Checking if volapi service needs to be updated');
++
++            if (ctx.volapiSvc.params.image_uuid !== ctx.volapiImg.uuid) {
++                ctx.volapiSvc.params.image_uuid = ctx.volapiImg.uuid;
++                self.progress('Updating "volapi" service');
++
++                self.sdcadm.sapi.updateService(ctx.volapiSvc.uuid,
++                    ctx.volapiSvc, next);
++                return;
++            } else {
++                self.progress('Volapi service doesn\'t need to be updated');
++                next();
++                return;
++            }
++        },
++
++        function createVolApiSvc(ctx, next) {
++            if (ctx.volapiSvc) {
++                return next();
++            }
++
++            self.progress('Creating "volapi" service');
++            ctx.didSomething = true;
++
++            svcData.params.image_uuid = ctx.volapiImg.uuid;
++            svcData.metadata['user-script'] = ctx.userScript;
++            svcData.metadata['SERVICE_DOMAIN'] = VOLAPI_DOMAIN;
++            svcData.params.billing_id = ctx.volapiPkg.uuid;
++            delete svcData.params.package_name;
++
++
++            self.sdcadm.sapi.createService('volapi', self.sdcadm.sdc.uuid,
++                    svcData, function (err, svc) {
++                if (err) {
++                    return next(new errors.SDCClientError(err, 'sapi'));
++                }
++                ctx.volapiSvc = svc;
++                self.log.info({svc: svc}, 'created volapi svc');
++                next();
++            });
++        },
++
++        // Get headnode's server UUID, which is needed to provision services
++        // instances in next tasks below.
++        function getHeadnode(ctx, next) {
++            self.sdcadm.cnapi.listServers({
++                headnode: true
++            }, function (err, servers) {
++                if (err) {
++                    return next(new errors.SDCClientError(err, 'cnapi'));
++                }
++                ctx.headnode = servers[0];
++                return next();
++            });
++        },
++
++        function getVolApiInst(ctx, next) {
++            // Here, either we had an existing VOLAPI service before the setup
++            // process started, or we created one in createVolApiSvc, so there
++            // has to be a VOLAPI service.
++            assert.object(ctx.volapiSvc, 'ctx.volapiSvc');
++
++            var filter = {
++                service_uuid: ctx.volapiSvc.uuid
++            };
++            self.sdcadm.sapi.listInstances(filter, function (err, insts) {
++                if (err) {
++                    return next(new errors.SDCClientError(err, 'sapi'));
++                } else if (insts && insts.length) {
++                    // Note this doesn't handle multiple insts.
++                    ctx.volapiInst = insts[0];
++                    self.sdcadm.vmapi.getVm({
++                        uuid: ctx.volapiInst.uuid
++                    }, function (vmErr, volapiVm) {
++                        if (vmErr) {
++                            return next(vmErr);
++                        }
++
++                        ctx.volapiVm = volapiVm;
++                        next();
++                    });
++                } else {
++                    next();
++                }
++            });
++        },
++
++        function removeLeftoverVolapiInst(ctx, next) {
++            var volapiVmDestroyed = ctx.volapiVm &&
++                ctx.volapiVm.state === 'destroyed';
++
++            if (ctx.volapiInst !== undefined && volapiVmDestroyed) {
++                self.progress('Deleting leftover VOLAPI SAPI instance');
++                self.sdcadm.sapi.deleteInstance(ctx.volapiInst.uuid,
++                    function onSapiInstDeleted(err) {
++                        if (err === undefined) {
++                            self.progress('Leftover VOLAPI SAPI instance ' +
++                                'deleted');
++                        } else {
++                            delete ctx.volapiInst;
++                        }
++
++                        next(err);
++                    });
++            } else {
++                next();
++            }
++        },
++
++        function createVolApiInst(ctx, next) {
++            if (ctx.volapiInst !== undefined) {
++                return next();
++            }
++
++            self.progress('Creating "volapi" instance');
++            ctx.didSomething = true;
++
++            var instOpts = {
++                params: {
++                    alias: 'volapi0',
++                    server_uuid: ctx.headnode.uuid
++                }
++            };
++            self.sdcadm.sapi.createInstance(ctx.volapiSvc.uuid, instOpts,
++                    function (err, inst) {
++                if (err) {
++                    return next(new errors.SDCClientError(err, 'sapi'));
++                }
++                self.progress('Created VM %s (%s)', inst.uuid,
++                    inst.params.alias);
++                ctx.newVolApiInst = inst;
++                next();
++            });
++        },
++
++        // NFS shared volumes zones use VMs to implement their underlying
++        // storage. Each volume size is represented by a different package used
++        // when provisioning these storage VMs. Thus these packages need to be
++        // added into PAPI before any NFS shared volume can be created.
++        function addSharedVolumesPackages(ctx, next) {
++            function createPackageSettings(packageSize) {
++                assert.number(packageSize, 'packageSize');
++                assert.ok(packageSize > 0);
++
++                return {
++                    size: packageSize,
++                    owner_uuids: [self.sdcadm.config.ufds_admin_uuid]
++                };
++            }
++
++            var packagesSettings =
++                NFS_SHARED_VOLUMES_PKG_SIZES.map(createPackageSettings);
++
++            vasync.forEachParallel({
++                func: addSharedVolumePackage.bind(null, self),
++                inputs: packagesSettings
++            }, function sharedVolumesPackagesAdded(err, results) {
++                if (err) {
++                    self.log.error({err: err}, 'Error when adding packages');
++                }
++
++                var addedPackageNames = [];
++
++                results.operations.forEach(function addPkgName(operation) {
++                    if (operation.result) {
++                        addedPackageNames.push(operation.result.name);
++                    }
++                });
++
++                if (addedPackageNames.length > 0) {
++                    self.progress('Added NFS shared volumes packages:\n'
++                        + addedPackageNames.join('\n'));
++
++                    ctx.didSomething = true;
++                }
++
++                next(err);
++            });
++        },
++
++        function done(ctx, next) {
++            if (ctx.didSomething) {
++                self.progress('Setup "volapi" (%ds)',
++                    Math.floor((Date.now() - start) / 1000));
++            } else {
++                self.progress('"volapi" is already set up');
++            }
++
++            next();
++        }
++    ]}, cb);
++}
++
++do_volapi.options = [
++    {
++        names: ['help', 'h'],
++        type: 'bool',
++        help: 'Show this help.'
++    }
++];
++
++do_volapi.help = (
++    'Create the "volapi" service and a first instance.\n' +
++    '\n' +
++    'Usage:\n' +
++    '     {{name}} volapi\n' +
++    '\n' +
++    '{{options}}'
++);
++
++// --- exports
++
++module.exports = {
++    do_volapi: do_volapi
++};
+diff --git a/lib/procedures/index.js b/lib/procedures/index.js
+index 893962a..7bd4167 100644
+--- a/lib/procedures/index.js
++++ b/lib/procedures/index.js
+@@ -179,7 +179,7 @@ function coordinatePlan(opts, cb) {
+             var simpleServices = [
+                 'amon', 'amonredis', 'assets', 'ca',
+                 'cnapi', 'cns', 'dhcpd', 'docker', 'fwapi', 'manta',
+-                'napi', 'rabbitmq', 'redis', 'sdc', 'vmapi'
++                'napi', 'rabbitmq', 'redis', 'sdc', 'vmapi', 'volapi'
+             ].concat(HA_READY_SIMPLE_SVCS);
+             var handle = [];
+             var remaining = [];
+diff --git a/lib/sdcadm.js b/lib/sdcadm.js
+index 095ac7e..cfcb834 100644
+--- a/lib/sdcadm.js
++++ b/lib/sdcadm.js
+@@ -4748,6 +4748,7 @@ SdcAdm.prototype.checkHealth = function checkHealth(opts, cb) {
+         papi:     '/ping',
+         sapi:     '/ping',
+         vmapi:    '/ping',
++        volapi:   '/ping',
+         workflow: '/ping',
+         // agents
+         firewaller: '/status'
+diff --git a/man/man1/sdcadm.1.ronn b/man/man1/sdcadm.1.ronn
+index aad3019..c3ea942 100644
+--- a/man/man1/sdcadm.1.ronn
++++ b/man/man1/sdcadm.1.ronn
+@@ -1057,6 +1057,39 @@ Installs a custom TLS certificate to be used by sdc-docker.
+ `-c, --cert`
+     Path to certificate.
+ 
++### sdcadm experimental nfs-volumes \[options\] \[args...\]
++
++Enables/disables support for various NFS volumes features.
++
++    # Enable NFS volume support for sdc-docker
++    sdcadm experimental nfs-volumes docker
++
++    # Disable NFS volume support for sdc-docker
++    sdcadm experimental nfs-volumes docker -d
++
++    # Enable NFS volume support for CloudAPI
++    sdcadm experimental nfs-volumes cloudapi
++
++    # Disable NFS volume support for CloudAPI
++    sdcadm experimental nfs-volumes cloudapi -d
++
++    # Enable docker containers automatically mounting NFS volumes
++    sdcadm experimental nfs-volumes docker-automount
++
++    # Disable docker containers automatically mounting NFS volumes
++    sdcadm experimental nfs-volumes docker-automount -d
++
++    # Enable CloudAPI containers automatically mounting NFS volumes
++    sdcadm experimental nfs-volumes cloudapi-automount
++
++    # Disable CloudAPI containers automatically mounting NFS volumes
++    sdcadm experimental nfs-volumes cloudapi-automount -d
++
++`-h, --help`
++    Show this help message and exit.
++
++`-d, --disable`
++    Disable a given NFS volume feature instead of enabling it.
+ 
+ ## COPYRIGHT
+ 
+diff --git a/package.json b/package.json
+index 1ed7a54..399ba2d 100644
+--- a/package.json
++++ b/package.json
+@@ -1,26 +1,27 @@
+ {
+   "name": "sdcadm",
+   "description": "Administer a SmartDataCenter (SDC) standup",
+-  "version": "1.16.3",
++  "version": "1.17.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+-    "async": "0.2.9",
+     "assert-plus": "^1.0.0",
++    "async": "0.2.9",
+     "backoff": "2.5.0",
+     "bunyan": "1.8.12",
+     "cmdln": "4.2.1",
+     "cueball": "2.4.0",
+     "extsprintf": "^1.3.0",
+-    "kthxbai": "~0.4.0",
+     "joyent-schemas": "git+https://github.com/joyent/schemas.git#385e6eb",
+     "jsprim": "1.2.2",
++    "kthxbai": "~0.4.0",
+     "lockfd": "1.2.1",
+     "mkdirp": "0.3.5",
+     "node-uuid": "1.4.1",
+     "once": "1.3.0",
+     "progbar": "1.1.0",
+     "read": "1.0.5",
++    "restify-clients": "1.4.0",
+     "sdc-clients": "10.3.0",
+     "semver": "2.2.1",
+     "strsplit": "1.0.0",

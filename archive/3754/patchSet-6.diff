@@ -1,0 +1,446 @@
+commit 441b24a64180ba8b834b849af7e799e0a90923ac (refs/changes/54/3754/6)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2018-04-03T17:35:10+00:00 (1 year, 6 months ago)
+    
+    TRITON-262 Want auto.INSTANCE_UUID in config-agent templates
+    TRITON-291 Want auto.DATACENTER_NAME in config-agent templates
+    TRITON-298 Want auto.ADMIN_IP in GZ config-agent templates
+
+diff --git a/CHANGES.md b/CHANGES.md
+index ddeca4e..1195d59 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,5 +1,11 @@
+ # sdc-config-agent changelog
+ 
++## 1.7.0
++
++- [TRITON-262] Add support for `auto.INSTANCE_UUID`
++- [TRITON-291] Add support for `auto.DATACENTER_NAME`
++- [TRITON-298] Add support for `auto.ADMIN_IP` in the global zone
++
+ ## 1.6.3
+ 
+ - [TRITON-220] Fix accidental breakage in TRITON-184 that could cause SAPI
+diff --git a/README.md b/README.md
+index 4dde447..986f01b 100644
+--- a/README.md
++++ b/README.md
+@@ -5,7 +5,7 @@
+ -->
+ 
+ <!--
+-    Copyright (c) 2014, Joyent, Inc.
++    Copyright (c) 2018, Joyent, Inc.
+ -->
+ 
+ # sdc-config-agent
+@@ -23,3 +23,17 @@ config files, if changed. More details in the SAPI documentation.
+ This repository is part of the Joyent SmartDataCenter project (SDC).  For
+ contribution guidelines, issues, and general documentation, visit the main
+ [SDC](http://github.com/joyent/sdc) project page.
++
++## `auto.*` variables
++
++config-agent takes care of discovering and providing a handful of variables
++about the local environment. They are:
++
++- `auto.DATACENTER_NAME`, the name of the datacenter
++- `auto.SERVER_UUID`, the UUID of the Computer Node
++- `auto.ZONENAME`, the name of the running zone (`"global"` when running in the
++  Global Zone)
++- `auto.INSTANCE_UUID`, the instance UUID in SAPI for the instance whose
++  template config-agent is rendering
++- `auto.<TAG>_IP`, the IP address on the NIC with tag `<TAG>` or `<TAG>_RACK<NUM>`
++- `auto.PRIMARY_IP`, in a zone, this is the IP address of the primary NIC
+diff --git a/agent.js b/agent.js
+index f07a1fe..96609ff 100644
+--- a/agent.js
++++ b/agent.js
+@@ -19,8 +19,10 @@
+ var assert = require('assert-plus');
+ var async = require('async');
+ var fs = require('fs');
++var jsprim = require('jsprim');
+ var optimist = require('optimist');
+ var util = require('./lib/common/util');
++var vasync = require('vasync');
+ 
+ var Agent = require('./lib/agent/agent');
+ var Logger = require('bunyan');
+@@ -46,6 +48,7 @@ var ARGV = optimist.options({
+ 	}
+ }).argv;
+ 
++var VNIC_NAME_RE = /^([a-zA-Z0-9_]{0,31})[0-9]+$/;
+ 
+ var config;
+ var configPath;
+@@ -123,6 +126,158 @@ function startPeriodicRefresh() {
+ 	setTimeout(checkOnce, delay);
+ }
+ 
++function setNicTag(nic_tag, ip) {
++	var NIC_TAG = nic_tag.toUpperCase();
++
++	autoMetadata[NIC_TAG + '_IP'] = ip;
++
++	/*
++	 * If there is a nic tag of the form <name>_RACK<number>,
++	 * it will override any similarly named nic tag (e.g.
++	 * "MANTA_RACK##" will override "MANTA" nic tags).
++	 */
++	if (NIC_TAG.search(/^[A-Z]+_RACK\d+$/) === 0) {
++		NIC_TAG = NIC_TAG.split('_')[0];
++		autoMetadata[NIC_TAG + '_IP'] = ip;
++	}
++}
++
++/**
++ * Mapping NIC tags to IPs is a bit messier to do in the Global Zone. The
++ * sysinfo output has two relevant arrays: "Network Interfaces", which
++ * represents physical interfaces (including aggregations) and their NIC
++ * tags, and "Virtual Network Interfaces", which is VNICs created with
++ * dladm(1M).
++ *
++ * For the most part, each NIC tag that has an IP address will get its
++ * own VNIC (named after the NIC tag). This means that we largely just
++ * need to strip the ending digit to get at the NIC tag for that IP.
++ *
++ * The exception is the admin IP: it doesn't get placed onto its own VNIC
++ * but instead gets placed directly on the physical interface that has
++ * the admin tag. We therefore need to check for IPs on the physical
++ * interfaces and use it when the NIC looks like an admin interface.
++ */
++function processGZNicTags(sysinfo) {
++	var pnics = sysinfo['Network Interfaces'];
++	var vnics = sysinfo['Virtual Network Interfaces'];
++	var ptags = {};
++
++	jsprim.forEachKey(pnics, function (name, pnic) {
++		pnic['NIC Names'].forEach(function (nic_tag) {
++			ptags[nic_tag] = name;
++
++			if (!pnic.ip4addr) {
++				return;
++			}
++
++			if (nic_tag === 'admin' || nic_tag.indexOf('admin_') === 0) {
++				setNicTag(nic_tag, pnic.ip4addr);
++			}
++		});
++	});
++
++	jsprim.forEachKey(vnics, function (name, vnic) {
++		var m = VNIC_NAME_RE.exec(name);
++		if (m === null) {
++			return;
++		}
++
++		if (!vnic.ip4addr) {
++			return;
++		}
++
++		if (ptags[m[1]] !== vnic['Host Interface']) {
++			/*
++			 * Under normal Triton operation this shouldn't happen, but if an
++			 * operator is running `dladm create-vnic` in the GZ themselves
++			 * we could arrive here.
++			 */
++			return;
++		}
++
++		setNicTag(m[1], vnic.ip4addr);
++	});
++}
++
++function setGlobalZoneAutoMetadata(callback) {
++	util.getSysinfo({ log: log }, function (sErr, sysinfo) {
++		if (sErr) {
++			callback(sErr);
++			return;
++		}
++
++		autoMetadata.SERVER_UUID = sysinfo['UUID'];
++		autoMetadata.DATACENTER_NAME = sysinfo['Datacenter Name'];
++
++		processGZNicTags(sysinfo);
++
++		callback();
++	});
++}
++
++function setInZoneAutoMetadata(callback) {
++	vasync.pipeline({
++		input: null,
++		funcs: [
++			function getServerUuidIZ(_, cb) {
++				util.mdataGet({
++					log: log,
++					key: 'sdc:server_uuid'
++				}, function (err, serverUuid) {
++					if (err) {
++						cb(err);
++						return;
++					}
++
++					autoMetadata.SERVER_UUID = serverUuid;
++
++					cb();
++				});
++			},
++			function getDatacenterNameIZ(_, cb) {
++				util.mdataGet({
++					log: log,
++					key: 'sdc:datacenter_name'
++				}, function (err, dcName) {
++					if (err) {
++						cb(err);
++						return;
++					}
++
++					autoMetadata.DATACENTER_NAME = dcName;
++
++					cb();
++				});
++			},
++			function getNicsIZ(_, cb) {
++				util.mdataGet({
++					log: log,
++					key: 'sdc:nics'
++				}, function (err, nicsJson) {
++					if (err) {
++						cb(err);
++						return;
++					}
++
++					var nics = JSON.parse(nicsJson);
++					for (var i = 0; i < nics.length; i++) {
++						var nic = nics[i];
++						if (i === 0) {
++							autoMetadata.PRIMARY_IP = nic.ip;
++						}
++						if (nic.nic_tag) {
++							setNicTag(nic.nic_tag, nic.ip);
++						}
++					}
++
++					cb();
++				});
++			}
++		]
++	}, callback);
++}
++
+ async.waterfall([
+ 	// TODO(refactor) move this to Agent.init
+ 	function gatherInsts(cb) {
+@@ -147,6 +302,14 @@ async.waterfall([
+ 		});
+ 	},
+ 
++	function gatherAutoMetadata(cb) {
++		if (zonename === 'global') {
++			setGlobalZoneAutoMetadata(cb);
++		} else {
++			setInZoneAutoMetadata(cb);
++		}
++	},
++
+ 	// For zone instances, make sure we always default to mdata-get sapi-url
+ 	// if the value was never passed
+ 	function ensureSapiUrl(cb) {
+@@ -164,68 +327,6 @@ async.waterfall([
+ 			cb();
+ 		});
+ 	},
+-
+-	// TODO(refactor) move this to Agent.init
+-	function autoMetadataIps(cb) {
+-		if (zonename === 'global') {
+-			return (cb());
+-		}
+-
+-		var mdataOpts = {log: log, key: 'sdc:nics'};
+-		util.mdataGet(mdataOpts, function (err, nicsJson) {
+-			if (err) {
+-				return (cb(err));
+-			}
+-
+-			var nics = JSON.parse(nicsJson);
+-			for (var i = 0; i < nics.length; i++) {
+-				var nic = nics[i];
+-				if (i === 0) {
+-					autoMetadata.PRIMARY_IP = nic.ip;
+-				}
+-				if (nic.nic_tag) {
+-					var NIC_TAG = nic.nic_tag.toUpperCase();
+-					autoMetadata[NIC_TAG + '_IP'] = nic.ip;
+-
+-					/*
+-					 * If there is a nic tag of the form <name>_RACK<number>,
+-					 * it will override any similarly named nic tag (e.g.
+-					 * "MANTA_RACK##" will override "MANTA" nic tags).
+-					 */
+-					if (NIC_TAG.search(/^[A-Z]+_RACK\d+$/) === 0) {
+-						NIC_TAG = NIC_TAG.split('_')[0];
+-						autoMetadata[NIC_TAG + '_IP'] = nic.ip;
+-					}
+-				}
+-			}
+-
+-			cb();
+-		});
+-	},
+-
+-	function autoMetadataServerUuid(cb) {
+-		if (zonename === 'global') {
+-			util.getSysinfo({log: log}, function (err, sysinfo) {
+-				if (err) {
+-					cb(err);
+-				} else {
+-					autoMetadata.SERVER_UUID = sysinfo.UUID;
+-					cb();
+-				}
+-			});
+-		} else {
+-			var mdataOpts = {log: log, key: 'sdc:server_uuid'};
+-			util.mdataGet(mdataOpts, function (err, serverUuid) {
+-				if (err) {
+-					cb(err);
+-				} else {
+-					autoMetadata.SERVER_UUID = serverUuid;
+-					cb();
+-				}
+-			});
+-		}
+-	},
+-
+ 	function (cb) {
+ 		agent = new Agent(config, log);
+ 
+diff --git a/lib/agent/agent.js b/lib/agent/agent.js
+index c28b380..26ebde7 100644
+--- a/lib/agent/agent.js
++++ b/lib/agent/agent.js
+@@ -45,6 +45,7 @@ var async = require('async');
+ var exec = require('child_process').exec;
+ var fs = require('fs');
+ var hogan = require('hogan.js');
++var jsprim = require('jsprim');
+ var objCopy = require('../common/util').objCopy;
+ var getZonename = require('../common/util').getZonename;
+ var once = require('once');
+@@ -338,6 +339,10 @@ Agent.prototype.checkAndRefreshInst = function checkAndRefreshInst(opts, cb) {
+ 	var inst = opts.inst;
+ 	var log = opts.log.child({inst: inst}, true);
+ 
++	var autoInstanceMetadata = {
++		INSTANCE_UUID: inst
++	};
++
+ 	var reqOpts = {
+ 		headers: {
+ 			'x-request-id': log.fields.req_id
+@@ -390,7 +395,8 @@ Agent.prototype.checkAndRefreshInst = function checkAndRefreshInst(opts, cb) {
+ 					self.renderConfigFile(
+ 						log.child({manifest: name}, true),
+ 						manifests[name],
+-						metadata);
++						metadata,
++						autoInstanceMetadata);
+ 				});
+ 
+ 				next(null, manifests);
+@@ -604,7 +610,7 @@ Agent.prototype.runPostCommand = function runPostCommand(log, post_cmd, cb) {
+  * Render a configuration file from its manifest.
+  */
+ Agent.prototype.renderConfigFile =
+-function renderConfigFile(log, manifest, rawMetadata)
++function renderConfigFile(log, manifest, rawMetadata, autoInstanceMetadata)
+ {
+ 	var self = this;
+ 
+@@ -622,11 +628,12 @@ function renderConfigFile(log, manifest, rawMetadata)
+ 		metadata[key] = self.localMetadata[key];
+ 	});
+ 
++	var auto = jsprim.mergeObjects(self.autoMetadata, autoInstanceMetadata);
+ 	if (metadata.auto) {
+-		log.warn({oldAuto: metadata.auto, newAuto: self.autoMetadata},
++		log.warn({oldAuto: metadata.auto, newAuto: auto},
+ 			'overwriting existing "metadata.auto" section');
+ 	}
+-	metadata.auto = self.autoMetadata;
++	metadata.auto = auto;
+ 
+ 	var contents = null;
+ 	try {
+diff --git a/lib/common/util.js b/lib/common/util.js
+index 9d6c26e..4ee305e 100644
+--- a/lib/common/util.js
++++ b/lib/common/util.js
+@@ -14,8 +14,10 @@
+ 
+ var assert = require('assert-plus');
+ var execFile = require('child_process').execFile;
+-var WError = require('verror').WError;
++var mod_verror = require('verror');
+ 
++var WError = mod_verror.WError;
++var VError = mod_verror.VError;
+ 
+ 
+ // ---- internal support
+@@ -123,16 +125,25 @@ function getSysinfo(opts, cb) {
+ 	assert.object(opts.log, 'opts.log');
+ 	assert.func(cb, 'cb');
+ 
+-	var execOpts = {
++	execFilePlus({
+ 		argv: ['/usr/bin/sysinfo'],
+ 		log: opts.log
+-	};
+-	execFilePlus(execOpts, function (err, stdout) {
++	}, function (err, stdout) {
+ 		if (err) {
+ 			cb(err);
+-		} else {
+-			cb(null, stdout.trim());
++			return;
+ 		}
++
++		var sysinfo;
++
++		try {
++			sysinfo = JSON.parse(stdout.trim());
++		} catch (e) {
++			cb(new VError(e, 'failed to parse sysinfo output'));
++			return;
++		}
++
++		cb(null, sysinfo);
+ 	});
+ }
+ 
+diff --git a/package.json b/package.json
+index e63bf2e..ecbc2eb 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+     "name": "config-agent",
+     "description": "SmartDataCenter Config Agent",
+-    "version": "1.6.3",
++    "version": "1.7.0",
+     "author": "Joyent (joyent.com)",
+     "dependencies": {
+         "assert-plus": "0.1.5",
+@@ -9,6 +9,7 @@
+         "bunyan": "1.5.1",
+         "cmdln": "3.4.0",
+         "hogan.js": "git+https://github.com/joyent/hogan.js#7d34ba7",
++        "jsprim": "2.0.0",
+         "kthxbai": "^0.4.0",
+         "mkdirp": "0.5.1",
+         "once": "1.3.2",

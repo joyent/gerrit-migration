@@ -1,0 +1,687 @@
+commit 2f66cc95fd48505a9b8113a2383783ad3458440a (refs/changes/43/3843/5)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2018-04-23T17:39:50+00:00 (1 year, 6 months ago)
+    
+    TRITON-269 Upgrade NAPI to Moray client v3
+
+diff --git a/lib/config.js b/lib/config.js
+index 351dcce..8ae1d6b 100644
+--- a/lib/config.js
++++ b/lib/config.js
+@@ -32,8 +32,13 @@ function validateConfig(config) {
+     assert.uuid(config.ufdsAdminUuid, 'ufdsAdminUuid (admin user uuid)');
+ 
+     assert.object(config.moray, 'moray (moray config section)');
+-    assert.string(config.moray.host, 'moray.host (moray IP)');
+-    assert.number(config.moray.port, 'moray.port (moray port number)');
++    if (config.moray.host) {
++        assert.string(config.moray.host, 'moray.host');
++        assert.number(config.moray.port, 'moray.port');
++    } else {
++        assert.string(config.moray.srvDomain, 'moray.srvDomain');
++        assert.object(config.moray.cueballOptions, 'moray.cueballOptions');
++    }
+ 
+     assert.object(config.overlay, 'overlay (overlay config section)');
+ }
+diff --git a/lib/migratectl.js b/lib/migratectl.js
+index 6449c69..8f6f808 100755
+--- a/lib/migratectl.js
++++ b/lib/migratectl.js
+@@ -33,6 +33,7 @@
+ var bunyan = require('bunyan');
+ var dashdash = require('dashdash');
+ var mod_ip = require('./lib/models/ip');
++var mod_jsprim = require('jsprim');
+ var mod_migrate = require('./migrate');
+ var mod_moray = require('./apis/moray');
+ var NAPI = require('sdc-clients').NAPI;
+@@ -97,19 +98,11 @@ function main() {
+         serializers: bunyan.stdSerializers
+     });
+ 
+-    var morayConf = {
+-        connectTimeout: 1000,
+-        host: config.moray.host,
+-        log: log,
+-        noCache: true,
+-        port: config.moray.port,
+-        reconnect: true,
+-        retry: {
+-            retries: 5,
+-            maxTimeout: 100,
+-            minTimeout: 10
+-        }
+-    };
++    var morayConf = mod_jsprim.deepCopy(config.moray);
++    morayConf.log = log.child({
++        component: 'moray',
++            level: config.moray.logLevel || 'info'
++    });
+ 
+     var client = mod_moray.createClient(morayConf);
+     var host = 'localhost';
+diff --git a/lib/napi.js b/lib/napi.js
+index 75a22d5..61e0b96 100644
+--- a/lib/napi.js
++++ b/lib/napi.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -18,13 +18,14 @@ var assert = require('assert-plus');
+ var constants = require('./util/constants');
+ var endpoints = require('./endpoints');
+ var EffluentLogger = require('effluent-logger');
+-var EventEmitter = require('events').EventEmitter;
+ var http = require('http');
+ var https = require('https');
+ var models = require('./models');
+ var mod_config = require('./config');
+ var mod_init = require('./init');
++var mod_jsprim = require('jsprim');
+ var mod_migrate = require('./migrate.js');
++var mod_mooremachine = require('mooremachine');
+ var moray = require('moray');
+ var os = require('os');
+ var restify = require('restify');
+@@ -32,6 +33,8 @@ var trace_event = require('trace-event');
+ var util = require('util');
+ var verror = require('verror');
+ 
++var VError = verror.VError;
++var WError = verror.WError;
+ 
+ 
+ // --- Globals
+@@ -71,7 +74,7 @@ function NAPI(opts) {
+         if (opts.config.overlay.defaultOverlayMTU === undefined ||
+             opts.config.overlay.overlayNicTag === undefined ||
+             opts.config.overlay.underlayNicTag === undefined) {
+-                throw new verror.VError('SAPI overlay configuration ' +
++                throw new VError('SAPI overlay configuration ' +
+                     'incomplete. Missing one of deafultOverlayMTU, ' +
+                     'overlayNicTag, underlayNicTag. Found: %j',
+                     opts.config.overlay);
+@@ -95,17 +98,13 @@ function NAPI(opts) {
+     }
+ 
+     function checkServices(req, res, next) {
+-        if (!req.app.moray) {
+-            return next(new restify.ServiceUnavailableError(
+-                'Moray client not initialized'));
+-        }
+-
+-        if (!req.app.initialDataLoaded) {
+-            return next(new restify.ServiceUnavailableError(
+-                'Initial network data not loaded'));
++        if (!req.app.isInState('running')) {
++            next(new restify.ServiceUnavailableError(
++                'Server is still initializing'));
++            return;
+         }
+ 
+-        return next();
++        next();
+     }
+ 
+     var before = [ populateReq, checkServices ];
+@@ -179,7 +178,7 @@ function NAPI(opts) {
+     });
+ 
+     server.on('uncaughtException', function (req, res, route, err) {
+-        res.send(new verror.WError(err, 'Internal error'));
++        res.send(new WError(err, 'Internal error'));
+         restify.auditLogger({
+             log: req.log.child({
+                 component: 'audit',
+@@ -189,9 +188,11 @@ function NAPI(opts) {
+     });
+ 
+     endpoints.registerEndpoints(server, before, this.log);
++
++    mod_mooremachine.FSM.call(this, 'waiting');
+ }
+ 
+-util.inherits(NAPI, EventEmitter);
++util.inherits(NAPI, mod_mooremachine.FSM);
+ 
+ 
+ /**
+@@ -201,14 +202,7 @@ NAPI.prototype.start = function start(callback) {
+     this.server.on('error', callback);
+     this.server.listen(this.config.port, callback);
+ 
+-    if (!this.moray) {
+-        this.createMorayClient();
+-    }
+-
+-
+-    this.log.info({ period: USAGE_PERIOD },
+-        'Starting periodic logging of memory usage');
+-    this.usageTimer = setInterval(periodicUsageLog, USAGE_PERIOD, this.log);
++    this.emit('startAsserted');
+ };
+ 
+ 
+@@ -216,19 +210,8 @@ NAPI.prototype.start = function start(callback) {
+  * Stops the server
+  */
+ NAPI.prototype.stop = function stop(callback) {
+-    var self = this;
+-    this.server.close(function (err) {
+-        if (self.moray) {
+-            self.moray.close();
+-        }
+-
+-        if (self.usageTimer) {
+-            clearInterval(self.usageTimer);
+-            self.usageTimer = null;
+-        }
+-
+-        callback(err);
+-    });
++    assert.ok(this.isInState('running'));
++    this.emit('stopAsserted', callback);
+ };
+ 
+ 
+@@ -252,144 +235,177 @@ NAPI.prototype.info = function info() {
+ // --- Setup and validation
+ 
+ 
++NAPI.prototype.state_waiting = function (S) {
++    S.validTransitions([ 'init' ]);
+ 
+-/**
+- * Populates initial network data from the config file
+- */
+-NAPI.prototype.loadInitialData = function loadInitialData(callback) {
+-    var self = this;
+-    mod_init.loadInitialData({
+-        app: this,
+-        config: this.config,
+-        log: this.log.child({ component: 'init' })
+-    }, function _afterLoad() {
+-        self.initialDataLoaded = true;
+-        return callback();
++    S.on(this, 'startAsserted', function () {
++        S.gotoState('init');
+     });
+ };
+ 
++NAPI.prototype.state_init = function (S) {
++    S.gotoState('init.memlogger');
++};
+ 
+-/**
+- * Creates a moray client, retrying as necessary
+- */
+-NAPI.prototype.createMorayClient = function createMorayClient() {
++NAPI.prototype.state_init.memlogger = function (S) {
++    this.log.info({ period: USAGE_PERIOD },
++        'Starting periodic logging of memory usage');
++    this.usageTimer = setInterval(periodicUsageLog, USAGE_PERIOD, this.log);
++    S.gotoState('init.moray');
++};
++
++NAPI.prototype.state_init.moray = function (S) {
+     var self = this;
+-    var conf = {
+-        connectTimeout: 1000,
+-        host: self.config.moray.host,
+-        noCache: true,
+-        port: self.config.moray.port,
+-        reconnect: true,
+-        retry: {
+-            maxTimeout: 6000,
+-            minTimeout: 100
+-        }
+-    };
++
++    S.validTransitions([ 'init.buckets', 'failed' ]);
++
++    if (self.moray) {
++        S.gotoState('init.buckets');
++        return;
++    }
++
++    var conf = mod_jsprim.deepCopy(self.config.moray);
+ 
+     self.log.debug(conf, 'Creating moray client');
++
+     conf.log = self.log.child({
+         component: 'moray',
+         level: self.config.moray.logLevel || 'info'
+     });
+-    var client = moray.createClient(conf);
+-
+-    function onMorayConnect() {
+-        client.removeListener('error', onMorayError);
+-        client.log.info('moray: connected');
+-        self.morayConnected = true;
+-        self.moray = client;
+-        self.emit('connected');
+-
+-        client.on('close', function () {
+-            client.log.error('moray: closed');
+-            self.morayConnected = false;
+-        });
+ 
+-        client.on('connect', function () {
+-            client.log.info('moray: reconnected');
+-            self.morayConnected = true;
+-        });
++    self.moray = moray.createClient(conf);
+ 
+-        client.on('error', function (err) {
+-            client.log.warn(err, 'moray: error (reconnecting)');
+-            self.morayConnected = false;
+-        });
+-    }
++    S.on(self.moray, 'connect', function onMorayConnect() {
++        self.log.info('moray: connected');
+ 
+-    function onMorayError(err) {
+-        client.removeListener('connect', onMorayConnect);
+-        self.morayConnected = false;
+-        client.log.error(err, 'moray: connection failed');
+-    }
++        S.gotoState('init.buckets');
++    });
++
++    S.on(self.moray, 'error', function onMorayError(err) {
++        self.initErr = new VError(err, 'moray: connection failed');
++        S.gotoState('failed');
++    });
++};
++
++NAPI.prototype.state_init.buckets = function (S) {
++    var self = this;
++
++    S.validTransitions([ 'init.buckets', 'init.migrations' ]);
++
++    /*
++     * There's no good way to deal with Moray versions currently (see RFD 33
++     * for a discussion of this), so for now we just hardcode version 2 until
++     * we have a way to enforce talking to a minimum Moray version.
++     */
++    self.morayVersion = 2;
+ 
+-    function onMorayConnectAttempt(number, delay) {
+-        var level;
+-        if (number === 0) {
+-            level = 'info';
+-        } else if (number < 5) {
+-            level = 'warn';
+-        } else {
+-            level = 'error';
++    models.init(self, function (err) {
++        if (err) {
++            self.log.error(err, 'Error initializing models; retrying in 10s');
++            S.timeout(function () {
++                S.gotoState('init.buckets');
++            }, 10000);
++            return;
+         }
+-        client.log[level]({
+-                attempt: number,
+-                delay: delay
+-        }, 'moray: connection attempted');
+-    }
+ 
+-    client.once('connect', onMorayConnect);
+-    client.once('error', onMorayError);
+-    client.on('connectAttempt', onMorayConnectAttempt); // this we always use
++        S.gotoState('init.migrations');
++    });
+ };
+ 
++NAPI.prototype.state_init.migrations = function (S) {
++    var self = this;
++
++    S.validTransitions([ 'init.loadInitialData', 'failed' ]);
+ 
+-/**
+- * Do any outstanding migrations
+- */
+-NAPI.prototype.doMigrations = function doMigrations(callback) {
+-    var opts = {
+-        app: this,
+-        log: this.log.child({ component: 'migrate' }),
++    mod_migrate.migrateAll({
++        app: self,
++        log: self.log.child({ component: 'migrate' }),
+         models: models.models
+-    };
+-    mod_migrate.migrateAll(opts, callback);
++    }, function afterMigrate(err) {
++        if (err) {
++            self.initErr = new VError(err, 'failed to migrate data');
++            S.gotoState('failed');
++            return;
++        }
++
++        self.log.info('Migrations complete');
++        S.gotoState('init.loadInitialData');
++    });
+ };
+ 
++NAPI.prototype.state_init.loadInitialData = function (S) {
++    var self = this;
+ 
+-/**
+- * Initializes moray buckets
+- */
+-NAPI.prototype.init = function serverInit() {
++    S.validTransitions([ 'running' ]);
++
++    mod_init.loadInitialData({
++        app: self,
++        config: self.config,
++        log: self.log
++    }, function _afterLoad() {
++        self.log.info('Initial data loaded');
++        S.gotoState('running');
++    });
++};
++
++NAPI.prototype.state_running = function (S) {
+     var self = this;
+-    var att = 1;
+-    var timeout = null;
+-
+-    function modelInitRetry() {
+-        models.init(self, function (err) {
+-            if (timeout) {
+-                clearTimeout(timeout);
+-            }
+-
+-            if (err) {
+-                self.log.error(err, 'Error initializing models (attempt=%d)',
+-                    att);
+-                att++;
+-                timeout = setTimeout(modelInitRetry, 10000);
+-                return;
+-            }
+-
+-            self.emit('initialized');
+-        });
+-    }
+ 
+-    /*
+-     * There's no good way to deal with Moray versions currently (see RFD 33
+-     * for a discussion of this), so for now we just hardcode version 2 until
+-     * we have a way to enforce talking to a minimum Moray version.
+-     */
+-    self.morayVersion = 2;
++    S.validTransitions([ 'stopping' ]);
++
++    S.on(self, 'stopAsserted', function (callback) {
++        self.stopcb = callback;
++        S.gotoState('stopping');
++    });
+ 
+-    modelInitRetry();
++    S.immediate(function () {
++        self.emit('initialized');
++    });
++};
++
++NAPI.prototype.state_failed = function (S) {
++    var self = this;
++
++    S.validTransitions([]);
++
++    self._cleanup(function () {
++        self.emit('error', self.initErr);
++    });
++};
++
++NAPI.prototype.state_stopping = function (S) {
++    var self = this;
++
++    S.validTransitions([ 'stopped' ]);
++
++    self._cleanup(function (err) {
++        self.stoperr = err;
++        S.gotoState('stopped');
++    });
++};
++
++NAPI.prototype.state_stopped = function (S) {
++    S.validTransitions([]);
++    setImmediate(this.stopcb, this.stoperr);
++};
++
++NAPI.prototype._cleanup = function (callback) {
++    var self = this;
++
++    this.server.close(function (err) {
++        if (self.moray) {
++            self.moray.close();
++        }
++
++        if (self.usageTimer) {
++            clearInterval(self.usageTimer);
++            self.usageTimer = null;
++        }
++
++        if (callback) {
++            callback(err);
++        }
++    });
+ };
+ 
+ 
+diff --git a/package.json b/package.json
+index 832ad6a..842b1d2 100644
+--- a/package.json
++++ b/package.json
+@@ -15,7 +15,8 @@
+     "jsprim": "1.4.0",
+     "lomstream": "1.1.0",
+     "macaddr": "0.0.1",
+-    "moray": "2.0.1",
++    "mooremachine": "2.2.0",
++    "moray": "3.4.2",
+     "node-uuid": "1.4.7",
+     "portolan-moray": "git+https://github.com/joyent/sdc-portolan-moray.git#7e2c4ca",
+     "restify": "4.1.1",
+@@ -27,7 +28,7 @@
+     "verror": "1.9.0"
+   },
+   "devDependencies": {
+-    "moray-sandbox": "0.1.3",
++    "moray-sandbox": "0.2.0",
+     "faucet": "0.0.1",
+     "istanbul": "^0.4.0",
+     "eslint": "2.13.1",
+diff --git a/sapi_manifests/napi/template b/sapi_manifests/napi/template
+index eb4ee61..ebd837d 100644
+--- a/sapi_manifests/napi/template
++++ b/sapi_manifests/napi/template
+@@ -11,9 +11,11 @@
+   "fluentd_host": "{{{experimental_fluentd_host}}}",
+ {{/experimental_fluentd_host}}
+   "moray": {
+-    "host": "{{{MORAY_SERVICE}}}",
++    "srvDomain": "{{{MORAY_SERVICE}}}",
+     "logLevel": "info",
+-    "port": 2020
++    "cueballOptions": {
++        "resolvers": [ "{{{BINDER_SERVICE}}}" ]
++    }
+   },
+ {{#fabric_cfg}}
+   "overlay": {
+diff --git a/sapi_manifests/registrar/manifest.json b/sapi_manifests/registrar/manifest.json
+new file mode 100644
+index 0000000..98cd3bb
+--- /dev/null
++++ b/sapi_manifests/registrar/manifest.json
+@@ -0,0 +1,5 @@
++{
++    "name": "registrar",
++    "path": "/opt/smartdc/registrar/etc/config.json",
++    "master": true
++}
+diff --git a/sapi_manifests/registrar/template b/sapi_manifests/registrar/template
+new file mode 100644
+index 0000000..8236209
+--- /dev/null
++++ b/sapi_manifests/registrar/template
+@@ -0,0 +1,30 @@
++{
++  "registration": {
++    "domain": "{{SERVICE_DOMAIN}}",
++    "type": "rr_host",
++    "service": {
++      "type": "service",
++      "service": {
++        "srvce": "_http",
++        "proto": "_tcp",
++        "port": 80
++      },
++      "ttl": 60
++    },
++    "ttl": 60
++  },
++
++  "zookeeper": {
++    "servers": [
++      {{#ZK_SERVERS}}
++        {
++          "host": "{{host}}",
++          "port": {{port}}
++        }{{^last}}, {{/last}}
++      {{/ZK_SERVERS}}
++    ],
++    "timeout": 60000
++  },
++
++  "adminIp": "{{auto.ADMIN_IP}}"
++}
+diff --git a/server.js b/server.js
+index 8ff2e6b..398d0ae 100644
+--- a/server.js
++++ b/server.js
+@@ -47,25 +47,8 @@ try {
+     exitOnError(err);
+ }
+ 
+-server.on('connected', function _afterConnect() {
+-    server.init(function () {
+-        log.info('Server init complete');
+-    });
+-});
+-
+-server.on('initialized', function _afterReady() {
+-    server.doMigrations(function (err) {
+-        if (err) {
+-            log.error(err, 'Error migrating data');
+-            return;
+-        }
+-
+-        log.info('Migrations complete');
+-
+-        server.loadInitialData(function () {
+-            log.info('Initial data loaded');
+-        });
+-    });
++server.on('initialized', function _afterConnect() {
++    log.info('Server init complete');
+ });
+ 
+ server.start(function _afterStart() {
+diff --git a/test/lib/portolan.js b/test/lib/portolan.js
+index 46bdc97..1d4a925 100644
+--- a/test/lib/portolan.js
++++ b/test/lib/portolan.js
+@@ -19,6 +19,7 @@ var clone = require('clone');
+ var config = require('./config');
+ var common = require('./common');
+ var log = require('./log');
++var mod_jsprim = require('jsprim');
+ var mod_mac = require('macaddr');
+ var mod_moray = require('moray');
+ var mod_portolan_moray = require('portolan-moray');
+@@ -156,12 +157,9 @@ function getMorayClient(callback) {
+     assert.func(callback, 'callback');
+ 
+     mod_portolan_moray.initConsumer({}, function _afterInit() {
+-        MORAY_CLIENT = mod_moray.createClient({
+-            host: config.moray.host,
+-            log: log,
+-            port: config.moray.port
+-        });
+-
++        MORAY_CLIENT = mod_moray.createClient(mod_jsprim.mergeObjects({
++            log: log
++        }, config.moray));
+ 
+         MORAY_CLIENT.once('error', callback);
+ 
+diff --git a/test/lib/server.js b/test/lib/server.js
+index 6a97283..d05f05c 100644
+--- a/test/lib/server.js
++++ b/test/lib/server.js
+@@ -118,7 +118,16 @@ function setupMoray(log, callback) {
+             return;
+         }
+ 
+-        pg.spawnMoray(callback);
++        pg.spawnMoray(function (err, moray) {
++            if (err) {
++                callback(err);
++                return;
++            }
++
++            moray.on('connect', function afterConnect() {
++                callback(null, moray);
++            });
++        });
+     });
+ }
+ 
+@@ -147,32 +156,18 @@ function createTestServer(opts, callback) {
+         });
+         SERVER = server;
+ 
+-        server.initialDataLoaded = true;
+         server.moray = moray;
+ 
+-        server.on('connected', function _afterConnect() {
+-            log_child.debug('server connected');
+-            server.init();
+-        });
+-
+-        server.on('initialized', function _afterReady() {
+-            log_child.debug('server initialized');
++        server.on('initialized', function _afterConnect() {
++            log_child.debug('server running');
+ 
+             var client = common.createClient(SERVER.info().url);
+             mod_client.set(client);
+             callback(null, { server: SERVER, client: client, moray: moray });
+         });
+ 
+-        server.start(function _afterStart(startErr) {
++        server.start(function _afterStart() {
+             log_child.debug('server started');
+-            if (startErr) {
+-                callback(startErr);
+-                return;
+-            }
+-
+-            // This is normally emitted when the moray client connects, but
+-            // we took care of setting the Moray client to the mock ourselves:
+-            server.emit('connected');
+         });
+     }
+ 

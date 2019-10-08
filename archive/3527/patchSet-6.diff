@@ -1,0 +1,321 @@
+commit a270778cc77fc9288c66233fb3a77f32cf9fdf73 (refs/changes/27/3527/6)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2018-03-07T20:29:13+00:00 (1 year, 7 months ago)
+    
+    MANTA-3591 muskie throttle doesn't enforce concurrency properly
+
+diff --git a/lib/server.js b/lib/server.js
+index df6a1d1..e0f7d73 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -205,6 +205,15 @@ function createServer(options, clients, name) {
+     // set up random stuff
+     other.mount(server);
+ 
++    if (options.throttle.enabled) {
++        options.throttle.log = options.log;
++        options.throttle.server = server;
++
++        server.throttle = throttle.createThrottle(options.throttle);
++        server.pre(server.throttle.throttlePreHandler());
++        log.info('registered throttle handler');
++    }
++
+     server.use(common.earlySetupHandler(options));
+     server.use(restify.dateParser(options.maxRequestAge || 300));
+     server.use(restify.queryParser());
+@@ -212,6 +221,7 @@ function createServer(options, clients, name) {
+     server.use(auth.checkIfPresigned);
+     server.use(common.enforceSSLHandler(options));
+ 
++
+     server.use(function ensureDependencies(req, res, next) {
+         var ok = true;
+         var errors = [];
+@@ -246,11 +256,6 @@ function createServer(options, clients, name) {
+         }
+     });
+ 
+-    if (options.throttle.enabled) {
+-        options.throttle.log = options.log;
+-        var throttleHandle = throttle.createThrottle(options.throttle);
+-        server.use(throttle.throttleHandler(throttleHandle));
+-    }
+     server.use(auth.authenticationHandler({
+         log: log,
+         mahi: clients.mahi,
+@@ -469,6 +474,7 @@ function createServer(options, clients, name) {
+         _audit(req, res, route, err);
+     });
+ 
++
+     server.on('after', function (req, res, route, err) {
+         _audit(req, res, route, err);
+ 
+@@ -484,6 +490,11 @@ function createServer(options, clients, name) {
+         }
+     });
+ 
++    if (options.throttle.enabled) {
++        server.on('uncaughtException', server.throttle.throttleAfterHandler());
++        server.on('after', server.throttle.throttleAfterHandler());
++    }
++
+     return (server);
+ }
+ 
+diff --git a/lib/throttle.js b/lib/throttle.js
+index 82cd5b4..006ce0b 100644
+--- a/lib/throttle.js
++++ b/lib/throttle.js
+@@ -12,6 +12,7 @@ var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var vasync = require('vasync');
+ var uuid = require('node-uuid');
++var once = require('once');
+ var util = require('util');
+ var mod_url = require('url');
+ var fs = require('fs');
+@@ -91,8 +92,7 @@ require('./errors');
+  * necessary.
+  */
+ 
+-// Used for nanosecond to second conversion
+-const NANOSEC_PER_SEC = Math.pow(10, 9);
++var DEFAULT_REAP_INTERVAL_MS = 5000;
+ 
+ /*
+  * The throttle object maintains all the state used by the throttle. This state
+@@ -108,8 +108,14 @@ function Throttle(options) {
+     assert.ok(options.log, 'options.log');
+     assert.number(options.queueTolerance, 'options.queueTolerance');
+     assert.ok(options.queueTolerance > 0, 'queueTolerance must be positive');
++    assert.ok(options.server, 'restify server');
+ 
+-    this.log = options.log.child({ component: 'throttle'}, true);
++    this.log = options.log.child({
++        component: 'Throttle'
++    });
++
++    this.server = options.server;
++    this.requestMap = {};
+ 
+     this.dtp = dtrace.createDTraceProvider('muskie-throttle');
+     this.throttle_probes = {
+@@ -135,55 +141,164 @@ function Throttle(options) {
+     this.requestQueue = vasync.queue(function (task, callback) {
+         task(callback);
+     }, this.concurrency);
++
++    this.reapInterval = options.reapInterval || DEFAULT_REAP_INTERVAL_MS;
++    this._reapStaleRequests();
+ }
+ 
+-Throttle.prototype.wait = function wait(req, res, next) {
++/*
++ * This is really bad. It's known that not all routes trigger the 'after'
++ * callback. To deal with this, we check whether requests that the throttle has
++ * marked as in flight have finished, if so, we call their callbacks.
++ */
++Throttle.prototype._reapStaleRequests = function reap() {
++
++    function hrtimeToMS(hrtime) {
++        return (hrtime[0]*1e3) + (hrtime[0]/1e6);
++    }
++
+     var self = this;
+ 
+-    if (self.requestQueue.length() >= self.queueTolerance) {
+-        self.throttle_probes.request_throttled.fire(function () {
+-            return ([self.requestQueue.npending, self.requestQueue.length(),
+-                req.url, req.method]);
++    self.log.debug({
++        numreqs: Object.keys(self.requestMap).length
++    }, 'checking for stale requests');
++
++    Object.keys(self.requestMap).forEach(function (key) {
++        var value = self.requestMap[key];
++
++        var req = value.req;
++        var res = value.res;
++        var cb = value.cb;
++
++        if (res.finished) {
++            self.log.debug({
++                reqid: req.getId()
++            }, 'reaping stale request slot');
++
++            delete (self.requestMap[key]);
++
++            cb();
++        }
++    });
++
++    setTimeout(self._reapStaleRequests.bind(self), self.reapInterval);
++};
++
++
++Throttle.prototype.throttlePreHandler = function preHandler() {
++    var self = this;
++
++    function wait(req, res, next) {
++        self.log.debug({
++            reqid: req.getId()
++        }, 'throttle wait');
++
++        if (self.requestQueue.length() >= self.queueTolerance) {
++            self.throttle_probes.request_throttled.fire(function () {
++                return ([self.requestQueue.npending, self.requestQueue.length(),
++                    req.url, req.method]);
++            });
++            /*
++             * Wrap the ThrottledError in a VError so that the relevant fields
++             * appear in the audit entry of the throttled request. We translate
++             * the error to its cause before sending the response, as we don't
++             * want to expose the queue length or the queue tolerance of the
++             * throttle to end users.
++             */
++            var state = {
++                queuedRequests: self.requestQueue.npending,
++                inFlightRequests: self.requestQueue.length()
++            };
++            var cfg = {
++                queueTolerance: self.queueTolerance,
++                concurrency: self.concurrency
++            };
++
++            self.log.warn({
++                reqid: req.getId(),
++                queued: self.requestQueue.npending,
++                inFlight: self.requestQueue.length(),
++                concurrency: self.concurrency,
++                queueTolerance: self.queueTolerance
++            }, 'request throttled');
++
++            next(new VError(new ThrottledError(), 'muskie throttled request ' +
++                '%s. observed: %j, configured with: %j', req.getId(), state,
++                cfg));
++
++            return;
++        }
++
++        assert.ok(Object.keys(self.requestMap).length <= self.concurrency,
++                'fewer than concurrency callbacks');
++
++        self.throttle_probes.queue_enter.fire(function () {
++            return ([req.getId()]);
++        });
++
++        self.requestQueue.push(function (cb) {
++            assert.ok(!self.requestMap[req.getId()],
++                'throttle callback for ' + req.getId() + ' already registered');
++
++            if (req.connection.destroyed) {
++                next(new VError('connection closed while req %s ' +
++                        'was on the throttle queue', req.getId()));
++                cb();
++                return;
++            }
++
++            self.requestMap[req.getId()] = {
++                req: req,
++                res: res,
++                cb: once(cb)
++            };
++
++            self.log.debug({
++                reqid: req.getId()
++            }, 'insert to throttle request map');
++
++            self.throttle_probes.queue_leave.fire(function () {
++                return ([req.getId()]);
++            });
++            next();
+         });
+-        /*
+-         * Wrap the ThrottledError in a VError so that the relevant fields
+-         * appear in the audit entry of the throttled request. We translate the
+-         * error to its cause before sending the response, as we don't want to
+-         * expose the queue length or the queue tolerance of the throttle to end
+-         * users.
+-         */
+-        var state = {
+-            queuedRequests: self.requestQueue.npending,
+-            inFlightRequests: self.requestQueue.length()
+-        };
+-        var cfg = {
+-            queueTolerance: self.queueTolerance,
+-            concurrency: self.concurrency
+-        };
+-        next(new VError(new ThrottledError(), 'muskie throttled this ' +
+-                    'request. observed: %j, configured with: %j', state,
+-                    cfg));
+-        return;
+     }
+ 
+-    var req_id = req.getId();
++    return (wait);
++};
+ 
+-    self.throttle_probes.queue_enter.fire(function () {
+-        return ([req_id]);
+-    });
++Throttle.prototype.throttleAfterHandler = function afterHandler() {
++    var self = this;
+ 
+-    self.requestQueue.push(function (cb) {
+-        self.throttle_probes.queue_leave.fire(function () {
+-            return ([req_id]);
++    function clearQueueSlot(req, _) {
++        var value = self.requestMap[req.getId()];
++        if (!value) {
++            self.log.warn({
++                reqid: req.getId()
++            }, 'found empty request map entry, ' +
++               'assuming it was reaped');
++            return;
++        }
++
++        assert.object(value.req, 'throttle req');
++        assert.object(value.res, 'throttle res');
++        assert.func(value.cb, 'throttle callback');
++
++        self.log.debug({
++            reqid: req.getId()
++        }, 'delete from throttle request map');
++
++        delete (self.requestMap[req.getId()]);
++
++        self.throttle_probes.request_handled.fire(function () {
++            return ([self.requestQueue.npending, self.requestQueue.length(),
++                req.url, req.method]);
+         });
+-        next();
+-        cb();
+-    });
+ 
+-    self.throttle_probes.request_handled.fire(function () {
+-        return ([self.requestQueue.npending, self.requestQueue.length(),
+-            req.url, req.method]);
+-    });
++        value.cb();
++    }
++
++    return (clearQueueSlot);
+ };
+ 
+ 
+@@ -193,13 +308,6 @@ module.exports = {
+ 
+     createThrottle: function createThrottle(options) {
+         return (new Throttle(options));
+-    },
+-
+-    throttleHandler: function (throttle) {
+-        function throttleRequest(req, res, next) {
+-            throttle.wait(req, res, next);
+-        }
+-        return (throttleRequest);
+     }
+ 
+ };

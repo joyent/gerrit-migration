@@ -1,0 +1,647 @@
+commit 31b31aa96bcef61ed89ac85a5538f1289ffe2c83 (refs/changes/51/2151/2)
+Author: Sean Chittenden <sean@chittenden.org>
+Date:   2017-06-26T14:25:51-07:00 (2 years, 3 months ago)
+    
+    MANTA-3325: Improve the performance of mako_gc
+    
+    I missed my goal of knocking this out over the course of two episodes
+    of Dinosaur Train this afternoon, but was close enough to declare
+    success at a round of Effectiveness Golf.  I'm not wild about the
+    structure but it's a close approximation of the shell script that was
+    there previously and the log lines/output should be compatible.  The
+    DeleteObject calls should be concurrent, too, but I'm leaving that as an
+    exercise for the reader.
+    
+    Also left as an exercise to the reader is testing this.  It compiles.
+    This is far from how I'd suggest or condone writing a Go CLI app,
+    but it's a start and certainly going to be more productive than
+    seeing mako_gc rewritten in C.
+    
+    Handed off to Kelly McLaughlin for experimentation and/or to take across
+    the finish line.
+
+diff --git a/bin/.gitignore b/bin/.gitignore
+new file mode 100644
+index 0000000..0efd413
+--- /dev/null
++++ b/bin/.gitignore
+@@ -0,0 +1 @@
++mako_gc
+diff --git a/bin/mako_gc.go b/bin/mako_gc.go
+new file mode 100755
+index 0000000..020cece
+--- /dev/null
++++ b/bin/mako_gc.go
+@@ -0,0 +1,612 @@
++// mako_gc cleans manta objects by first sucking down all files under:
++//
++// /manta_gc/mako/$MANTA_STORAGE_ID
++//
++// Which come in the following format:
++//
++//   mako + \t + mantaStorageId + \t + ownerId + \t + objectId
++//
++// Since manta objects are kept under /manta/ownerId/objectId, the ids are taken
++// from the lines in the file and used to find and unlink the objects on the
++// local filesystem.  When it is done it deletes the file in manta.
++
++package main
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"io"
++	"io/ioutil"
++	"os"
++	"os/exec"
++	"path"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	manta "github.com/jen20/manta-go"
++	"github.com/jen20/manta-go/authentication"
++	daemon "github.com/sevlyar/go-daemon"
++	"github.com/tidwall/gjson"
++)
++
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ *
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++type auditLog struct {
++	Audit          bool      `json:"audit,omitempty"`
++	Name           string    `json:"name,omitempty"`
++	Level          int       `json:"level,omitempty"`
++	Error          string    `json:"string,omitempty"`
++	Message        string    `json:"msg,omitempty"`
++	Version        int       `json:"v"`
++	Time           time.Time `json:"time,omitempty"`
++	PID            int       `json:"pid,omitempty"`
++	CronExec       int       `json:"cronExec,omitempty"`
++	AlreadyDeleted bool      `json:alreadyDeleted,omitempty"`
++	ObjectID       string    `json:objectId,omitempty"`
++	Tomb           string    `json:tomb,omitempty"`
++	Processed      int       `json:tomb,omitempty"`
++	Hostname       string    `json:"hostname,omitempty"`
++	FileCount      uint64    `json:"fileCount,omitempty"`
++	ObjectCount    uint64    `json:"objectCount,omitempty"`
++	CleanCount     uint64    `json:"tombDirCleanupCount,omitempty"`
++}
++
++func auditRaw(r *auditLog) error {
++	enc := json.NewEncoder(os.Stderr)
++	if err := enc.Encode(r); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func newAuditRecord() *auditLog {
++	return &auditLog{
++		Audit:       true,
++		Name:        "mako_gc",
++		Level:       30,
++		Message:     "audit",
++		Time:        time.Now(),
++		PID:         myPID,
++		Hostname:    myHostname,
++		FileCount:   atomic.LoadUint64(&fileCount),
++		ObjectCount: atomic.LoadUint64(&objectCount),
++		CleanCount:  atomic.LoadUint64(&cleanCount),
++	}
++}
++
++func audit() error {
++	auditRecord := auditLog{
++		Audit:       true,
++		Name:        "mako_gc",
++		Level:       30, // XXX(seanc@): Magic number.  Where's this constant coming from?
++		Error:       auditError.Error(),
++		Message:     "audit",
++		Time:        time.Now(),
++		PID:         myPID,
++		CronExec:    1,
++		Hostname:    myHostname,
++		FileCount:   fileCount,
++		ObjectCount: objectCount,
++		CleanCount:  cleanCount,
++	}
++
++	return auditRaw(&auditRecord)
++}
++
++const (
++	makoGCPID         = "/tmp/mako_gc.pid"
++	mantaGCConfig     = "/opt/smartdc/mako/etc/gc_config.json"
++	mantaStorageIDEnv = "MANTA_STORAGE_ID"
++	mantaStorageIDKey = "manta_storage_id"
++	sdcCommonConfig   = "/opt/smartdc/common/etc/config.json"
++
++	tombRoot           = "/manta/tombstone"
++	tombDirsToKeep     = 21
++	cleanupConcurrency = 8
++)
++
++type mantaConfig struct {
++	id         string
++	sshKeyPath string
++	sshKeyID   string
++	url        string
++	user       string
++}
++
++func loadConfig() (*mantaConfig, error) {
++	cfg := &mantaConfig{}
++
++	mantaStorageID, err := getConfigAny(mantaGCConfig, "MANTA_STORAGE_ID", "manta_storage_id")
++	if err != nil {
++		return nil, err
++	}
++	cfg.id = mantaStorageID
++
++	mantaURL, err := getConfigAny(mantaGCConfig, "MANTA_URL", "manta_url")
++	if err != nil {
++		return nil, err
++	}
++	cfg.url = mantaURL
++
++	mantaUser, err := getConfigKey(sdcCommonConfig, "MANTA_USER", "manta.user")
++	if err != nil {
++		return nil, err
++	}
++	cfg.user = mantaUser
++
++	cfg.sshKeyPath = getConfigAnyDefault("", "SSH_KEY", "", "/root/.ssh/id_rsa")
++
++	cmd := exec.Command("ssh-keygen", "-l", "-f", fmt.Sprintf("%s.pub", cfg.sshKeyPath))
++	stdoutStderr, err := cmd.CombinedOutput()
++	if err != nil {
++		return nil, err
++	}
++
++	toks := strings.Fields(string(stdoutStderr))
++	cfg.sshKeyID = toks[1]
++
++	return cfg, nil
++}
++
++// getConfigAny iterates through the entire json document until it finds configKey
++func getConfigAny(configPath, envVar, configKey string) (string, error) {
++	var val string
++	if envVar != "" {
++		var found bool
++		val, found = os.LookupEnv(envVar)
++		if found {
++			return val, nil
++		}
++	}
++
++	if configPath != "" {
++		json, err := ioutil.ReadFile(configPath)
++		if err != nil {
++			return "", err
++		}
++
++		r := gjson.ParseBytes(json)
++		r.ForEach(func(k, v gjson.Result) bool {
++			if k.String() == configKey {
++				val = v.String()
++				return false // terminate search
++			}
++
++			return true // keep searching
++		})
++	}
++
++	if val == "" {
++		return "", fmt.Errorf("unable to find %s in the config or environment variable %s", configKey, envVar)
++	}
++
++	return val, nil
++}
++
++// getConfigAnyDefault is a wrapper around getConfigAny()
++func getConfigAnyDefault(configPath, envVar, configKey, defaultValue string) string {
++	v, err := getConfigAny(configPath, envVar, configKey)
++	if err != nil {
++		return defaultValue
++	}
++
++	return v
++}
++
++// getConfigKey looks up a specific JSON key
++func getConfigKey(configPath, envVar, configKey string) (string, error) {
++	var val string
++	if envVar != "" {
++		var found bool
++		val, found = os.LookupEnv(envVar)
++		if found {
++			return val, nil
++		}
++	}
++
++	if configPath != "" {
++		json, err := ioutil.ReadFile(configPath)
++		if err != nil {
++			return "", err
++		}
++
++		r := gjson.ParseBytes(json).Get(configKey)
++		val = r.String()
++	}
++
++	if val == "" {
++		return "", fmt.Errorf("unable to find %s in the config or environment variable %s", configKey, envVar)
++	}
++
++	return val, nil
++}
++
++// Aggregate all process-wide variables into a single place
++var (
++	auditError error
++	myHostname string
++	myPID      int         = os.Getpid()
++	pidMode    os.FileMode = 0644
++
++	TOMB_DIR string
++	tombMode os.FileMode = 0755
++
++	// Atomically updated counters
++	fileCount   uint64
++	objectCount uint64
++	cleanCount  uint64
++)
++
++type LogLevel int
++
++func (l LogLevel) String() string {
++	switch l {
++	case INFO:
++		return "info"
++	case FATAL:
++		return "fatal"
++	default:
++		return fmt.Sprintf("<unknown %d>", l)
++	}
++}
++
++const (
++	INFO LogLevel = iota
++	FATAL
++)
++
++func log(level LogLevel, msg string) {
++	now := time.Now()
++	fmt.Fprintf(os.Stderr, "%s: %s (%d): %s: %s\n", now.Format(time.RFC3339), os.Args[0], myPID, level, msg)
++}
++
++func main() {
++	os.Exit(realMain())
++}
++
++func realMain() int {
++	{
++		var err error
++		myHostname, err = os.Hostname()
++		if err != nil {
++			log(FATAL, "unable to determine hostname")
++			return 1
++		}
++	}
++
++	{
++		now := time.Now()
++		now.Format("2006-01-02")
++		TOMB_DIR = fmt.Sprintf("%s/%s", tombRoot, now)
++	}
++
++	pidFile, err := daemon.CreatePidFile(makoGCPID, pidMode)
++	if err != nil {
++		fmt.Printf("%s process still running. Exiting...\n", os.Args[0])
++		return 1
++	}
++	defer pidFile.Remove()
++
++	cfg, err := loadConfig()
++	if err != nil {
++		log(FATAL, err.Error())
++		return 1
++	}
++
++	log(INFO, "starting gc")
++
++	sshKeySigner, err := authentication.NewSSHAgentSigner(cfg.sshKeyID, "mako_gc")
++	if err != nil {
++		log(FATAL, err.Error())
++		return 1
++	}
++
++	client, err := manta.NewClient(&manta.ClientOptions{
++		Endpoint:    cfg.url,
++		AccountName: cfg.user,
++		Signers:     []authentication.Signer{sshKeySigner},
++	})
++	if err != nil {
++		log(FATAL, err.Error())
++		return 1
++	}
++
++	// Unconditionally call audit
++	defer audit()
++
++	mpath := fmt.Sprintf("/manta_gc/mako/%s", cfg.id)
++	if ready, soft, err := isGCReady(client, mpath); !ready {
++		if soft {
++			log(INFO, fmt.Sprintf("GC not ready yet: %s %s", mpath, err.Error()))
++			return 0
++		}
++
++		log(FATAL, fmt.Sprintf("GC not ready yet: %s %s", mpath, err.Error()))
++		return 1
++	}
++
++	if err := createTombDirs(); err != nil {
++		log(FATAL, fmt.Sprintf("createTombDirs: %v", err))
++		return 1
++	}
++
++	// Begin reading from stdin, newline encoded JSON objects
++	scanner := bufio.NewScanner(os.Stdin)
++	for scanner.Scan() {
++		line := scanner.Bytes()
++		r := gjson.ParseBytes(line)
++		var file string
++		r.ForEach(func(k, v gjson.Result) bool {
++			if k.String() == "name" {
++				file = v.String()
++				return false // terminate search
++			}
++			return true // keep searching
++		})
++
++		mfile := path.Join(mpath, file)
++		output, err := client.GetObject(&manta.GetObjectInput{
++			ObjectPath: mfile,
++		})
++		if err != nil {
++			log(FATAL, err.Error())
++			return 1
++		}
++		defer output.ObjectReader.Close()
++
++		lineScanner := bufio.NewScanner(output.ObjectReader)
++		for lineScanner.Scan() {
++			line := lineScanner.Text()
++			arr := strings.Fields(line)
++			if len(arr) != 4 {
++				log(INFO, fmt.Sprintf("unable to parse line %q", line))
++				continue
++			}
++
++			// Filter out any lines that aren't meant for this storage node...
++			if arr[1] != cfg.id {
++				continue
++			}
++
++			log(INFO, fmt.Sprintf("Processing %q", line))
++
++			ownerID := arr[2]
++			objectID := arr[3]
++
++			objectPath := path.Join("/manta", ownerID, objectID)
++			fi, err := os.Stat(objectPath)
++			if err != nil || !fi.Mode().IsRegular() {
++				rec := newAuditRecord()
++				rec.AlreadyDeleted = true
++				rec.ObjectID = objectID
++				rec.Tomb = TOMB_DIR
++				rec.Processed = 1 // NOTE(seanc@): this is a boolean expressed as an integer
++				auditRaw(rec)
++				continue
++			}
++
++			{
++				rec := newAuditRecord()
++				rec.AlreadyDeleted = false
++				rec.ObjectID = objectID
++				rec.Tomb = TOMB_DIR
++				rec.Processed = 1 // NOTE(seanc@): this is a boolean expressed as an integer
++				auditRaw(rec)
++			}
++
++			if err := CopyFile(objectPath, path.Join(TOMB_DIR, objectID)); err != nil {
++				log(FATAL, fmt.Sprintf("unable to copy %q: %s", objectID, err))
++				return 1
++			}
++
++			if err := os.Remove(objectPath); err != nil {
++				log(FATAL, fmt.Sprintf("unable to remove %q: %s", objectPath, err))
++				return 1
++			}
++
++			atomic.AddUint64(&objectCount, 1)
++		}
++
++		err = client.DeleteObject(&manta.DeleteObjectInput{
++			ObjectPath: mfile,
++		})
++		if err != nil {
++			log(FATAL, fmt.Sprintf("Unable to delete %q", mfile))
++			return 1
++		}
++		atomic.AddUint64(&fileCount, 1)
++	}
++	if err := scanner.Err(); err != nil {
++		log(FATAL, fmt.Sprintf("reading standard input: %v", err))
++		return 1
++	}
++
++	if err := cleanupOldDirectories(); err != nil {
++		log(FATAL, fmt.Sprintf("error cleaning up directories: %v", err))
++		return 1
++	}
++
++	return 0
++}
++
++// cleanupOldDirectories removes directories scheduled for deletion.
++func cleanupOldDirectories() error {
++	log(INFO, "starting tombstone directory cleanup")
++
++	// ReadDir reads the directory named by dirname and returns a list of
++	// directory entries sorted by filename.  Perform the ReadDir() before
++	// initializing the workers in order to simplify the error handling code.
++	files, err := ioutil.ReadDir(tombRoot)
++	if err != nil {
++		return err
++	}
++
++	var waitGroup sync.WaitGroup
++	cleanupChan := make(chan string)
++
++	// Cleanup functor
++	var workerLock sync.Mutex
++	workerErr := make([]error, 0, cleanupConcurrency)
++
++	removeWorker := func() {
++		defer func() {
++			waitGroup.Done()
++		}()
++
++		for {
++			dir, ok := <-cleanupChan
++			if !ok {
++				break
++			}
++
++			log(INFO, fmt.Sprintf("cleaning up %s", dir))
++			if err := os.RemoveAll(dir); err != nil {
++				workerLock.Lock()
++				workerErr = append(workerErr, err)
++				workerLock.Unlock()
++				return
++			}
++
++			atomic.AddUint64(&cleanCount, 1)
++		}
++	}
++
++	// Spin up the necessary worker threads
++	for i := 0; i < cleanupConcurrency; i++ {
++		waitGroup.Add(1)
++		go removeWorker()
++	}
++
++	// Only iterate over the first TOMB_DIRS_TO_KEEP entries
++	if len(files) > 0 {
++		files = files[0:tombDirsToKeep]
++	}
++
++	for _, tombStoneDir := range files {
++		fullPath := path.Join(tombRoot, tombStoneDir.Name())
++		cleanupChan <- fullPath
++	}
++
++	close(cleanupChan)
++	waitGroup.Wait()
++
++	// Return the first error for now
++	if len(workerErr) > 0 {
++		return workerErr[0]
++	}
++
++	return nil
++}
++
++func createTombDirs() error {
++	fi, err := os.Stat(TOMB_DIR)
++	if err == nil && !fi.Mode().IsDir() {
++		return fmt.Errorf("%s exists but is not a directory: %v", TOMB_DIR)
++	} else {
++		if err := os.MkdirAll(TOMB_DIR, tombMode); err != nil {
++			return err
++		}
++	}
++
++	// Avoid requiring cgo.
++	cmd := exec.Command("chown", "nobody:nobody", tombRoot, TOMB_DIR)
++	if err := cmd.Run(); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++// isGCReady returns nil if we can run the GC.
++//
++// NOTE(seanc@): I dislike this function signature.
++func isGCReady(client *manta.Client, mpath string) (ready, softFail bool, err error) {
++	output, err := client.GetObject(&manta.GetObjectInput{
++		ObjectPath: mpath,
++	})
++	if err != nil {
++		if mantaError, ok := err.(manta.MantaError); ok && mantaError.StatusCode == 404 {
++			return false, true, err
++		}
++		return false, false, err
++	}
++
++	// Copy and close as fast as possible
++	io.Copy(ioutil.Discard, output.ObjectReader)
++	output.ObjectReader.Close()
++
++	return true, false, nil
++}
++
++// Copy and pasted from:
++// https://stackoverflow.com/questions/21060945/simple-way-to-copy-a-file-in-golang
++
++// CopyFile copies a file from src to dst. If src and dst files exist, and are
++// the same, then return success. Otherise, attempt to create a hard link
++// between the two files. If that fail, copy the file contents from src to dst.
++func CopyFile(src, dst string) (err error) {
++	sfi, err := os.Stat(src)
++	if err != nil {
++		return
++	}
++	if !sfi.Mode().IsRegular() {
++		// cannot copy non-regular files (e.g., directories, symlinks, devices,
++		// etc.)
++		return fmt.Errorf("CopyFile: non-regular source file %s (%q)", sfi.Name(), sfi.Mode().String())
++	}
++	dfi, err := os.Stat(dst)
++	if err != nil {
++		if !os.IsNotExist(err) {
++			return
++		}
++	} else {
++		if !(dfi.Mode().IsRegular()) {
++			return fmt.Errorf("CopyFile: non-regular destination file %s (%q)", dfi.Name(), dfi.Mode().String())
++		}
++		if os.SameFile(sfi, dfi) {
++			return
++		}
++	}
++	if err = os.Link(src, dst); err == nil {
++		return
++	}
++	err = copyFileContents(src, dst)
++	return
++}
++
++// copyFileContents copies the contents of the file named src to the file named
++// by dst. The file will be created if it does not already exist. If the
++// destination file exists, all it's contents will be replaced by the contents
++// of the source file.
++func copyFileContents(src, dst string) (err error) {
++	in, err := os.Open(src)
++	if err != nil {
++		return
++	}
++	defer in.Close()
++	out, err := os.Create(dst)
++	if err != nil {
++		return
++	}
++	defer func() {
++		cerr := out.Close()
++		if err == nil {
++			err = cerr
++		}
++	}()
++	if _, err = io.Copy(out, in); err != nil {
++		return
++	}
++	err = out.Sync()
++	return
++}

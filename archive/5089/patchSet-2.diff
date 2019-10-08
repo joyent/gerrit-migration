@@ -1,0 +1,147 @@
+commit 78fb015dab109f7dd4ac84ebebcc79eb91474920 (refs/changes/89/5089/2)
+Author: Mike Gerdts <mike.gerdts@joyent.com>
+Date:   2018-11-21T18:17:22+00:00 (11 months ago)
+    
+    OS-7356 bhyve metadata timeouts during guest-initiated reboots
+
+diff --git a/src/vm/lib/metadata/agent.js b/src/vm/lib/metadata/agent.js
+index 565c729b..eb774ef6 100644
+--- a/src/vm/lib/metadata/agent.js
++++ b/src/vm/lib/metadata/agent.js
+@@ -456,15 +456,32 @@ MetadataAgent.prototype.start = function start() {
+ 
+         /*
+          * For non-KVM and non-bhyve, we only care about create/delete since
+-         * the socket only needs to be created once for these zones. For KVM
+-         * however, the qemu process recreates the socket on every boot, so we
+-         * want to catch 'start' events for KVM to ensure we connect to
+-         * metadata as soon as possible.
++         * the socket only needs to be created once for these zones.
++         *
++         * For KVM the qemu process recreates the socket on every boot, so we
++         * want to catch 'start' events to ensure we connect to metadata as soon
++         * as possible.
++         *
++         * For bhyve, the bhyve process recreates the socket every time it
++         * starts. This happens when the zone first starts and every time the
++         * guest reboots. The 'running' state change will catch the first one.
++         * Guest reboots can be detected by 'init_restarts' incrementing.
+          */
+         if (ev.vm.brand !== 'kvm' && ev.vm.brand !== 'bhyve') {
+             return;
+         }
+ 
++        var restarts = ev.changes.filter(function (change) {
++            return (change.path.length === 1
++                && change.path[0] === 'init_restarts');
++        });
++        if (restarts.length !== 0) {
++            // The previous zoneConnection should have already been cleaned up
++            // when the bhyve process died and the kernel closed the connection.
++            assert(!self.zoneKvmReconnTimers.hasOwnProperty(ev.zonename));
++            self.handleZoneCreated(ev.vm);
++        }
++
+         // Find state transition
+         state = ev.changes.filter(function (change) {
+             return (change.path.length === 1 && change.path[0] === 'state');
+@@ -498,7 +515,7 @@ MetadataAgent.prototype.start = function start() {
+             delay: (new Date()) - ev.date,
+             when: ev.date,
+             zonename: ev.zonename
+-        }, 'VminfodWatcher saw KVM zone boot');
++        }, 'VminfodWatcher saw KVM or bhyve zone boot');
+ 
+         self.addDebug(ev.zonename, 'last_zone_start');
+ 
+diff --git a/src/vm/node_modules/proptable.js b/src/vm/node_modules/proptable.js
+index d0865f2a..60787090 100644
+--- a/src/vm/node_modules/proptable.js
++++ b/src/vm/node_modules/proptable.js
+@@ -924,6 +924,9 @@ exports.properties = {
+             type: 'string'
+         },
+         zonexml: 'zone.attr.init-name'
++    }, init_restarts: {
++        loadValueTranslator: 'utils.numberify',
++        zoneinfo: 'init_restarts'
+     }, internal_metadata: {
+         flattenable: 'hash_key',
+         json: 'internal_metadata',
+diff --git a/src/vm/node_modules/vminfod/vminfod.js b/src/vm/node_modules/vminfod/vminfod.js
+index b59a2e60..3fb502b8 100644
+--- a/src/vm/node_modules/vminfod/vminfod.js
++++ b/src/vm/node_modules/vminfod/vminfod.js
+@@ -2429,6 +2429,7 @@ Vminfod.prototype.enqueueMetadataFileUpdate =
+ 
+     var contexts = [
+         'last_modified',
++        'zoneinfo_objects',
+         'json_objects'
+     ];
+ 
+diff --git a/src/vm/node_modules/vminfod/zonewatcher.js b/src/vm/node_modules/vminfod/zonewatcher.js
+index 7df21c18..054a90cf 100644
+--- a/src/vm/node_modules/vminfod/zonewatcher.js
++++ b/src/vm/node_modules/vminfod/zonewatcher.js
+@@ -45,7 +45,6 @@ function ZoneWatcher(options) {
+     // create a Sysevent stream
+     var opts = {
+         logger: self.log,
+-        class: 'status',
+         channel: 'com.sun:zones:status'
+     };
+     if (options.hasOwnProperty('highWaterMark')) {
+@@ -64,11 +63,18 @@ function ZoneWatcher(options) {
+             var o = {
+                 type: 'event',
+                 zonename: ev.data.zonename,
+-                newstate: ev.data.newstate,
+                 time: ev.time,
+                 ev: ev
+             };
+ 
++            if (ev.class === 'status') {
++                o.newstate = ev.data.newstate;
++            } else if (ev.class === 'init' && ev.subclass === 'restart') {
++                o.restarts = ev.data.restarts;
++            } else {
++                continue;
++            }
++
+             self.emit('event', o);
+         }
+     });
+diff --git a/src/vm/node_modules/vmload/vmload-zoneinfo.js b/src/vm/node_modules/vmload/vmload-zoneinfo.js
+index c978b75a..bec9d094 100644
+--- a/src/vm/node_modules/vmload/vmload-zoneinfo.js
++++ b/src/vm/node_modules/vmload/vmload-zoneinfo.js
+@@ -20,7 +20,7 @@
+  *
+  * CDDL HEADER END
+  *
+- * Copyright (c) 2015, Joyent, Inc. All rights reserved.
++ * Copyright (c) 2018, Joyent, Inc.
+  *
+  */
+ 
+@@ -70,6 +70,7 @@ var ZONE_MISC_READER = new kstat.Reader({
+  *     forkfail_nomem: 0,
+  *     forkfail_misc: 0,
+  *     init_pid: 6841,
++ *     init_restarts: 0,
+  *     boot_time: 1430183276
+  *
+  * but we will only include fields that are in proptable.js and we'll include
+diff --git a/src/vm/tests/test-defaults.js b/src/vm/tests/test-defaults.js
+index 270e40ac..e37dd312 100644
+--- a/src/vm/tests/test-defaults.js
++++ b/src/vm/tests/test-defaults.js
+@@ -59,6 +59,7 @@ var zone_defaults = {
+     headnode_id: ['<OPTIONAL-NON-EMPTY>'],
+     hvm: [false],
+     image_uuid: [image_uuid],
++    init_restarts: [0],
+     internal_metadata: ['<EMPTY-OBJ>'],
+     last_modified: ['<NON-EMPTY>'],
+     limit_priv: ['default'],

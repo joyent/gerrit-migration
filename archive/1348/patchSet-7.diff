@@ -1,0 +1,2309 @@
+commit 8cf1818e8415ce17fcb80eed85528119b9b106ba (refs/changes/48/1348/7)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2017-04-19T10:36:01-07:00 (2 years, 6 months ago)
+    
+    DOCKER-929 Support the docker v2.2 manifest format
+
+diff --git a/lib/images.js b/lib/images.js
+index 6673217..df67d0b 100644
+--- a/lib/images.js
++++ b/lib/images.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -19,6 +19,7 @@ var fs = require('fs');
+ var crypto = require('crypto');
+ var url = require('url');
+ var path = require('path');
++var zlib = require('zlib');
+ 
+ var assert = require('assert-plus');
+ var async = require('async');
+@@ -28,10 +29,12 @@ var lib_uuid = require('uuid');
+ var once = require('once');
+ var restify = require('restify');
+ var sdcClients = require('sdc-clients');
++var streampeek = require('buffer-peek-stream');
+ var vasync = require('vasync');
+ 
+ var channels = require('./channels');
+ var errors = require('./errors');
++var magic = require('./magic');
+ var utils = require('./utils'),
+     objCopy = utils.objCopy,
+     boolFromString = utils.boolFromString,
+@@ -303,6 +306,51 @@ Image.prototype.addFile = function addFile(app, file, log, callback) {
+ };
+ 
+ 
++/**
++ * Remove an uploaded file to this Image instance. The file will have already
++ * be written out (to disk or to manta, depending).
++ *
++ * @param app {App} The IMGAPI app.
++ * @param file {Object} Describes the uploaded file, with keys:
++ *      - `sha1` {String}
++ *      - `size` {Integer}
++ *      - `contentMD5` {String}
++ *      - `mtime` {String} ISO date string
++ * @param log {Bunyan Logger}
++ * @param callback {Function} `function (err)` where `err` is some internal
++ *      detail (i.e. it should be wrapped for the user).
++ */
++Image.prototype.moveFile = function moveFile(app, toImage, log, callback) {
++    var files = this.files;
++    assert.equal(files.length, 1, 'Expect exactly one image file');
++    var file = files[0];
++    var self = this;
++
++    var stor = app.getStor(file.stor);
++    stor.moveFileBetweenImages(self, toImage, 'file0',
++            function _moveFileCb(err) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        toImage.addFile(app, file, log, function _addFileCb(addErr) {
++            if (addErr) {
++                callback(addErr);
++                return;
++            }
++            // Null out the file fields.
++            self.raw.files = [];
++            delete self._filesCache;
++
++            log.debug({fromUuid: self.uuid, toUuid: toImage.uuid},
++                'Moving file0 between images');
++
++            Image.modify(app, self, log, callback);
++        });
++    });
++};
++
++
+ /**
+  * Add an uploaded icon to this Image instance. The file will have already
+  * be written out (to disk or to manta, depending).
+@@ -2405,151 +2453,134 @@ function apiAdminImportRemoteImage(req, res, callback) {
+  * @param opts {Object}
+  *      - @param ctx {Object} The run context for the
+  *        `apiAdminImportRemoteImage` call.
+- *      - @param imgId {String} The docker image id.
+- *      - @param imgJson {Object} If this is a v2 import, then we'll have the
+- *        imgJson already.
+- *      - @param fsLayer {Object} If this is a v2 import, this is the object
+- *        from `manifest.fsLayers`.
++ *      - @param imgJson {Object} Docker image object (config, rootfs, layers).
++ *      - @param digest {String} This is the layer sha256 digest.
++ *      - @param layerDigests {Array} All digests in the chain (including the
++ *        current digest as the last entry).
++ *      - @param uncompressedDigest {String} Sha256 of the uncompressed layer.
+  * @param callback {Function}
+  */
+ function _dockerDownloadAndImportImage(opts, callback) {
+-    assert.string(opts.imgId, 'opts.imgId');
++    assert.object(opts, 'opts');
++    assert.optionalString(opts.compression, 'opts.compression');
+     assert.object(opts.ctx, 'opts.ctx');
++    assert.object(opts.ctx.digestFromUuid, 'opts.ctx.digestFromUuid');
++    assert.object(opts.ctx.rat, 'opts.ctx.rat');
++    assert.object(opts.ctx.regClientV2, 'opts.ctx.regClientV2');
++    assert.object(opts.ctx.req, 'opts.ctx.req');
++    assert.func(opts.ctx.resMessage, 'opts.ctx.resMessage');
++    assert.string(opts.digest, 'opts.digest');
++    assert.object(opts.imgJson, 'opts.imgJson');
++    assert.arrayOfString(opts.layerDigests, 'opts.layerDigests');
++    assert.optionalString(opts.uncompressedDigest, 'opts.uncompressedDigest');
+     assert.func(callback, 'callback');
+-    var ctx = opts.ctx;
+-    assert.finite(ctx.regV, 'ctx.regV');
+-    if (ctx.regV === 1) {
+-        assert.object(ctx.regClientV1, 'ctx.regClientV1');
+-    } else {
+-        assert.object(ctx.regClientV2, 'ctx.regClientV2');
+-        assert.object(opts.imgJson, 'ctx.imgJson');
+-        assert.object(opts.fsLayer, 'ctx.fsLayer');
+-    }
+ 
+-    var imgId = opts.imgId;
++    var compression = opts.compression;
++    var ctx = opts.ctx;
++    var digest = opts.digest;
+     var imgJson = opts.imgJson;
+     var req = ctx.req;
+     var app = req._app;
+     var log = req.log;
+     var rat = ctx.rat;
+ 
+-    try {
+-        var uuid = imgmanifest.imgUuidFromDockerInfo({
+-            id: imgId,
+-            indexName: rat.index.name
+-        });
+-    } catch (infoErr) {
+-        return callback(infoErr);
+-    }
+-    var active = false;
+-    var addImageFileAttempts = 0;
+-    var unactivated = false;
+     var fileSize = -1; // The same value used in Docker-docker for "don't know".
+     var manifest;
+     var newImage;
++    var shortId = imgmanifest.shortDockerId(
++        imgmanifest.dockerIdFromDigest(digest));
++    var uuid = imgmanifest.imgUuidFromDockerDigests(opts.layerDigests);
++
++    var uncompressedSha256;
++    if (opts.uncompressedDigest) {
++        uncompressedSha256 = imgmanifest.dockerIdFromDigest(
++            opts.uncompressedDigest);
++    }
++
++    function progressStatus(msg, progressDetail) {
++        var payload = {
++            id: shortId,
++            status: msg
++        };
++        if (progressDetail) {
++            payload.progressDetail = progressDetail;
++        }
++        ctx.resMessage({
++            type: 'progress',
++            payload: payload
++        });
++    }
++
++    // Remember the uuid -> digest relationship.
++    ctx.digestFromUuid[uuid] = digest;
+ 
+-    log.debug({imgId: imgId, uuid: uuid},
++    log.debug({uuid: uuid, digest: digest},
+         'AdminImportDockerImage: check if image already exists');
+     Image.get(app, uuid, log, function (gErr, image) {
+         if (!gErr) {
+             assert.object(image, 'image');
+-            ctx.imageFromImgId[imgId] = newImage = image;
+ 
+-            if (newImage.state === 'unactivated') {
+-                unactivated = true;
+-            } else {
+-                // TODO: Can we `resMessage('Already exists')` and early abort?
+-                active = true;
+-                ctx.alreadyExistsFromImgId[imgId] = true;
++            if (image.state !== 'unactivated') {
++                // When the image already exists, just return the image as is.
++                log.debug({uuid: uuid, repo: rat.canonicalName, digest: digest},
++                    'AdminImportDockerImage: layer already exists');
++                progressStatus('Already exists');
++                callback(null, image);
++                return;
+             }
+ 
+             // Mark this Image as existing in the database
+-            newImage.exists = true;
++            log.debug({uuid: uuid, repo: rat.canonicalName, digest: digest},
++                'AdminImportDockerImage: layer exists, but is unactivated');
++            newImage = image;
+ 
+         } else if (gErr.restCode !== 'ResourceNotFound') {
+             return callback(gErr);
+         }
+ 
+         // Check if this image layer has already been downloaded before.
+-        if (DOCKER_IMAGE_CACHE.hasOwnProperty(imgId)) {
+-            var cachedItem = DOCKER_IMAGE_CACHE[imgId];
+-            ctx.fileInfoFromImgId[imgId] = cachedItem.fileInfo;
+-            ctx.imageFromImgId[imgId] = cachedItem.image;
+-            ctx.alreadyExistsFromImgId[imgId] = true;
++        if (DOCKER_IMAGE_CACHE.hasOwnProperty(uuid)) {
++            var cachedItem = DOCKER_IMAGE_CACHE[uuid];
++            ctx.digestFromUuid[uuid] = digest;
++            ctx.newFileInfoFromUuid[uuid] = cachedItem;
++            newImage = cachedItem.image;
+ 
+-            log.debug({imgId: imgId, uuid: uuid},
++            log.debug({digest: digest, uuid: uuid},
+                 'dockerDownloadAndImportImage: image layer already cached');
+ 
+-            callback();
++            progressStatus('Download complete (cached)');
++            callback(null, newImage);
+             return;
+         }
+ 
+-        log.debug({uuid: uuid, repo: rat.canonicalName, imgId: imgId},
++        log.debug({uuid: uuid, repo: rat.canonicalName, digest: digest},
+             'AdminImportDockerImage: start import');
+ 
+-        vasync.pipeline({ funcs: [
+-            getImgJson,
++        vasync.pipeline({ arg: {}, funcs: [
+             genImgapiManifest,
+             handleOwner,
+             handleChannels,
++            createReadStream,
++            detectCompression,
++            uncompressAndSha256Contents,
+             createImageFromManifest,
+-            addImageFile
+-        ]}, function afterPipe(pipeErr, results) {
++            addImageFile,
++            addUncompressedSha256
++        ]}, function afterPipe(pipeErr) {
+             if (pipeErr) {
+-                log.info({imgId: imgId, err: pipeErr},
+-                    'dockerDownloadAndImportImage: error downloading layer');
+-                ctx.resMessage({
+-                    type: 'progress',
+-                    payload: {
+-                        id: imgId.substr(0, 12),
+-                        status: format('import error: %s', pipeErr.message)
+-                    }
+-                });
+                 callback(pipeErr);
+                 return;
+             }
+-
+-            ctx.resMessage({
+-                type: 'progress',
+-                payload: {
+-                    id: imgId.substr(0, 12),
+-                    status: (active ? 'Already exists' : 'Download complete')
+-                }
+-            });
+-            ctx.resMessage({
+-                type: 'data',
+-                imgJson: imgJson,
+-                image: newImage.serialize(app.mode, req.getVersion()),
+-                private: ctx.isPrivate
+-            });
+-            callback();
++            progressStatus('Download complete');
++            callback(null, newImage);
+         });
+     });
+ 
+-    function getImgJson(_, next) {
+-        if (imgJson) {
+-            return next();
+-        }
+-
+-        ctx.resMessage({
+-            type: 'progress',
+-            payload: {
+-                id: imgId.substr(0, 12),
+-                status: 'Pulling metadata'
+-            }
+-        });
+-
+-        ctx.regClientV1.getImgJson({
+-            imgId: imgId
+-        }, function (err, imgJson_, getRes) {
+-            imgJson = imgJson_;
+-            next(errors.wrapErrorFromDrc(err));
+-        });
+-    }
+-
+     function genImgapiManifest(_, next) {
+         try {
+             manifest = imgmanifest.imgManifestFromDockerInfo({
++                uuid: uuid,
++                layerDigests: opts.layerDigests,
+                 imgJson: imgJson,
+                 repo: rat,
+                 public: ctx.public_
+@@ -2566,7 +2597,7 @@ function _dockerDownloadAndImportImage(opts, callback) {
+     }
+ 
+     function handleOwner(_, next) {
+-        if (active || unactivated) {
++        if (newImage) {
+             next();
+             return;
+         }
+@@ -2593,7 +2624,7 @@ function _dockerDownloadAndImportImage(opts, callback) {
+     }
+ 
+     function handleChannels(_, next) {
+-        if (active || unactivated) {
++        if (newImage) {
+             next();
+             return;
+         }
+@@ -2605,8 +2636,88 @@ function _dockerDownloadAndImportImage(opts, callback) {
+         next();
+     }
+ 
++    function createReadStream(arg, next) {
++        ctx.regClientV2.createBlobReadStream({digest: digest},
++                function onStreamCb(err, blobStream) {
++            if (err) {
++                next(errors.wrapErrorFromDrc(err));
++                return;
++            }
++            arg.httpResponse = blobStream;
++            arg.stream = blobStream;
++            next();
++        });
++    }
++
++    function detectCompression(arg, next) {
++        if (compression) {
++            next();
++            return;
++        }
++
++        streampeek(arg.stream, magic.minBytesRequired,
++                function onpeek(err, buf, stream) {
++            if (err) {
++                next(err);
++                return;
++            }
++
++            // Update stream reference.
++            arg.stream = stream;
++
++            if (buf.length < magic.minBytesRequired) {
++                // Not a compressed file.
++                compression = 'none';
++                next();
++                return;
++            }
++
++            compression = magic.compressionTypeFromBufSync(buf) || 'none';
++            next();
++        });
++    }
++
++    function uncompressAndSha256Contents(arg, next) {
++        if (compression === 'none' || uncompressedSha256) {
++            next();
++            return;
++        }
++
++        // Need to uncompress the data to get the sha256.
++        var uncompressStream;
++        if (compression === 'gzip') {
++            uncompressStream = zlib.createGunzip();
++        } else if (compression === 'bzip2') {
++            uncompressStream = zlib.createBunzip2();
++        } else {
++            // Unsupported compression stream.
++            next(new errors.InternalError(format(
++                'Unsupported layer compression: %s', compression)));
++            return;
++        }
++
++        var sha256sum = crypto.createHash('sha256');
++        sha256sum.on('readable', function () {
++            var hash = sha256sum.read();
++            if (hash) {
++                uncompressedSha256 = hash.toString('hex');
++                // Check if the final callback is waiting for this hash.
++                if (arg.uncompressedSha256Callback) {
++                    arg.uncompressedSha256Callback(null, uncompressedSha256);
++                }
++            }
++        });
++        uncompressStream.pipe(sha256sum);
++
++        // Pipe contents, but ensure stream is put back into paused mode.
++        arg.stream.pipe(uncompressStream);
++        arg.stream.pause();
++
++        next();
++    }
++
+     function createImageFromManifest(_, next) {
+-        if (active || unactivated) {
++        if (newImage) {
+             next();
+             return;
+         }
+@@ -2616,241 +2727,278 @@ function _dockerDownloadAndImportImage(opts, callback) {
+             if (cErr) {
+                 return next(cErr);
+             }
+-            ctx.imageFromImgId[imgId] = newImage = img;
++            newImage = img;
+             next();
+         });
+     }
+ 
+-    function addImageFile(_, next) {
+-        if (active) {
+-            next();
+-            return;
+-        }
++    function addImageFile(arg, next) {
++        log.debug({digest: digest}, 'AddImageLayer: start');
+ 
+-        log.debug({imgId: imgId}, 'AddImageLayer: start');
++        var DOCKER_READ_STREAM_TIMEOUT = 15 * 1000;
+ 
+-        ctx.resMessage({
+-            type: 'progress',
+-            payload: {
+-                id: imgId.substr(0, 12),
+-                status: 'Pulling fs layer'
++        var lastUpdate = 0;
++        var resp = arg.httpResponse;
++        var sha1;
++        var sha256;
++        var size = 0;
++        var startTs = Math.floor(new Date().getTime() / 1000);
++        var stor;  // the storage class
++        var stream = arg.stream;
++        var streamTimeoutHandler;
++        var updateEvery = 512 * 1024;
++
++        progressStatus('Pulling fs layer');
++
++        if (resp.headers['content-length'] !== undefined) {
++            fileSize = Number(resp.headers['content-length']);
++            if (fileSize > MAX_IMAGE_SIZE) {
++                // XXX: We don't want to retry this download - it's too big. How
++                // to set a marker such that we can detect this error in the
++                // calling function (which is doing the retry):
++                //  1. Change the error class?
++                //  2. Set a marker in `ctx` object?
++                return next(new errors.DownloadError(format(
++                    'Download error: image file size, %s, exceeds the ' +
++                    'maximum allowed file size, %s',
++                    size, MAX_IMAGE_SIZE_STR)));
+             }
+-        });
++        }
+ 
+-        (function createLayerReadStream(cbStream) {
+-            if (ctx.regV === 1) {
+-                ctx.regClientV1.getImgLayerStream(
+-                    {imgId: imgId},
+-                    cbStream);
+-            } else {
+-                ctx.regClientV2.createBlobReadStream(
+-                    {digest: opts.fsLayer.blobSum},
+-                    cbStream);
++        // Setup a timeout listener and handle connection timeout.
++        assert.object(stream.connection, 'stream.connection');
++
++        stream.connection.setTimeout(DOCKER_READ_STREAM_TIMEOUT);
++        streamTimeoutHandler = function onDockerStreamTimeout() {
++            log.info({digest: digest, size: size, fileSize: fileSize},
++                'dockerDownloadAndImportImage: '
++                + 'createBlobReadStream connection timed out');
++            progressStatus('Connection timed out');
++            // Note that by destroying the stream this will result in a
++            // call to finish() with an error, as the drc
++            // createBlobReadStream handler has an 'end' handler that
++            // validates the size and digest of downloaded data and
++            // emits an error event when all the data wasn't downloaded.
++            stream.destroy();
++        };
++        stream.connection.on('timeout', streamTimeoutHandler);
++
++        function finish_(fErr, tmpFilename, filename) {
++            // Remove connection timeout handler.
++            stream.connection.removeListener('timeout',
++                streamTimeoutHandler);
++            streamTimeoutHandler = null;
++
++            if (fErr) {
++                log.info({digest: digest, err: fErr},
++                    'dockerDownloadAndImportImage: error');
++                return next(fErr);
++            } else if (ctx.downloadsCanceled) {
++                return next(new errors.DownloadError('Download canceled'));
++            } else if (size > MAX_IMAGE_SIZE) {
++                // XXX: We don't want to retry this download - it's too big. How
++                // to set a marker such that we can detect this error in the
++                // calling function (which is doing the retry):
++                //  1. Change the error class?
++                //  2. Set a marker in `ctx` object?
++                return next(new errors.DownloadError(format(
++                    'Download error: image file size, %s, exceeds the ' +
++                    'maximum allowed file size, %s',
++                    size, MAX_IMAGE_SIZE_STR)));
++            } else if (fileSize >= 0 && size !== fileSize) {
++                return next(new errors.DownloadError(format(
++                    'Download error: "Content-Length" header, %s, does ' +
++                    'not match downloaded size, %d', fileSize, size)));
+             }
+-        })(function (err, stream) {
+-            if (err) {
+-                next(errors.wrapErrorFromDrc(err));
++
++            sha1 = shasum.digest('hex');
++            sha256 = sha256sum.digest('hex');
++
++            // Validate the sha256 of the downloaded bits matches the
++            // digest, if they don't match there is a corruption.
++            var gotDigest = 'sha256:' + sha256;
++            if (gotDigest !== digest) {
++                // XXX: @Trent: Do we need to delete the downloaded
++                // layer here (i.e. when there was an error)?
++                log.warn({expectedDigest: digest, gotDigest: gotDigest},
++                    'Downloaded layer sha256 digest does not match');
++                next(new errors.DownloadError(format(
++                    'layer "sha256" hash, %s, does not match the ' +
++                    'expected hash, %s', gotDigest, digest)));
+                 return;
+             }
+ 
+-            assert.object(stream.connection, 'stream.connection');
++            var file = {
++                sha1: sha1,
++                sha256: sha256,
++                size: size,
++                contentMD5: md5sum.digest('base64'),
++                mtime: (new Date()).toISOString(),
++                stor: stor.type,
++                compression: compression
++            };
+ 
+-            var DOCKER_READ_STREAM_TIMEOUT = 15 * 1000;
+-            var MAX_IMAGE_FILE_DOWNLOAD_ATTEMPTS = 5;
++            ctx.newFileInfoFromUuid[uuid] = {
++                file: file,
++                image: newImage,
++                storage: stor.type,
++                tmpFilename: tmpFilename,
++                filename: filename
++            };
+ 
+-            var lastUpdate = 0;
+-            var updateEvery = 512 * 1024;
+-            var startTs = Math.floor(new Date().getTime() / 1000);
+-            var streamTimeoutHandler;
++            log.info({digest: digest, fileSize: fileSize},
++                'dockerDownloadAndImportImage: Download successful');
++            return next();
++        }
++        var finish = once(finish_);
+ 
+-            var compression = 'none';
++        var shasum = crypto.createHash('sha1');
++        var sha256sum = crypto.createHash('sha256');
++        var md5sum = crypto.createHash('md5');
+ 
+-            // Setup a timeout listener and handle connection timeout.
+-            stream.connection.setTimeout(DOCKER_READ_STREAM_TIMEOUT);
+-            streamTimeoutHandler = function onDockerStreamTimeout() {
+-                log.info({imgId: imgId, size: size, fileSize: fileSize},
+-                    'dockerDownloadAndImportImage: '
+-                    + 'createBlobReadStream connection timed out');
+-                ctx.resMessage({
+-                    type: 'progress',
+-                    payload: {
+-                        id: imgId.substr(0, 12),
+-                        status: 'Connection timed out',
+-                        progressDetail: {
+-                            current: size,
+-                            total: fileSize,
+-                            start: startTs
+-                        }
+-                    }
+-                });
+-                // Note that by destroying the stream this will result in a
+-                // call to finish() with an error, as the drc
+-                // createBlobReadStream handler has an 'end' handler that
+-                // validates the size and digest of downloaded data and
+-                // emits an error event when all the data wasn't downloaded.
++        stream.on('data', function (chunk) {
++            if (ctx.downloadsCanceled) {
+                 stream.destroy();
+-            };
+-            stream.connection.on('timeout', streamTimeoutHandler);
+-
+-            // Retry the download if there are attempts left.
+-            function retryAddImageFile(rErr) {
+-                addImageFileAttempts += 1;
+-                if (addImageFileAttempts >= MAX_IMAGE_FILE_DOWNLOAD_ATTEMPTS) {
+-                    log.info({imgId: imgId, fileSize: fileSize},
+-                        'dockerDownloadAndImportImage: download failed after '
+-                        + '%d attempts', addImageFileAttempts);
+-                    next(rErr);
+-                    return;
+-                }
+-                // Give a short respite and then go again.
+-                setTimeout(function () {
+-                    if (ctx.downloadsCanceled) {
+-                        log.info({err: rErr, imgId: imgId, fileSize: fileSize,
+-                            addImageFileAttempts: addImageFileAttempts},
+-                            'dockerDownloadAndImportImage: not retrying, ' +
+-                            'download already canceled');
+-                        next(new errors.DownloadError(rErr,
+-                            'Download canceled'));
+-                        return;
+-                    }
+-                    log.info({imgId: imgId, fileSize: fileSize,
+-                        addImageFileAttempts: addImageFileAttempts},
+-                        'dockerDownloadAndImportImage: retrying blob download');
+-                    addImageFile(null, next);
+-                }, 1000);
++                progressStatus('Aborted');
++                return;
+             }
+ 
+-            if (stream.headers['content-length'] !== undefined) {
+-                fileSize = Number(stream.headers['content-length']);
++            size += chunk.length;
++            if (size > MAX_IMAGE_SIZE) {
++                finish(new errors.DownloadError(format(
++                    'Download error: image file size exceeds the ' +
++                    'maximum allowed size, %s', MAX_IMAGE_SIZE_STR)));
+             }
++            shasum.update(chunk, 'binary');
++            sha256sum.update(chunk, 'binary');
++            md5sum.update(chunk, 'binary');
++
++            if ((size - lastUpdate) > updateEvery) {
++                progressStatus('Downloading', {
++                    current: size,
++                    total: fileSize,
++                    start: startTs
++                });
++                lastUpdate = size;
++            }
++        });
+ 
+-            var size = 0;
+-            var stor;  // the storage class
+-            var sha1;
+-            function finish_(fErr, tmpFilename, filename) {
+-                // Remove connection timeout handler.
+-                stream.connection.removeListener('timeout',
+-                    streamTimeoutHandler);
+-                streamTimeoutHandler = null;
+-
+-                if (fErr) {
+-                    if (fErr.name === 'DownloadError') {
+-                        retryAddImageFile(fErr);
+-                        return;
+-                    }
+-                    log.info({imgId: imgId, err: fErr},
+-                        'dockerDownloadAndImportImage: ' +
+-                        'not retrying on this error');
+-                    return next(fErr);
+-                } else if (ctx.downloadsCanceled) {
+-                    return next(new errors.DownloadError('Download canceled'));
+-                } else if (size > MAX_IMAGE_SIZE) {
+-                    return next(new errors.DownloadError(format(
+-                        'Download error: image file size, %s, exceeds the ' +
+-                        'maximum allowed file size, %s',
+-                        size, MAX_IMAGE_SIZE_STR)));
+-                } else if (fileSize >= 0 && size !== fileSize) {
+-                    // Retry - as there was an issue downloading all the bits.
+-                    retryAddImageFile(new errors.DownloadError(format(
+-                        'Download error: "Content-Length" header, %s, does ' +
+-                        'not match downloaded size, %d', fileSize, size)));
+-                    return;
+-                }
++        stream.on('error', function (streamErr) {
++            finish(errors.wrapErrorFromDrc(streamErr));
++        });
+ 
+-                sha1 = shasum.digest('hex');
++        stor = app.chooseStor(newImage);
++        stor.storeFileFromStream({
++            image: newImage,
++            stream: stream,
++            reqId: resp.id(),
++            filename: 'file0',
++            noStreamErrorHandler: true
++        }, function (sErr, tmpFilename, filename) {
++            if (sErr) {
++                log.error({err: sErr, digest: digest},
++                    'error storing image file');
++                finish(errors.parseErrorFromStorage(
++                    sErr, 'error receiving image file'));
++            } else {
++                finish(null, tmpFilename, filename);
++            }
++        });
++    }
+ 
+-                var file = {
+-                    sha1: sha1,
+-                    size: size,
+-                    contentMD5: md5sum.digest('base64'),
+-                    mtime: (new Date()).toISOString(),
+-                    stor: stor.type,
+-                    compression: compression
+-                };
++    function addUncompressedSha256(arg, next) {
++        var newFileInfo = ctx.newFileInfoFromUuid[uuid];
++        assert.object(newFileInfo, 'newFileInfo');
++        assert.object(newFileInfo.file, 'newFileInfo.file');
+ 
+-                ctx.fileInfoFromImgId[imgId] = {
+-                    file: file,
+-                    storage: stor.type,
+-                    tmpFilename: tmpFilename,
+-                    filename: filename
+-                };
++        if (compression === 'none') {
++            // Same sha256 - as there is no compression.
++            newFileInfo.file.uncompressedSha256 = newFileInfo.sha256;
++            next();
++            return;
++        }
+ 
+-                log.info({imgId: imgId, fileSize: fileSize},
+-                    'dockerDownloadAndImportImage: Download successful');
+-                return next();
++        if (uncompressedSha256) {
++            newFileInfo.file.uncompressedSha256 = uncompressedSha256;
++            next();
++            return;
++        }
++
++        // Data is still piping to the uncompress/sha256 function, set and wait
++        // for it's callback.
++        arg.uncompressedSha256Callback = function (err, sha256) {
++            if (!err) {
++                newFileInfo.file.uncompressedSha256 = sha256;
++                progressStatus('Uncompression completed');
+             }
+-            var finish = once(finish_);
++            next(err);
++        };
+ 
+-            var shasum = crypto.createHash('sha1');
+-            var md5sum = crypto.createHash('md5');
++        progressStatus('Uncompressing layer');
++    }
++}
+ 
+-            stream.on('data', function (chunk) {
+-                if (ctx.downloadsCanceled) {
+-                    stream.destroy();
+-                    ctx.resMessage({
+-                        type: 'progress',
+-                        payload: {
+-                            id: imgId.substr(0, 12),
+-                            status: 'Aborted',
+-                            progressDetail: {
+-                                current: size,
+-                                total: fileSize,
+-                                start: startTs
+-                            }
+-                        }
+-                    });
+-                    return;
+-                }
+ 
+-                size += chunk.length;
+-                if (size > MAX_IMAGE_SIZE) {
+-                    finish(new errors.DownloadError(format(
+-                        'Download error: image file size exceeds the ' +
+-                        'maximum allowed size, %s', MAX_IMAGE_SIZE_STR)));
+-                }
+-                shasum.update(chunk, 'binary');
+-                md5sum.update(chunk, 'binary');
++function _dockerDownloadAndImportImageWithRetries(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.optionalNumber(opts.addImageFileAttempt, 'opts.addImageFileAttempt');
++    assert.object(opts.ctx, 'opts.ctx');
++    assert.object(opts.ctx.req, 'opts.ctx.req');
++    assert.object(opts.ctx.req.log, 'opts.ctx.req.log');
++    assert.func(opts.ctx.resMessage, 'opts.ctx.resMessage');
++    assert.string(opts.digest, 'opts.digest');
++    assert.func(callback, 'callback');
+ 
+-                if ((size - lastUpdate) > updateEvery) {
+-                    ctx.resMessage({
+-                        type: 'progress',
+-                        payload: {
+-                            id: imgId.substr(0, 12),
+-                            status: 'Downloading',
+-                            progressDetail: {
+-                                current: size,
+-                                total: fileSize,
+-                                start: startTs
+-                            }
+-                        }
+-                    });
+-                    lastUpdate = size;
+-                }
+-            });
++    var MAX_IMAGE_FILE_DOWNLOAD_ATTEMPTS = 5;
++    var addImageFileAttempt = opts.addImageFileAttempt || 0;
++    var ctx = opts.ctx;
++    var digest = opts.digest;
++    var log = ctx.req.log;
++
++    function retryDownload(err) {
++        addImageFileAttempt += 1;
++
++        // Abort if we've exceeded the maximum retry attempts.
++        if (addImageFileAttempt >= MAX_IMAGE_FILE_DOWNLOAD_ATTEMPTS) {
++            log.info({digest: digest},
++                'dockerDownloadAndImportImage: download failed after '
++                + '%d attempts', addImageFileAttempt);
++            callback(err);
++            return;
++        }
+ 
+-            stream.on('error', function (streamErr) {
+-                finish(errors.wrapErrorFromDrc(streamErr));
+-            });
++        // Give a short respite and then go again.
++        setTimeout(function _retryDockerImgDownload() {
++            if (ctx.downloadsCanceled) {
++                log.info({err: err, digest: digest,
++                    addImageFileAttempt: addImageFileAttempt},
++                    'dockerDownloadAndImportImage: not retrying, ' +
++                    'download already canceled');
++                callback(new errors.DownloadError(err, 'Download canceled'));
++                return;
++            }
+ 
+-            stor = app.chooseStor(newImage);
+-            stor.storeFileFromStream({
+-                image: newImage,
+-                stream: stream,
+-                reqId: stream.id(),
+-                filename: 'file0',
+-                noStreamErrorHandler: true
+-            }, function (sErr, tmpFilename, filename) {
+-                if (sErr) {
+-                    log.error({err: sErr, imgId: imgId},
+-                        'error storing image file');
+-                    finish(errors.parseErrorFromStorage(
+-                        sErr, 'error receiving image file'));
+-                } else {
+-                    finish(null, tmpFilename, filename);
+-                }
+-            });
+-        });
++            log.info({digest: digest, addImageFileAttempt: addImageFileAttempt},
++                'dockerDownloadAndImportImage: retrying blob download');
++            opts.addImageFileAttempt = addImageFileAttempt;
++            _dockerDownloadAndImportImageWithRetries(opts, callback);
++        }, 1000);
+     }
++
++    _dockerDownloadAndImportImage(opts, function _dockerDlImgCb(err, image) {
++        // Return if no error, or the error is not a DownloadError.
++        if (err) {
++            if (err.name === 'DownloadError') {
++                retryDownload(err);
++                return;
++            }
++
++            callback(err);
++            return;
++        }
++
++        callback(null, image);
++    });
+ }
+ 
+ 
+@@ -2859,16 +3007,16 @@ function _dockerDownloadAndImportImage(opts, callback) {
+  * to ensure image objects are added serially into the database.
+  * The function 'this' is bound to be { req: req, res: res }
+  */
+-function _dockerActivateImage(imgId, ctx, callback) {
++function _dockerActivateImage(newImage, ctx, callback) {
+     var req = ctx.req;
+     var resMessage = ctx.resMessage;
+     var app = req._app;
+     var log = req.log;
+-    var newImage = ctx.imageFromImgId[imgId];
+-    var newFile = ctx.fileInfoFromImgId[imgId];
+-
+-    var exists = (newImage.exists === true);
+-    delete newImage.exists;
++    var digest = ctx.digestFromUuid[newImage.uuid];
++    // If newFileInfo exists, it means a new file was downloaded for this image.
++    var newFileInfo = ctx.newFileInfoFromUuid[newImage.uuid];
++    var shortId = imgmanifest.shortDockerId(
++        imgmanifest.dockerIdFromDigest(digest));
+ 
+     vasync.pipeline({ funcs: [
+         archiveManifest,
+@@ -2881,11 +3029,11 @@ function _dockerActivateImage(imgId, ctx, callback) {
+             return;
+         }
+ 
+-        if (!exists) {
++        if (newFileInfo) {
+             resMessage({
+                 type: 'progress',
+                 payload: {
+-                    id: imgId.substr(0, 12),
++                    id: shortId,
+                     status: 'Pull complete'
+                 }
+             });
+@@ -2895,7 +3043,7 @@ function _dockerActivateImage(imgId, ctx, callback) {
+     });
+ 
+     function archiveManifest(_, next) {
+-        if (exists) {
++        if (!newFileInfo) {
+             next();
+             return;
+         }
+@@ -2914,7 +3062,7 @@ function _dockerActivateImage(imgId, ctx, callback) {
+     }
+ 
+     function addManifestToDb(_, next) {
+-        if (exists) {
++        if (!newFileInfo) {
+             next();
+             return;
+         }
+@@ -2938,16 +3086,17 @@ function _dockerActivateImage(imgId, ctx, callback) {
+             return;
+         }
+ 
+-        log.debug({imgId: imgId}, 'MoveImageLayer: start');
+-        var stor = app.getStor(newFile.storage);
++        log.debug({digest: digest}, 'MoveImageLayer: start');
++        var stor = app.getStor(newFileInfo.storage);
+ 
+-        stor.moveImageFile(newImage, newFile.tmpFilename, newFile.filename,
+-          function (mErr) {
++        stor.moveImageFile(newImage, newFileInfo.tmpFilename,
++                newFileInfo.filename,
++                function (mErr) {
+             if (mErr) {
+                 return next(mErr);
+             }
+ 
+-            newImage.addFile(app, newFile.file, req.log, function (err2) {
++            newImage.addFile(app, newFileInfo.file, req.log, function (err2) {
+                 if (err2) {
+                     req.log.error(err2, 'error adding file info to Image');
+                     return next(new errors.InternalError(err2,
+@@ -2968,7 +3117,7 @@ function _dockerActivateImage(imgId, ctx, callback) {
+         resMessage({
+             type: 'progress',
+             payload: {
+-                id: imgId.substr(0, 12),
++                id: shortId,
+                 status: 'Activating image'
+             }
+         });
+@@ -2978,126 +3127,191 @@ function _dockerActivateImage(imgId, ctx, callback) {
+ }
+ 
+ 
+-function _dockerV1Pull(ctx, cb) {
+-    assert.object(ctx, 'ctx');
+-    assert.func(ctx.resMessage, 'ctx.resMessage');
+-    assert.object(ctx.rat, 'ctx.rat');
+-    assert.string(ctx.imgId, 'ctx.imgId');
+-    assert.object(ctx.regClientV1, 'ctx.regClientV1');
+-    assert.func(cb, 'cb');
++/**
++ * Check if the cmd is a metadata command - i.e. doesn't modify the filesystem.
++ */
++function isMetadataCmd(cmd) {
++    assert.string(cmd, 'cmd');
++    var marker = ' #(nop) ';
++    var idx = cmd.indexOf(marker);
++    if (idx === -1) {
++        // Some older manifests don't include the #nop marker, e.g. for run
++        // commands.
++        return false;
++    }
++    var name = cmd.substr(idx + marker.length).split(' ')[0];
++    return ['ADD', 'COPY', 'RUN'].indexOf(name) === -1;
++}
+ 
+-    var req = ctx.req;
+-    var log = req.log;
+-    var resMessage = ctx.resMessage;
+-    var rat = ctx.rat;
+-    var tag = rat.tag;
+ 
+-    var reverseAncestry;
++/**
++ * Add image history entries.
++ *
++ *  [
++ *    {
++ *      "created": "2016-05-05T18:13:29.963947682Z",
++ *      "author": "Me Now <me@now.com>",
++ *      "created_by": "/bin/sh -c #(nop) MAINTAINER Me Now <me@now.com>",
++ *      "empty_layer": true
++ *    }, {
++ *      "created": "2016-05-05T18:13:30.218788521Z",
++ *      "author": "Me Now <me@now.com>",
++ *      "created_by": "/bin/sh -c #(nop) ADD file:c59222783...364a in /"
++ *    }, {
++ *      "created": "2016-05-05T18:13:30.456465331Z",
++ *      "author": "Me Now <me@now.com>",
++ *      "created_by": "/bin/touch /odd.txt"
++ *    }
++ *  ]
++ */
++function historyEntryFromImageJson(imgJson) {
++    assert.object(imgJson.container_config, 'imgJson.container_config');
++    assert.arrayOfString(imgJson.container_config.Cmd,
++        'imgJson.container_config.Cmd');
++
++    var entry = {
++        created: imgJson.created,
++        created_by: imgJson.container_config.Cmd.join(' ')
++    };
+ 
+-    vasync.pipeline({funcs: [
+-        function starterMessages(_, next) {
+-            resMessage({
+-                type: 'status',
+-                payload: {
+-                    /*
+-                     * When pulling all images in a repository is supported
+-                     * Docker-docker says: 'Pulling repository $localName'.
+-                     */
+-                    status: format('%s: Pulling from %s (%s)',
+-                        tag, rat.localName, req.getId())
+-                }
+-            });
+-            // The `head` message tells sdc-docker to tag this Docker imgId
+-            // for the pulling user.
+-            resMessage({type: 'head', head: ctx.imgId});
+-            resMessage({
+-                type: 'progress',
+-                payload: {
+-                    id: ctx.imgId.substr(0, 12),
+-                    status: 'Pulling dependent layers'
+-                }
+-            });
++    if (isMetadataCmd(entry.created_by)) {
++        entry.empty_layer = true;
++    }
++    if (imgJson.author) {
++        entry.author = imgJson.author;
++    }
++    if (imgJson.comment) {
++        entry.comment = imgJson.comment;
++    }
+ 
+-            next();
+-        },
++    return entry;
++}
+ 
+-        function getAncestry(_, next) {
+-            ctx.regClientV1.getImgAncestry({
+-                imgId: ctx.imgId
+-            }, function (err, ancestry) {
+-                if (err) {
+-                    return next(errors.wrapErrorFromDrc(err));
+-                }
+-                // Want to import oldest in ancestry first.
+-                reverseAncestry = ancestry.reverse();
+-                next();
+-            });
+-        },
++function createImgJsonFromLayers(layers, fakeIt) {
++    assert.arrayOfObject(layers, 'layers');
++    assert.optionalBool(fakeIt, 'fakeIt');
+ 
+-        /*
+-         * In *parallel*, create (unactivated) and download the images.
+-         */
+-        function importImagesPart1(_, next) {
+-            var pullQueueError;
+-            ctx.downloadsCanceled = false;
+-            var pullQueue = vasync.queue(function (imgId, nextImg) {
+-                _dockerDownloadAndImportImage({imgId: imgId, ctx: ctx},
+-                    nextImg);
+-            }, 5);
++    var imgJson = objCopy(layers.slice(-1)[0].imgJson);
++    if (imgJson.hasOwnProperty('id')) {
++        delete imgJson.id;   // No longer needed.
++    }
++    imgJson.history = layers.map(function (layer) {
++        return historyEntryFromImageJson(layer.imgJson);
++    });
+ 
+-            pullQueue.on('end', function () {
+-                next(pullQueueError);
+-            });
++    assert.equal(layers.length, imgJson.history.length,
++        'Layers and image history must be the same length');
+ 
+-            pullQueue.push(reverseAncestry, function (qErr) {
+-                if (qErr) {
+-                    log.debug(qErr, '_dockerDownloadAndImportImage err');
+-                }
+-                if (qErr && pullQueueError === undefined) {
+-                    pullQueueError = qErr;
+-                    ctx.downloadsCanceled = true;
+-                    pullQueue.kill();
+-                }
+-            });
+-            pullQueue.close();
+-        },
++    /**
++     * Add RootFS layers.
++     *
++     * {
++     *   "type": "layers",
++     *   "diff_ids": [
++     *       "sha256:3f69a7949970fe2d62a5...c65003d01ac3bbe8645d574b",
++     *       "sha256:f980315eda5e9265282c...41b30de83027a2077651b465",
++     *       "sha256:30785cd7f84479984348...533457f3a5dcf677d0b0c51e"
++     *   ]
++     * }
++     */
++    var nonEmptyLayers = layers.filter(function _filterEmpty(layer, idx) {
++        return !imgJson.history[idx].empty_layer;
++    });
++    imgJson.rootfs = {
++        type: 'layers',
++        diff_ids: nonEmptyLayers.map(function _getRootfsDiffId(layer) {
++            if (!layer.uncompressedDigest && fakeIt) {
++                return '';
++            }
++            assert.string(layer.uncompressedDigest);
++            return layer.uncompressedDigest;
++        })
++    };
+ 
+-        /*
+-         * *Serially* complete the import of all the images:
+-         * - We only ActivateImage's at this stage after the file downloading
+-         *   (anticipated to be the most error-prone stage).
+-         * - We activate images in ancestry order (parent before child) for
+-         *   db consistency.
+-         */
+-        function importImagesPart2(_, next) {
+-            vasync.forEachPipeline({
+-                inputs: reverseAncestry,
+-                func: function (imgId, nextImg) {
+-                    _dockerActivateImage(imgId, ctx, nextImg);
+-                }
+-            }, function (vErr, results) {
+-                next(vErr);
+-            });
++    return imgJson;
++}
++
++
++        //layerInfos.push({
++        //    digest: layerDigest,
++        //    layerDigests: layerDigests.slice(),  // A copy - not a reference.
++        //    imgJson: imgJson,
++        //    fsLayer: ctx.manifestV2.fsLayers[i],
++        //    shortId: imgmanifest.shortDockerId(
++        //        imgmanifest.dockerIdFromDigest(layerDigest))
++        //});
++function createV2Manifest(imgJson, layers, fakeIt) {
++    assert.object(imgJson, 'imgJson');
++    assert.arrayOfObject(imgJson.history, 'imgJson.history');
++    assert.arrayOfObject(layers, 'layers');
++    assert.optionalBool(fakeIt, 'fakeIt');
++
++    assert.equal(imgJson.history.length, layers.length,
++        'history length should equal layers length');
++
++    var imageStr = JSON.stringify(imgJson);
++    var imageDigest = 'sha256:' + crypto.createHash('sha256')
++        .update(imageStr, 'binary').digest('hex');
++
++    var manifest = {
++        schemaVersion: 2,
++        mediaType: 'application/vnd.docker.distribution.manifest.v2+json',
++        config: {
++            'mediaType': 'application/vnd.docker.container.image.v1+json',
++            'size': imageStr.length,
++            'digest': imageDigest
+         },
++        layers: layers.filter(function _filterLayers(layer, idx) {
++            return !(imgJson.history[idx].empty_layer);
++        }).map(function _mapLayers(layer) {
++            assert.string(layer.digest, 'layer.digest');
++            if (!layer.imgManifest && fakeIt) {
++                // Fake it until you make it.
++                return {
++                    digest: layer.digest,
++                    mediaType: '(unknown)'
++                };
++            }
++            assert.object(layer.imgFile, 'layer.imgFile');
++            assert.string(layer.compression, 'layer.compression');
++            var compressionSuffix = '';
++            if (layer.compression && layer.compression !== 'none') {
++                compressionSuffix = '.' + layer.compression;
++            }
++            return {
++                digest: layer.digest,
++                mediaType: 'application/vnd.docker.image.rootfs.diff.tar' +
++                    compressionSuffix,
++                size: layer.imgFile.size
++            };
++        })
++    };
+ 
+-        function finishingMessages(_, next) {
+-            var status = (ctx.alreadyExistsFromImgId[ctx.imgId]
+-                ? 'Status: Image is up to date for ' + ctx.repoAndRef
+-                : 'Status: Downloaded newer image for ' + ctx.repoAndRef);
+-            resMessage({
+-                type: 'status',
+-                payload: {status: status}
+-            });
++    return manifest;
++}
+ 
+-            next();
+-        }
+-    ]}, cb);
++
++function _compressionFromMediaType(mediaType) {
++    switch (mediaType) {
++        case 'application/vnd.docker.image.rootfs.diff.tar.bzip2':
++            return 'bzip2';
++        case 'application/vnd.docker.image.rootfs.diff.tar.gzip':
++            return 'gzip';
++        case 'application/vnd.docker.image.rootfs.diff.tar.xz':
++            return 'xz';
++        case 'application/vnd.docker.image.rootfs.diff.tar':
++        case 'application/vnd.docker.image.rootfs.diff':
++            return 'none';
++        default:
++            return undefined;
++    }
++    return undefined;
+ }
+ 
+ 
+ /* BEGIN JSSTYLED */
+ /*
+- * Pull a docker image using v2 registry.
++ * Pull a docker image (with schemaVersion === 2) using v2 registry.
+  *
+  * Example Docker-docker pull:
+  *
+@@ -3115,63 +3329,186 @@ function _dockerV1Pull(ctx, cb) {
+  *  Status: Image is up to date for alpine@sha256:fb9f16730ac6316afa4d97caa5130219927bfcecf0b0ce35c01dcb612f449739
+  */
+ /* END JSSTYLED */
+-function _dockerV2Pull(ctx, cb) {
++function _dockerV22Pull(ctx, cb) {
+     assert.object(ctx, 'ctx');
+-    assert.func(ctx.resMessage, 'ctx.resMessage');
+-    assert.object(ctx.rat, 'ctx.rat');
+-    assert.string(ctx.digestV2, 'ctx.digestV2');
++    assert.string(ctx.manifestDigest, 'ctx.manifestDigest');
+     assert.object(ctx.manifestV2, 'ctx.manifestV2');
++    assert.object(ctx.manifestV2.config, 'ctx.manifest.config');
++    assert.object(ctx.rat, 'ctx.rat');
+     assert.object(ctx.regClientV2, 'ctx.regClientV2');
++    assert.func(ctx.resMessage, 'ctx.resMessage');
++    assert.optionalObject(ctx.config, 'ctx.config');
++    assert.optionalBool(ctx.upconvertV21Manifest, 'ctx.upconvertV21Manifest');
+     assert.func(cb, 'cb');
+ 
+     var cacheDownloadedLayers = false;
++    var configDigest = ctx.manifestV2.config.digest;
++    var imgJson = ctx.imgJson;
+     var req = ctx.req;
+     var log = req.log;
+     var resMessage = ctx.resMessage;
+     var rat = ctx.rat;
+     var tag = rat.tag;
+     var digest = rat.digest;
++    var layerDigests = [];
+ 
+-    var reverseAncestry = [];  // 'reversed' so that the base image is first
+-    for (var i = ctx.manifestV2.history.length - 1; i >= 0; i--) {
+-        try {
+-            var imgJson = JSON.parse(ctx.manifestV2.history[i].v1Compatibility);
+-        } catch (manifestErr) {
+-            return cb(new errors.ValidationFailedError(manifestErr, format(
+-                'invalid "v1Compatibility" JSON in docker manifest: %s (%s)',
+-                manifestErr, ctx.manifestV2.history[i].v1Compatibility)));
++    // Get the docker config layer id, from the manifest, then fetch the config
++    // details.
++
++    // Send initial status message.
++    resMessage({
++        type: 'status',
++        payload: {
++            /*
++             * When pulling all images in a repository is supported
++             * Docker-docker says: 'Pulling repository $localName'.
++             */
++            status: format('%s: Pulling from %s (req %s)',
++                tag || digest, rat.localName, req.getId())
+         }
+-        reverseAncestry.push({
+-            imgJson: imgJson,
+-            fsLayer: ctx.manifestV2.fsLayers[i]
+-        });
+-    }
+-    var imgId = reverseAncestry[reverseAncestry.length - 1].imgJson.id;
++    });
+ 
+     vasync.pipeline({funcs: [
+-        function starterMessages(_, next) {
+-            resMessage({
+-                type: 'status',
+-                payload: {
+-                    /*
+-                     * When pulling all images in a repository is supported
+-                     * Docker-docker says: 'Pulling repository $localName'.
+-                     */
+-                    status: format('%s: Pulling from %s (req %s)',
+-                        tag || digest, rat.localName, req.getId())
++        function downloadImgJson(_, next) {
++            if (imgJson) {
++                // This should only be when upconverting a v2.1 manifest.
++                assert.equal(ctx.upconvertV21Manifest, true,
++                    'ctx.upconvertV21Manifest');
++                next();
++                return;
++            }
++            ctx.regClientV2.createBlobReadStream({digest: configDigest},
++                function (err, stream, res_) {
++                if (err) {
++                    next(errors.wrapErrorFromDrc(err));
++                    return;
+                 }
++                // Read, validate and store the config.
++                log.debug({digest: configDigest},
++                    'downloadConfig:: stream started');
++
++                var configStr = '';
++                var hadErr = false;
++                var sha256sum = crypto.createHash('sha256');
++
++                stream.on('end', function _downloadConfigStreamEnd() {
++                    if (hadErr) {
++                        return;
++                    }
++                    log.debug({digest: configDigest},
++                        'downloadConfig:: stream ended, config: %s', configStr);
++                    var gotDigest = 'sha256:' + sha256sum.digest('hex');
++                    if (gotDigest !== configDigest) {
++                        log.warn({expectedDigest: configDigest,
++                            gotDigest: gotDigest},
++                            'Downloaded config sha256 digest does not match');
++                        next(new errors.DownloadError(format(
++                            'config "sha256" hash, %s, does not match the ' +
++                            'expected hash, %s', gotDigest, configDigest)));
++                        return;
++                    }
++                    // Convert into JSON.
++                    try {
++                        imgJson = JSON.parse(configStr);
++                    } catch (configErr) {
++                        next(new errors.ValidationFailedError(configErr, format(
++                            'invalid JSON for docker config, digest %s, err %s',
++                            configDigest, configErr)));
++                        return;
++                    }
++                    next();
++                });
++
++                stream.on('error', function _downloadConfigStreamError(sErr) {
++                    hadErr = true;
++                    log.warn({digest: configDigest},
++                        'downloadConfig:: error downloading config: %s', sErr);
++                    stream.destroy();
++                    next(new errors.DownloadError(format(
++                        'error downloading config with digest %s, %s',
++                        configDigest, sErr)));
++                    return;
++                });
++
++                stream.on('data', function _downloadConfigStreamData(chunk) {
++                    if (ctx.downloadsCanceled) {
++                        stream.destroy();
++                        return;
++                    }
++                    configStr += String(chunk);
++                    sha256sum.update(chunk, 'binary');
++                });
++
++                // Stream is paused, so get it moving again.
++                stream.resume();
+             });
+-            // The `head` message tells sdc-docker to tag this Docker imgId
+-            // for the pulling user.
+-            resMessage({type: 'head', head: imgId});
+-            resMessage({
+-                type: 'progress',
+-                payload: {
+-                    id: imgId.substr(0, 12),
+-                    status: 'Pulling dependent layers'
++        },
++
++        function determineLayers(_, next) {
++            assert.arrayOfObject(imgJson.history, 'imgJson.history');
++            assert.arrayOfString(imgJson.rootfs.diff_ids,
++                'imgJson.rootfs.diff_ids');
++            assert.arrayOfObject(ctx.manifestV2.layers,
++                'ctx.manifestV2.layers');
++            // History is from oldest change (index 0) to the newest change. For
++            // each entry in history, there should be a corresponding entry in
++            // both the manifestV2.layers array and the imgJson.rootfs.diff_ids
++            // array, except in the case the history entry has a 'empty_layer'
++            // attribute set to true.
++            var layerInfos = [];
++            var loopErr;
++            var idx = -1;
++            imgJson.history.forEach(function _histForEach(h, pos) {
++                // Emulate Docker's barebones imgJson so we can later generate
++                // the history entries.
++                var layerImgJson = {
++                    created: h.created,
++                    container_config: {
++                      Cmd: [ h.created_by ]
++                    }
++                };
++                if (pos === (imgJson.history.length - 1)) {
++                    // Last layer uses the original imgJson.
++                    layerImgJson = imgJson;
+                 }
+-            });
+ 
++                if (h.empty_layer) {
++                    layerInfos.push({
++                        historyEntry: h,
++                        imgJson: layerImgJson,
++                        layerDigests: layerDigests.slice()  // A copy
++                    });
++                    return;
++                }
++
++                idx += 1;
++                var compression = _compressionFromMediaType(
++                    ctx.manifestV2.layers[idx].mediaType);
++                var layerDigest = ctx.manifestV2.layers[idx].digest;
++                var id = imgmanifest.dockerIdFromDigest(layerDigest);
++                layerDigests.push(layerDigest);
++                layerInfos.push({
++                    compression: compression,
++                    digest: layerDigest,
++                    historyEntry: h,
++                    imgJson: layerImgJson,
++                    layerDigests: layerDigests.slice(),  // A copy
++                    uncompressedDigest: imgJson.rootfs.diff_ids[idx]
++                });
++                resMessage({
++                    type: 'status',
++                    payload: {
++                        id: imgmanifest.shortDockerId(id),
++                        progressDetail: {},
++                        status: 'Pulling fs layer'
++                    }
++                });
++            });
++            if (loopErr) {
++                next(loopErr);
++                return;
++            }
++            ctx.layerInfos = layerInfos;
+             next();
+         },
+ 
+@@ -3179,24 +3516,50 @@ function _dockerV2Pull(ctx, cb) {
+          * In *parallel*, create (unactivated) and download the images.
+          */
+         function importImagesPart1(_, next) {
+-            var pullQueueError;
+-            ctx.downloadsCanceled = false;
+             cacheDownloadedLayers = true;
++            ctx.downloadsCanceled = false;
++            var pullQueueError;
++
++            var pullQueue = vasync.queue(function (layerInfo, nextImg) {
++                if (layerInfo.historyEntry.empty_layer) {
++                    // Nothing to download for this layer.
++                    nextImg();
++                    return;
++                }
+ 
+-            var pullQueue = vasync.queue(function (imgInfo, nextImg) {
+-                _dockerDownloadAndImportImage({
+-                    imgId: imgInfo.imgJson.id,
+-                    imgJson: imgInfo.imgJson,
+-                    fsLayer: imgInfo.fsLayer,
++                _dockerDownloadAndImportImageWithRetries({
++                    compression: layerInfo.compression,
++                    digest: layerInfo.digest,
++                    layerDigests: layerInfo.layerDigests,
++                    imgJson: layerInfo.imgJson,
++                    uncompressedDigest: layerInfo.uncompressedDigest,
+                     ctx: ctx
+-                }, nextImg);
++                }, function _dockerDownloadImageCb(err, image) {
++                    if (err) {
++                        log.info({err: err, digest: layerInfo.digest},
++                            'dockerDownloadAndImportImageWithRetries err');
++                        nextImg(err);
++                        return;
++                    }
++
++                    var file0;
++                    if (ctx.newFileInfoFromUuid.hasOwnProperty(image.uuid)) {
++                        file0 = ctx.newFileInfoFromUuid[image.uuid].file;
++                    } else {
++                        // Existing image.
++                        file0 = image.files[0];
++                    }
++                    layerInfo.imgFile = file0;
++                    layerInfo.imgManifest = image;
++                    nextImg();
++                });
+             }, 5);
+ 
+             pullQueue.on('end', function () {
+                 next(pullQueueError);
+             });
+ 
+-            pullQueue.push(reverseAncestry, function (qErr) {
++            pullQueue.push(ctx.layerInfos, function (qErr) {
+                 if (qErr) {
+                     log.debug(qErr, '_dockerDownloadAndImportImage err');
+                 }
+@@ -3209,19 +3572,86 @@ function _dockerV2Pull(ctx, cb) {
+             pullQueue.close();
+         },
+ 
++        function recalculateConfigAndManifest(_, next) {
++            if (!ctx.upconvertV21Manifest) {
++                next();
++                return;
++            }
++            // Update compression and digest for all file layers.
++            ctx.layerInfos.forEach(function (layer) {
++                if (layer.historyEntry.empty_layer) {
++                    return;
++                }
++                assert.object(layer.imgFile, 'layer.imgFile');
++                assert.string(layer.imgFile.compression,
++                    'layer.imgFile.compression');
++                assert.string(layer.imgFile.uncompressedSha256,
++                    'layer.imgFile.uncompressedSha256');
++                layer.compression = layer.imgFile.compression;
++                layer.uncompressedDigest = 'sha256:' +
++                    layer.imgFile.uncompressedSha256;
++            });
++            imgJson = createImgJsonFromLayers(ctx.layerInfos);
++            ctx.manifestV2 = createV2Manifest(imgJson, ctx.layerInfos);
++            ctx.manifestStr = JSON.stringify(ctx.manifestV2, null, 4);
++            ctx.manifestDigest = 'sha256:' + crypto.createHash('sha256')
++                .update(ctx.manifestStr, 'binary').digest('hex');
++            configDigest = ctx.manifestV2.config.digest;
++
++            log.debug({manifest: ctx.manifestV2},
++                'recalculateConfigAndManifest');
++
++            next();
++        },
++
++        function addSdcDockerImage(_, next) {
++            // Create the sdc-docker image in the docker_images bucket.
++
++            // Calculate total size and find the last image uuid.
++            var finalUuid;
++            var size = ctx.layerInfos.map(function (layer) {
++                if (!layer.imgManifest) {
++                    return 0;
++                }
++                assert.object(layer.imgFile, 'layer.imgFile');
++                finalUuid = layer.imgManifest.uuid;
++                return layer.imgFile && layer.imgFile.size || 0;
++            }).reduce(function (a, b) { return a + b; }, 0);
++
++            ctx.resMessage({
++                type: 'create-docker-image',
++                digest: configDigest,
++                head: true,
++                image: imgJson,
++                image_uuid: finalUuid,
++                manifest_digest: ctx.manifestDigest,
++                manifest_str: ctx.manifestStr,
++                size: size
++            });
++            next();
++        },
++
+         /*
+          * *Serially* complete the import of all the images:
+          * - We only ActivateImage's at this stage after the file downloading
+          *   (anticipated to be the most error-prone stage).
+-         * - We activate images in ancestry order (parent before child) for
++         * - We activate images in layerInfos order (parent before child) for
+          *   db consistency.
+          */
+         function importImagesPart2(_, next) {
+             cacheDownloadedLayers = false;
+             vasync.forEachPipeline({
+-                inputs: reverseAncestry,
+-                func: function (imgInfo, nextImg) {
+-                    _dockerActivateImage(imgInfo.imgJson.id, ctx, nextImg);
++                inputs: ctx.layerInfos,
++                func: function (layerInfo, nextImg) {
++                    assert.object(layerInfo.historyEntry,
++                        'layerInfo.historyEntry');
++                    if (layerInfo.historyEntry.empty_layer) {
++                        nextImg();
++                        return;
++                    }
++                    assert.object(layerInfo.imgManifest,
++                        'layerInfo.imgManifest');
++                    _dockerActivateImage(layerInfo.imgManifest, ctx, nextImg);
+                 }
+             }, function (vErr, results) {
+                 next(vErr);
+@@ -3232,11 +3662,11 @@ function _dockerV2Pull(ctx, cb) {
+             resMessage({
+                 type: 'status',
+                 payload: {
+-                    status: 'Digest: ' + ctx.digestV2
++                    status: 'Digest: ' + ctx.manifestDigest
+                 }
+             });
+ 
+-            var status = (ctx.alreadyExistsFromImgId[imgId]
++            var status = (ctx.newFileInfoFromUuid.length === 0
+                 ? 'Status: Image is up to date for ' + ctx.repoAndRef
+                 : 'Status: Downloaded newer image for ' + ctx.repoAndRef);
+             resMessage({
+@@ -3251,11 +3681,8 @@ function _dockerV2Pull(ctx, cb) {
+             // There was a failure downloading one or more image layers - keep
+             // the downloaded image metadata in memory, so we can avoid
+             // downloading it again next time.
+-            Object.keys(ctx.fileInfoFromImgId).forEach(function (id) {
+-                DOCKER_IMAGE_CACHE[id] = {
+-                    fileInfo: ctx.fileInfoFromImgId[id],
+-                    image: ctx.imageFromImgId[id]
+-                };
++            Object.keys(ctx.newFileInfoFromUuid).forEach(function (u) {
++                DOCKER_IMAGE_CACHE[u] = ctx.newFileInfoFromUuid[u];
+             });
+         }
+ 
+@@ -3264,6 +3691,63 @@ function _dockerV2Pull(ctx, cb) {
+ }
+ 
+ 
++/*
++ * Pull a docker image using v2.1 image manifest format (schemaVersion === 1).
++ *
++ * We upconvert the manifest into a v2.2 format and then have the _dockerV22Pull
++ * function do the bulk of the layer download work. Note that we have to fake a
++ * part of the config and manifest, as we don't know the uncompressed digest or
++ * the compression of the layer at this time - luckily the _dockerV22Pull can
++ * work this out for us and then regenerates the config and manifest once this
++ * information is known.
++ */
++function _dockerV21Pull(ctx, callback) {
++    assert.object(ctx, 'ctx');
++    assert.string(ctx.manifestDigest, 'ctx.manifestDigest');
++    assert.object(ctx.manifestV2, 'ctx.manifestV2');
++    assert.object(ctx.req, 'ctx.req');
++    assert.func(callback, 'callback');
++
++    var req = ctx.req;
++    var log = req.log;
++    var layerDigest;
++    var layerDigests = [];
++
++    var layerInfos = [];  // Docker image info with the base image first.
++    for (var i = ctx.manifestV2.history.length - 1; i >= 0; i--) {
++        var imgJson;
++        try {
++            imgJson = JSON.parse(ctx.manifestV2.history[i].v1Compatibility);
++        } catch (manifestErr) {
++            return callback(
++                new errors.ValidationFailedError(manifestErr, format(
++                'invalid "v1Compatibility" JSON in docker manifest: %s (%s)',
++                manifestErr, ctx.manifestV2.history[i].v1Compatibility)));
++        }
++        layerDigest = ctx.manifestV2.fsLayers[i].blobSum;
++        layerDigests.push(layerDigest);
++        layerInfos.push({
++            digest: layerDigest,
++            imgJson: imgJson,
++            layerDigests: layerDigests.slice(),  // A copy - not a reference.
++            shortId: imgmanifest.shortDockerId(
++                imgmanifest.dockerIdFromDigest(layerDigest))
++        });
++    }
++
++    log.debug({manifestV21: ctx.manifest},
++        'Upconverting manifest from v2.1 to v2.2');
++    var fakeIt = true;
++    ctx.upconvertV21Manifest = true;
++    ctx.imgJson = createImgJsonFromLayers(layerInfos, fakeIt);
++    ctx.manifestV2 = createV2Manifest(ctx.imgJson, layerInfos, fakeIt);
++    ctx.manifestStr = JSON.stringify(ctx.manifestV2, null, 4);
++    ctx.manifestDigest = 'sha256:' + crypto.createHash('sha256')
++        .update(ctx.manifestStr, 'binary').digest('hex');
++
++    _dockerV22Pull(ctx, callback);
++}
++
+ 
+ /* BEGIN JSSTYLED */
+ /**
+@@ -3282,20 +3766,13 @@ function _dockerV2Pull(ctx, cb) {
+  *          "payload":{"status":"Pulling repository busybox"}
+  *      }
+  *
+- *      {
+- *          "type":"head",
+- *          // A head Docker imgId for sdc-docker to tag.
+- *          "head":"8c2e06607696bd4afb3d03b687e361cc43cf8ec1a4a725bc96e39f05ba97dd55",
+- *          "id":"docker.io/busybox"
+- *      }
+- *
+  *      {"type":"progress","payload":{"id":"8c2e06607696","status":"Pulling dependent layers"},"id":"docker.io/busybox"}
+  *      {"type":"progress","id":"docker.io/busybox","payload":{"id":"8c2e06607696","status":"Pulling metadata."}}
+  *
+  *      {
+- *          "type":"data",
+- *          // Docker imgJson. TODO: How used by caller?
+- *          "imgJson":{"container":"39e79119...
++ *          "type":"create-docker-image",
++ *          // Docker image. TODO: How used by caller?
++ *          "image":{"container":"39e79119...
+  *      }
+  *
+  *      {
+@@ -3342,6 +3819,7 @@ function apiAdminImportDockerImage(req, res, callback) {
+         });
+     }
+     if (errs.length) {
++        log.debug({errs: errs}, 'apiAdminImportDockerImage error');
+         return callback(new errors.ValidationFailedError(
+             'missing parameters', errs));
+     }
+@@ -3442,141 +3920,51 @@ function apiAdminImportDockerImage(req, res, callback) {
+             name: repo,
+             log: req.log,
+             insecure: req._app.config.dockerRegistryInsecure,
++            maxSchemaVersion: 2,
+             username: username,
+             password: password
+         }, req),
+ 
+-        imageFromImgId: {},  // <docker imgId> -> <IMGAPI image manifest>
+-        fileInfoFromImgId: {},  // <docker imgId> -> <file import info>
+-        alreadyExistsFromImgId: {},
++        digestFromUuid: {},  // <uuid> -> <docker digest>
++        newFileInfoFromUuid: {},  // <uuid> -> <file import info>
+         public_: public_
+     };
+     log.trace({rat: context.rat}, 'docker pull');
+ 
+     vasync.pipeline({arg: context, funcs: [
+         /*
+-         * To use Docker Registry v2 or v1 to pull? That is the question.
++         * Use Docker Registry v2 to pull - v1 is no longer supported.
+          *
+-         * 1. Try v2 ping to include v2 as candidate.
+-         * 2. If so, check v2.getManifest for the tag/digest. If it exists,
+-         *    then we'll be using v2 for the pull.
+-         * 3. Else, try to resolve an imgId with v1. If 'digest', then error
+-         *    because v1 doesn't support docker pull by digest. If no v1 or
+-         *    the given tag not found with v1, then error out. Otherwise,
+-         *    we'll be using v1 for the pull.
+-         *
+-         * Note: This "fallback to v1 if can't find the tag/digest in v2"
+-         * behaviour is to copy `docker pull` behaviour (at least what it
+-         * seems to do to Docker Hub). Basically that behaviour
+-         * says that "v2" isn't a separate API version to the same underlying
+-         * data, but instead is a completely disjoint registry... *some* of
+-         * which Docker Hub migrated over.
++         * Check v2.getManifest for the tag/digest. If it exists,
++         * then we'll be using v2 for the pull, else error.
+          */
+-        function regSupportsV2(ctx, next) {
+-            var client = drc.createClientV2(ctx.regClientOpts);
+-            client.supportsV2(function (err, supportsV2) {
+-                if (err) {
+-                    next(errors.wrapErrorFromDrc(err));
+-                } else {
+-                    log.info({indexName: rat.index.name,
+-                        supportsV2: supportsV2}, 'regSupportsV2');
+-                    if (supportsV2) {
+-                        ctx.regClientV2 = client;
+-                    } else {
+-                        client.close();
+-                    }
+-                    next();
+-                }
+-            });
+-        },
+-
+         function v2GetManifest(ctx, next) {
+-            if (!ctx.regClientV2) {
+-                return next();
+-            }
+             var ref = rat.tag || rat.digest;
+-            // TODO: Can we send in pingRes, from earlier 'supportsV2' call?
++            ctx.regClientV2 = drc.createClientV2(ctx.regClientOpts);
+             ctx.regClientV2.getManifest({ref: ref},
+-                    function (err, man, res_, manifestStr) {
++                    function (err, manifest, res_, manifestStr) {
+                 if (err) {
+-                    if (err.statusCode === 404 || err.statusCode === 401) {
+-                        /*
+-                         * No workie with v2. We'll fallback to trying API v1.
+-                         *
+-                         * Yes a 401 is sometimes how Docker Hub v2 responds.
+-                         * For example, see DOCKER-625.
+-                         */
+-                        log.debug({ref: ref, statusCode: err.statusCode},
+-                            'v2.getManifest 404 or 401');
+-                        ctx.regClientV2.close();
+-                        delete ctx.regClientV2;
+-                        ctx.errV2 = err; // Save it for possible use below.
+-                        next();
+-                    } else {
+-                        next(errors.wrapErrorFromDrc(err));
+-                    }
++                    next(errors.wrapErrorFromDrc(err));
+                 } else {
+-                    log.debug({ref: ref, manifest: man},
++                    log.debug({ref: ref, manifest: manifest},
+                         'v2.getManifest found');
+-                    ctx.manifestV2 = man;
+-                    ctx.digestV2 = res_.headers['docker-content-digest'];
+-                    if (!ctx.digestV2) {
++                    ctx.manifestV2 = manifest;
++                    ctx.manifestStr = manifestStr;
++                    ctx.manifestDigest = res_.headers['docker-content-digest'];
++                    if (!ctx.manifestDigest) {
+                         // Some registries (looking at you Amazon ECR) do not
+                         // provide the docker-content-digest header in the
+                         // response, so we have to calculate it.
+-                        ctx.digestV2 = drc.digestFromManifestStr(manifestStr);
+-                    }
+-                    ctx.regV = 2;   // The signal we'll be using v2.
+-                    next();
+-                }
+-            });
+-        },
+-
+-        function v1GetImgId(ctx, next) {
+-            if (ctx.regV) {
+-                // We've already determined we're not using v1.
+-                return next();
+-            } else if (ctx.digest) {
+-                // V1 doesn't support pull by digest.
+-                if (ctx.errV2) {
+-                    next(ctx.errV2);
+-                } else {
+-                    next(new errors.BadRequestError(format(
+-                        'Docker registry "%s" does not support v2 required ' +
+-                        'to pull by digest, digest="%s"',
+-                        ctx.rat.index.name, ctx.digest)));
+-                }
+-            }
+-
+-            var client = drc.createClientV1(ctx.regClientOpts);
+-            client.getImgId({tag: ctx.rat.tag}, function (err, imgId) {
+-                if (err) {
+-                    /*
+-                     * At this point we know we can't find the image.
+-                     * We are going to error back to the caller. If the
+-                     * repository supported v2, then we prefer to use *that*
+-                     * error response.
+-                     */
+-                    client.close();
+-                    if (ctx.errV2) {
+-                        log.debug({err: err}, 'v1GetImgId error');
+-                        next(errors.wrapErrorFromDrc(ctx.errV2));
+-                    } else {
+-                        next(errors.wrapErrorFromDrc(err));
++                        ctx.manifestDigest = drc.digestFromManifestStr(
++                            manifestStr);
+                     }
+-                } else {
+-                    ctx.regClientV1 = client;
+-                    ctx.imgId = imgId;
+-                    ctx.regV = 1;
+                     next();
+                 }
+             });
+         },
+ 
+         /*
+-         * At this point we know if we are using v1 or v2 (`ctx.regV`).
+-         *
+-         * Now determine if this is a private Docker image by trying the same
++         * Determine if this is a private Docker image by trying the same
+          * without auth. The only thing this does is determine `ctx.isPrivate`
+          * so the caller (typically sdc-docker) can note that.
+          * We still used the auth'd client for doing the image pull.
+@@ -3595,57 +3983,31 @@ function apiAdminImportDockerImage(req, res, callback) {
+             delete opts.password;
+             var noAuthClient;
+ 
+-            if (ctx.regV === 1) {
+-                noAuthClient = drc.createClientV1(opts);
+-                noAuthClient.getImgId({tag: ctx.rat.tag},
+-                        function (err, imgId) {
+-                    if (err) {
+-                        if (err.statusCode === 404 ||
+-                            err.statusCode === 403 ||
+-                            err.statusCode === 401)
+-                        {
+-                            err = null;
+-                            ctx.isPrivate = true;
+-                        }
+-                    } else {
+-                        assert.equal(imgId, ctx.imgId);
+-                        ctx.isPrivate = false;
+-                    }
+-                    noAuthClient.close();
+-                    next(errors.wrapErrorFromDrc(err));
+-                });
+-
+-            } else {
+-                assert.equal(ctx.regV, 2);
+-
+-                var ref = rat.tag || rat.digest;
+-                noAuthClient = drc.createClientV2(opts);
+-                noAuthClient.getManifest({ref: ref}, function (err, man) {
+-                    if (err) {
+-                        if (err.statusCode === 404 ||
+-                            err.statusCode === 403 ||
+-                            err.statusCode === 401)
+-                        {
+-                            log.debug({ref: ref, code: err.code,
+-                                statusCode: err.statusCode}, 'isPrivate: true');
+-                            err = null;
+-                            ctx.isPrivate = true;
+-                        } else {
+-                            log.debug({ref: ref, code: err.code,
+-                                statusCode: err.statusCode},
+-                                'isPrivate: unexpected err code/statusCode');
+-                        }
++            var ref = rat.tag || rat.digest;
++            noAuthClient = drc.createClientV2(opts);
++            noAuthClient.getManifest({ref: ref}, function (err, man, res_) {
++                if (err) {
++                    if (err.statusCode === 404 ||
++                        err.statusCode === 403 ||
++                        err.statusCode === 401)
++                    {
++                        log.debug({ref: ref, code: err.code,
++                            statusCode: err.statusCode}, 'isPrivate: true');
++                        err = null;
++                        ctx.isPrivate = true;
+                     } else {
+-                        // TODO: Better to assert that the Docker-Content-Digest
+-                        //    is equal to above.
+-                        assert.equal(man.fsLayers[0].blobSum,
+-                            ctx.manifestV2.fsLayers[0].blobSum);
+-                        ctx.isPrivate = false;
++                        log.debug({ref: ref, code: err.code,
++                            statusCode: err.statusCode},
++                            'isPrivate: unexpected err code/statusCode');
+                     }
+-                    noAuthClient.close();
+-                    next(errors.wrapErrorFromDrc(err));
+-                });
+-            }
++                } else {
++                    var noAuthDigest = res_.headers['docker-content-digest'];
++                    assert.equal(noAuthDigest, ctx.manifestDigest);
++                    ctx.isPrivate = false;
++                }
++                noAuthClient.close();
++                next(errors.wrapErrorFromDrc(err));
++            });
+         },
+ 
+         /*
+@@ -3659,17 +4021,14 @@ function apiAdminImportDockerImage(req, res, callback) {
+             res.status(200);
+             res.header('Content-Type', 'application/json');
+ 
+-            if (ctx.regV === 1) {
+-                _dockerV1Pull(ctx, next);
++            if (ctx.manifestV2.schemaVersion === 2) {
++                _dockerV22Pull(ctx, next);
+             } else {
+-                _dockerV2Pull(ctx, next);
++                _dockerV21Pull(ctx, next);
+             }
+         }
+ 
+     ]}, function (err) {
+-        if (context.regClientV1) {
+-            context.regClientV1.close();
+-        }
+         if (context.regClientV2) {
+             context.regClientV2.close();
+         }
+@@ -4728,14 +5087,19 @@ function apiUpdateImage(req, res, cb) {
+ 
+     req.log.debug({image: req._image}, 'UpdateImage: start');
+ 
++    var app = req._app;
+     var image;
+-    vasync.pipeline({funcs: [
+-        function validateFields(_, next) {
++
++    vasync.pipeline({arg: {}, funcs: [
++        function validateFields(ctx, next) {
+             var ADMIN_ONLY_ATTRS = [
+                 'state',
+                 'error',
+                 'billing_tags',
+-                'traits'
++                'traits',
++                'files',   // Restricted to sha256 and uncompressedSha256.
++                'origin',  // Restricted to unactivated images.
++                'uuid'     // Restricted to unactivated images.
+             ];
+ 
+             var UPDATEABLE_ATTRS = imgmanifest.fields.filter(function (field) {
+@@ -4781,6 +5145,18 @@ function apiUpdateImage(req, res, cb) {
+                         code: 'NotAllowed',
+                         message: 'Can only be updated by operators'
+                     });
++                } else if ((key === 'uuid' || key === 'origin' ||
++                        key === 'files') && data[key] !== undefined) {
++                    // These fields are a special case (used by docker build),
++                    // and it requires that the image be unactivated.
++                    if (req._image.activated) {
++                        errs.push({
++                            field: key,
++                            code: 'NotAllowed',
++                            message: 'Can only be updated on unactivated images'
++                        });
++                        // TODO: Only allow 'sha256' and 'uncompressedSha256'?
++                    }
+                 }
+             }
+ 
+@@ -4810,23 +5186,47 @@ function apiUpdateImage(req, res, cb) {
+ 
+             // Revalidate.
+             try {
+-                image = new Image(req._app, raw);
++                image = new Image(app, raw);
+             } catch (cErr) {
+                 return next(cErr);
+             }
+ 
++            ctx.isImageRename = (req._image.uuid !== image.uuid);
+             next();
+         },
+ 
+         function checkOwner(_, next) {
+             utils.checkOwnerExists({
+-                app: req._app,
++                app: app,
+                 owner: image.owner
+             }, next);
+         },
+ 
++        function moveImageFile(ctx, next) {
++            if (!ctx.isImageRename) {
++                next();
++                return;
++            }
++            req._image.moveFile(app, image, req.log, next);
++        },
++
+         function doModify(_, next) {
+-            Image.modify(req._app, image, req.log, next);
++            Image.modify(app, image, req.log, next);
++        },
++
++        function deleteOldImage(ctx, next) {
++            if (!ctx.isImageRename) {
++                next();
++                return;
++            }
++            // Delete the original model.
++            app.db.del(req._image.uuid, function (delErr) {
++                if (delErr) {
++                    return next(delErr);
++                }
++                app.cacheInvalidateDelete('Image', req._image);
++                next();
++            });
+         }
+ 
+     ]}, function (err) {
+@@ -4835,7 +5235,7 @@ function apiUpdateImage(req, res, cb) {
+         }
+ 
+         // Respond.
+-        var serialized = image.serialize(req._app.mode, req.getVersion());
++        var serialized = image.serialize(app.mode, req.getVersion());
+         resSetEtag(req, res, serialized);
+         res.send(serialized);
+         cb(false);
+diff --git a/lib/magic.js b/lib/magic.js
+index dfe8490..059ef23 100644
+--- a/lib/magic.js
++++ b/lib/magic.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -87,5 +87,7 @@ function compressionTypeFromPath(path, cb) {
+ // ---- exports
+ 
+ module.exports = {
++    minBytesRequired: maxMagicLen,  // Min number of bytes needed for detection.
++    compressionTypeFromBufSync: compressionTypeFromBufSync,
+     compressionTypeFromPath: compressionTypeFromPath
+ };
+diff --git a/lib/storage.js b/lib/storage.js
+index e41e308..457b273 100644
+--- a/lib/storage.js
++++ b/lib/storage.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -132,6 +132,18 @@ Storage.prototype.storeFileFromStream =
+  */
+ Storage.prototype.moveImageFile = function (image, from, to, callback) {};
+ 
++/**
++ * Moves an image file from one image to another image.
++ *
++ * @param fromImage {Image}
++ * @param toImage {Image}
++ * @param filename {String} Image filename (i.e. 'file0')
++ * @param callback {Function} `function (err)`
++ */
++Storage.prototype.moveFileBetweenImages =
++    function (fromImage, toImage, filename, callback) {
++};
++
+ 
+ /**
+  * Returns the archive path for image manifests. Image manifests are archived
+@@ -437,6 +449,33 @@ LocalStorage.prototype.moveImageFile = function (image, from, to, callback) {
+ };
+ 
+ 
++LocalStorage.prototype.moveFileBetweenImages =
++function (fromImage, toImage, filename, callback) {
++    assert.object(fromImage, 'fromImage');
++    assert.string(fromImage.uuid, 'fromImage.uuid');
++    assert.object(toImage, 'toImage');
++    assert.string(toImage.uuid, 'toImage.uuid');
++    assert.string(filename, 'filename');
++    assert.func(callback, 'callback');
++
++    var fromPath = this.storPathFromImageUuid(fromImage.uuid, filename);
++    var toPath = this.storPathFromImageUuid(toImage.uuid, filename);
++
++    var toDir = path.dirname(toPath);
++    mkdirp(toDir, function (mkdirErr) {
++        if (mkdirErr) {
++            return callback(mkdirErr);
++        }
++        fs.rename(fromPath, toPath, function (err) {
++            if (err) {
++                return callback(err);
++            }
++            return callback(null);
++        });
++    });
++};
++
++
+ LocalStorage.prototype.archiveImageManifest = function (manifest, callback) {
+     assert.object(manifest, 'manifest');
+     assert.string(manifest.uuid, 'manifest.uuid');
+@@ -716,6 +755,40 @@ MantaStorage.prototype.moveImageFile = function (image, from, to, callback) {
+     });
+ };
+ 
++MantaStorage.prototype.moveFileBetweenImages =
++function (fromImage, toImage, filename, callback) {
++    assert.object(fromImage, 'fromImage');
++    assert.string(fromImage.uuid, 'fromImage.uuid');
++    assert.object(toImage, 'toImage');
++    assert.string(toImage.uuid, 'toImage.uuid');
++    assert.string(filename, 'filename');
++    assert.func(callback, 'callback');
++
++    var fromPath = this._storPathFromImageUuid(fromImage.uuid, filename);
++    var toPath = this._storPathFromImageUuid(toImage.uuid, filename);
++    var toDir = path.dirname(toPath);
++
++    var self = this;
++
++    self.client.mkdirp(toDir, function (mkdirErr) {
++        if (mkdirErr) {
++            return callback(mkdirErr);
++        }
++        self.client.ln(fromPath, toPath, function (err) {
++            if (err) {
++                return callback(err);
++            }
++
++            self.deleteImageFile(fromImage, filename, function (delErr) {
++                if (delErr) {
++                    return callback(delErr);
++                }
++                return callback();
++            });
++        });
++    });
++};
++
+ MantaStorage.prototype.archiveImageManifest =
+ function (manifest, callback) {
+     assert.object(manifest, 'manifest');
+diff --git a/package.json b/package.json
+index a00ca10..930ed0c 100644
+--- a/package.json
++++ b/package.json
+@@ -1,12 +1,13 @@
+ {
+   "name": "imgapi",
+   "description": "Image API to manage images for SDC 7",
+-  "version": "3.2.2",
++  "version": "4.0.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
+     "assert-plus": "1.0.0",
+     "async": "0.7.0",
++    "buffer-peek-stream": "1.0.1",
+     "bunyan": "1.8.8",
+     "cmdln": "3.2.1",
+     "dashdash": "1.10.0",
+@@ -17,7 +18,7 @@
+     "forkexec": "1.1.0",
+     "glob": "7.0.5",
+     "handlebars": "4.0.5",
+-    "imgmanifest": "2.3.0",
++    "imgmanifest": "git+https://github.com/joyent/node-imgmanifest.git#b2e47b96e588a811ad36725fb138530efc0e4ff4",
+     "json": "9.0.4",
+     "ldap-filter": "0.3.1",
+     "uuid": "2.0.2",

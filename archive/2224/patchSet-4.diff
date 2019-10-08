@@ -1,0 +1,2941 @@
+commit 0e03fa6a612c88dd3e9ab0f7b1146f6a2c3a667b (refs/changes/24/2224/4)
+Author: David Pacheco <dap@joyent.com>
+Date:   2017-07-26T16:46:31-07:00 (2 years, 2 months ago)
+    
+    MANTA-3196 want tool for creating and managing amon maintenance windows
+    MANTA-3346 manta-init behaves badly if -c does not include a numeric arg
+    MANTA-3353 long-running query alarm output could be more concise
+    MANTA-3354 long-running query alarm fails spuriously
+    MANTA-3352 sdc-manta could use an environment file
+
+diff --git a/README.md b/README.md
+index 0b81d28..ab320ad 100644
+--- a/README.md
++++ b/README.md
+@@ -49,6 +49,12 @@ Directories specific to this repo include:
+ 
+ # Development
+ 
++It's convenient during development and testing to set up your PATH to include
++the Node.js executables and other commands provided by this repository.  You can
++do that with:
++
++    source env.sh
++
+ Before committing and pushing a change, run:
+ 
+     make prepush
+diff --git a/alarm_metadata/probe_templates/postgres.yaml b/alarm_metadata/probe_templates/postgres.yaml
+index b661696..97b55e3 100644
+--- a/alarm_metadata/probe_templates/postgres.yaml
++++ b/alarm_metadata/probe_templates/postgres.yaml
+@@ -228,6 +228,14 @@
+             need to rebuild a deposed peer.
+ 
+ -
++    #
++    # This query looks for non-autovacuum, long-running queries.  To reliably
++    # identify error cases and cases where there are one or more long-running
++    # query, the check fails if the output does NOT match the empty string.
++    # There are some transient errors that can cause this to trip erroneously
++    # while PostgreSQL is starting up, so we require two failures in 5 minutes
++    # (the default value of "period").
++    #
+     event: upset.manta.postgres.long_query
+     scope:
+         service: postgres
+@@ -235,9 +243,10 @@
+         -
+             type: cmd
+             config:
+-                cmd: "/opt/local/bin/psql -U postgres -c \"SELECT *, NOW() - query_start AS elapsed FROM pg_stat_activity WHERE state != 'idle' AND query NOT LIKE 'autovacuum: %' AND NOW() - query_start > interval '120 seconds'\""
++                cmd: "/opt/local/bin/psql -U postgres -c \"SELECT pid,usename,client_addr,client_port,waiting,state,NOW() - query_start AS elapsed, query FROM pg_stat_activity WHERE state != 'idle' AND query NOT LIKE 'autovacuum: %' AND NOW() - query_start > interval '120 seconds'\" | tail +3"
+                 interval: 60
+                 timeout: 30
++                threshold: 2
+                 stdoutMatch:
+                     type: regex
+                     invert: true
+diff --git a/cmd/manta-adm.js b/cmd/manta-adm.js
+index 19c6a8c..f277622 100755
+--- a/cmd/manta-adm.js
++++ b/cmd/manta-adm.js
+@@ -53,6 +53,12 @@ var maArg0 = path.basename(process.argv[1]);
+ 
+ var maDefaultAlarmConcurrency = 10;
+ 
++/*
++ * We will warn when the user attempts to create a maintenance window that's
++ * longer than this value (in milliseconds).  This is currently 4 hours.
++ */
++var maMaintWindowLong = 4 * 60 * 60 * 1000;
++
+ /*
+  * These node-cmdln options are used by multiple subcommands.  They're defined
+  * in one place to ensure consistency in names, aliases, and help message.
+@@ -1048,6 +1054,8 @@ MantaAdmAlarm.prototype.do_list.options = [
+     }
+ ];
+ 
++MantaAdmAlarm.prototype.do_maint = MantaAdmAlarmMaint;
++
+ MantaAdmAlarm.prototype.do_metadata = MantaAdmAlarmMetadata;
+ 
+ MantaAdmAlarm.prototype.do_notify = function (subcmd, opts, args, callback)
+@@ -1365,6 +1373,387 @@ MantaAdmAlarmConfig.prototype.amonUpdateSubcommand =
+ 	});
+ };
+ 
++
++/*
++ * Maintenance windows
++ */
++
++function MantaAdmAlarmMaint(parent)
++{
++	this.mam_parent = parent;
++	this.mam_root = parent.maa_parent;
++
++	cmdln.Cmdln.call(this, {
++	    'name': parent.name + ' maint',
++	    'desc': 'View and manage maintenance windows.'
++	});
++
++}
++
++util.inherits(MantaAdmAlarmMaint, cmdln.Cmdln);
++
++MantaAdmAlarmMaint.prototype.do_create = function (subcmd, opts, args, callback)
++{
++	var nscopes, scopeProp, targets;
++	var params, i;
++	var tstart, tend, tnow;
++	var parent, root;
++
++	/*
++	 * We accept no non-option arguments.
++	 */
++	if (args.length > 0) {
++		callback(new Error('unexpected arguments'));
++		return;
++	}
++
++	/*
++	 * Parse and validate the scope options.
++	 */
++	nscopes = 0;
++	targets = [];
++	if (opts.probe) {
++		nscopes++;
++		targets = opts.probe.slice(0);
++		scopeProp = 'probes';
++	}
++	if (opts.probegroup) {
++		nscopes++;
++		targets = opts.probegroup.slice(0);
++		scopeProp = 'probeGroups';
++	}
++	if (opts.machine) {
++		nscopes++;
++		targets = opts.machine.slice(0);
++		scopeProp = 'machines';
++	}
++
++	if (nscopes > 1) {
++		callback(new VError('only one of --probe, --probegroup, or ' +
++		    '--machine may be specified'));
++		return;
++	}
++
++	/*
++	 * We cannot easily validate these identifiers against the set of
++	 * deployed probes, probe groups, or machines, but we can detect some
++	 * cases of obviously bogus input.
++	 */
++	params = {};
++	if (nscopes > 0) {
++		for (i = 0; i < targets.length; i++) {
++			if (!/^[a-zA-Z0-9_-]+$/.test(targets[i])) {
++				callback(new VError('identifier "%s": ' +
++				    'does not look like a valid uuid',
++				    targets[i]));
++				return;
++			}
++		}
++
++		params[scopeProp] = targets;
++	} else {
++		params['all'] = true;
++	}
++
++	tnow = Date.now();
++
++	/*
++	 * The "--start" and "--end" options are required.
++	 *
++	 * "--start" may have the special value "now", in which case we'll
++	 * generate a start timestamp based on the current time.  That means we
++	 * have to parse it here and not rely on dashdash's "date" type.
++	 */
++	if (!opts.start) {
++		callback(new VError('argument is required: --start'));
++		return;
++	}
++	if (opts.start == 'now') {
++		params['start'] = new Date(tnow);
++	} else {
++		var d = Date.parse(opts.start);
++		if (isNaN(d)) {
++			callback(new VError('unsupported value for --start: %s',
++			    opts.start));
++			return;
++		}
++
++		params['start'] = new Date(d);
++	}
++
++	if (!opts.end) {
++		callback(new VError('argument is required: --end'));
++		return;
++	}
++	params['end'] = opts.end;
++
++	/*
++	 * --notes is required unless the user specifies the undocumented
++	 * --no-notes option.  The rationale is that we want to require
++	 * operators to provide some kind of note, but it's useful in
++	 * development to have a tool for creating a window with no note so that
++	 * we can test the CLI's behavior when encountering such windows.
++	 */
++	if (!opts.notes && !opts.no_notes) {
++		callback(new VError('argument is required: --notes'));
++		return;
++	}
++	if (opts.notes) {
++		params['notes'] = opts.notes;
++	}
++
++	/*
++	 * Validate the semantics of the time window.
++	 */
++	tstart = params['start'].getTime();
++	assertplus.number(tstart);
++	assertplus.ok(!isNaN(tstart));
++
++	tend = params['end'].getTime();
++	assertplus.number(tend);
++	assertplus.ok(!isNaN(tend));
++
++	if (tend <= tstart) {
++		callback(new VError('specified window does not start ' +
++		    'before it ends'));
++		return;
++	}
++
++	if (tend < tnow) {
++		callback(new VError('cannot create windows in the past'));
++		return;
++	}
++
++	console.log('creating maintenance window of duration %s:',
++	    common.fmtDuration(tend - tstart));
++	console.log('    from %s', params['start'].toISOString());
++	console.log('    to   %s', params['end'].toISOString());
++
++	if (tstart < tnow) {
++		console.error('note: maintenance window starts in the past');
++	}
++
++	if (tend - tstart > maMaintWindowLong) {
++		console.error('note: maintenance window exceeds expected ' +
++		    'maximum (%s)', common.fmtDuration(maMaintWindowLong));
++	}
++
++	root = this.mam_root;
++	parent = this.mam_parent;
++	parent.initAdmAndFetchAlarms({
++	    'clioptions': opts,
++	    'sources': {}
++	}, function () {
++		var adm = root.madm_adm;
++		adm.alarmsMaintWindowCreate({
++		    'windef': params
++		}, function (err, maintwin) {
++			if (err) {
++				fatal(err.message);
++			}
++
++			console.log('window created: %d', maintwin.win_id);
++			root.finiAdm();
++			callback();
++		});
++	});
++
++};
++
++MantaAdmAlarmMaint.prototype.do_create.help = [
++    'Create (schedule) a future maintenance window.',
++    '',
++    'Usage:',
++    '',
++    '    manta-adm alarm maint create OPTIONS',
++    '',
++    'The --start, --end, and --notes options are required.  See the manual',
++    'page for details.',
++    '',
++    '{{options}}'
++].join('\n');
++
++MantaAdmAlarmMaint.prototype.do_create.options = [
++    maCommonOptions.configFile,
++{
++    'names': [ 'start' ],
++    'type': 'string',
++    'help': 'Start time of the window (use "now" to start immediately)'
++}, {
++    'names': [ 'end' ],
++    'type': 'date',
++    'help': 'End time of the window'
++}, {
++    'names': [ 'notes' ],
++    'type': 'string',
++    'help': 'Notes (typically use a JIRA ticket number)'
++}, {
++    'names': [ 'no-notes' ],
++    'type': 'bool',
++    'hidden': true,
++    'help': 'Omit "notes" field (for dev only)'
++}, {
++    'names': [ 'probe' ],
++    'type': 'arrayOfString',
++    'helpArg': 'PROBEID...',
++    'help': 'List of probes affected by window (default: all)'
++}, {
++    'names': [ 'probegroup' ],
++    'type': 'arrayOfString',
++    'helpArg': 'GROUPID...',
++    'help': 'List of probe groups affected by window (default: all)'
++}, {
++    'names': [ 'machine' ],
++    'type': 'arrayOfString',
++    'helpArg': 'MACHINEID...',
++    'help': 'List of machines affected by window (default: all)'
++} ];
++
++MantaAdmAlarmMaint.prototype.do_delete = function (subcmd, opts, args, callback)
++{
++	var parent, root;
++
++	if (args.length < 1) {
++		callback(new Error('expected WINID'));
++		return;
++	}
++
++	root = this.mam_root;
++	parent = this.mam_parent;
++	parent.initAdmAndFetchAlarms({
++	    'clioptions': opts,
++	    'sources': {}
++	}, function () {
++		var adm = root.madm_adm;
++		adm.alarmsMaintWindowsDelete({
++		    'winIds': args,
++		    'concurrency': opts.concurrency
++		}, function (err) {
++			if (err) {
++				VError.errorForEach(err, function (e) {
++					console.error('error: %s', e.message);
++				});
++
++				process.exit(1);
++			}
++
++			root.finiAdm();
++			callback();
++		});
++	});
++};
++
++MantaAdmAlarmMaint.prototype.do_delete.help = [
++    'Delete (cancel) pending maintenance windows.',
++    '',
++    'Usage:',
++    '',
++    '    manta-adm alarm maint delete WINID...',
++    '',
++    '{{options}}'
++].join('\n');
++
++MantaAdmAlarmMaint.prototype.do_delete.options = [
++    maCommonOptions.concurrency,
++    maCommonOptions.configFile
++];
++
++MantaAdmAlarmMaint.prototype.do_list =
++    function cmdMaintList(subcmd, opts, args, callback)
++{
++	var self = this;
++	var options = {};
++	var sources;
++
++	if (args.length > 0) {
++		callback(new Error('unexpected arguments'));
++		return;
++	}
++
++	options = listPrepareArgs(opts, madm.maintWindowColumnNames());
++	if (options instanceof Error) {
++		callback(options);
++		return;
++	}
++
++	options.stream = process.stdout;
++	sources = { 'windows': true };
++	this.mam_parent.initAdmAndFetchAlarms({
++	    'clioptions': opts,
++	    'sources': sources
++	}, function () {
++		self.mam_root.madm_adm.alarmsMaintWindowsList(options);
++		self.mam_root.finiAdm();
++		callback();
++	});
++};
++
++
++MantaAdmAlarmMaint.prototype.do_list.help = [
++    'List maintenance windows',
++    '',
++    'Usage:',
++    '',
++    '    manta-adm alarm maint list OPTIONS',
++    '',
++    '{{options}}',
++    '',
++    'Available columns for -o:\n',
++    '    ' + madm.maintWindowColumnNames().join(', ')
++].join('\n');
++
++MantaAdmAlarmMaint.prototype.do_list.options = [
++    maCommonOptions.omitHeader,
++    maCommonOptions.columns,
++    maCommonOptions.configFile
++];
++
++MantaAdmAlarmMaint.prototype.do_show =
++    function cmdMaintShow(subcmd, opts, args, callback)
++{
++	var self = this;
++	var options = {};
++	var sources;
++
++	if (args.length > 0) {
++		callback(new Error('unexpected arguments'));
++		return;
++	}
++
++	options.stream = process.stdout;
++	sources = { 'windows': true };
++	this.mam_parent.initAdmAndFetchAlarms({
++	    'clioptions': opts,
++	    'sources': sources
++	}, function () {
++		self.mam_root.madm_adm.alarmsMaintWindowsShow(options);
++		self.mam_root.finiAdm();
++		callback();
++	});
++};
++
++MantaAdmAlarmMaint.prototype.do_show.help = [
++    'Show details about maintenance windows',
++    '',
++    'Usage:',
++    '',
++    '    manta-adm alarm maint show OPTIONS',
++    '',
++    '{{options}}',
++    '',
++    'Available columns for -o:\n',
++    '    ' + madm.maintWindowColumnNames().join(', ')
++].join('\n');
++
++MantaAdmAlarmMaint.prototype.do_show.options = [
++    maCommonOptions.configFile
++];
++
++
++/*
++ * Local alarm metadata
++ */
++
+ function MantaAdmAlarmMetadata(parent)
+ {
+ 	this.maam_parent = parent;
+diff --git a/cmd/manta-init.js b/cmd/manta-init.js
+index e613264..6059a43 100755
+--- a/cmd/manta-init.js
++++ b/cmd/manta-init.js
+@@ -7,7 +7,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -40,6 +40,12 @@ var POSEIDON;
+ var POSEIDON_LOGIN = 'poseidon';
+ var POSEIDON_PASSWORD = 'trident123';
+ 
++/*
++ * If the -c option isn't specified, the default is to download 10 images in
++ * parallel.
++ */
++var CONCURRENCY = 10;
++
+ optimist.usage('Usage:\tmanta-init -e <email>');
+ 
+ var ARGV = optimist.options({
+@@ -73,8 +79,12 @@ var ARGV = optimist.options({
+ 	}
+ }).argv;
+ 
+-function usage() {
++function usage(message) {
++	if (message) {
++		console.error(message);
++	}
+ 	optimist.showHelp();
++	process.exit(2);
+ }
+ 
+ // -- User management
+@@ -383,10 +393,35 @@ self.log = new Logger({
+ });
+ 
+ /*
+- * If the -c option isn't specified, the default is to download 10 images in
+- * parallel.
++ * node-optimist infers the type of an argument from the way it was used.  For
++ * example:
++ *
++ *     -c foo        ARGV.c is the string "foo"
++ *     -c 37         ARGV.c is the number 37
++ *     -c ' 37'      ARGV.c is the number 37
++ *     -c 37invalid  ARGV.c is the string "37invalid"
++ *     -c            ARGV.c is the boolean true
++ *     -c ''         ARGV.c is the boolean true
++ *     -c ' '        ARGV.c is the number 0
++ *     (-c left out) ARGV.c is undefined
++ *
++ * Note that this has the usual problem of attempting to coerce a string to a
++ * number with Number: a string of all spaces is parsed as 0.  We should be
++ * using jsprim.parseInteger() here, but for now, we only handle the two cases
++ * that we intend to support.
+  */
+-ARGV.c = ARGV.c ? parseInt(ARGV.c, 10) : 10;
++if (typeof (ARGV.c) == 'number' && ARGV.c > 0 && ARGV.c < 128 &&
++    Math.floor(ARGV.c) == ARGV.c) {
++	CONCURRENCY = ARGV.c;
++} else if (ARGV.c !== undefined) {
++	/*
++	 * It would be nice to provide the user with value that we
++	 * failed to parse, but optimist has potentially mangled it
++	 * badly by the time we get here, so we don't bother.
++	 */
++	usage('unsupported value for "-c" option ' +
++	    '(must be a positive integer less than 128)');
++}
+ 
+ async.waterfall([
+ 	function verifyArgs(cb) {
+@@ -724,7 +759,8 @@ async.waterfall([
+ 		log.info({ images: images, remote_url: remote_url },
+ 			'downloading images');
+ 
+-		async.forEachLimit(images, ARGV.c, function (image, subcb) {
++		async.forEachLimit(images, CONCURRENCY,
++		    function (image, subcb) {
+ 			var import_opts = {};
+ 			import_opts.skipOwnerCheck = true;
+ 
+diff --git a/deps/jsstyle b/deps/jsstyle
+index d75b7ca..b9f5092 160000
+--- a/deps/jsstyle
++++ b/deps/jsstyle
+@@ -1 +1 @@
+-Subproject commit d75b7ca8308be17c80e2b120f2a01d4a0c20d8a8
++Subproject commit b9f50929ee2df140fd2d111f053b20593e068cdc
+diff --git a/docs/man/man1/manta-adm.md b/docs/man/man1/manta-adm.md
+index 020f65c..4231665 100644
+--- a/docs/man/man1/manta-adm.md
++++ b/docs/man/man1/manta-adm.md
+@@ -172,6 +172,14 @@ status of the program to determine success or failure.
+ 
+ `manta-adm alarm list [-H] [-o FIELD...] [--state=STATE]`
+ 
++`manta-adm alarm maint create CREATE_OPTIONS`
++
++`manta-adm alarm maint delete WIN_ID...`
++
++`manta-adm alarm maint list [-H] [-o FIELD...]`
++
++`manta-adm alarm maint show`
++
+ `manta-adm alarm metadata events`
+ 
+ `manta-adm alarm metadata ka [EVENT_NAME...]`
+@@ -186,6 +194,7 @@ The `manta-adm alarm` subcommand provides several tools that allow operators to:
+ * view open alarms (`show`, `list`, `details`, and `faults` subcommands)
+ * configure notifications for open alarms (`notify` subcommand)
+ * view local metadata about alarms and probes (`metadata` subcommand)
++* view and configure amon maintenance windows (`maint` subcommand)
+ 
+ The primary commands for working with alarms are:
+ 
+@@ -223,6 +232,11 @@ resurface.  In the case of transient issues, a new alarm may not open again
+ until the issue occurs again, which could be days, weeks, or months later.  That
+ does not mean the underlying issue was actually resolved.
+ 
++As mentioned above, this command attempts to separately close each of the
++specified alarms.  It's possible for some of the specified alarms to be closed
++even if others were not.
++
++
+ `manta-adm alarm config probegroup list [-H] [-o FIELD...]`
+ 
+ List configured probe groups in tabular form.  This is primarily useful in
+@@ -291,6 +305,98 @@ may be any of "open", "closed", "all", or "recent".  The default is "open".
+ 
+ See also the `manta-adm alarm show` command.
+ 
++`manta-adm alarm maint create CREATE_OPTIONS`
++
++Creates (schedules) an Amon maintenance window, which is a period of time and a
++scope for which alarm notifications are suspended.  Maintenance windows have a
++start time, an end time, and an operator-provided notes field (typically used to
++reference a ticket number in some other system).  By default, maintenance
++windows affect all notifications for an account (and so Manta maintenance
++windows affect all Manta-related notifications), but they can be scoped to a
++specific set of probes, probe groups, or machines.
++
++During maintenance windows, Amon continues to execute all probe checks and it
++continues to open new alarms for failing probe checks.  However, faults created
++during a maintenance window that are within the scope of that window are
++reported as "maintenance faults", and such faults do not trigger notifications.
++
++As an example, suppose an operator creates a maintenance window for the period
++today between 0200Z and 0400Z scoped to machine "lb7".  At 0214Z, Amon detects a
++failure for a "log-scan" probe on machine "lb7" that would normally open a new
++alarm and send notifications.  The alarm is opened as usual.  Because the event
++happened within the maintenance window's time period and within its scope
++(namely, machine "lb7"), a new maintenance fault is created, not a regular
++fault, and no notifications are sent out.  But the alarm remains open until an
++operator closes it.  A probe check failure for "lb7" after 0400Z would result in
++a normal fault being created for the same alarm, and notifications would be
++sent.  Similarly, a probe check failure at 0300Z for a different machine would
++result in notifications being sent, even if the resulting fault would be
++attached to the same alarm (e.g., because the "lb7" probe and this new probe are
++in the same probe group).
++
++The following three option-arguments are always required:
++
++`--start START_TIME`
++  Specifies the start time of the maintenance window.  `START_TIME` should be an
++  ISO 8601 timestamp, or else the special string `now`, which means that the
++  window should begin immediately.
++
++`--end END_TIME`
++  Specifies the end time of the maintenance window.  `END_TIME` should be an ISO
++  8601 timestamp, and it must be later than the specified start time.
++
++`--notes NOTES`
++  Provides arbitrary notes to be recorded with the window.  This is intended for
++  operators to reference tickets or other identifiers in other systems.  The
++  system ignores the contents of this field except to report it back via the
++  other subcommands.
++
++You may also specify:
++
++`--machine MACHINE_UUID, --probe PROBE_UUID, --probegroup GROUP_UUID`
++  Limits the scope of the maintenance window so that it only affects the
++  specified machines, probes, or probe groups.  You can specify any one of these
++  options multiple times (e.g., to specify multiple machines), but you cannot
++  mix these options together.  The values are only validated for basic syntax.
++  They are not validated against the set of deployed machines, probes, or probe
++  groups.
++
++Note that Amon automatically deletes maintenance windows whose end time has
++passed.  This tool does not allow you to create maintenance windows whose end
++time is in the past.
++
++Example: create an alarm for the period between 0200Z and 0400Z on July 17,
++2017 associated with ticket `CM-123`
++
++    # manta-adm alarm maint create --start=2017-07-17T02:00:00Z \
++        --end=2017-07-17T04:00:00Z --notes "CM-123"
++
++`manta-adm alarm maint delete WIN_ID...`
++
++Deletes (cancels) the maintenance windows with identifiers `WIN_ID...`.  The
++windows will no longer show up in the `manta-adm alarm maint list` or `manta-adm
++alarm maint show` output, and Amon will resume sending notifications for events
++that would have fallen within the window's time period and scope.
++
++`WIN_ID` is Amon's integer identifier for the window.  You can retrieve this
++from the `manta-adm alarm maint list` or `manta-adm alarm maint show` commands.
++
++This command attempts to separately delete each of the specified windows.  If it
++fails to delete any of them (e.g., because they're not valid window identifiers
++or because of a transient problem with Amon), it may still have deleted others.
++
++`manta-adm alarm maint list [-H] [-o FIELD...]`
++
++Lists basic information about outstanding maintenance windows.  This command is
++intended when you want tabular output or specific fields.  See the `manta-adm
++alarm maint show` command for a more useful human-readable summary.
++
++`manta-adm alarm maint show`
++
++Summarizes each outstanding maintenance window.  This is intended for human
++operators, not programmatic tools.  The output format may change in future
++versions.
++
+ `manta-adm alarm metadata events`
+ 
+ List the names for all of the events known to this version of `manta-adm`.  Each
+diff --git a/env.sh b/env.sh
+new file mode 100644
+index 0000000..d2a9c59
+--- /dev/null
++++ b/env.sh
+@@ -0,0 +1,20 @@
++#
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++#
++
++#
++# Copyright (c) 2017, Joyent, Inc.
++#
++
++#
++# bash environment file for working on this repository.
++# This puts this repository's command-line tools onto the PATH, along with the
++# "node" that's bundled with this component.
++#
++
++env_sh_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++set -o xtrace
++export PATH="$env_sh_dir/build/node/bin:$env_sh_dir/bin:$PATH"
++set +o xtrace
+diff --git a/lib/adm.js b/lib/adm.js
+index 1f02814..f1cee61 100644
+--- a/lib/adm.js
++++ b/lib/adm.js
+@@ -40,6 +40,7 @@ exports.columnNames = columnNames;
+ exports.alarmColumnNames = alarmColumnNames;
+ exports.cnColumnNames = cnColumnNames;
+ exports.probeGroupColumnNames = probeGroupColumnNames;
++exports.maintWindowColumnNames = maintWindowColumnNames;
+ exports.zkColumnNames = zkColumnNames;
+ exports.MantaAdm = maAdm;
+ 
+@@ -218,6 +219,34 @@ function probeGroupColumnNames()
+ 	return (Object.keys(maProbeGroupColumns));
+ }
+ 
++var maMaintWindowColumns = {
++    'win': {
++	'label': 'WIN',
++	'width': 3,
++	'align': 'right'
++    },
++    'start': {
++	'label': 'START',
++	'width': 20
++    },
++    'end': {
++	'label': 'END',
++	'width': 20
++    },
++    'scope': {
++	'label': 'SCOPE',
++	'width': 11
++    },
++    'notes': {
++	'label': 'NOTES'
++    }
++};
++
++function maintWindowColumnNames()
++{
++	return (Object.keys(maMaintWindowColumns));
++}
++
+ var maCnColumns = {
+     'server_uuid': {
+ 	'label': 'SERVER UUID',
+@@ -438,6 +467,11 @@ function maAdm(log)
+ 	 */
+ 	this.ma_amon_deployed = null;
+ 
++	/*
++	 * Amon maintenance windows
++	 */
++	this.ma_maint_windows = null;
++
+ 	/*
+ 	 * Warning-level issues encountered while loading alarms information.
+ 	 */
+@@ -842,6 +876,9 @@ var schemaAlarmConfig = {
+  *            alarmIds          fetch the specified alarm ids
+  *            (array of string)
+  *
++ *        windows               load maintenance windows
++ *        (boolean)
++ *
+  * In all cases, even if "sources" is empty, local metadata related to alarms is
+  * loaded.
+  *
+@@ -863,9 +900,11 @@ maAdm.prototype.alarmsInit = function (args, callback)
+ 	assertplus.strictEqual(this.ma_alarms, null);
+ 	assertplus.strictEqual(this.ma_amon_deployed, null);
+ 	assertplus.strictEqual(this.ma_alarm_metadata, null);
++	assertplus.strictEqual(this.ma_maint_windows, null);
+ 
+ 	assertplus.optionalBool(args.sources.configBasic);
+ 	assertplus.optionalBool(args.sources.configFull);
++	assertplus.optionalBool(args.sources.windows);
+ 	assertplus.optionalObject(args.sources.alarms);
+ 	if (args.sources.alarms) {
+ 		assertplus.optionalString(args.sources.alarms.state);
+@@ -947,6 +986,54 @@ maAdm.prototype.alarmsInit = function (args, callback)
+ 		});
+ 	});
+ 
++	/*
++	 * If the user asked for "windows", load the maintenance windows.
++	 */
++	if (args.sources.windows) {
++		account = this.ma_app.owner_uuid;
++		funcs.push(function fetchMaintWindows(_, stepcb) {
++			alarms.amonLoadMaintWindows({
++			    'amonRaw': self.ma_sdc.AMON_RAW,
++			    'account': account
++			}, function (err, windows) {
++				if (!windows) {
++					stepcb(err);
++					return;
++				}
++
++				/*
++				 * Sort the maintenance windows by start time,
++				 * then end time, and finally by their
++				 * identifier.  This should produce a stable
++				 * sort in chronological order.
++				 */
++				self.ma_maint_windows = windows.sort(
++				    function sortWindows(s1, s2) {
++					var rv;
++					rv = s1.win_tstart - s2.win_tstart;
++					if (rv !== 0) {
++						return (rv);
++					}
++
++					rv = s1.win_tend - s2.win_tend;
++					if (rv !== 0) {
++						return (rv);
++					}
++
++					return (s1.win_id - s2.win_id);
++				    });
++				if (err) {
++					VError.errorForEach(err,
++					    function (e) {
++						self.ma_alarm_warnings.push(e);
++					    });
++				}
++
++				stepcb();
++			});
++		});
++	}
++
+ 	/*
+ 	 * If the user asked for "configBasic" or "configFull", then we need the
+ 	 * list of probe groups.
+@@ -1168,6 +1255,10 @@ maAdm.prototype.alarmsShow = function (args)
+ 		    details.ka !== null ?
+ 		    details.ka.ka_severity.toUpperCase() : 'UNKNOWN',
+ 		    details.summary);
++		if (details.maintOnly) {
++			fprintf(out, '    NOTE: all faults for this alarm ' +
++			    'originated inside a maintenance window.\n');
++		}
+ 		fprintf(out, '    %d event%s (last: %s)\n',
+ 		    alarm.a_nevents,
+ 		    alarm.a_nevents == 1 ? ' ' : 's',
+@@ -1383,6 +1474,9 @@ maAdm.prototype.alarmsUpdateNotification = function (args, callback)
+  *     affects          array of service names whose instances have faults
+  *                      associated with this alarm.
+  *
++ *     maintOnly	if true, indicates that the only faults for this
++ *     			alarm were associated with a maintenance window
++ *
+  *     summary          one-line string summary of the alarm.  We prefer
+  *                      information provided in the associated knowledge
+  *                      article, if there is one.  Otherwise, we use the probe
+@@ -1405,6 +1499,7 @@ maAdm.prototype.alarmDetails = function (alarm)
+ 	    'nogroup': false,
+ 	    'affects': null,
+ 	    'summary': null,
++	    'maintOnly': true,
+ 	    'ka': null
+ 	};
+ 
+@@ -1452,6 +1547,9 @@ maAdm.prototype.alarmDetails = function (alarm)
+ 	 */
+ 	svcnames = {};
+ 	alarm.a_faults.forEach(function (f) {
++		if (!f.aflt_ismaint) {
++			rv.maintOnly = false;
++		}
+ 		svcnames[
+ 		    self.ma_instance_svcname.hasOwnProperty(f.aflt_agent) ?
+ 		    self.ma_instance_svcname[f.aflt_agent] :
+@@ -1585,22 +1683,26 @@ maAdm.prototype.alarmPrint = function alarmPrint(args)
+ 	    'closed': 'open');
+ 	fprintf(out, 'opened:          %s (%s ago)\n',
+ 	    alarm.a_time_opened.toISOString(),
+-	    fmtDuration(now - alarm.a_time_opened.getTime()));
++	    common.fmtDuration(now - alarm.a_time_opened.getTime()));
+ 	fprintf(out, 'last event:      %s (%s ago)\n',
+ 	    alarm.a_time_last.toISOString(),
+-	    fmtDuration(now - alarm.a_time_last.getTime()));
++	    common.fmtDuration(now - alarm.a_time_last.getTime()));
+ 	if (alarm.a_time_closed === null) {
+ 		fprintf(out, 'closed:          never\n');
+ 	} else {
+ 		fprintf(out, 'closed:          %s (%s ago)\n',
+ 		    alarm.a_time_closed.toISOString(),
+-		    fmtDuration(now - alarm.a_time_closed.getTime()));
++		    common.fmtDuration(now - alarm.a_time_closed.getTime()));
+ 	}
+ 	fprintf(out, 'notifications:   %s\n', alarm.a_suppressed ?
+ 	    'disabled' : 'enabled');
+ 	fprintf(out, 'total faults:    %s\n', alarm.a_faults.length);
+ 	fprintf(out, 'total events:    %s\n', alarm.a_nevents);
+ 	fprintf(out, 'affects zones:   %s\n', details.affects.join(', '));
++	if (details.maintOnly) {
++		fprintf(out, 'NOTE: all faults for this alarm ' +
++		    'originated inside a maintenance window.\n');
++	}
+ 
+ 	if (alarm.a_faults.length === 0) {
+ 		return (null);
+@@ -1616,10 +1718,16 @@ maAdm.prototype.alarmPrint = function alarmPrint(args)
+ 		fprintf(out, '\n    FAULT %d of %d FOR ALARM %d\n',
+ 		    i + 1, alarm.a_faults.length, alarm.a_id);
+ 		fault = alarm.a_faults[i];
++
++		if (fault.aflt_ismaint) {
++			fprintf(out, '    NOTE: This fault originated inside ' +
++			    'a maintenance window.\n');
++		}
++
+ 		fprintf(out, '    reason:          %s\n', fault.aflt_summary);
+ 		fprintf(out, '    time:            %s (%s ago)\n',
+ 		    fault.aflt_time.toISOString(),
+-		    fmtDuration(now - fault.aflt_time.getTime()));
++		    common.fmtDuration(now - fault.aflt_time.getTime()));
+ 		fprintf(out, '    machine:         %s\n', fault.aflt_machine);
+ 		fprintf(out, '    agent:           %s\n', fault.aflt_agent);
+ 		fprintf(out, '    agent alias:     %s\n',
+@@ -1754,6 +1862,147 @@ maAdm.prototype.doKaPrint = function doKaPrint(args)
+ 	fprintf(out, 'SUGGESTED ACTION:\n%s\n', wrapper(ka.ka_action));
+ };
+ 
++/*
++ * Prints a tabular summary of maintenance windows.  This accepts arguments
++ * similar to the other "list" functions.
++ */
++maAdm.prototype.alarmsMaintWindowsList = function (args)
++{
++	var rows;
++
++	assertplus.object(args, 'args');
++	assertplus.object(args.stream, 'args.stream');
++	assertplus.optionalArrayOfString(args.columns, 'args.columns');
++	assertplus.bool(args.omitHeader, 'args.omitHeader');
++	assertplus.notStrictEqual(this.ma_maint_windows, null,
++	    'must call alarmsInit() with "windows" source first');
++
++	rows = [];
++	this.ma_maint_windows.forEach(function (maintwin) {
++		var row;
++
++		row = {
++		    'WIN': maintwin.win_id,
++		    'START': fmtDateToSecond(maintwin.win_tstart.toISOString()),
++		    'END': fmtDateToSecond(maintwin.win_tend.toISOString()),
++		    'SCOPE': maintwin.scopeName(),
++		    'NOTES': maintwin.win_notes !== null ?
++		        maintwin.win_notes : '-'
++		};
++
++		rows.push(row);
++	});
++
++	this.doList({
++	    'stream': args.stream,
++	    'columnsSelected': args.columns,
++	    'columnsDefault': [ 'win', 'start', 'end', 'scope', 'notes' ],
++	    'columnMetadata': maMaintWindowColumns,
++	    'rows': rows,
++	    'omitHeader': args.omitHeader
++	});
++};
++
++/*
++ * Prints a human-readable summary of maintenance windows.  The only named
++ * argument is "stream", the output stream to which the summary should be
++ * written.
++ */
++maAdm.prototype.alarmsMaintWindowsShow = function (args)
++{
++	var stream;
++
++	assertplus.object(args, 'args');
++	assertplus.object(args.stream, 'args.stream');
++	assertplus.notStrictEqual(this.ma_maint_windows, null,
++	    'must call alarmsInit() with "windows" source first');
++
++	stream = args.stream;
++	this.ma_maint_windows.forEach(function (maintwin) {
++		var duration = common.fmtDuration(maintwin.win_tend.getTime() -
++		        maintwin.win_tstart.getTime());
++		fprintf(stream, 'MAINTENANCE WINDOW %4d: %s for %s\n',
++		    maintwin.win_id, maintwin.win_tstart.toISOString(),
++		    duration);
++		fprintf(stream, '    start:    %s\n',
++		    maintwin.win_tstart.toISOString());
++		fprintf(stream, '    end:      %s\n',
++		    maintwin.win_tend.toISOString());
++		fprintf(stream, '    duration: %s\n', duration);
++		fprintf(stream, '    notes:    %s\n',
++		    maintwin.win_notes === null ?  'NO NOTES SPECIFIED' :
++		    maintwin.win_notes);
++		fprintf(stream, '    affects:  ');
++
++		if (maintwin.win_scope ==
++		    alarms.AmonMaintWindow.WIN_SCOPE_ALL) {
++			fprintf(stream, 'all probes, probe groups, and ' +
++			    'machines\n');
++		} else {
++			switch (maintwin.win_scope) {
++			case alarms.AmonMaintWindow.WIN_SCOPE_MACHINES:
++				fprintf(stream, 'specific machines: ');
++				break;
++			case alarms.AmonMaintWindow.WIN_SCOPE_PROBES:
++				fprintf(stream, 'specific probes: ');
++				break;
++			default:
++				assertplus.equal(maintwin.win_scope,
++				    alarms.AmonMaintWindow.
++				    WIN_SCOPE_PROBEGROUPS);
++				fprintf(stream, 'specific probe groups: ');
++				break;
++			}
++
++			if (maintwin.win_targets.length === 0) {
++				fprintf(stream, 'NONE\n');
++			} else {
++				fprintf(stream, '\n%s',
++				    maintwin.win_targets.map(function (t) {
++					return ('        ' + t + '\n');
++				    }).join(''));
++			}
++		}
++
++		fprintf(stream, '\n');
++	});
++};
++
++/*
++ * Create a maintenance window.  By the time we get here, this should be
++ * validated already, having the same arguments as the underlying
++ * amonCreateMaintWindow().
++ */
++maAdm.prototype.alarmsMaintWindowCreate = function (args, callback)
++{
++	assertplus.object(args, 'args');
++	assertplus.object(args.windef, 'args.windef');
++
++	alarms.amonCreateMaintWindow({
++	    'amonRaw': this.ma_sdc.AMON_RAW,
++	    'account': this.ma_app.owner_uuid,
++	    'windef': args.windef
++	}, callback);
++};
++
++/*
++ * Delete a list of maintenance windows, each identified by id.  Invalid window
++ * ids are operational errors here (resulting in warnings).
++ */
++maAdm.prototype.alarmsMaintWindowsDelete = function (args, callback)
++{
++	assertplus.object(args, 'args');
++	assertplus.arrayOfString(args.winIds, 'args.winIds');
++	assertplus.number(args.concurrency, 'args.concurrency');
++
++	alarms.amonDeleteMaintWindows({
++	    'amonRaw': this.ma_sdc.AMON_RAW,
++	    'account': this.ma_app.owner_uuid,
++	    'winIds': args.winIds,
++	    'concurrency': args.concurrency
++	}, callback);
++};
++
+ /*
+  * General-purpose function for printing tabular output.
+  */
+@@ -3779,52 +4028,26 @@ function fmtListDateTime(ts)
+ 	return (new Date(ts).toISOString());
+ }
+ 
+-function fmtDateOnly(ts)
++/*
++ * Format a Date object as an ISO timestamp, but only out to second precision.
++ */
++function fmtDateToSecond(ts)
+ {
+ 	if (ts === null) {
+ 		return ('-');
+ 	}
+ 
+-	return (new Date(ts).toISOString().substr(0, '2017-02-06'.length));
++	return (new Date(ts).toISOString().substr(
++	    0, '2017-02-06T00:00:00'.length) + 'Z');
+ }
+ 
+-/*
+- * TODO This implementation is copied from manta-marlin.  It should be moved to
+- * node-jsprim.
+- */
+-function fmtDuration(ms)
++function fmtDateOnly(ts)
+ {
+-	var hour, min, sec, rv;
+-
+-	/* compute totals in each unit */
+-	assertplus.number(ms, 'ms');
+-	sec = Math.floor(ms / 1000);
+-	min = Math.floor(sec / 60);
+-	hour = Math.floor(min / 60);
+-
+-	/* compute offsets for each unit */
+-	ms %= 1000;
+-	sec %= 60;
+-	min %= 60;
+-
+-	rv = '';
+-	if (hour > 0)
+-		rv += hour + 'h';
+-
+-	if (hour > 0 || min > 0) {
+-		if (hour > 0 && min < 10)
+-			rv += '0' + min + 'm';
+-		else
+-			rv += min + 'm';
++	if (ts === null) {
++		return ('-');
+ 	}
+ 
+-	if ((hour > 0 || min > 0) && sec < 10)
+-		rv += '0' + sec;
+-	else
+-		rv += sec;
+-
+-	rv += 's';
+-	return (rv);
++	return (new Date(ts).toISOString().substr(0, '2017-02-06'.length));
+ }
+ 
+ function formatCmdOutput(prefix, streamname, str)
+diff --git a/lib/alarms/amon_objects.js b/lib/alarms/amon_objects.js
+index 784d452..061f7f1 100644
+--- a/lib/alarms/amon_objects.js
++++ b/lib/alarms/amon_objects.js
+@@ -25,6 +25,9 @@ var common = require('../common');
+ exports.loadAlarmObject = loadAlarmObject;
+ exports.loadProbeObject = loadProbeObject;
+ exports.loadProbeGroupObject = loadProbeGroupObject;
++exports.loadMaintWindow = loadMaintWindow;
++/* Exported for the scope-related constants */
++exports.AmonMaintWindow = AmonMaintWindow;
+ 
+ /*
+  * This class is used as a struct, with details exposed to the next-level
+@@ -46,6 +49,8 @@ function AmonAlarm(alarmdef)
+ 	assertplus.number(alarmdef.timeLastEvent, 'alarmdef.timeLastEvent');
+ 	assertplus.number(alarmdef.numEvents, 'alarmdef.numEvents');
+ 	assertplus.arrayOfObject(alarmdef.faults, 'alarmdef.faults');
++	assertplus.arrayOfObject(alarmdef.maintFaults,
++	    'alarmdef.maintFaults');
+ 
+ 	this.a_id = alarmdef.id;
+ 	this.a_user = alarmdef.user;
+@@ -58,8 +63,10 @@ function AmonAlarm(alarmdef)
+ 	this.a_time_last = new Date(alarmdef.timeLastEvent);
+ 	this.a_nevents = alarmdef.numEvents;
+ 	this.a_faults = alarmdef.faults.map(function (f) {
+-		return (new AmonFault(self, f));
+-	});
++		return (new AmonFault(self, f, false));
++	}).concat(alarmdef.maintFaults.map(function (f) {
++		return (new AmonFault(self, f, true));
++	}));
+ }
+ 
+ /*
+@@ -67,7 +74,7 @@ function AmonAlarm(alarmdef)
+  * subsystem (lib/adm.js).  The fields here mirror those in the Amon API for
+  * Alarms.
+  */
+-function AmonFault(alarm, faultdef)
++function AmonFault(alarm, faultdef, ismaint)
+ {
+ 	assertplus.object(alarm, 'alarm');
+ 	assertplus.ok(alarm instanceof AmonAlarm);
+@@ -89,6 +96,7 @@ function AmonFault(alarm, faultdef)
+ 	assertplus.object(faultdef.event.data, 'faultdef.event.data');
+ 	assertplus.string(faultdef.event.data.message,
+ 	    'faultdef.event.data.message');
++	assertplus.bool(ismaint, 'ismaint');
+ 
+ 	this.aflt_alarm = alarm;
+ 	this.aflt_probeid = faultdef.probe;
+@@ -100,6 +108,7 @@ function AmonFault(alarm, faultdef)
+ 	this.aflt_time = new Date(faultdef.event.time);
+ 	this.aflt_summary = faultdef.event.data.message;
+ 	this.aflt_data = faultdef.event.data;
++	this.aflt_ismaint = ismaint;
+ }
+ 
+ /*
+@@ -156,6 +165,91 @@ function AmonProbeGroup(groupdef)
+ 	this.pg_enabled = groupdef.disabled ? false : true;
+ }
+ 
++/*
++ * This class is used as a struct, with details exposed to the next-level
++ * subsystem (lib/adm.js).  The fields here mirror those in the Amon API for
++ * Maintenance Windows.
++ */
++function AmonMaintWindow(windef)
++{
++	assertplus.object(windef, 'windef');
++	assertplus.number(windef.id, 'windef.id');
++	assertplus.string(windef.user, 'windef.user');
++	assertplus.number(windef.start, 'windef.start');
++	assertplus.number(windef.end, 'windef.end');
++	assertplus.optionalString(windef.notes, 'windef.notes');
++	assertplus.optionalBool(windef.all, 'windef.all');
++	assertplus.optionalArrayOfString(windef.machines, 'windef.machines');
++	assertplus.optionalArrayOfString(windef.probes, 'windef.probes');
++	assertplus.optionalArrayOfString(windef.probeGroups,
++	    'windef.probeGroups');
++
++	this.win_id = windef.id;
++	this.win_user = windef.user;
++	this.win_tstart = new Date(windef.start);
++	this.win_tend = new Date(windef.end);
++	this.win_notes = typeof (windef.notes) == 'string' ?
++	    windef.notes : null;
++	this.win_targets = null;
++
++	if (windef.all) {
++		assertplus.ok(!windef.probes);
++		assertplus.ok(!windef.probeGroups);
++		assertplus.ok(!windef.machines);
++		this.win_scope = AmonMaintWindow.WIN_SCOPE_ALL;
++	} else if (windef.probes) {
++		assertplus.ok(!windef.probeGroups);
++		assertplus.ok(!windef.machines);
++		this.win_scope = AmonMaintWindow.WIN_SCOPE_PROBES;
++		this.win_targets = windef.probes.slice(0);
++	} else if (windef.probeGroups) {
++		assertplus.ok(!windef.machines);
++		this.win_scope = AmonMaintWindow.WIN_SCOPE_PROBEGROUPS;
++		this.win_targets = windef.probeGroups.slice(0);
++	} else {
++		assertplus.ok(windef.machines);
++		this.win_scope = AmonMaintWindow.WIN_SCOPE_MACHINES;
++		this.win_targets = windef.machines.slice(0);
++	}
++
++	assertplus.string(this.win_scope);
++}
++
++AmonMaintWindow.prototype.scopeAll = function ()
++{
++	assertplus.string(this.win_scope);
++	return (this.win_scope == AmonMaintWindow.WIN_SCOPE_ALL);
++};
++
++AmonMaintWindow.prototype.scopeName = function ()
++{
++	var rv;
++
++	switch (this.win_scope) {
++	case AmonMaintWindow.WIN_SCOPE_ALL:
++		rv = 'all';
++		break;
++	case AmonMaintWindow.WIN_SCOPE_PROBES:
++		rv = 'probes';
++		break;
++	case AmonMaintWindow.WIN_SCOPE_PROBEGROUPS:
++		rv = 'probegroups';
++		break;
++	default:
++		assertplus.strictEqual(this.win_scope,
++		    AmonMaintWindow.WIN_SCOPE_MACHINES);
++		rv = 'machines';
++		break;
++	}
++
++	return (rv);
++};
++
++AmonMaintWindow.WIN_SCOPE_ALL = '_winscope_all';
++AmonMaintWindow.WIN_SCOPE_PROBES = '_winscope_probes';
++AmonMaintWindow.WIN_SCOPE_PROBEGROUPS = '_winscope_probegroups';
++AmonMaintWindow.WIN_SCOPE_MACHINES = '_winscope_machines';
++
+ 
+ /*
+  * Schema helper functions
+@@ -291,6 +385,11 @@ var schemaTypeAmonAlarm = {
+ 	    'type': 'array',
+ 	    'required': true,
+ 	    'items': schemaTypeAmonFault
++	},
++	'maintFaults': {
++	    'type': 'array',
++	    'required': true,
++	    'items': schemaTypeAmonFault
+ 	}
+     }
+ };
+@@ -349,13 +448,30 @@ var schemaTypeAmonProbeGroup = {
+     }
+ };
+ 
++var schemaTypeAmonMaintWindow = {
++    'type': 'object',
++    'properties': {
++	'id': schemaTypeNonNegativeIntegerRequired,
++	'user': { 'type': 'string',  'required': true },
++	'start': schemaTypeTimestampAsNumberRequired,
++	'end': schemaTypeTimestampAsNumberRequired,
++	'notes': { 'type': 'string' },
++
++	'all': { 'type': 'boolean' },
++	'probes': { 'type': 'array', 'items': { 'type': 'string' } },
++	'probeGroups': { 'type': 'array', 'items': { 'type': 'string' } },
++	'machines': { 'type': 'array', 'items': { 'type': 'string' } }
++    }
++};
++
+ function loadAlarmObject(alarmdef)
+ {
+ 	var error;
+ 
+ 	error = jsprim.validateJsonObject(schemaTypeAmonAlarm, alarmdef);
+ 	if (error === null &&
+-	    !alarmdef.closed && alarmdef.faults.length === 0) {
++	    !alarmdef.closed && alarmdef.faults.length === 0 &&
++	    alarmdef.maintFaults.length === 0) {
+ 		error = new VError('alarm open with no faults');
+ 	}
+ 
+@@ -409,3 +525,46 @@ function loadProbeGroupObject(groupdef)
+ 
+ 	return (new AmonProbeGroup(groupdef));
+ }
++
++function loadMaintWindow(windef)
++{
++	var error, nscopes;
++
++	error = jsprim.validateJsonObject(schemaTypeAmonMaintWindow, windef);
++	if (error === null) {
++		/*
++		 * Validate that exactly one of the scope properties is present.
++		 */
++		nscopes = 0;
++
++		if (windef.all) {
++			nscopes++;
++		}
++		if (windef.probes) {
++			nscopes++;
++		}
++		if (windef.probeGroups) {
++			nscopes++;
++		}
++		if (windef.machines) {
++			nscopes++;
++		}
++
++		if (nscopes != 1) {
++			error = new VError('expected exactly one of "all", ' +
++			    '"machines", "probes", or "probeGroups" ' +
++			    'properties, but found %d', nscopes);
++		}
++	}
++
++	if (error !== null) {
++		if (typeof (windef.id) == 'number') {
++			error = new VError(error,
++			    'maintenance window %d', windef.id);
++		}
++
++		return (error);
++	}
++
++	return (new AmonMaintWindow(windef));
++}
+diff --git a/lib/alarms/index.js b/lib/alarms/index.js
+index a215109..7efaa98 100644
+--- a/lib/alarms/index.js
++++ b/lib/alarms/index.js
+@@ -207,6 +207,9 @@
+  *       and classes for walking these structures for the purpose of verifying
+  *       or updating the configuration.
+  *
++ *     - lib/alarms/maint.js: defines data structures and functions for working
++ *       with Amon maintenance windows
++ *
+  *     - lib/alarms/metadata.js: defines data structures and functions for
+  *       working with the locally provided metadata for known failure modes.
+  *
+@@ -220,7 +223,9 @@
+ var alarm_metadata = require('./metadata');
+ var alarm_alarms = require('./alarms');
+ var alarm_config = require('./config');
++var alarm_maint_windows = require('./maint_windows');
+ var alarm_update = require('./update');
++var amon_objects = require('./amon_objects');
+ 
+ /* Exported interfaces */
+ 
+@@ -241,5 +246,11 @@ exports.amonUpdatePlanCreate = alarm_update.amonUpdatePlanCreate;
+ exports.amonUpdatePlanSummarize = alarm_update.amonUpdatePlanSummarize;
+ exports.amonUpdatePlanApply = alarm_update.amonUpdatePlanApply;
+ 
++/* Maintenance windows */
++exports.amonCreateMaintWindow = alarm_maint_windows.amonCreateMaintWindow;
++exports.amonDeleteMaintWindows = alarm_maint_windows.amonDeleteMaintWindows;
++exports.amonLoadMaintWindows = alarm_maint_windows.amonLoadMaintWindows;
++exports.AmonMaintWindow = amon_objects.AmonMaintWindow;
++
+ /* Local metadata */
+ exports.loadMetadata = alarm_metadata.loadMetadata;
+diff --git a/lib/alarms/maint_windows.js b/lib/alarms/maint_windows.js
+new file mode 100644
+index 0000000..94f5432
+--- /dev/null
++++ b/lib/alarms/maint_windows.js
+@@ -0,0 +1,252 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * lib/alarms/maint_windows.js: manage maintenance windows
++ */
++
++var assertplus = require('assert-plus');
++var extsprintf = require('extsprintf');
++var jsprim = require('jsprim');
++var vasync = require('vasync');
++var VError = require('verror');
++var sprintf = extsprintf.sprintf;
++
++var amon_objects = require('./amon_objects');
++
++exports.amonLoadMaintWindows = amonLoadMaintWindows;
++exports.amonCreateMaintWindow = amonCreateMaintWindows;
++exports.amonDeleteMaintWindows = amonDeleteMaintWindows;
++
++/*
++ * Load the list of Amon maintenance windows from the Amon master API, creating
++ * an AmonMaintWindow object for each valid window found on the server.  Named
++ * arguments include:
++ *
++ *    account (string)	the Triton account for which to fetch windows
++ *
++ *    amonRaw (object)	a restify client created for the Amon master API.
++ *    			Note that this is not an sdc-clients Amon client.
++ *
++ * The callback is invoked as callback(err, windows), where "windows" (if
++ * present) is a list of AmonMaintWindow objects.  If "windows" is falsey, then
++ * the call completely failed, and "err" indicates why.  It's possible for "err"
++ * and "windows" to both be present, which indicates that we successfully
++ * retrieved a list of windows, but some of them could not be interpreted
++ * correctly.  "err" describes the problems in interpreting those windows.
++ */
++function amonLoadMaintWindows(args, callback)
++{
++	var client, account, uripath;
++
++	assertplus.object(args, 'args');
++	assertplus.string(args.account, 'args.account');
++	assertplus.object(args.amonRaw, 'args.amonRaw');
++
++	client = args.amonRaw;
++	account = args.account;
++	uripath = sprintf('/pub/%s/maintenances', encodeURIComponent(account));
++	client.get(uripath, function (err, req, res, rawWindows) {
++		var warnings, windows;
++
++		if (err) {
++			err = new VError(err, 'amon: get "%s"', uripath);
++			callback(err);
++			return;
++		}
++
++		warnings = [];
++		windows = [];
++		rawWindows.forEach(function (rawWindow) {
++			var maintwin = amon_objects.loadMaintWindow(rawWindow);
++			if (!(maintwin instanceof Error) &&
++			    maintwin.win_user != account) {
++				maintwin = new VError('window %d: ' +
++				    'account does not match expected',
++				    maintwin.win_id);
++			}
++
++			if (maintwin instanceof Error) {
++				warnings.push(maintwin);
++			} else {
++				windows.push(maintwin);
++			}
++		});
++
++		callback(VError.errorFromList(warnings), windows);
++	});
++}
++
++/*
++ * Create a single maintenance window.  Named arguments include:
++ *
++ *    account (string)  the Triton account in which to create the window
++ *
++ *    amonRaw (object)  a restify client created for the Amon master API
++ *                      Note that this is not an sdc-clients Amon client.
++ *
++ *    windef (object)   defines the window itself
++ *
++ *        start (Date)     start time of the window
++ *
++ *        end (Date)       end time of the window
++ *
++ *        notes (string)   notes for the window
++ *
++ *        all (boolean)    indicates that this is not scoped to machines,
++ *                         probes, or probe groups
++ *
++ *        machines         limit scope to specified array of machine uuids
++ *                         (strings)
++ *
++ *        probes           limit scope to specified array of probe uuids
++ *                         (strings)
++ *
++ *        probeGroups       limit scope to specified array of probe group uuids
++ *                          (strings)
++ *
++ * Note that only one of "all", "machines", "probes", or "probe groups" may be
++ * specified.  See the Amon Master API documentation for details.
++ */
++function amonCreateMaintWindows(args, callback)
++{
++	var client, account, uripath, winparams;
++
++	assertplus.object(args, 'args');
++	assertplus.string(args.account, 'args.account');
++	assertplus.object(args.amonRaw, 'args.amonRaw');
++	assertplus.object(args.windef, 'args.windef');
++	assertplus.object(args.windef.start, 'args.windef.start');
++	assertplus.ok(args.windef.start instanceof Date);
++	assertplus.object(args.windef.end, 'args.windef.end');
++	assertplus.ok(args.windef.end instanceof Date);
++	assertplus.optionalString(args.windef.notes, 'args.windef.notes');
++	assertplus.optionalBool(args.windef.all, 'args.windef.all');
++	assertplus.optionalArrayOfString(
++	    args.windef.probes, 'args.windef.probes');
++	assertplus.optionalArrayOfString(
++	    args.windef.probeGroups, 'args.windef.probeGroups');
++	assertplus.optionalArrayOfString(
++	    args.windef.machines, 'args.windef.machines');
++
++	winparams = {};
++	winparams.start = args.windef.start.toISOString();
++	winparams.end = args.windef.end.toISOString();
++	if (typeof (args.windef.notes) == 'string') {
++		winparams.notes = args.windef.notes;
++	}
++
++	if (args.windef.probes) {
++		assertplus.ok(!args.windef.probeGroups);
++		assertplus.ok(!args.windef.machines);
++		winparams.probes = args.windef.probes;
++	} else if (args.windef.probeGroups) {
++		assertplus.ok(!args.windef.machines);
++		winparams.probeGroups = args.windef.probeGroups;
++	} else if (args.windef.machines) {
++		winparams.machines = args.windef.machines;
++	} else {
++		winparams.all = true;
++	}
++
++	client = args.amonRaw;
++	account = args.account;
++	uripath = sprintf('/pub/%s/maintenances', encodeURIComponent(account));
++	client.post(uripath, winparams, function (err, req, res, obj) {
++		if (!err) {
++			obj = amon_objects.loadMaintWindow(obj);
++			if (obj instanceof Error) {
++				err = new VError(obj,
++				    'window created, but could not ' +
++				    'process response');
++			} else if (obj.win_user != account) {
++				err = new VError(obj,
++				    'window created, but returned with ' +
++				    'a different account');
++			}
++		}
++
++		if (err) {
++			err = new VError(err, 'amon: post "%s"', uripath);
++			callback(err);
++		} else {
++			callback(err, obj);
++		}
++	});
++}
++
++/*
++ * Deletes the specified list of windows.
++ *
++ * Named arguments:
++ *
++ *    account (string)	the Triton account for which to fetch windows
++ *
++ *    amonRaw (object)	a restify client created for the Amon master API.
++ *    			Note that this is not an sdc-clients Amon client.
++ *
++ *    winIds (array)    array of strings identifying windows to delete
++ *
++ *    concurrency (int) number of operations to attempt in parallel
++ *
++ * Note that the window ids are validated, and invalid windows are operational
++ * errors (not programmer errors).
++ */
++function amonDeleteMaintWindows(args, callback)
++{
++	var client, account, errors, queue;
++
++	assertplus.object(args, 'args');
++	assertplus.string(args.account, 'args.account');
++	assertplus.object(args.amonRaw, 'args.amonRaw');
++	assertplus.arrayOfString(args.winIds, 'args.winIds');
++	assertplus.number(args.concurrency, 'args.concurrency');
++
++	client = args.amonRaw;
++	account = args.account;
++	errors = [];
++	queue = vasync.queuev({
++	    'concurrency': args.concurrency,
++	    'worker': function deleteWindow(winid, qcallback) {
++		var num, uripath;
++
++		num = jsprim.parseInteger(winid);
++		if (typeof (num) == 'number' && num < 1) {
++			num = VError('not a positive integer');
++		}
++
++		if (num instanceof Error) {
++			errors.push(new VError(num, 'window "%s"', winid));
++			qcallback();
++			return;
++		}
++
++		assertplus.equal(typeof (num), 'number');
++		uripath = sprintf('/pub/%s/maintenances/%d',
++		    encodeURIComponent(account), num);
++		client.del(uripath, function (err) {
++			if (err) {
++				err = new VError(err,
++				    'amon: delete "%s"', uripath);
++				errors.push(err);
++			}
++
++			qcallback();
++		});
++	    }
++	});
++
++	args.winIds.forEach(function (w) { queue.push(w); });
++	queue.on('end', function () {
++		callback(VError.errorFromList(errors));
++	});
++
++	queue.close();
++}
+diff --git a/lib/common.js b/lib/common.js
+index 48fb6da..349c19e 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -658,6 +658,45 @@ function sortObjectsByProps(rows, comparators)
+ 	}));
+ }
+ 
++/*
++ * TODO This implementation is copied from manta-marlin.  It should be moved to
++ * node-jsprim.
++ */
++function fmtDuration(ms)
++{
++	var hour, min, sec, rv;
++
++	/* compute totals in each unit */
++	assert.number(ms, 'ms');
++	sec = Math.floor(ms / 1000);
++	min = Math.floor(sec / 60);
++	hour = Math.floor(min / 60);
++
++	/* compute offsets for each unit */
++	ms %= 1000;
++	sec %= 60;
++	min %= 60;
++
++	rv = '';
++	if (hour > 0)
++		rv += hour + 'h';
++
++	if (hour > 0 || min > 0) {
++		if (hour > 0 && min < 10)
++			rv += '0' + min + 'm';
++		else
++			rv += min + 'm';
++	}
++
++	if ((hour > 0 || min > 0) && sec < 10)
++		rv += '0' + sec;
++	else
++		rv += sec;
++
++	rv += 's';
++	return (rv);
++}
++
+ exports.shuffle = shuffle;
+ exports.domainToPath = domainToPath;
+ exports.initSdcClients = initSdcClients;
+@@ -671,3 +710,4 @@ exports.commandExecute = commandExecute;
+ exports.insert = insert;
+ exports.stripe = stripe;
+ exports.sortObjectsByProps = sortObjectsByProps;
++exports.fmtDuration = fmtDuration;
+diff --git a/man/man1/manta-adm.1 b/man/man1/manta-adm.1
+index 4c464aa..acd8e0d 100644
+--- a/man/man1/manta-adm.1
++++ b/man/man1/manta-adm.1
+@@ -169,6 +169,14 @@ status of the program to determine success or failure.
+ .PP
+ \fB\fCmanta\-adm alarm list [\-H] [\-o FIELD...] [\-\-state=STATE]\fR
+ .PP
++\fB\fCmanta\-adm alarm maint create CREATE_OPTIONS\fR
++.PP
++\fB\fCmanta\-adm alarm maint delete WIN_ID...\fR
++.PP
++\fB\fCmanta\-adm alarm maint list [\-H] [\-o FIELD...]\fR
++.PP
++\fB\fCmanta\-adm alarm maint show\fR
++.PP
+ \fB\fCmanta\-adm alarm metadata events\fR
+ .PP
+ \fB\fCmanta\-adm alarm metadata ka [EVENT_NAME...]\fR
+@@ -187,6 +195,8 @@ view open alarms (\fB\fCshow\fR, \fB\fClist\fR, \fB\fCdetails\fR, and \fB\fCfaul
+ configure notifications for open alarms (\fB\fCnotify\fR subcommand)
+ .IP \(bu 2
+ view local metadata about alarms and probes (\fB\fCmetadata\fR subcommand)
++.IP \(bu 2
++view and configure amon maintenance windows (\fB\fCmaint\fR subcommand)
+ .RE
+ .PP
+ The primary commands for working with alarms are:
+@@ -230,6 +240,10 @@ resurface.  In the case of transient issues, a new alarm may not open again
+ until the issue occurs again, which could be days, weeks, or months later.  That
+ does not mean the underlying issue was actually resolved.
+ .PP
++As mentioned above, this command attempts to separately close each of the
++specified alarms.  It's possible for some of the specified alarms to be closed
++even if others were not.
++.PP
+ \fB\fCmanta\-adm alarm config probegroup list [\-H] [\-o FIELD...]\fR
+ .PP
+ List configured probe groups in tabular form.  This is primarily useful in
+@@ -303,6 +317,102 @@ may be any of "open", "closed", "all", or "recent".  The default is "open".
+ .PP
+ See also the \fB\fCmanta\-adm alarm show\fR command.
+ .PP
++\fB\fCmanta\-adm alarm maint create CREATE_OPTIONS\fR
++.PP
++Creates (schedules) an Amon maintenance window, which is a period of time and a
++scope for which alarm notifications are suspended.  Maintenance windows have a
++start time, an end time, and an operator\-provided notes field (typically used to
++reference a ticket number in some other system).  By default, maintenance
++windows affect all notifications for an account (and so Manta maintenance
++windows affect all Manta\-related notifications), but they can be scoped to a
++specific set of probes, probe groups, or machines.
++.PP
++During maintenance windows, Amon continues to execute all probe checks and it
++continues to open new alarms for failing probe checks.  However, faults created
++during a maintenance window that are within the scope of that window are
++reported as "maintenance faults", and such faults do not trigger notifications.
++.PP
++As an example, suppose an operator creates a maintenance window for the period
++today between 0200Z and 0400Z scoped to machine "lb7".  At 0214Z, Amon detects a
++failure for a "log\-scan" probe on machine "lb7" that would normally open a new
++alarm and send notifications.  The alarm is opened as usual.  Because the event
++happened within the maintenance window's time period and within its scope
++(namely, machine "lb7"), a new maintenance fault is created, not a regular
++fault, and no notifications are sent out.  But the alarm remains open until an
++operator closes it.  A probe check failure for "lb7" after 0400Z would result in
++a normal fault being created for the same alarm, and notifications would be
++sent.  Similarly, a probe check failure at 0300Z for a different machine would
++result in notifications being sent, even if the resulting fault would be
++attached to the same alarm (e.g., because the "lb7" probe and this new probe are
++in the same probe group).
++.PP
++The following three option\-arguments are always required:
++.TP
++\fB\fC\-\-start START_TIME\fR
++Specifies the start time of the maintenance window.  \fB\fCSTART_TIME\fR should be an
++ISO 8601 timestamp, or else the special string \fB\fCnow\fR, which means that the
++window should begin immediately.
++.TP
++\fB\fC\-\-end END_TIME\fR
++Specifies the end time of the maintenance window.  \fB\fCEND_TIME\fR should be an ISO
++8601 timestamp, and it must be later than the specified start time.
++.TP
++\fB\fC\-\-notes NOTES\fR
++Provides arbitrary notes to be recorded with the window.  This is intended for
++operators to reference tickets or other identifiers in other systems.  The
++system ignores the contents of this field except to report it back via the
++other subcommands.
++.PP
++You may also specify:
++.TP
++\fB\fC\-\-machine MACHINE_UUID, \-\-probe PROBE_UUID, \-\-probegroup GROUP_UUID\fR
++Limits the scope of the maintenance window so that it only affects the
++specified machines, probes, or probe groups.  You can specify any one of these
++options multiple times (e.g., to specify multiple machines), but you cannot
++mix these options together.  The values are only validated for basic syntax.
++They are not validated against the set of deployed machines, probes, or probe
++groups.
++.PP
++Note that Amon automatically deletes maintenance windows whose end time has
++passed.  This tool does not allow you to create maintenance windows whose end
++time is in the past.
++.PP
++Example: create an alarm for the period between 0200Z and 0400Z on July 17,
++2017 associated with ticket \fB\fCCM\-123\fR
++.PP
++.RS
++.nf
++# manta\-adm alarm maint create \-\-start=2017\-07\-17T02:00:00Z \\
++    \-\-end=2017\-07\-17T04:00:00Z \-\-notes "CM\-123"
++.fi
++.RE
++.PP
++\fB\fCmanta\-adm alarm maint delete WIN_ID...\fR
++.PP
++Deletes (cancels) the maintenance windows with identifiers \fB\fCWIN_ID...\fR\&.  The
++windows will no longer show up in the \fB\fCmanta\-adm alarm maint list\fR or \fB\fCmanta\-adm
++alarm maint show\fR output, and Amon will resume sending notifications for events
++that would have fallen within the window's time period and scope.
++.PP
++\fB\fCWIN_ID\fR is Amon's integer identifier for the window.  You can retrieve this
++from the \fB\fCmanta\-adm alarm maint list\fR or \fB\fCmanta\-adm alarm maint show\fR commands.
++.PP
++This command attempts to separately delete each of the specified windows.  If it
++fails to delete any of them (e.g., because they're not valid window identifiers
++or because of a transient problem with Amon), it may still have deleted others.
++.PP
++\fB\fCmanta\-adm alarm maint list [\-H] [\-o FIELD...]\fR
++.PP
++Lists basic information about outstanding maintenance windows.  This command is
++intended when you want tabular output or specific fields.  See the \fB\fCmanta\-adm
++alarm maint show\fR command for a more useful human\-readable summary.
++.PP
++\fB\fCmanta\-adm alarm maint show\fR
++.PP
++Summarizes each outstanding maintenance window.  This is intended for human
++operators, not programmatic tools.  The output format may change in future
++versions.
++.PP
+ \fB\fCmanta\-adm alarm metadata events\fR
+ .PP
+ List the names for all of the events known to this version of \fB\fCmanta\-adm\fR\&.  Each
+diff --git a/package.json b/package.json
+index 212aa89..6df79ca 100644
+--- a/package.json
++++ b/package.json
+@@ -33,5 +33,8 @@
+         "verror": "1.10.0",
+         "wordwrap": "1.0.0",
+         "zonename": "1.1.0"
++    },
++    "devDependencies": {
++	"strsplit": "^1.0.0"
+     }
+ }
+diff --git a/test/alarms/tst.alarms.js b/test/alarms/tst.alarms.js
+index 3dc0177..8ca6001 100644
+--- a/test/alarms/tst.alarms.js
++++ b/test/alarms/tst.alarms.js
+@@ -158,6 +158,7 @@ function main()
+ 				assertplus.equal(f.aflt_time.toISOString(),
+ 				    tsiso);
+ 				assertplus.equal(f.aflt_summary, 'boom (35)');
++				assertplus.strictEqual(f.aflt_ismaint, false);
+ 
+ 				/*
+ 				 * The second one is largely the same, but has
+@@ -400,6 +401,7 @@ alarmsById['35'] = {
+     'timeClosed': null,
+     'timeLastEvent': timestamp,
+     'numEvents': 3,
++    'maintFaults': [],
+     'faults': [ {
+ 	    'type': 'probe',
+ 	    'probe': 'probe-uuid-35',
+@@ -429,6 +431,7 @@ alarmsById['40'] = {
+     'timeClosed': null,
+     'timeLastEvent': timestamp,
+     'numEvents': 3,
++    'maintFaults': [],
+     'faults': [ {
+ 	'type': 'probe',
+ 	'probe': 'probe-uuid-40',
+@@ -458,6 +461,7 @@ alarmsById['45'] = {
+     'timeClosed': null,
+     'timeLastEvent': timestamp,
+     'numEvents': 3,
++    'maintFaults': [],
+     'faults': [ {
+ 	'type': 'probe',
+ 	'probe': 'probe-uuid-nonexistent',
+@@ -488,6 +492,7 @@ alarmsById['50'] = {
+     'timeClosed': null,
+     'timeLastEvent': timestamp,
+     'numEvents': 3,
++    'maintFaults': [],
+     'faults': [ {
+ 	'type': 'probe',
+ 	'probe': 'probe-uuid-nonexistent',
+@@ -517,6 +522,7 @@ alarmsById['55'] = {
+     'timeClosed': null,
+     'timeLastEvent': timestamp,
+     'numEvents': 3,
++    'maintFaults': [],
+     'faults': [ {
+ 	'type': 'probe',
+ 	'probe': 'probe-uuid-nonexistent',
+diff --git a/test/alarms/tst.amon_objects.js b/test/alarms/tst.amon_objects.js
+index bb3686c..ac29f13 100644
+--- a/test/alarms/tst.amon_objects.js
++++ b/test/alarms/tst.amon_objects.js
+@@ -32,7 +32,7 @@ function main()
+  *
+  *    name (string)	name of the test case
+  *
+- *    objtype (string)	one of "probe", "probe group", or "alarm"
++ *    objtype (string)	one of "probe", "probe group", "alarm", or "window"
+  *
+  *    input (object)	an object as it might be returned from Amon
+  *
+@@ -75,6 +75,10 @@ function runTestCase(tc)
+ 		load = amon_objects.loadProbeGroupObject;
+ 		break;
+ 
++	case 'window':
++		load = amon_objects.loadMaintWindow;
++		break;
++
+ 	default:
+ 		throw (new VError('unsupported object type: "%s"', tc.objtype));
+ 	}
+@@ -101,7 +105,7 @@ function runTestCase(tc)
+ 
+ function generateTestCases()
+ {
+-	var validAlarm, validProbeGroup, validProbe, input;
++	var validAlarm, validProbeGroup, validProbe, validWindow, input;
+ 
+ 	testCases = [];
+ 
+@@ -151,6 +155,23 @@ function generateTestCases()
+ 			'message': 'a different summary message'
+ 		    }
+ 		}
++	    } ],
++	    'maintFaults': [ {
++		'type': 'probe',
++		'probe': 'probe-uuid-3',
++		'event': {
++		    'v': 1,
++		    'type': 'probe',
++		    'clear': true,
++		    'machine': 'machine-uuid-3',
++		    'uuid': 'event-uuid-3',
++		    'agent': 'agent-uuid-3',
++		    'agentAlias': 'anAgent3',
++		    'time': Date.parse('2017-04-26T08:54:32.876Z'),
++		    'data': {
++			'message': 'a maintenance summary message'
++		    }
++		}
+ 	    } ]
+ 	};
+ 
+@@ -173,7 +194,7 @@ function generateTestCases()
+ 		    '2017-04-26T09:54:32.876Z');
+ 		assertplus.strictEqual(result.a_nevents, 14);
+ 		assertplus.arrayOfObject(result.a_faults);
+-		assertplus.strictEqual(result.a_faults.length, 2);
++		assertplus.strictEqual(result.a_faults.length, 3);
+ 
+ 		/*
+ 		 * If new properties are added to alarm objects, they should be
+@@ -208,6 +229,7 @@ function generateTestCases()
+ 		assertplus.strictEqual(fault.aflt_summary,
+ 		    'some summary message');
+ 		assertplus.object(fault.aflt_data);
++		assertplus.strictEqual(fault.aflt_ismaint, false);
+ 
+ 		/*
+ 		 * Similarly, if new properties are added to fault objects,
+@@ -223,7 +245,8 @@ function generateTestCases()
+ 		    'aflt_agent_alias',
+ 		    'aflt_time',
+ 		    'aflt_summary',
+-		    'aflt_data'
++		    'aflt_data',
++		    'aflt_ismaint'
+ 		]);
+ 		assertplus.deepEqual([], extras,
+ 		    'fault object has untested properties: ' +
+@@ -231,6 +254,7 @@ function generateTestCases()
+ 
+ 		fault = result.a_faults[1];
+ 		assertplus.ok(fault.aflt_alarm == result);
++		assertplus.strictEqual(fault.aflt_ismaint, false);
+ 		assertplus.strictEqual(fault.aflt_probeid, 'probe-uuid-2');
+ 		assertplus.strictEqual(fault.aflt_clear, true);
+ 		assertplus.strictEqual(fault.aflt_uuid, 'event-uuid-2');
+@@ -241,6 +265,21 @@ function generateTestCases()
+ 		    '2017-04-26T08:54:32.876Z');
+ 		assertplus.strictEqual(fault.aflt_summary,
+ 		    'a different summary message');
++
++		fault = result.a_faults[2];
++		assertplus.ok(fault.aflt_alarm == result);
++		assertplus.strictEqual(fault.aflt_ismaint, true);
++		assertplus.strictEqual(fault.aflt_probeid, 'probe-uuid-3');
++		assertplus.strictEqual(fault.aflt_clear, true);
++		assertplus.strictEqual(fault.aflt_uuid, 'event-uuid-3');
++		assertplus.strictEqual(fault.aflt_machine, 'machine-uuid-3');
++		assertplus.strictEqual(fault.aflt_agent, 'agent-uuid-3');
++		assertplus.strictEqual(fault.aflt_agent_alias, 'anAgent3');
++		assertplus.strictEqual(fault.aflt_time.toISOString(),
++		    '2017-04-26T08:54:32.876Z');
++		assertplus.strictEqual(fault.aflt_summary,
++		    'a maintenance summary message');
++
+ 	    }
+ 	} ];
+ 
+@@ -490,6 +529,7 @@ function generateTestCases()
+ 
+ 	input = jsprim.deepCopy(validAlarm);
+ 	input.faults = [];
++	input.maintFaults = [];
+ 	testCases.push({
+ 	    'name': 'alarm: open with no faults',
+ 	    'objtype': 'alarm',
+@@ -673,6 +713,142 @@ function generateTestCases()
+ 		        '": number.*found.*required')
+ 		});
+ 	    });
++
++	/*
++	 * Maintenance window objects
++	 */
++
++	validWindow = {
++	    'id': 3,
++	    'user': 'account-one',
++	    'start': Date.parse('2017-04-25T01:23:45.678Z'),
++	    'end': Date.parse('2017-04-25T03:23:45.678Z'),
++	    'all': true
++	};
++
++	input = jsprim.deepCopy(validWindow);
++	testCases.push({
++	    'name': 'window: basic case (all)',
++	    'objtype': 'window',
++	    'input': input,
++	    'verify': function verifyBasicWindowAll(w) {
++		assertplus.equal(w.win_id, 3);
++		assertplus.equal(w.win_user, 'account-one');
++		assertplus.equal(w.win_tstart.toISOString(),
++		    '2017-04-25T01:23:45.678Z');
++		assertplus.equal(w.win_tend.toISOString(),
++		    '2017-04-25T03:23:45.678Z');
++		assertplus.strictEqual(w.win_notes, null);
++		assertplus.strictEqual(w.win_targets, null);
++		assertplus.strictEqual(w.win_scope,
++		    amon_objects.AmonMaintWindow.WIN_SCOPE_ALL);
++	    }
++	});
++
++	input = jsprim.deepCopy(validWindow);
++	delete (input['all']);
++	input['notes'] = 'my note';
++	input['machines'] = [ 'machine-1', 'machine-2' ];
++	testCases.push({
++	    'name': 'window: basic case (machines)',
++	    'objtype': 'window',
++	    'input': input,
++	    'verify': function verifyBasicWindowMachine(w) {
++		assertplus.equal(w.win_id, 3);
++		assertplus.strictEqual(w.win_notes, 'my note');
++		assertplus.deepEqual(w.win_targets,
++		    [ 'machine-1', 'machine-2' ]);
++		assertplus.strictEqual(w.win_scope,
++		    amon_objects.AmonMaintWindow.WIN_SCOPE_MACHINES);
++	    }
++	});
++
++	input = jsprim.deepCopy(validWindow);
++	delete (input['all']);
++	input['probes'] = [ 'probe-1' ];
++	testCases.push({
++	    'name': 'window: basic case (probes)',
++	    'objtype': 'window',
++	    'input': input,
++	    'verify': function verifyBasicWindowProbe(w) {
++		assertplus.equal(w.win_id, 3);
++		assertplus.strictEqual(w.win_notes, null);
++		assertplus.deepEqual(w.win_targets, [ 'probe-1' ]);
++		assertplus.strictEqual(w.win_scope,
++		    amon_objects.AmonMaintWindow.WIN_SCOPE_PROBES);
++	    }
++	});
++
++	input = jsprim.deepCopy(validWindow);
++	delete (input['all']);
++	input['probeGroups'] = [];
++	testCases.push({
++	    'name': 'window: basic case (probe groups)',
++	    'objtype': 'window',
++	    'input': input,
++	    'verify': function verifyBasicWindowGroup(w) {
++		assertplus.equal(w.win_id, 3);
++		assertplus.strictEqual(w.win_notes, null);
++		assertplus.deepEqual(w.win_targets, []);
++		assertplus.strictEqual(w.win_scope,
++		    amon_objects.AmonMaintWindow.WIN_SCOPE_PROBEGROUPS);
++	    }
++	});
++
++	/* Exercise what happens when we provide more than one scope. */
++	input = jsprim.deepCopy(validWindow);
++	input['probeGroups'] = [];
++	testCases.push({
++	    'name': 'window: "all" and "probeGroups"',
++	    'objtype': 'window',
++	    'input': input,
++	    'errmsg': new RegExp('^maintenance window 3: expected exactly ' +
++	        'one of "all", "machines", "probes", or "probeGroups" ' +
++		'properties, but found 2$')
++	});
++
++	/* Exercise what happens when we provide no scope. */
++	input = jsprim.deepCopy(validWindow);
++	delete (input['all']);
++	testCases.push({
++	    'name': 'window: missing scope',
++	    'objtype': 'window',
++	    'input': input,
++	    'errmsg': new RegExp('^maintenance window 3: expected exactly ' +
++	        'one of "all", "machines", "probes", or "probeGroups" ' +
++		'properties, but found 0$')
++	});
++
++	/*
++	 * For each required property, create a test case that exercises what
++	 * happens when that property is missing.
++	 */
++	[ 'id', 'start', 'end' ].forEach(function (prop) {
++		input = jsprim.deepCopy(validWindow);
++		delete (input[prop]);
++		testCases.push({
++		    'name': 'window: missing "' + prop + '"',
++		    'objtype': 'window',
++		    'input': input,
++		    'errmsg': new RegExp(
++		        'property "' + prop + '": .* missing and.*required')
++		});
++	});
++
++	/*
++	 * "Bad type" test cases
++	 */
++	[ 'id', 'start', 'end' ].forEach(function (prop) {
++		input = jsprim.deepCopy(validWindow);
++		input[prop] = 'asdf';
++		testCases.push({
++		    'name': 'window: bad type for "' + prop + '"',
++		    'objtype': 'window',
++		    'input': input,
++		    'errmsg': new RegExp(
++		        'property "' + prop + '": string value found.*required')
++		});
++	});
+ }
+ 
+ main();
+diff --git a/test/alarms/tst.maint_windows.js b/test/alarms/tst.maint_windows.js
+new file mode 100644
+index 0000000..bda89ab
+--- /dev/null
++++ b/test/alarms/tst.maint_windows.js
+@@ -0,0 +1,649 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * tst.maint_windows.js: integration test for maintenance windows.  This test
++ * exercises the "manta-adm alarm maint" functionality, including:
++ *
++ * - a bunch of invalid invocations
++ * - creating a few windows
++ * - listing and showing details about these windows
++ * - removing these windows
++ */
++
++var assertplus = require('assert-plus');
++var cmdutil = require('cmdutil');
++var forkexec = require('forkexec');
++var path = require('path');
++var strsplit = require('strsplit');
++var vasync = require('vasync');
++var VError = require('verror');
++
++/*
++ * Below are parameters used for windows created by this test.  The "example"
++ * values are the ones we use as a base for most successful cases.  These dates
++ * are deliberately very far in the future so that Amon will not remove them
++ * while we're running.  To those debugging this test failing on the first
++ * Monday (US time) in 2038: sorry for this, and best of luck with that Y2038
++ * thing.
++ */
++var exampleStart = '2038-01-06T17:00:00Z';
++var exampleEnd = '2038-01-06T21:00:00Z';
++var exampleNote = 'tst.maint_windows.js test';
++var exampleArgs = [ 'create', '--start', exampleStart, '--end', exampleEnd,
++    '--notes',  exampleNote ];
++
++/* "end" time for a window longer than the expected maximum */
++var longEnd = '2038-01-06T21:01:00Z';
++/* "start" and "end" times for a window in the past */
++var pastStart = '2007-07-16T00:00:00Z';
++var pastEnd = '2017-07-16T01:00:00Z';
++
++/* path to the "manta-adm" executable */
++var execname = path.join(__dirname, '..', '..', 'bin', 'manta-adm');
++/* initial arguments used for all command invocations */
++var baseArgs = [ process.execPath, execname, 'alarm', 'maint' ];
++
++/*
++ * These counters help verify that the Node program does not exit prematurely.
++ */
++var nstarted = 0;
++var ndone = 0;
++
++var testsInvalid;
++
++function main()
++{
++	vasync.forEachPipeline({
++	    'func': runTestCase,
++	    'inputs': testsInvalid
++	}, function (err) {
++		if (err) {
++			cmdutil.fail(err);
++		}
++
++		assertplus.equal(ndone, nstarted);
++		assertplus.equal(nstarted, testsInvalid.length);
++
++		var ctx = {};
++		nstarted++;
++		vasync.pipeline({
++		    'arg': ctx,
++		    'funcs': validPipeline
++		}, function (pipelineErr) {
++			if (pipelineErr) {
++				cmdutil.fail(pipelineErr);
++			}
++
++			assertplus.equal(ndone, nstarted);
++		});
++	});
++}
++
++/*
++ * Each of these test cases should cause the command to exit with non-zero
++ * status and an error message.  These should have no side effects and do not
++ * require that any Triton services be configured or online.
++ */
++testsInvalid = [ {
++    'name': 'missing command',
++    'argv': [],
++    'error': /^manta-adm alarm: error: no command given$/
++}, {
++    'name': 'create: --start: missing',
++    'argv': [ 'create', '--end', exampleEnd, '--notes', exampleNote ],
++    'error': /^manta-adm alarm: error: argument is required: --start$/
++}, {
++    'name': 'create: --end: missing',
++    'argv': [ 'create', '--start', exampleStart, '--notes', exampleNote ],
++    'error': /^manta-adm alarm: error: argument is required: --end$/
++}, {
++    'name': 'create: --notes: missing',
++    'argv': [ 'create', '--start', exampleStart, '--end', exampleEnd ],
++    'error': /^manta-adm alarm: error: argument is required: --notes$/
++}, {
++    'name': 'create: --start: bad date',
++    'argv': [ 'create', '--start', 'never', '--end', exampleEnd,
++	'--notes', exampleNote ],
++    'error': /^manta-adm alarm: error: unsupported value for --start: never$/
++}, {
++    'name': 'create: --end: bad date',
++    'argv': [ 'create', '--start', exampleStart, '--end', 'never', '--notes',
++	exampleNote ],
++    'error': /arg for "--end" is not a valid date format: "never"$/
++}, {
++    'name': 'create: --start/--end: entire window is in the past',
++    'argv': [ 'create', '--start', pastStart, '--end', pastEnd, '--notes',
++	exampleNote ],
++    'error': /^manta-adm alarm: error: cannot create windows in the past$/
++}, {
++    'name': 'create: --start/--end: window is empty',
++    'argv': [ 'create', '--start', exampleStart, '--end', exampleStart,
++	'--notes', exampleNote ],
++    'error': /specified window does not start before it ends/
++}, {
++    'name': 'create: bad combination of scopes (probe, probe group)',
++    'argv': exampleArgs.concat(
++	[ '--probe', 'probe1', '--probegroup', 'group1' ]),
++    'error': /only one of --probe, --probegroup, or --machine/
++}, {
++    'name': 'create: bad combination of scopes (probe, machine)',
++    'argv': exampleArgs.concat(
++	[ '--probe', 'probe1', '--machine', 'machine1' ]),
++    'error': /only one of --probe, --probegroup, or --machine/
++}, {
++    'name': 'create: bad combination of scopes (probe group, machine)',
++    'argv': exampleArgs.concat(
++	[ '--probegroup', 'group1', '--machine', 'machine1' ]),
++    'error': /only one of --probe, --probegroup, or --machine/
++}, {
++    'name': 'create: --probe: bad value',
++    'argv': exampleArgs.concat([ '--probe', 'foo,bar' ]),
++    'error': /identifier "foo,bar": does not look like a valid uuid$/
++}, {
++    'name': 'create: --probegroup: bad value',
++    'argv': exampleArgs.concat([ '--probegroup', 'foo,bar' ]),
++    'error': /identifier "foo,bar": does not look like a valid uuid$/
++}, {
++    'name': 'create: --machine: bad value',
++    'argv': exampleArgs.concat([ '--machine', 'foo,bar' ]),
++    'error': /identifier "foo,bar": does not look like a valid uuid$/
++}, {
++    'name': 'create: extra arguments',
++    'argv': exampleArgs.concat([ 'boom' ]),
++    'error': /^manta-adm alarm: error: unexpected arguments$/
++}, {
++    'name': 'delete: missing arguments',
++    'argv': [ 'delete' ],
++    'error': /^manta-adm alarm: error: expected WINID$/
++}, {
++    'name': 'delete: invalid concurrency',
++    'argv': [ 'delete', '--concurrency=bump' ],
++    'error': /arg for "--concurrency" is not a positive integer: "bump"$/
++}, {
++    'name': 'list: extra arguments',
++    'argv': [ 'list', 'boom' ],
++    'error': /^manta-adm alarm: error: unexpected arguments$/
++}, {
++    'name': 'show: extra arguments',
++    'argv': [ 'show', 'boom' ],
++    'error': /^manta-adm alarm: error: unexpected arguments$/
++} ];
++
++function runTestCase(tc, callback)
++{
++	var argv;
++
++	assertplus.object(tc, 'tc');
++	assertplus.string(tc.name, 'tc.name');
++	assertplus.arrayOfString(tc.argv, 'tc.argv');
++
++	console.error('test case: %s', tc.name);
++	argv = baseArgs.concat(tc.argv);
++	nstarted++;
++	forkexec.forkExecWait({
++	    'argv': argv
++	}, function (err, result) {
++		var stderr, testresult;
++
++		ndone++;
++		assertplus.number(result.status,
++		    'command did not exit normally');
++		assertplus.strictEqual(result.signal, null,
++		    'command did not exit normally');
++
++		if (tc.error) {
++			assertplus.ok(result.status !== 0,
++			    'expected non-zero exit status');
++			stderr = result.stderr.trim();
++			testresult = tc.error.test(stderr);
++			if (!testresult) {
++				console.error('output did not match expected');
++				console.error('found:    %s', stderr);
++				console.error('expected: %s', tc.error.source);
++				callback(new Error('test case failed'));
++				return;
++			}
++		} else {
++			assertplus.strictEqual(result.status, 0,
++			    'expected zero exit status');
++		}
++
++		callback(null, result);
++	});
++}
++
++function findTestWindows(callback)
++{
++	var found;
++
++	console.error('listing windows to find test windows');
++	found = [];
++	forkexec.forkExecWait({
++	    'argv': baseArgs.concat([ 'list', '-H', '-o', 'win,notes' ])
++	}, function (err, result) {
++		var windows;
++
++		if (err) {
++			callback(new VError(err, 'listing for test windows'));
++			return;
++		}
++
++		windows = result.stdout.trim().split('\n');
++		windows.forEach(function (l) {
++			var parts = strsplit(l.trim(), /\s+/, 2);
++			if (parts[1] == exampleNote) {
++				console.error('    found window %s ' +
++				    'from this test suite',
++				    parts[0]);
++				found.push(parts[0]);
++			} else {
++				console.error('    ignoring ' +
++				    'pre-existing window %s', parts[0]);
++			}
++		});
++
++		callback(null, found);
++	});
++}
++
++/*
++ * The following executes a valid sequence of commands that show, create, list,
++ * and delete maintenance windows.  If this fails partway through, it may leave
++ * these windows around.  However, upon startup and any successful completion,
++ * it removes any windows created by previous invocations.  It does not touch
++ * windows that existed prior to the test starting.
++ *
++ * The valid sequence looks like this:
++ *
++ * - find and remove windows from previous tests
++ * - initial "list" and "show", used to compare against later output
++ * - run through several normal "create" test cases
++ * - "list" and "show" the newly-created windows
++ * - run through "create" cases that produce warnings
++ * - "delete" one of the new windows, also supplying arguments to the "delete"
++ *   that produce operational errors.
++ * - "list" again to show the window was deleted
++ * - "delete" the rest of the windows we created (exiting status 0)
++ * - final "list" and "show" should match initial output
++ */
++var validPipeline = [
++	/*
++	 * Find and remove windows from previous invocations of this command.
++	 */
++
++	function listOldWindows(ctx, callback) {
++		findTestWindows(function (err, found) {
++			if (err) {
++				callback(err);
++				return;
++			}
++
++			ctx.ctx_found = found;
++			callback();
++		});
++	},
++
++	function removeOldTestWindows(ctx, callback) {
++		if (ctx.ctx_found.length === 0) {
++			console.error('no old windows to remove');
++			setImmediate(callback);
++			return;
++		}
++
++		console.error('removing %s old window%s',
++		    ctx.ctx_found.length, ctx.ctx_found.length != 1 ? 's' : '');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'delete' ]).concat(ctx.ctx_found)
++		}, function (err) {
++			if (err) {
++				err = new VError(err, 'removing old windows');
++			}
++
++			callback(err);
++		});
++	},
++
++
++	/*
++	 * Save the output of "show" and "list" for comparison later.
++	 */
++
++	function showInitial(ctx, callback) {
++		console.error('initial "show"');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'show' ])
++		}, function (err, result) {
++			if (err) {
++				callback(new VError(err, 'initial "show"'));
++				return;
++			}
++
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			ctx.ctx_initial_show = result.stdout;
++			callback();
++		});
++	},
++
++	function listInitial(ctx, callback) {
++		console.error('initial "list"');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'list' ])
++		}, function (err, result) {
++			if (err) {
++				callback(new VError(err, 'initial "list"'));
++				return;
++			}
++
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			ctx.ctx_initial_list = result.stdout;
++			callback();
++		});
++	},
++
++
++	/*
++	 * Run through several "create" test cases.
++	 */
++
++	function createNormalAll(ctx, callback) {
++		runTestCase({
++		    'name': 'normal create, scope "all"',
++		    'argv': exampleArgs
++		}, function (err, result) {
++			assertplus.ok(!err);
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			callback();
++		});
++	},
++
++	function createNormalMachines(ctx, callback) {
++		runTestCase({
++		    'name': 'normal create, scope "machines"',
++		    'argv': exampleArgs.concat([ '--machine', 'machine1' ])
++		}, function (err, result) {
++			assertplus.ok(!err);
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			callback();
++		});
++	},
++
++	function createNormalProbes(ctx, callback) {
++		runTestCase({
++		    'name': 'normal create, scope "probes"',
++		    'argv': exampleArgs.concat(
++		        [ '--probe', 'probe1', '--probe', 'probe2' ])
++		}, function (err, result) {
++			assertplus.ok(!err);
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			callback();
++		});
++	},
++
++	function createNormalGroups(ctx, callback) {
++		runTestCase({
++		    'name': 'normal create, scope "probegroups"',
++		    'argv': exampleArgs.concat([ '--probegroup', 'group1' ])
++		}, function (err, result) {
++			assertplus.ok(!err);
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			callback();
++		});
++	},
++
++
++	/*
++	 * At this point, list the newly created windows.  This is a basic
++	 * exercise of the "list" command output.  Because all of the windows
++	 * that we've created up to this point are in the far future, we expect
++	 * the initial "list" output to be a prefix of this new output.
++	 */
++
++	function listNew(ctx, callback) {
++		console.error('list all windows');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'list' ])
++		}, function (err, result) {
++			var lines;
++
++			if (err) {
++				callback(new VError(err, 'later "list"'));
++				return;
++			}
++
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			assertplus.ok(result.stdout.indexOf(
++			    ctx.ctx_initial_list) === 0);
++
++			/*
++			 * Strip out the unique identifiers from the
++			 * newly-created windows so that we can have stable
++			 * output for a basic stdout comparison.  Because the
++			 * expected stdout is supposed to be hand-checked
++			 * whenever it's updated, if this regexp becomes
++			 * erroneously aggressive, that should cause the test to
++			 * fail.
++			 */
++			console.log('"list" for newly-created windows:');
++			lines = result.stdout.substr(
++			    ctx.ctx_initial_list.length).trim().split('\n');
++			lines.forEach(function (l) {
++				console.log('%s', l.replace(
++				    /^\s*\d+/, '<id_stripped_by_test_suite>'));
++			});
++			callback();
++		});
++	},
++
++	function showNew(ctx, callback) {
++		console.error('show all windows');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'show' ])
++		}, function (err, result) {
++			var lines;
++
++			if (err) {
++				callback(new VError(err, 'later "show"'));
++				return;
++			}
++
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			assertplus.ok(result.stdout.indexOf(
++			    ctx.ctx_initial_show) === 0);
++
++			/*
++			 * See the note about "list" above.
++			 */
++			console.log('"show" for newly-created windows:');
++			lines = result.stdout.substr(
++			    ctx.ctx_initial_show.length).trim().split('\n');
++			lines.forEach(function (l) {
++				console.log('%s', l.replace(
++				    /^MAINTENANCE WINDOW\s*\d+:/,
++				    'MAINTENANCE WINDOW ' +
++				    '<id_stripped_by_test_suite>:'));
++			});
++
++			callback();
++		});
++	},
++
++
++	/*
++	 * Exercise "create" cases that produce warnings: a long window, and a
++	 * window that extends into the past.
++	 */
++
++	function createLong(ctx, callback) {
++		runTestCase({
++		    'name': 'create long window',
++		    'argv': [ 'create', '--start', exampleStart, '--end',
++		        longEnd, '--notes', exampleNote ]
++		}, function (err, result) {
++			var warnings;
++
++			assertplus.ok(!err);
++			warnings = result.stderr.trim().split('\n').sort();
++			assertplus.deepEqual(warnings, [
++			    'note: maintenance window exceeds expected ' +
++			        'maximum (4h00m00s)'
++			]);
++			callback();
++		});
++	},
++
++	function createPartwayPast(ctx, callback) {
++		runTestCase({
++		    'name': 'create window extending into past',
++		    'argv': [ 'create', '--start', pastStart, '--end',
++		        exampleEnd, '--notes', exampleNote ]
++		}, function (err, result) {
++			var warnings;
++
++			assertplus.ok(!err);
++			warnings = result.stderr.trim().split('\n').sort();
++			assertplus.deepEqual(warnings, [
++			    'note: maintenance window exceeds expected ' +
++			        'maximum (4h00m00s)',
++			    'note: maintenance window starts in the past'
++			]);
++			callback();
++		});
++	},
++
++
++	/*
++	 * Find and delete one of the windows we created, plus a few invalid
++	 * values.  This should successfully delete the one we created and split
++	 * out warnings for the other values.
++	 */
++
++	function findNewTestWindows(ctx, callback) {
++		findTestWindows(function (err, found) {
++			if (err) {
++				callback(err);
++				return;
++			}
++
++			assertplus.equal(found.length, 6,
++			    'expected six test windows created so far');
++			ctx.ctx_new = found;
++			callback();
++		});
++	},
++
++	function deleteValidAndInvalid(ctx, callback) {
++		console.error('removing one valid and several invalid windows');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'delete' ]).concat(
++		        [ '--', 'bogus', ctx.ctx_new[0], '-1' ])
++		}, function (err, result) {
++			var errors;
++
++			errors = result.stderr.trim().split('\n').sort();
++			assertplus.notStrictEqual(result.status, 0);
++			assertplus.deepEqual(errors, [
++			    'error: window "-1": not a positive integer',
++			    'error: window "bogus": invalid number: "bogus"'
++			]);
++			callback();
++		});
++	},
++
++	/*
++	 * Prove to ourselves that despite those errors, one window was removed.
++	 */
++	function findRemainingTestWindows(ctx, callback) {
++		findTestWindows(function (err, found) {
++			if (err) {
++				callback(err);
++				return;
++			}
++
++			assertplus.equal(found.length, 5,
++			    'expected five test windows remaining');
++			assertplus.deepEqual(found, ctx.ctx_new.slice(1));
++			ctx.ctx_remaining = found;
++			callback();
++		});
++	},
++
++
++	/*
++	 * Remove the rest of the windows that we've created.
++	 */
++	function deleteRemainingTestWindows(ctx, callback) {
++		console.error('remove remaining test windows');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'delete' ]).concat(
++		        ctx.ctx_remaining)
++		}, function (err, result) {
++			assertplus.strictEqual(result.status, 0);
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			callback();
++		});
++	},
++
++
++	/*
++	 * Finally, "list" and "show" again and make sure the output is the same
++	 * as before we started.
++	 */
++
++	function checkFinalList(ctx, callback) {
++		console.error('list final');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'list' ])
++		}, function (err, result) {
++			if (err) {
++				callback(new VError(err, 'final "list"'));
++				return;
++			}
++
++			assertplus.strictEqual(result.stdout,
++			    ctx.ctx_initial_list,
++			    'unexpected change from start');
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			callback();
++		});
++	},
++
++	function checkFinalShow(ctx, callback) {
++		console.error('show final');
++		forkexec.forkExecWait({
++		    'argv': baseArgs.concat([ 'show' ])
++		}, function (err, result) {
++			if (err) {
++				callback(new VError(err, 'final "show"'));
++				return;
++			}
++
++			assertplus.strictEqual(result.stdout,
++			    ctx.ctx_initial_show,
++			    'unexpected change from start');
++			assertplus.strictEqual(result.stderr, '',
++			    'unexpected content on stderr');
++			ndone++;
++			callback();
++		});
++	}
++];
++
++main();
+diff --git a/test/alarms/tst.maint_windows.js.out b/test/alarms/tst.maint_windows.js.out
+new file mode 100644
+index 0000000..ed686da
+--- /dev/null
++++ b/test/alarms/tst.maint_windows.js.out
+@@ -0,0 +1,37 @@
++"list" for newly-created windows:
++<id_stripped_by_test_suite> 2038-01-06T17:00:00Z 2038-01-06T21:00:00Z all         tst.maint_windows.js test
++<id_stripped_by_test_suite> 2038-01-06T17:00:00Z 2038-01-06T21:00:00Z machines    tst.maint_windows.js test
++<id_stripped_by_test_suite> 2038-01-06T17:00:00Z 2038-01-06T21:00:00Z probes      tst.maint_windows.js test
++<id_stripped_by_test_suite> 2038-01-06T17:00:00Z 2038-01-06T21:00:00Z probegroups tst.maint_windows.js test
++"show" for newly-created windows:
++MAINTENANCE WINDOW <id_stripped_by_test_suite>: 2038-01-06T17:00:00.000Z for 4h00m00s
++    start:    2038-01-06T17:00:00.000Z
++    end:      2038-01-06T21:00:00.000Z
++    duration: 4h00m00s
++    notes:    tst.maint_windows.js test
++    affects:  all probes, probe groups, and machines
++
++MAINTENANCE WINDOW <id_stripped_by_test_suite>: 2038-01-06T17:00:00.000Z for 4h00m00s
++    start:    2038-01-06T17:00:00.000Z
++    end:      2038-01-06T21:00:00.000Z
++    duration: 4h00m00s
++    notes:    tst.maint_windows.js test
++    affects:  specific machines: 
++        machine1
++
++MAINTENANCE WINDOW <id_stripped_by_test_suite>: 2038-01-06T17:00:00.000Z for 4h00m00s
++    start:    2038-01-06T17:00:00.000Z
++    end:      2038-01-06T21:00:00.000Z
++    duration: 4h00m00s
++    notes:    tst.maint_windows.js test
++    affects:  specific probes: 
++        probe1
++        probe2
++
++MAINTENANCE WINDOW <id_stripped_by_test_suite>: 2038-01-06T17:00:00.000Z for 4h00m00s
++    start:    2038-01-06T17:00:00.000Z
++    end:      2038-01-06T21:00:00.000Z
++    duration: 4h00m00s
++    notes:    tst.maint_windows.js test
++    affects:  specific probe groups: 
++        group1
+diff --git a/test/tst.oneach_exec.js b/test/tst.oneach_exec.js
+index 4a3c325..06c01da 100644
+--- a/test/tst.oneach_exec.js
++++ b/test/tst.oneach_exec.js
+@@ -18,7 +18,6 @@
+ var assertplus = require('assert-plus');
+ var bunyan = require('bunyan');
+ var cmdutil = require('cmdutil');
+-var forkexec = require('forkexec');
+ var jsprim = require('jsprim');
+ var path = require('path');
+ var vasync = require('vasync');

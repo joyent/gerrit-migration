@@ -1,0 +1,420 @@
+commit 7440ea4e9fdd0f482d19e7a5dc23d6f88e4290b0 (refs/changes/50/3250/2)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2018-01-22T19:16:36-08:00 (1 year, 9 months ago)
+    
+    TRITON-59 check that instances mounting NFS volumes are provisioned on networks on which volumes are reachable
+    VOLAPI-100 Attempting to mount a volume in an incorrect fabric network does not give an error correctly.
+
+diff --git a/lib/backends/sdc/containers.js b/lib/backends/sdc/containers.js
+index c8b2559..177631e 100644
+--- a/lib/backends/sdc/containers.js
++++ b/lib/backends/sdc/containers.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var child_process = require('child_process');
+@@ -27,7 +27,6 @@ var PAPI = require('sdc-clients').PAPI;
+ var restify = require('restify');
+ var triton_tags = require('triton-tags');
+ var vasync = require('vasync');
+-var VError = require('verror');
+ var VMAPI = require('sdc-clients').VMAPI;
+ 
+ var affinity = require('./affinity');
+@@ -39,8 +38,6 @@ var mod_containers = require('../../containers');
+ var mod_networks = require('./networks');
+ var utils = require('./utils');
+ var validate = require('../../validate');
+-var VolumesUnreachableByContainerOnNetworksError =
+-    errors.VolumesUnreachableByContainerOnNetworksError;
+ 
+ //---- globals
+ 
+@@ -1875,12 +1872,16 @@ function buildVmPayload(opts, container, callback) {
+                 || container.HostConfig && container.HostConfig.Binds;
+ 
+             if (binds && binds.length > 0) {
+-                /*
+-                 * We already validated earlier that the proper NFS volumes
+-                 * experimental flags are enabled, so we know NFS volumes are
+-                 * supported if we're here.
+-                 */
+-                addNfsVolumesToPayload(opts, payload, binds);
++                if (dockerNfsVolumes !== true) {
++                    cb(new Error('Support for NFS volumes is not enabled'));
++                    return;
++                } else if (dockerNfsVolumesAutomount !== true) {
++                    cb(new Error('Support for automounting NFS volumes is not '
++                        + 'enabled'));
++                    return;
++                } else {
++                    addNfsVolumesToPayload(opts, payload, binds);
++                }
+             }
+ 
+             cb();
+@@ -2781,12 +2782,11 @@ function getContainers(opts, callback) {
+ 
+ function createContainer(opts, callback) {
+     assert.object(opts, 'opts');
+-    assert.object(opts.account, 'opts.account');
+     assert.object(opts.app, 'opts.app');
+-    assert.number(opts.clientApiVersion, 'opts.clientApiVersion');
+     assert.optionalObject(opts.log, 'opts.log');
+-    assert.object(opts.payload, 'opts.payload');
+     assert.string(opts.req_id, 'opts.req_id');
++    assert.object(opts.account, 'opts.account');
++    assert.number(opts.clientApiVersion, 'opts.clientApiVersion');
+ 
+     var log = opts.log || this.log;
+     var name = opts.name;
+@@ -2797,67 +2797,12 @@ function createContainer(opts, callback) {
+     var linkDetails;
+ 
+     vasync.waterfall([
+-        _checkNfsVolumesSupportEnabled,
+-        _allNfsVolumesNetworkReachable,
+         _buildPayload,
+         _addLinks,
+         _createVm,
+         _saveLinks
+     ], _done);
+ 
+-    function _checkNfsVolumesSupportEnabled(cb) {
+-        var binds;
+-        var dockerNfsVolumes = config.experimental_docker_nfs_shared_volumes;
+-        var dockerNfsVolumesAutomount =
+-            config.experimental_docker_automount_nfs_shared_volumes;
+-        var err;
+-
+-        if (container.Binds) {
+-            binds = container.Binds;
+-        } else if (container.HostConfig) {
+-            binds = container.HostConfig.Binds;
+-        }
+-
+-        if (binds && binds.length > 0) {
+-            if (dockerNfsVolumes !== true) {
+-                err = new Error('Support for NFS volumes is not enabled');
+-            } else if (dockerNfsVolumesAutomount !== true) {
+-                err = new Error('Support for automounting NFS volumes is not '
+-                    + 'enabled');
+-            }
+-        }
+-
+-        cb(err);
+-    }
+-    function _allNfsVolumesNetworkReachable(cb) {
+-        var app = opts.app;
+-        var binds;
+-        var containerNetwork;
+-
+-        if (container.Binds) {
+-            binds = container.Binds;
+-        } else if (container.HostConfig) {
+-            binds = container.HostConfig.Binds;
+-        }
+-
+-        if (container.HostConfig && container.HostConfig.NetworkMode) {
+-            containerNetwork = container.HostConfig.NetworkMode;
+-        }
+-
+-        if (binds) {
+-            _checkNfsVolumesReachableOnNetworkByContainer(binds,
+-                containerNetwork, name, {
+-                account: opts.account,
+-                app: opts.app,
+-                log: log,
+-                req_id: opts.req_id,
+-                volapiClient: app.volapi
+-            }, cb);
+-        } else {
+-            cb();
+-        }
+-    }
+-
+     function _buildPayload(cb) {
+         // XXX check that "name" is not already used? VMAPI also does that.
+         container.Name = name;
+@@ -2932,142 +2877,6 @@ function createContainer(opts, callback) {
+     }
+ }
+ 
+-function _checkNfsVolumesReachableOnNetworkByContainer(binds, networkName,
+-    containerName, opts, cb) {
+-    assert.arrayOfString(binds, 'binds');
+-    assert.optionalString(networkName, 'networkName');
+-    assert.object(opts, 'opts');
+-    assert.object(opts.account, 'opts.account');
+-    assert.object(opts.log, 'opts.log');
+-    assert.uuid(opts.req_id, 'opts.req_id');
+-    assert.object(opts.volapiClient, 'opts.volapiClient');
+-    assert.func(cb, 'cb');
+-
+-    var account = opts.account;
+-    var app = opts.app;
+-    var context = {};
+-    var log = opts.log;
+-    var networkUuid;
+-    var volapiClient = opts.volapiClient;
+-
+-    vasync.pipeline({arg: context, funcs: [
+-        function getNetworkInfo(ctx, next) {
+-            if (networkName === undefined || networkName === 'default'
+-                || networkName === 'bridge') {
+-                mod_networks.getDefaultFabricNetwork({
+-                    account: account,
+-                    app: app,
+-                    log: log
+-                }, function onGetDefaultFabricNet(getDefaultFabricNetErr,
+-                        defaultFabricNet) {
+-                    if (getDefaultFabricNetErr) {
+-                        next(getDefaultFabricNetErr);
+-                        return;
+-                    }
+-
+-                    networkUuid = defaultFabricNet;
+-                    next();
+-                });
+-            } else {
+-                mod_networks.findNetworkOrPoolByNameOrId(networkName, {
+-                    account: opts.account,
+-                    app: app,
+-                    config: app.config,
+-                    log: log,
+-                    req_id: opts.req_id
+-                }, function onGetNet(getNetErr, network) {
+-                    if (getNetErr) {
+-                        next(getNetErr);
+-                        return;
+-                    }
+-
+-                    networkUuid = network.uuid;
+-                    next();
+-                });
+-            }
+-        },
+-        function checkVolumes(ctx, next) {
+-            vasync.forEachParallel({
+-                func: function checkVolumeAtttachedToNetwork(bind, done) {
+-                    var bindComponents;
+-                    var volumeName;
+-
+-                    assert.string(bind, 'bind');
+-                    /*
+-                     * The format of each bind has been validated earlier, so we
+-                     * assume they're all valid.
+-                     */
+-                    bindComponents = bind.split(':');
+-                    assert.ok(bindComponents, 'bindComponents');
+-                    assert.ok(bindComponents.length > 1,
+-                            'bindComponents.length > 1');
+-                    volumeName = bindComponents[0];
+-
+-                    log.debug({
+-                        networkName: networkName,
+-                        owner_uuid: account.uuid,
+-                        volumeName: volumeName
+-                    }, 'checking that volume is reachable on network');
+-
+-                    volapiClient.listVolumes({
+-                        name: volumeName,
+-                        owner_uuid: account.uuid
+-                    }, function onListVolumes(listVolsErr, volumes) {
+-                        var volUnreachableErr;
+-
+-                        if (listVolsErr) {
+-                            done(listVolsErr);
+-                            return;
+-                        }
+-
+-                        if (!volumes || volumes.length === 0) {
+-                            log.info({
+-                                volumeName: volumeName, owner_uuid: account.uuid
+-                            }, 'No existing volume found, volume to be '
+-                                + 'created will be reachable');
+-                            /*
+-                             * No volume found, they will be created by the
+-                             * workflow job that provisions the Docker
+-                             * container, and they will be attached to the
+-                             * container's network, so they'll be reachable.
+-                             */
+-                            done();
+-                            return;
+-                        }
+-
+-                        if (volumes.length > 1) {
+-                            done(new Error('more than one volume with name '
+-                                + volumeName + ', expected 1 or 0'));
+-                            return;
+-                        }
+-
+-                        if (volumes[0].networks.indexOf(networkUuid) === -1) {
+-                            volUnreachableErr = new Error('volume ' + volumeName
+-                                + ' unreachable on network ' + networkUuid);
+-                            done(volUnreachableErr);
+-                        } else {
+-                            done();
+-                        }
+-                    });
+-                },
+-                inputs: binds
+-            }, function onVolumesChecked(volumesReachableErr) {
+-                var errs;
+-
+-                if (volumesReachableErr) {
+-                    errs = volumesReachableErr.errors();
+-                    next(new VolumesUnreachableByContainerOnNetworksError(
+-                        containerName, errs));
+-                } else {
+-                    next();
+-                }
+-            });
+-        }
+-    ]}, function allVolumesChecked(err, results) {
+-        cb(err);
+-    });
+-}
+-
+ function stopContainer(opts, callback) {
+     assert.object(opts, 'opts');
+     assert.optionalObject(opts.log, 'opts.log');
+diff --git a/lib/backends/sdc/networks.js b/lib/backends/sdc/networks.js
+index 6437216..3aba583 100644
+--- a/lib/backends/sdc/networks.js
++++ b/lib/backends/sdc/networks.js
+@@ -574,7 +574,6 @@ function findNetworkOrPoolByNameOrId(name, opts, callback) {
+  */
+ function getDefaultFabricNetwork(opts, callback) {
+     assert.object(opts, 'opts');
+-    assert.object(opts.account, 'opts.account');
+     assert.object(opts.app, 'opts.app');
+     assert.object(opts.app.config, 'opts.app.config');
+     assert.string(opts.app.config.datacenterName,
+diff --git a/lib/backends/sdc/volumes.js b/lib/backends/sdc/volumes.js
+index bc2f9cd..2655e80 100644
+--- a/lib/backends/sdc/volumes.js
++++ b/lib/backends/sdc/volumes.js
+@@ -126,10 +126,7 @@ function createVolume(volumeParams, options, callback) {
+                 mod_networks.findNetworkOrPoolByNameOrId(volumeParams.network,
+                     networkOpts,
+                     function onGetNamedNetwork(getNetworkErr, network) {
+-                        if (network) {
+-                            payload.networks = [network.uuid];
+-                        }
+-
++                        payload.networks = [network.uuid];
+                         next(getNetworkErr);
+                     });
+             }
+diff --git a/lib/errors.js b/lib/errors.js
+index eaf77a1..7d2d574 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -587,31 +587,32 @@ PathNotDirectoryError.restCode = 'VolumeSizeNotAvailable';
+ PathNotDirectoryError.statusCode = 409;
+ PathNotDirectoryError.description = 'Volume size is not available';
+ 
+-function VolumesUnreachableByContainerOnNetworksError(containerName, errors) {
+-    assert.string(containerName, 'containerName');
+-    assert.arrayOfObject(errors, 'errors');
++function VolumesNotReachableError(cause) {
++    assert.object(cause, 'cause');
+ 
+-    var message = 'Some volumes are not reachable from container '
+-        + containerName  + ': ' + errors.join(', ');
++    var message = 'Volumes not reachable from container';
+ 
+     _DockerBaseError.call(this, {
+         restCode: this.constructor.restCode,
+         statusCode: this.constructor.statusCode,
+-        message: message
++        message: message + ': ' + cause.body.errors.map(function render(err) {
++            return err.message;
++        }).join(', '),
++        cause: cause
+     });
+ }
+-util.inherits(VolumesUnreachableByContainerOnNetworksError, _DockerBaseError);
+-VolumesUnreachableByContainerOnNetworksError.prototype.name =
+-    'VolumesUnreachableByContainerOnNetworksError';
+-VolumesUnreachableByContainerOnNetworksError.restCode =
+-    'VolumesUnreachableByContainerOnNetworks';
+-VolumesUnreachableByContainerOnNetworksError.statusCode = 409;
+-VolumesUnreachableByContainerOnNetworksError.description =
+-    'Some volumes are not reachable by container on network';
++util.inherits(VolumesNotReachableError, _DockerBaseError);
++VolumesNotReachableError.prototype.name = 'VolumesNotReachableError';
++VolumesNotReachableError.restCode = 'VolumesNotReachableError';
++VolumesNotReachableError.statusCode = 409;
++VolumesNotReachableError.description = 'Volumes not reachable from container';
+ 
+ // ---- wrappers for API responses
+ 
+ function vmapiErrorWrap(cause, message) {
++    console.log('cause:', cause);
++    console.log('cause.restCode:', cause.restCode);
++
+     if (!cause) {
+         return cause;
+     } else if (!cause.restCode) {
+@@ -625,6 +626,9 @@ function vmapiErrorWrap(cause, message) {
+         case 'NoAllocatableServersError':
+             return new DockerNoComputeResourcesError();
+ 
++        case 'VolumesNotReachable':
++            return new VolumesNotReachableError(cause);
++
+         case 'VolumeServerNoResourcesError':
+             return new VolumeServerNoResourcesError();
+ 
+@@ -798,8 +802,7 @@ module.exports = {
+     PathNotDirectoryError: PathNotDirectoryError,
+ 
+     VolumeSizeNotAvailableError: VolumeSizeNotAvailableError,
+-    VolumesUnreachableByContainerOnNetworksError:
+-        VolumesUnreachableByContainerOnNetworksError,
++    VolumesNotReachableError: VolumesNotReachableError,
+ 
+     cnapiErrorWrap: cnapiErrorWrap,
+     fwapiErrorWrap: fwapiErrorWrap,
+diff --git a/package.json b/package.json
+index 2295078..a809285 100644
+--- a/package.json
++++ b/package.json
+@@ -30,7 +30,7 @@
+     "triton-tags": "1.1.4",
+     "ufds": "1.2.0",
+     "vasync": "2.1.0",
+-    "verror": "1.10.0",
++    "verror": "1.9.0",
+     "wf-client": "0.2.1",
+     "xregexp": "3.1.0"
+   },
+diff --git a/test/integration/api-mounts-nfs-shared-volume-networks.test.js b/test/integration/api-mounts-nfs-shared-volume-networks.test.js
+index e68023b..5c41ea0 100644
+--- a/test/integration/api-mounts-nfs-shared-volume-networks.test.js
++++ b/test/integration/api-mounts-nfs-shared-volume-networks.test.js
+@@ -137,7 +137,7 @@ test('api: attach containers to volumes on different networks', function (tt) {
+                 function createContainer(_, next) {
+                     testHelpers.createDockerContainer({
+                         dockerClient: DOCKER_ALICE,
+-                        expectedErr: /unreachable on network/,
++                        expectedErr: /Volumes not reachable from container/,
+                         extra: {
+                             Binds: [volumeName + ':/data'],
+                             Cmd: ['/bin/sh', '-c', 'touch', '/data/foo']
+@@ -184,7 +184,7 @@ test('api: attach containers to volumes on different networks', function (tt) {
+                 function createContainer(_, next) {
+                     testHelpers.createDockerContainer({
+                         dockerClient: DOCKER_ALICE,
+-                        expectedErr: /unreachable on network/,
++                        expectedErr: /Volumes not reachable from container/,
+                         extra: {
+                             Binds: [volumeName + ':/data'],
+                             Cmd: ['/bin/sh', '-c', 'touch', '/data/foo'],

@@ -1,0 +1,320 @@
+commit 6e876142d70d88b870a35ee0f890ea5fc9ec9bbc (refs/changes/60/2160/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2017-06-27T17:59:47-07:00 (2 years, 3 months ago)
+    
+    joyent/node-zkstream#17 downed zk server coming back causes crash
+
+diff --git a/lib/connection-fsm.js b/lib/connection-fsm.js
+index 9150745..e947ab4 100644
+--- a/lib/connection-fsm.js
++++ b/lib/connection-fsm.js
+@@ -60,7 +60,7 @@ ZKConnectionFSM.prototype.close = function () {
+ ZKConnectionFSM.prototype.destroy = function () {
+ 	if (this.isInState('closed'))
+ 		return;
+-	this.emit('closeAsserted');
++	this.emit('destroyAsserted');
+ };
+ 
+ ZKConnectionFSM.prototype.nextXid = function () {
+@@ -106,6 +106,9 @@ ZKConnectionFSM.prototype.state_connecting = function (S) {
+ 	S.on(this, 'closeAsserted', function () {
+ 		S.gotoState('closed');
+ 	});
++	S.on(this, 'destroyAsserted', function () {
++		S.gotoState('closed');
++	});
+ };
+ 
+ ZKConnectionFSM.prototype.state_handshaking = function (S) {
+@@ -146,6 +149,9 @@ ZKConnectionFSM.prototype.state_handshaking = function (S) {
+ 	S.on(this, 'closeAsserted', function () {
+ 		S.gotoState('closed');
+ 	});
++	S.on(this, 'destroyAsserted', function () {
++		S.gotoState('closed');
++	});
+ 	this.zcf_socket.pipe(this.zcf_decoder);
+ 	this.zcf_encoder.pipe(this.zcf_socket);
+ 
+@@ -216,6 +222,9 @@ ZKConnectionFSM.prototype.state_connected = function (S) {
+ 	S.on(this, 'closeAsserted', function () {
+ 		S.gotoState('closing');
+ 	});
++	S.on(this, 'destroyAsserted', function () {
++		S.gotoState('closed');
++	});
+ 	S.on(this, 'pingTimeout', function () {
+ 		self.zcf_lastError = new mod_errors.ZKPingTimeoutError();
+ 		S.gotoState('error');
+@@ -265,11 +274,10 @@ ZKConnectionFSM.prototype.state_closing = function (S) {
+ 	function sendCloseSession() {
+ 		xid = self.nextXid();
+ 		self.zcf_log.info({ xid: xid }, 'sent CLOSE_SESSION request');
+-		self.zcf_encoder.write({
++		self.zcf_encoder.end({
+ 			opcode: 'CLOSE_SESSION',
+ 			xid: xid
+ 		});
+-		self.zcf_encoder.end();
+ 	}
+ };
+ 
+@@ -311,10 +319,13 @@ ZKConnectionFSM.prototype.processReply = function (pkt) {
+ 	var self = this;
+ 
+ 	var req = self.zcf_reqs[pkt.xid];
++	var opcode;
++	if (req !== undefined && req.packet !== undefined)
++		opcode = req.packet.opcode;
+ 
+ 	self.zcf_log.trace({
+ 		xid: pkt.xid,
+-		opcode: req.packet.opcode,
++		opcode: opcode,
+ 		errorCode: pkt.err
+ 	}, 'server replied to request');
+ 
+diff --git a/lib/zk-session.js b/lib/zk-session.js
+index d2d85e8..66da2b7 100644
+--- a/lib/zk-session.js
++++ b/lib/zk-session.js
+@@ -28,6 +28,7 @@ function ZKSession(opts) {
+ 	mod_assert.object(opts.log, 'options.log');
+ 
+ 	this.zs_conn = undefined;
++	this.zs_oldConn = undefined;
+ 
+ 	this.zs_lastPkt = undefined;
+ 	this.zs_expiryTimer = new mod_events.EventEmitter();
+@@ -58,10 +59,11 @@ ZKSession.prototype.isAlive = function () {
+ };
+ 
+ ZKSession.prototype.attachAndSendCR = function (conn) {
+-	if (!this.isInState('detached')) {
++	if (!this.isInState('detached') &&
++	    !this.isInState('attached')) {
+ 		throw (new Error('ZKSession#attachAndSendCR may only be ' +
+-		    'called in state "detached" (is in ' + this.getState() +
+-		    ')'));
++		    'called in state "attached" or "detached" (is in ' +
++		    this.getState() + ')'));
+ 	}
+ 	this.emit('assertAttach', conn);
+ };
+@@ -217,6 +219,73 @@ ZKSession.prototype.state_attached = function (S) {
+ 			self.resumeWatches();
+ 		}
+ 	});
++
++	S.on(this, 'assertAttach', function (client) {
++		self.zs_oldConn = self.zs_conn;
++		self.zs_conn = client;
++		S.gotoState('reattaching');
++	});
++};
++
++ZKSession.prototype.state_reattaching = function (S) {
++	var self = this;
++
++	S.on(this.zs_conn, 'packet', function (pkt) {
++		var sid = new mod_jsbn.BigInteger(pkt.sessionId);
++		if (sid.equals(mod_jsbn.BigInteger.ZERO)) {
++			revert();
++			return;
++		}
++		/*
++		 * We don't do anything to oldConn here: cueball will handle
++		 * destroying it for us once this new connection has emitted
++		 * 'connect'.
++		 */
++		self.zs_log.info('moved zookeeper session %s to more ' +
++		    'preferred backend (%s:%d) with timeout %d ms',
++		    pkt.sessionId.toString('hex'),
++		    self.zs_conn.zcf_server.address,
++		    self.zs_conn.zcf_server.port,
++		    pkt.timeOut);
++		self.zs_log = self.zs_log.child({
++			id: pkt.sessionId.toString('hex')
++		});
++		self.zs_timeout = pkt.timeOut;
++		self.zs_sessionId = sid;
++		self.zs_passwd = pkt.passwd;
++		self.resetExpiryTimer();
++		S.gotoState('attached');
++	});
++
++	function revert() {
++		if (self.isAlive() &&
++		    self.zs_oldConn.isInState('connected')) {
++			self.zs_conn = self.zs_oldConn;
++			S.gotoState('attached');
++		} else if (self.isAlive()) {
++			self.zs_oldConn.close();
++			S.gotoState('detached');
++		} else {
++			self.zs_oldConn.close();
++			S.gotoState('expired');
++		}
++	}
++	S.on(this.zs_conn, 'error', revert);
++	S.on(this.zs_conn, 'close', revert);
++	S.on(this.zs_expiryTimer, 'timeout', revert);
++
++	S.on(this, 'closeAsserted', function () {
++		self.zs_oldConn.close();
++		S.gotoState('closing');
++	});
++
++	this.zs_conn.send({
++		protocolVersion: 0,
++		lastZxidSeen: this.zs_lastZxid,
++		timeOut: this.zs_timeout,
++		sessionId: this.zs_sessionId,
++		passwd: this.zs_passwd
++	});
+ };
+ 
+ ZKSession.prototype.state_closing = function (S) {
+diff --git a/package.json b/package.json
+index f182ef8..91813e9 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "zkstream",
+-  "version": "0.8.0",
++  "version": "0.8.1",
+   "description": "",
+   "main": "lib/index.js",
+   "dependencies": {
+diff --git a/test/multi-node.test.js b/test/multi-node.test.js
+index 0b6db5b..1e92fdb 100644
+--- a/test/multi-node.test.js
++++ b/test/multi-node.test.js
+@@ -218,6 +218,125 @@ mod_tape.test('cross-server data watch', function (t) {
+ 	}
+ });
+ 
++mod_tape.test('ephemeral node failover', function (t) {
++	var closed = 0, connected = 0;
++	var created = 0, deleted = 0;
++
++	var zkc1 = new mod_zkc.Client({
++		log: log,
++		servers: Object.keys(zks).map(function (k) {
++			return ({
++			    address: '127.0.0.1',
++			    port: zks[k].clientPort
++			});
++		}),
++		sessionTimeout: 10000
++	});
++
++	/* Testing hack: force cueball to connect to backends in order */
++	setImmediate(function () {
++		zkc1.zc_set.cs_keys.sort();
++		var k0 = zkc1.zc_set.cs_keys[0];
++		var zkPort = zkc1.zc_set.cs_backends[k0].port;
++		t.strictEqual(zkPort, zks['1'].clientPort);
++		t.notStrictEqual(zkPort, zks['3'].clientPort);
++	});
++
++	var zkc2 = new mod_zkc.Client({
++		log: log,
++		address: '127.0.0.1',
++		port: zks['3'].clientPort
++	});
++
++	zkc1.on('close', function () {
++		if (++closed >= 2)
++			t.end();
++	});
++
++	zkc2.on('close', function () {
++		if (++closed >= 2)
++			t.end();
++	});
++
++	zkc1.on('connect', function () {
++		if (++connected == 2) {
++			setup();
++		}
++	});
++
++	zkc2.on('connect', function () {
++		if (++connected == 2) {
++			setup();
++		}
++	});
++
++	function setup() {
++		var data = new Buffer('hello world');
++		var opts = { flags: ['EPHEMERAL'] };
++		zkc2.watcher('/foo.ephem').on('created', function () {
++			++created;
++			zkc2.watcher('/foo.ephem').on('deleted', function () {
++				++deleted;
++			});
++		});
++		zkc1.create('/foo.ephem', data, opts, function (err, path) {
++			t.error(err);
++			t.strictEqual(path, '/foo.ephem');
++			zkc1.sync('/foo.ephem', function (err2) {
++				t.error(err2);
++				zkc2.sync('/foo.ephem', function (err3) {
++					t.error(err3);
++					t.ok(created > 0, 'saw created');
++					t.ok(deleted == 0, 'saw no deleted');
++					kill();
++				});
++			});
++		});
++	}
++
++	function kill() {
++		zk1.on('stateChanged', function (st) {
++			if (st === 'stopped') {
++				setTimeout(check, 11000);
++			}
++		});
++		zk1.stop();
++	}
++
++	function check() {
++		t.ok(created > 0, 'saw created');
++		t.ok(deleted == 0, 'saw no deleted');
++		zkc2.get('/foo.ephem', function (err, data) {
++			t.error(err);
++			t.strictEqual(data.toString(), 'hello world');
++			unkill();
++		});
++	}
++
++	function unkill() {
++		zk1 = new mod_zk.ZKServer({
++			servers: zks,
++			serverId: '1'
++		});
++		zk1.on('stateChanged', function (st) {
++			if (st === 'running') {
++				setTimeout(checkAgain, 10000);
++			}
++		});
++	}
++
++	function checkAgain() {
++		t.ok(created > 0, 'saw created');
++		t.ok(deleted == 0, 'saw no deleted');
++		zkc1.get('/foo.ephem', function (err, data) {
++			t.error(err);
++			t.strictEqual(data.toString(), 'hello world');
++			zkc1.close();
++			zkc2.close();
++		});
++	}
++});
++
+ mod_tape.test('stop zk servers', function (t) {
+ 	var stopped = 0;
+ 	zk1.on('stateChanged', function (st) {

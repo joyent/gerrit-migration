@@ -1,0 +1,2431 @@
+commit e223aa696fbb315eca09a0e0e5bc4edc55a54ff9 (refs/changes/93/1493/3)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2017-03-13T12:19:53-04:00 (2 years, 7 months ago)
+    
+    OS-3069 need fs watcher to watch zones' files
+
+diff --git a/.gitignore b/.gitignore
+index 9641c782..7b9710f4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,6 +14,7 @@
+ /src/measure_terminal
+ /src/bootparams
+ /src/disk_size
++/src/fswatcher
+ /src/removable_disk
+ /src/disklist
+ /src/qemu-exec
+diff --git a/src/Makefile b/src/Makefile
+index bd81a5fa..d0f63e7b 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -62,6 +62,7 @@ SMARTDCLIBDIR =	$(DESTDIR)/smartdc/lib
+ #
+ bootparams :	LIBS +=		-ldevinfo
+ bootparams :	WARN_FLAGS +=	-Wno-unused
++fswatcher :	LIBS +=		-lthread -lnvpair -lavl
+ zfs_recv :	LIBS +=		-lsocket
+ zfs_send :	LIBS +=		-lsocket
+ vmbundle :	CPPFLAGS +=	-D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+@@ -82,6 +83,7 @@ JS_CHECK_TARGETS=\
+ 	vm/sbin/*.js \
+ 	vm/node_modules/dladm.js \
+ 	vm/node_modules/expander.js \
++	vm/node_modules/fswatcher.js \
+ 	vm/node_modules/ip.js \
+ 	vm/node_modules/nic.js \
+ 	vm/node_modules/proptable.js \
+@@ -100,6 +102,7 @@ JS_CHECK_TARGETS=\
+ 	vm/tests/test-create-filesystems.js \
+ 	vm/tests/test-docker.js \
+ 	vm/tests/test-defaults.js \
++	vm/tests/test-fswatcher.js \
+ 	vm/tests/test-indestructible.js \
+ 	vm/tests/test-internal_metadata_namespaces.js \
+ 	vm/tests/test-lastexited.js \
+@@ -122,6 +125,7 @@ JS_CHECK_OLDSKOOL_TARGETS = \
+ # These files will get run through cstyle on 'make check'
+ C_CHECK_TARGETS=\
+ 	cryptpass.c \
++	fswatcher.c \
+ 	qemu-exec.c \
+ 	vmunbundle.c \
+ 	zfs_recv.c \
+@@ -358,6 +362,7 @@ TARGETS = \
+ 	disklayout \
+ 	disklist \
+ 	disk_size \
++	fswatcher\
+ 	mkzpool \
+ 	removable_disk \
+ 	vmunbundle \
+@@ -466,6 +471,7 @@ install: all $(SUBDIRS)
+ 	sed -e "s|var expat.*;|var expat = require('./expat_binding');|" \
+ 	    < node-expat/lib/node-expat.js \
+ 	    > $(PREFIX_NODE)/node_modules/node-expat.js
++	cp fswatcher $(DESTDIR)/usr/vm/sbin/fswatcher
+ 	cp dockerinit/build/dockerinit $(DESTDIR)/usr/vm/sbin/dockerinit
+ 	cp dockerinit/build/dockerexec $(DESTDIR)/usr/vm/sbin/dockerexec
+ 	cp zoneevent $(DESTDIR)/usr/vm/sbin/zoneevent
+diff --git a/src/fswatcher.c b/src/fswatcher.c
+new file mode 100644
+index 00000000..0f36ef23
+--- /dev/null
++++ b/src/fswatcher.c
+@@ -0,0 +1,1032 @@
++/*
++ * CDDL HEADER START
++ *
++ * The contents of this file are subject to the terms of the
++ * Common Development and Distribution License, Version 1.0 only
++ * (the "License").  You may not use this file except in compliance
++ * with the License.
++ *
++ * You can obtain a copy of the license at http://smartos.org/CDDL
++ *
++ * See the License for the specific language governing permissions
++ * and limitations under the License.
++ *
++ * When distributing Covered Code, include this CDDL HEADER in each
++ * file.
++ *
++ * If applicable, add the following below this CDDL HEADER, with the
++ * fields enclosed by brackets "[]" replaced with your own identifying
++ * information: Portions Copyright [yyyy] [name of copyright owner]
++ *
++ * CDDL HEADER END
++ *
++ * Copyright 2017, Joyent, Inc.
++ *
++ * cc -Wall -Wextra fswatcher.c -o fswatcher -lthread -lnvpair -lavl
++ *
++ */
++
++/*
++ * On STDIN you can send:
++ *
++ * <KEY> WATCH <pathname>\n
++ * <KEY> UNWATCH <pathname>\n
++ * <KEY> STATUS\n
++ *
++ * The first will cause <pathname> to be added to the watch list. The second
++ * will cause the watch for the specified path to be removed.  The third will
++ * print this programs status to stdout. The <KEY> must be an integer in the
++ * range 1-4294967295 (inclusive). Leading 0's will be removed. NOTE: 0 is a
++ * special key that will be used in output for errors which were not directly
++ * the result of a command.
++ *
++ * "pathname" can be any type of file that event ports supports (file,
++ * directory, pipe, etc.).  This program will also follow symlinks as well:
++ * note that the source file for the symlink must exist to watch, and if
++ * the source file is deleted after a watch is established a FILE_DELETE
++ * event will be seen.
++ *
++ * When watching a file, it will be rewatched every time an event is seen
++ * until an UNWATCH command for the file is received by the user, or an event
++ * indicates that the file can no longer be watched (like FILE_DELETE).
++ *
++ * On STDOUT you will see JSON messages that look like the following but are
++ * on a single line:
++ *
++ *  {
++ *     "type": <string>,
++ *     "date": <string>,
++ *     "changes": [array],
++ *     "code": <number>,
++ *     "final": true|false,
++ *     "key": <number>,
++ *     "message": "human readable string",
++ *     "pathname": "/path/which/had/event",
++ *     "result": "SUCCESS|FAIL"
++ *  }
++ *
++ * Where:
++ *
++ *   changes   is an array of strings indicating which changes occurred
++ *   code      is a positive integer code for an error
++ *   final     true when the event being printed is the last without re-watch
++ *   key       is the <KEY> for which a response corresponds
++ *   message   is a human-readable string describing response
++ *   pathname  is the path to which an event applies
++ *   result    indicates whether a command was a "SUCCESS" or "FAILURE"
++ *   date      ISO string date with millisecond resolution
++ *   type      is one of: ready, event, response, error
++ *
++ * And:
++ *
++ *   "type" is always included
++ *   "date" is always included
++ *   "changes" is included only when (type == event)
++ *   "code" is included only when (type == error)
++ *   "final" is included when (type == event)
++ *   "key" is included whenever (type == response)
++ *   "message" is included whenever (type == error)
++ *   "pathname" is included whenever (type == event)
++ *   "result" is included when (type == response) value: "SUCCESS" or "FAILURE"
++ *   "data" is included when a call to STATUS is made (type == response)
++ *
++ * Current values for "code" are in the ErrorCodes enum below.
++ *
++ * EXIT STATUS
++ *
++ *   Under normal operation, fswatcher will run until STDIN is closed or a fatal
++ *   error occurs.
++ *
++ *   When errors occur that are completly unexpected, this will call abort() to
++ *   generate a core dump.
++ *
++ */
++
++#include <assert.h>
++#include <ctype.h>
++#include <stdarg.h>
++#include <stdlib.h>
++#include <err.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <limits.h>
++#include <fcntl.h>
++#include <strings.h>
++#include <port.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <thread.h>
++#include <time.h>
++
++#include <sys/avl.h>
++#include <libnvpair.h>
++
++#define MAX_FMT_LEN 64
++#define MAX_KEY 4294967295
++#define MAX_KEY_LEN 10     /* number of digits (0-4294967295) */
++#define MAX_STAT_RETRY 10  /* number of times to retry stat() before abort() */
++
++/* longest command is '<KEY> UNWATCH <path>' with <KEY> being 10 characters. */
++#define MAX_CMD_LEN (MAX_KEY_LEN + 1 + 7 + 1 + PATH_MAX + 1)
++#define SYSTEM_KEY 0
++
++/*
++ * Like VERIFY0, but instead of calling abort(), will print an error message
++ * to stderr and exit the program.
++ *
++ * This is used by the nvlist_* functions to ensure that we are able to create
++ * and add to an nvlist without error.  The nvlist functions used can only
++ * fail with EINVAL or ENOMEM: dumping core because of either of these failure
++ * modes would be excessive.
++ */
++#define ENSURE0(arg) {	\
++    if (arg != 0)	\
++        err(1, #arg);	\
++}
++
++/*
++ * These are possible values returned from an "error" event
++ */
++enum ErrorCodes {
++	ERR_INVALID_COMMAND = 1, // failed to parse command from stdin line
++	ERR_INVALID_KEY,         // key parsed from command is invalid
++	ERR_UNKNOWN_COMMAND,     // line was parsable, but unimplmented command
++	ERR_CANNOT_ASSOCIATE     // port_associate(3c) failed
++};
++
++/*
++ * Values returned for "result" events
++ */
++enum ResultCodes {
++	RESULT_SUCCESS = 0,
++	RESULT_FAILURE
++};
++
++/*
++ * file_obj structs are held in memory for every file that is currently being
++ * watched.  This way we can 1. verify that incoming events are for files being
++ * watched, and 2. unwatch files at a later time if the user wants.
++ *
++ * These structs are stored in a global AVL tree that uses the filename (and a
++ * hash of it) as the key.
++ */
++static avl_tree_t files_tree;
++struct files_tree_node {
++	struct file_obj fobj;
++	char *name;
++	unsigned long name_hash;
++	avl_node_t avl_node;
++};
++
++/*
++ * This programs has 2 main threads running that block on new events from:
++ *
++ * 1. stdin (user commands)
++ * 2. event ports (filesystem events)
++ *
++ * When an event is received from either, this global "work_mutex" is acquired.
++ * This way, no other locks are necessary, and whatever method is currently
++ * processing its event can safely access members of the AVL tree and write
++ * to stdout/stderr.
++ */
++static mutex_t work_mutex;
++
++/* global event port handle */
++static int port = -1;
++
++/* CLI args */
++static struct {
++	boolean_t opt_j; /* -j, json output */
++	boolean_t opt_r; /* -r, print ready event */
++} opts;
++
++/*
++ * Print the usage message to the given FILE handle
++ */
++static void
++usage(FILE *s)
++{
++	fprintf(s, "Usage: fswatcher [-hrj]\n");
++	fprintf(s, "\n");
++	fprintf(s, "Watch files using event ports with commands sent to\n");
++	fprintf(s, "stdin and event notifications sent to stdout.\n");
++	fprintf(s, "\n");
++	fprintf(s, "Options\n");
++	fprintf(s, "  -h             print this message and exit\n");
++	fprintf(s, "  -j             JSON output\n");
++	fprintf(s, "  -r             print 'ready' event at start\n");
++}
++
++/*
++ * The unique key for the files_tree_node objects are the filenames.  When a
++ * node is created, a hash is calculated for the filename to make comparisons
++ * fast.  Only if the hash matches is a full string (strcmp) comparison done.
++ */
++static int
++files_tree_node_comparator(const void *l, const void *r)
++{
++	const struct files_tree_node *ltn = l;
++	const struct files_tree_node *rtn = r;
++	int ret;
++
++	/* first check filename hash */
++	if (ltn->name_hash < rtn->name_hash)
++		return (-1);
++	else if (ltn->name_hash > rtn->name_hash)
++		return (1);
++
++	/* hashes are the same, do string comparison */
++	ret = strcmp(ltn->name, rtn->name);
++
++	if (ret < 0)
++		return (-1);
++	else if (ret > 0)
++		return (1);
++
++	return (0);
++}
++
++/*
++ * Simple hashing algorithm pulled from http://www.cse.yorku.ca/~oz/hash.html
++ */
++unsigned long
++djb2(char *str)
++{
++	unsigned long hash = 5381;
++	int c;
++	while ((c = *str++))
++		hash = ((hash << 5) + hash) + c;
++	return (hash);
++}
++
++/*
++ * Allocate an nvlist with the "type" set to the type argument given, and the
++ * "date" set to the current time.  This function handles any error checking
++ * needed and will exit the program if anything fails.
++ *
++ * nvlist must be freed by the caller
++ */
++nvlist_t *
++make_nvlist(char *type)
++{
++	nvlist_t *nvl;
++	struct timeval tv;
++	struct tm *gmt;
++	char date[128];
++	size_t i;
++
++	ENSURE0(nvlist_alloc(&nvl, NV_UNIQUE_NAME, 0));
++
++	/* get the current time */
++	if (gettimeofday(&tv, NULL) != 0)
++		err(1, "gettimeofday");
++
++	if ((gmt = gmtime(&tv.tv_sec)) == NULL)
++		err(1, "gmtime");
++
++	i = strftime(date, sizeof (date), "%Y-%m-%dT%H:%M:%S", gmt);
++	if (i == 0)
++		err(1, "strftime");
++
++	/* append milliseconds */
++	i = snprintf(date + i, sizeof (date) - i, ".%03ldZ", tv.tv_usec / 1000);
++	if (i == 0)
++		err(1, "snprintf date");
++
++	ENSURE0(nvlist_add_string(nvl, "date", date));
++	ENSURE0(nvlist_add_string(nvl, "type", type));
++
++	return (nvl);
++}
++
++/*
++ * Print an nvlist to stdout.  Will use the proper function to print
++ * based on -j being set or not.
++ *
++ * This function handles fflushing stdout.
++ */
++void
++print_nvlist(nvlist_t *nvl)
++{
++	if (opts.opt_j)
++		nvlist_print_json(stdout, nvl);
++	else
++		nvlist_print(stdout, nvl);
++	printf("\n");
++
++	fflush(stdout);
++}
++
++/*
++ * Handle creating and printing an "event" message.
++ */
++void
++print_event(int event, char *pathname, int final)
++{
++	int i = 0;
++	char *changes[16];
++	nvlist_t *nvl = make_nvlist("event");
++
++	if (event & FILE_ACCESS) {
++		changes[i++] = "FILE_ACCESS";
++	}
++	if (event & FILE_ATTRIB) {
++		changes[i++] = "FILE_ATTRIB";
++	}
++	if (event & FILE_DELETE) {
++		changes[i++] = "FILE_DELETE";
++	}
++	if (event & FILE_EXCEPTION) {
++		changes[i++] = "FILE_EXCEPTION";
++	}
++	if (event & FILE_MODIFIED) {
++		changes[i++] = "FILE_MODIFIED";
++	}
++	if (event & FILE_RENAME_FROM) {
++		changes[i++] = "FILE_RENAME_FROM";
++	}
++	if (event & FILE_RENAME_TO) {
++		changes[i++] = "FILE_RENAME_TO";
++	}
++	if (event & FILE_TRUNC) {
++		changes[i++] = "FILE_TRUNC";
++	}
++	if (event & FILE_NOFOLLOW) {
++		changes[i++] = "FILE_NOFOLLOW";
++	}
++	if (event & MOUNTEDOVER) {
++		changes[i++] = "MOUNTEDOVER";
++	}
++	if (event & UNMOUNTED) {
++		changes[i++] = "UNMOUNTED";
++	}
++
++	ENSURE0(nvlist_add_string_array(nvl, "changes", changes, i));
++	ENSURE0(nvlist_add_string(nvl, "pathname", pathname));
++        ENSURE0(nvlist_add_int32(nvl, "revents", event));
++	ENSURE0(nvlist_add_boolean_value(nvl, "final", final));
++
++	print_nvlist(nvl);
++
++	nvlist_free(nvl);
++}
++
++/*
++ * Handle creating and printing a "ready" message.
++ */
++void
++print_ready()
++{
++	nvlist_t *nvl = make_nvlist("ready");
++
++	print_nvlist(nvl);
++
++	nvlist_free(nvl);
++}
++
++/*
++ * print_error() takes a key, code (one of the ErrorCodes) and message and
++ * handles creating and printing an "error" message.
++ */
++void
++print_error(uint32_t key, uint32_t code, const char *message_fmt, ...)
++{
++	va_list arg_ptr;
++	char message[4096];
++	nvlist_t *nvl = make_nvlist("error");
++
++	va_start(arg_ptr, message_fmt);
++	if (vsnprintf(message, 4096, message_fmt, arg_ptr) < 0) {
++		perror("fswatcher: vsnprintf");
++		abort();
++	}
++	va_end(arg_ptr);
++
++	ENSURE0(nvlist_add_uint32(nvl, "key", key));
++	ENSURE0(nvlist_add_uint32(nvl, "code", code));
++	ENSURE0(nvlist_add_string(nvl, "message", message));
++
++	print_nvlist(nvl);
++
++	nvlist_free(nvl);
++}
++
++/*
++ * print_response() takes a key, code (RESULT_SUCCESS||RESULT_FAILURE), pathname
++ * and message and handles creating and printing a "result" message.
++ */
++void
++print_response(uint32_t key, uint32_t code, const char *pathname,
++    const char *message_fmt, ...)
++{
++	va_list arg_ptr;
++	char message[4096];
++	nvlist_t *nvl = make_nvlist("response");
++
++	va_start(arg_ptr, message_fmt);
++	if (vsnprintf(message, 4096, message_fmt, arg_ptr) < 0) {
++		perror("fswatcher: vsnprintf");
++		abort();
++	}
++	va_end(arg_ptr);
++
++	ENSURE0(nvlist_add_uint32(nvl, "key", key));
++	ENSURE0(nvlist_add_uint32(nvl, "code", code));
++	ENSURE0(nvlist_add_string(nvl, "pathname", pathname));
++	ENSURE0(nvlist_add_string(nvl, "message", message));
++	ENSURE0(nvlist_add_string(nvl, "result",
++	    code == RESULT_SUCCESS ? "SUCCESS" : "FAIL"));
++
++	print_nvlist(nvl);
++
++	nvlist_free(nvl);
++}
++
++/*
++ * Only called from stdin thread.  Prints information about this program
++ *
++ * print_status prints a message of type "response"
++ */
++void
++print_status(uint32_t key)
++{
++	int numnodes;
++	char **filenames;
++	struct files_tree_node *ftn;
++	int i = 0;
++	nvlist_t *nvl = make_nvlist("response");
++	nvlist_t *data_nvl = fnvlist_alloc();
++
++	ENSURE0(nvlist_add_uint32(nvl, "key", key));
++	ENSURE0(nvlist_add_uint32(nvl, "code", RESULT_SUCCESS));
++	ENSURE0(nvlist_add_string(nvl, "result", "SUCCESS"));
++
++	// get all nodes in the avl tree
++	numnodes = avl_numnodes(&files_tree);
++	filenames = malloc(numnodes * (sizeof (char *)));
++
++	if (filenames == NULL)
++		err(1, "malloc");
++
++	// walk the avl tree and add each filename
++	for (ftn = avl_first(&files_tree); ftn != NULL;
++	    ftn = AVL_NEXT(&files_tree, ftn)) {
++
++		filenames[i++] = ftn->name;
++	}
++
++	// all STATUS data is stored in a separate nvl that is attached to the
++	// "data" key of the response object.
++	ENSURE0(nvlist_add_string_array(data_nvl, "files", filenames, i));
++	ENSURE0(nvlist_add_uint32(data_nvl, "files_count", numnodes));
++	ENSURE0(nvlist_add_int32(data_nvl, "pid", getpid()));
++
++	ENSURE0(nvlist_add_nvlist(nvl, "data", data_nvl));
++
++	print_nvlist(nvl);
++
++	nvlist_free(data_nvl);
++	nvlist_free(nvl);
++	free(filenames);
++}
++
++/*
++ * find_handle() takes a pathname and returns the files_tree_node struct from
++ * the files_tree treeh. returns NULL if no pathname matches.
++ */
++struct files_tree_node *
++find_handle(char *pathname)
++{
++	struct files_tree_node lookup;
++
++	lookup.name = pathname;
++	lookup.name_hash = djb2(pathname);
++
++	return (avl_find(&files_tree, &lookup, NULL));
++}
++
++/*
++ * insert_handle() inserts a files_tree_node struct into the files_tree tree.
++ */
++void
++add_handle(struct files_tree_node *ftn)
++{
++	avl_add(&files_tree, ftn);
++}
++
++/*
++ * remove_handle() removes a files_tree_node struct from the files_tree tree.
++ */
++void
++remove_handle(struct files_tree_node *ftn)
++{
++	avl_remove(&files_tree, ftn);
++}
++
++/*
++ * free_handle() frees a file_tree_node struct
++ */
++void
++free_handle(struct files_tree_node *ftn)
++{
++	if (ftn->name) {
++		free(ftn->name);
++		ftn->name = NULL;
++	}
++	free(ftn);
++}
++
++/*
++ * destroy_handle() removes and frees a files_tree_node struct from the
++ * files_tree tree.
++ */
++void
++destroy_handle(struct files_tree_node *ftn)
++{
++	remove_handle(ftn);
++	free_handle(ftn);
++}
++
++/*
++ * stat_file() takes the same arguments as stat and calls stat for you but does
++ * retries on errors and ultimately returns either 0 (success) or one of the
++ * errno's listed in stat(2).
++ *
++ * WARNING: If it gets EINTR too many times (more than MAX_STAT_RETRY), this
++ * will call abort().
++ */
++int
++stat_file(const char *path, struct stat *buf)
++{
++	int stat_err;
++	int stat_ret;
++	int i;
++
++	for (i = 0; i < MAX_STAT_RETRY; i++) {
++		stat_ret = stat(path, buf);
++		stat_err = errno;
++
++		// return immediately upon success
++		if (stat_ret == 0)
++			return (0);
++
++		// error from stat that means we can't retry - just return it
++		if (stat_err != EINTR)
++			return (stat_err);
++
++		// Interrupted by signal, try again...
++	}
++
++	// if we are here, give up
++	fprintf(stderr, "failed to stat %s more than %d times\n",
++	    path, MAX_STAT_RETRY);
++	abort();
++
++	return (-1);
++}
++
++/*
++ * Returns:
++ *
++ *  0     - success: atime, ctime and mtime will be populated
++ *  non-0 - failed: file could not be accessed (return is stat(2) errno)
++ */
++int
++get_stat(char *pathname, struct stat *sb)
++{
++	int stat_ret;
++
++	stat_ret = stat_file(pathname, sb);
++
++	switch (stat_ret) {
++	case 0:
++		/* SUCCESS! (sb will be populated) */
++		return (0);
++	case ELOOP:         /* symbolic links in path point to each other */
++	case ENOTDIR:       /* component of path is not a dir */
++	case EACCES:        /* permission denied */
++	case ENOENT:        /* file or component path doesn't exist */
++		/*
++		 * The above are all fixable problems. We can't open the file
++		 * right now, but we know that we shouldn't be able to either.
++		 * As such, these are non-fatal and just result in a FAIL (with
++		 * final flag set true) response if we're responding to a
++		 * request or an error line if we're dealing with an event.
++		 */
++		return (stat_ret);
++	case EFAULT:        /* filename or buffer invalid (programmer error) */
++	case EIO:           /* error reading from filesystem (system error) */
++	case ENAMETOOLONG:  /* fo_name is too long (programmer error) */
++	case ENOLINK:       /* broken link to remote machine */
++	case ENXIO:         /* path marked faulty and retired */
++	case EOVERFLOW:     /* file is broken (system error) */
++	default:
++		/*
++		 * This handles cases we don't know how to deal with, by
++		 * dumping core so that it can later be debugged.
++		 */
++		abort();
++		break;
++	}
++}
++
++/*
++ * check_and_rearm_event() is called to (re)arm watches. This can either be
++ * because of an event (in which case revents should be pe.portev_events) or to
++ * initially arm in which case revents should be 0.
++ *
++ * It also performs the required stat() and in case this is a re-arm prints
++ * the event.
++ *
++ * We keep these two functions together (rearming and printing) because we need
++ * to do the stat() before we print the results since if the file no longer
++ * exists we cannot rearm. In that case we set the 'final' flag in the response.
++ */
++void
++check_and_rearm_event(uint32_t key, char *name, int revents,
++    struct files_tree_node *ftn)
++{
++	int final = 0;
++	struct stat sb;
++	int stat_ret;
++	int pa_ret;
++	struct file_obj *fobjp;
++
++	/* ftn may be passed as an argument.  if not, we look for it. */
++	if (ftn == NULL) {
++		ftn = find_handle(name);
++	}
++
++	/* we don't have a handle for this file so ignore the event */
++	if (ftn == NULL) {
++		fprintf(stderr, "got event for '%s' without a handle\n", name);
++		return;
++	}
++
++	/*
++	 * We always stat the file after an event is received, or for the
++	 * inital watch.  If the stat fails for any reason, or any event is
++	 * seen that indicates the file is gone, we mark this file as "final" -
++	 * this means we will no longer be watching this file.
++	 */
++	stat_ret = get_stat(name, &sb);
++	if (stat_ret != 0 ||
++	    revents & FILE_DELETE || revents & FILE_RENAME_FROM ||
++	    revents & UNMOUNTED || revents & MOUNTEDOVER) {
++
++		final = 1;
++	}
++
++	if (key != SYSTEM_KEY && stat_ret != 0) {
++		/*
++		 * We're doing the initial register for this file, so we need
++		 * to send a result.
++		 */
++		print_response(key, RESULT_FAILURE, name,
++		    "stat(2) failed with errno %d: %s",
++		    stat_ret, strerror(stat_ret));
++		assert(final);
++	}
++
++	if (final) {
++		/* We're not going to re-watch the file, so cleanup */
++		if (revents != 0) {
++			print_event(revents, name, final);
++		}
++		destroy_handle(ftn);
++		return;
++	}
++
++	// (re)register watch
++	fobjp = &ftn->fobj;
++	fobjp->fo_atime = sb.st_atim;
++	fobjp->fo_mtime = sb.st_mtim;
++	fobjp->fo_ctime = sb.st_ctim;
++
++	pa_ret = port_associate(port, PORT_SOURCE_FILE, (uintptr_t)fobjp,
++	    FILE_MODIFIED|FILE_TRUNC, name);
++
++	if (key != SYSTEM_KEY) {
++		/*
++		 * We're trying to do an initial associate, so we'll print a
++		 * result whether we succeeded or failed.
++		 */
++		assert(revents == 0);
++		if (pa_ret == -1) {
++			print_response(key, RESULT_FAILURE, name,
++			    "port_associate(3c) failed with errno %d: %s",
++			    errno, strerror(errno));
++			destroy_handle(ftn);
++			return;
++		}
++
++		print_response(key, RESULT_SUCCESS, name,
++		    "port_associate(3c) started watching path");
++		return;
++	}
++
++	/*
++	 * If we are here, this function was called as a result of an event
++	 * being seen.
++	 */
++	assert(revents != 0);
++	print_event(revents, name, final);
++
++	if (pa_ret == -1) {
++		print_error(key, ERR_CANNOT_ASSOCIATE,
++		    "port_associate(3c) failed for '%s', errno %d: %s",
++		    name, errno, strerror(errno));
++		destroy_handle(ftn);
++	}
++}
++
++/*
++ * Only called from stdin thread. Attempts to watch pathname.
++ */
++void
++watch_path(char *pathname, uint32_t key)
++{
++	struct files_tree_node *ftn;
++	char *dupname;
++
++	if (find_handle(pathname) != NULL) {
++		print_response(key, RESULT_SUCCESS, pathname,
++		    "already watching");
++		return;
++	}
++
++	ftn = malloc(sizeof (struct files_tree_node));
++	if (ftn == NULL)
++		err(1, "malloc new watcher");
++
++	dupname = strdup(pathname);
++	if (dupname == NULL)
++		err(1, "strdup new watcher");
++
++	ftn->fobj.fo_name = dupname;
++	ftn->name = dupname;
++	ftn->name_hash = djb2(dupname);
++
++	add_handle(ftn);
++
++	check_and_rearm_event(key, dupname, 0, ftn);
++}
++
++/*
++ * Only called from stdin thread. Attempts to unwatch pathname.
++ */
++void
++unwatch_path(char *pathname, uint32_t key)
++{
++	struct file_obj *fobjp;
++	int ret;
++
++	struct files_tree_node *ftn;
++
++	ftn = find_handle(pathname);
++	if (ftn == NULL) {
++		print_response(key, RESULT_FAILURE, pathname,
++		    "not watching '%s', cannot unwatch", pathname);
++		return;
++	}
++
++	fobjp = &ftn->fobj;
++	/*
++	 * From the man page, there are 5 possible errors for port_dissociate():
++	 *
++	 * EBADF
++	 *          The port identifier is not valid.
++	 *
++	 * EBADFD
++	 *          The source argument is of type PORT_SOURCE_FD  and  the
++	 *          object argument is not a valid file descriptor.
++	 *
++	 * EINVAL
++	 *          The source argument is not valid.
++	 *
++	 * EACCES
++	 *          The process is not the owner of the association.
++	 *
++	 * ENOENT
++	 *          The specified object is not associated with the port.
++	 *
++	 *
++	 * none of these seem like they'll succeed if tried again later for this
++	 * same file, so in every case we assume that the file is no longer
++	 * associated and remove the handle.
++	 */
++	ret = port_dissociate(port, PORT_SOURCE_FILE, (uintptr_t)fobjp);
++
++	destroy_handle(ftn);
++
++	if (ret == -1) {
++		print_response(key, RESULT_FAILURE, pathname,
++		    "failed to unregister '%s' (errno %d): %s", pathname, errno,
++		    strerror(errno));
++	} else {
++		print_response(key, RESULT_SUCCESS, pathname,
++		    "no longer watching '%s'", pathname);
++	}
++}
++
++/*
++ * process one line of stdin
++ *
++ * returns 0 if we can continue, otherwise returns a value suitable
++ * for exiting the program with.
++ */
++void
++process_stdin_line(char *str)
++{
++	char cmd[MAX_CMD_LEN + 1] = {'\0'};
++	uint32_t key;
++	char key_str[MAX_KEY_LEN + 2];
++	char path[MAX_CMD_LEN + 1] = {'\0'};
++	int res;
++	char sscanf_fmt[MAX_FMT_LEN];
++
++	/* read one character past MAX_KEY_LEN so we know if it's too long */
++	snprintf(sscanf_fmt, MAX_FMT_LEN, "%%%ds %%s %%s", MAX_KEY_LEN + 1);
++	res = sscanf(str, sscanf_fmt, key_str, cmd, path);
++
++	if (!(res == 2 || res == 3)) {
++		print_error(SYSTEM_KEY, ERR_INVALID_COMMAND,
++		    "invalid command line");
++		return;
++	}
++
++	/* convert key to a number we can work with it */
++	key = strtoul(key_str, NULL, 10);
++	if ((strlen(key_str) > MAX_KEY_LEN) ||
++	    (key == ULONG_MAX && errno == ERANGE)) {
++
++		print_error(SYSTEM_KEY, ERR_INVALID_KEY,
++		    "invalid key: > ULONG_MAX");
++		return;
++	}
++
++	/* this is a reserved key */
++	if (key == SYSTEM_KEY) {
++		print_error(SYSTEM_KEY, ERR_INVALID_KEY,
++		    "invalid key: %d", SYSTEM_KEY);
++		return;
++	}
++
++	if (strcmp("UNWATCH", cmd) == 0) {
++		if (path[0] == '\0') {
++			print_error(SYSTEM_KEY, ERR_INVALID_COMMAND,
++			    "invalid command line - UNWATCH requires pathname");
++			return;
++		}
++
++		unwatch_path(path, key);
++	} else if (strcmp("WATCH", cmd) == 0) {
++		if (path[0] == '\0') {
++			print_error(SYSTEM_KEY, ERR_INVALID_COMMAND,
++			    "invalid command line - WATCH requires pathname");
++			return;
++		}
++
++		watch_path(path, key);
++	} else if (strcmp("STATUS", cmd) == 0) {
++		if (path[0] != '\0') {
++			print_error(SYSTEM_KEY, ERR_INVALID_COMMAND,
++			    "invalid command line - STATUS takes no arguments");
++			return;
++		}
++
++		print_status(key);
++	} else {
++		print_error(key, ERR_UNKNOWN_COMMAND, "unknown command '%s'",
++		    cmd);
++	}
++}
++
++/*
++ * Worker thread waits here for stdin data.
++ */
++void *
++wait_for_stdin(void *arg)
++{
++	(void) arg;
++	char str[MAX_CMD_LEN + 1];
++
++	/* read stdin line-by-line indefinitely */
++	while (fgets(str, MAX_CMD_LEN + 1, stdin) != NULL) {
++		mutex_lock(&work_mutex);
++		process_stdin_line(str);
++		mutex_unlock(&work_mutex);
++
++		str[0] = '\0';
++	}
++
++	/* should not be reached */
++	err(1, "fswatcher: error on stdin (errno: %d): %s\n",
++	    errno, strerror(errno));
++}
++
++/*
++ * Worker thread waits here for event port events.
++ */
++void *
++wait_for_events(void *arg)
++{
++	(void) arg;
++	port_event_t pe;
++
++	while (!port_get(port, &pe, NULL)) {
++		mutex_lock(&work_mutex);
++
++		switch (pe.portev_source) {
++		case PORT_SOURCE_FILE:
++			/* call handler for filesystem event */
++			check_and_rearm_event(0, (char *)pe.portev_user,
++			    pe.portev_events, NULL);
++			break;
++		default:
++			/*
++			 * Something's seriously wrong if we get events with a
++			 * port source other than FILE, since that's all we're
++			 * adding. So abort and hope there's enough state in
++			 * the core.
++			 */
++			fprintf(stderr, "event from unexpected source: %d",
++			    pe.portev_source);
++			abort();
++		}
++
++		mutex_unlock(&work_mutex);
++	}
++
++	/* should not be reached */
++	err(1, "wait_for_events thread exited");
++}
++
++
++int
++main(int argc, char **argv)
++{
++	int opt;
++	pthread_t tid;
++
++	opts.opt_j = B_FALSE;
++	opts.opt_r = B_FALSE;
++	while ((opt = getopt(argc, argv, "hjr")) != -1) {
++		switch (opt) {
++		case 'h':
++			usage(stdout);
++			return (0);
++		case 'j':
++			opts.opt_j = B_TRUE;
++			break;
++		case 'r':
++			opts.opt_r = B_TRUE;
++			break;
++		default:
++			usage(stderr);
++			return (1);
++		}
++	}
++	argc -= optind;
++	argv += optind;
++
++	/* create event port globally */
++	if ((port = port_create()) == -1) {
++		fprintf(stderr, "port_create failed(%d): %s",
++		    errno, strerror(errno));
++		return (1);
++	}
++
++	/* initialize the AVL tree to hold all files currently being watched */
++	avl_create(&files_tree, files_tree_node_comparator,
++	    sizeof (struct files_tree_node),
++	    offsetof(struct files_tree_node, avl_node));
++
++	/*
++	 * If the caller wants a "ready" event to be emitted, we grab the
++	 * global mutex here, and unlock it after the threads are created.
++	 */
++	if (opts.opt_r) {
++		mutex_lock(&work_mutex);
++	}
++
++	/* create worker threads to process stdin and event ports */
++	pthread_create(&tid, NULL, wait_for_events, NULL);
++	pthread_create(&tid, NULL, wait_for_stdin, NULL);
++
++	/* alert that we are ready for input */
++	if (opts.opt_r) {
++		print_ready();
++		mutex_unlock(&work_mutex);
++	}
++
++	/* do nothing while threads handle the load */
++	while (thr_join(0, NULL, NULL) == 0) {
++		/* pass */
++	}
++
++	return (0);
++}
+diff --git a/src/manifest b/src/manifest
+index 869a54f9..974c2d53 100644
+--- a/src/manifest
++++ b/src/manifest
+@@ -277,6 +277,7 @@ f usr/vm/test/runtests 0555 root bin
+ f usr/vm/sbin/add-userscript 0555 root bin
+ f usr/vm/sbin/dockerexec 0555 root bin
+ f usr/vm/sbin/dockerinit 0555 root bin
++f usr/vm/sbin/fswatcher 0555 root bin
+ f usr/vm/sbin/filewait 0555 root bin
+ f usr/vm/sbin/rotate-kvm-logs.sh 0555 root bin
+ f usr/vm/sbin/rotate-logs.sh 0555 root bin
+@@ -293,6 +294,7 @@ f usr/node/0.10/node_modules/node-expat.js 0444 root bin
+ f usr/vm/node_modules/bunyan.js 0444 root bin
+ f usr/vm/node_modules/dladm.js 0444 root bin
+ f usr/vm/node_modules/expander.js 0444 root bin
++f usr/vm/node_modules/fswatcher.js 0444 root root
+ f usr/vm/node_modules/ip.js 0444 root bin
+ f usr/vm/node_modules/locker.js 0444 root bin
+ f usr/vm/node_modules/nic.js 0444 root bin
+diff --git a/src/vm/node_modules/fswatcher.js b/src/vm/node_modules/fswatcher.js
+new file mode 100644
+index 00000000..76fadc12
+--- /dev/null
++++ b/src/vm/node_modules/fswatcher.js
+@@ -0,0 +1,780 @@
++/*
++ * CDDL HEADER START
++ *
++ * The contents of this file are subject to the terms of the
++ * Common Development and Distribution License, Version 1.0 only
++ * (the "License").  You may not use this file except in compliance
++ * with the License.
++ *
++ * You can obtain a copy of the license at http://smartos.org/CDDL
++ *
++ * See the License for the specific language governing permissions
++ * and limitations under the License.
++ *
++ * When distributing Covered Code, include this CDDL HEADER in each
++ * file.
++ *
++ * If applicable, add the following below this CDDL HEADER, with the
++ * fields enclosed by brackets "[]" replaced with your own identifying
++ * information: Portions Copyright [yyyy] [name of copyright owner]
++ *
++ * CDDL HEADER END
++ *
++ * Copyright 2017, Joyent, Inc.
++ *
++ * This module exists to watch files for changes. It is somewhat similar to
++ * node's fs.watch except:
++ *
++ *  * FsWatcher.watch() is asynchronous and optionally can call a callback when
++ *    it actually starts watching.
++ *  * FsWatcher works with files that do not exist yet, notifying you when they
++ *    are created.
++ *
++ * To use you should do something like:
++ *
++ *  var fsw = new FsWatcher({log: log});
++ *  fsw.once('ready', function () {
++ *      fsw.watch('/path/to/some/file', function (err) { ... });
++ *      fsw.unwatch('/path/to/some/file', function (err) { ... });
++ *      fsw.status(function (err, obj) { ... });
++ *      fsw.stop();
++ *  });
++ *  fsw.on(<event type>, callback(event));
++ *  fsw.start();
++ *
++ * Where the event types can be:
++ *
++ *  * event - for any event
++ *  * create - emitted when a file is created
++ *  * change - emitted when a file is modified
++ *  * delete - emitted when a file is deleted
++ *
++ * How this works:
++ *
++ *   This module is a wrapper around the fswatcher tool. That tool is driven by
++ *   commands on STDIN which start and stop watches on files. Output goes to
++ *   STDOUT (as json)  and is scraped by this module and turned into events.
++ *
++ * When `fsw.start()` is called, the companion fswatcher C program is started,
++ * and a 'ready' event is emitted when the program is fully loaded and ready to
++ * start receiving input.  Once it is ready, you may call .watch, .unwatch,
++ * etc.
++ *
++ * When a file watch is attempted, the command to watch it is sent to the
++ * fswatcher C program.  If it succeeds, the callback is fired immediately
++ * and any new events for the file will be emitted when they are seen.  If
++ * it fails however, a successful callback is still fired, but the file
++ * is moved to a retry "interval".  The term interval is used here, but it's
++ * actually a JavaScript setTimeout under the hood that calls itself as part
++ * of the retry logic.
++ *
++ * The common case is, when a .watch() command is given, the file we want to
++ * watch either exists or will exist very soon.  Because of this, if the initial
++ * watch fails, that file specifically will be retried (the WATCH command sent
++ * to the fswatcher program again) 10 times every 200ms - this is called the
++ * INITIAL_WATCH_INTERVAL.  If it succeeds during this time, the timeout will
++ * be cleared and a 'create' event for the file will be emitted.
++ *
++ * If the file fails the INITIAL_WATCH_INTERVAL, it will move over to the
++ * LONG_WATCH_INTERVAL.  This is an interval (again, actually a setTimeout
++ * that calls itself when finished) that runs every 5 seconds to retry every
++ * file that does not yet exist.  This is a single interval that runs every
++ * 5 seconds no matter what, and loops every file that we want to watch but
++ * does not yet exist.  When a WATCH command succeeds for a file in this
++ * interval it is removed from the "not_yet_watching" list and a 'create'
++ * event for the file be emitted.
++ *
++ */
++
++var cp = require('child_process');
++var EventEmitter = require('events').EventEmitter;
++var util = require('util');
++
++var assert = require('/usr/node/node_modules/assert-plus');
++var bunyan = require('/usr/node/node_modules/bunyan');
++var LineStream = require('/usr/node/node_modules/linestream');
++var RingBuffer = require('/usr/vm/node_modules/bunyan').RingBuffer;
++var vasync = require('/usr/vm/node_modules/vasync');
++
++// default values
++
++// when a file is watched but does not yet exist, FsWatcher will default to
++// retry watching the file INITIAL_WATCH_TRIES (10) tries every
++// INITIAL_WATCH_DELAY (200) milliseconds before transitioning the file
++// to the long watch interval.
++var INITIAL_WATCH_DELAY = 200;
++var INITIAL_WATCH_TRIES = 10;
++
++// when a file fails to be watched during its own initial watch interval it
++// will be transferred to a longer class-wide interval that tries to watch
++// all unwatched files every LONG_WATCH_DELAY (5000) milliseconds.
++var LONG_WATCH_DELAY = 5 * 1000;
++
++// maximum value of the request key to use - this is defined inside fswatcher.c
++var FSWATCHER_MAX_KEY = 4294967295;
++
++// illegal characters for filenames - this limitation is in fswatcher.c
++var ILLEGAL_FILENAME_CHARS = ['\n', '\0'];
++
++// companion C program that is our interface to event ports
++var FSWATCHER_CMD = '/usr/vm/sbin/fswatcher';
++if (process.env.FSWATCHER_CMD) {
++    FSWATCHER_CMD = process.env.FSWATCHER_CMD;
++}
++
++// default logger if left unspecified
++var LOG = bunyan.createLogger({
++    level: 'debug',
++    name: 'fswatcher',
++    streams: [
++    {
++        stream: process.stderr,
++        level: 'debug'
++    }
++    ],
++    serializers: bunyan.stdSerializers
++});
++
++function noop() {}
++
++function FsWatcher(opts) {
++    var self = this;
++
++    opts = opts || {};
++    self.log = opts.log || LOG;
++
++    // current state, set by .start and .stop
++    self.stopped = true;
++
++    // if we should dedup events from the same time (millisecond resolution)
++    self.dedup = opts.dedup;
++
++    // files currently being watched
++    self.watching = {};
++
++    // files that need to be watched but don't exist yet
++    self.not_yet_watching = {};
++
++    // see comments at the top of this file for "default values" for information
++    // on these variables
++    self.initial_watch_delay = opts.initial_watch_delay || INITIAL_WATCH_DELAY;
++    self.initial_watch_tries = opts.initial_watch_tries || INITIAL_WATCH_TRIES;
++    self.long_watch_delay = opts.long_watch_delay || LONG_WATCH_DELAY;
++}
++util.inherits(FsWatcher, EventEmitter);
++
++// start the long interval
++FsWatcher.prototype.start = function start() {
++    var self = this;
++
++    assert.ok(self.stopped, 'already running');
++
++    self.stopped = false;
++    self.stderr_buffer = new RingBuffer({limit: 100});
++    self.cur_request_key = 0;
++    self.pending_actions = {};
++
++    // we store the previous event seen to use for deduplication purposes.
++    // if the same exact event is seen (same timestamp in milliseconds as
++    // well) every event after the first is thrown out.
++    self.prev_event = {
++        date: new Date(0)
++    };
++
++    // no matter what, this loop runs to watch any unwatched files
++    function long_watch_interval() {
++        self._watch_unwatched_files(function () {
++            self.long_watch_timeout = setTimeout(long_watch_interval,
++                self.long_watch_delay);
++        });
++    }
++    self.long_watch_timeout = setTimeout(long_watch_interval,
++        self.long_watch_delay);
++
++    // start the companion C program
++    self.watcher = cp.spawn(FSWATCHER_CMD, ['-r', '-j'], {stdio: 'pipe'});
++    self.watcher_pid = self.watcher.pid;
++
++    // stdout is newline separated JSON.  It is broken into lines
++    // here and each raw line (String) is pushed on the vasync res_queue
++    // that handles parsing and processing it.  A queue is used to add
++    // a callback to processing a single line of stdout - this way, any
++    // async work required by a stdout line is handled before a next line is
++    // processed.
++    var stdoutls = new LineStream();
++    self.watcher.stdout.pipe(stdoutls).on('readable', function () {
++        var line;
++        while ((line = stdoutls.read()) !== null) {
++            self.log.trace({line: line}, 'fswatcher stdout line');
++            self.res_queue.push(line);
++        }
++    });
++
++    // stderr can contain useful debugging information from the fswatcher
++    // program, so all lines are output via log.trace(), and the last 10
++    // lines are stored in a ring buffer and printed if a fatal error
++    // occurs
++    var stderrls = new LineStream();
++    self.watcher.stderr.pipe(stderrls).on('readable', function () {
++        var line;
++        while ((line = stderrls.read()) !== null) {
++            self.stderr_buffer.write(line);
++            self.log.trace({line: line}, 'fswatcher stderr line');
++        }
++    });
++
++    // handle watcher exiting.  if this is not the result of .stop(), we
++    // error loudly
++    self.watcher.on('close', function (code, signal) {
++        var e = new Error('fswatcher exited');
++        e.code = code;
++        e.signal = signal;
++        e.pid = self.watcher_pid;
++        e.stderr = self.stderr_buffer.records.join('\n');
++
++        self.watcher = null;
++        self.watcher_pid = null;
++
++        if (self.stopped) {
++            self.log.debug({err: e, signal: signal, code: code, pid: e.pid},
++                'fswatcher exited');
++        } else {
++            self.log.error({err: e, signal: signal, code: code, pid: e.pid},
++                'fswatcher exited');
++            self.log.error({dump: self.dump()},
++                'fswatcher .dump()');
++            self.log.error({stderr: e.stderr}, 'fswatcher stderr');
++            self.emit('error', e);
++        }
++    });
++
++    // this queue handles line-by-line stdout responses from the fswatcher.c
++    // program
++    self.res_queue = vasync.queue(function (line, cb) {
++        if (self.stopped) {
++            self.log.warn({line: line},
++                'stdout received after .stop() instructed');
++            cb();
++            return;
++        }
++
++        var obj;
++        try {
++            obj = JSON.parse(line);
++            assert.string(obj.type, 'stdout obj.type');
++            assert.string(obj.date, 'stdout obj.date');
++            obj.date = new Date(obj.date);
++            assert.ok(isFinite(obj.date), 'stdout invalid obj.date');
++        } catch (err) {
++            self.log.error({
++                line: line
++            }, 'BAD JSON');
++            throw err;
++        }
++        self.log.trace({obj: obj}, 'fswatcher event');
++
++        // discard duplicate events
++        if (self.dedup) {
++            var o1 = deepClone(self.prev_event);
++            var o2 = deepClone(obj);
++            o1.date = o1.date.toISOString();
++            o2.date = o2.date.toISOString();
++            try {
++                assert.deepEqual(o1, o2, 'duplicate object');
++                // the same
++                self.log.debug({obj: obj}, 'discarding duplicate object');
++                process.nextTick(cb);
++                return;
++            } catch (err) {
++                // not the same
++                self.prev_event = deepClone(obj);
++            }
++        }
++
++        switch (obj.type) {
++        case 'ready':
++            handleReady(obj, cb);
++            break;
++        case 'event':
++            handleEvent(obj, cb);
++            break;
++        case 'response':
++            handleResponse(obj, cb);
++            break;
++        case 'error':
++        default:
++            self.log.warn({obj: obj}, 'dispatching error');
++            var e = new Error('dispatching error');
++            throw e;
++        }
++    }, 1);
++
++    function handleReady(obj, cb) {
++        self.emit('ready', obj);
++        cb();
++    }
++
++    function handleEvent(obj, cb) {
++        assert.bool(obj.final, 'obj.final');
++        assert.arrayOfString(obj.changes, 'obj.changes');
++        assert.string(obj.pathname, 'obj.pathname');
++
++        var f = obj.pathname;
++        var w = self.watching[f];
++        assert.object(w, 'not watching ' + obj.pathname);
++
++        // UNWATCH is queued, ignore event
++        if (!w.active) {
++            cb();
++            return;
++        }
++
++        // fswatcher.c is done watching this file, queue a rewatch
++        if (obj.final) {
++            self.log.debug({f: f}, 'file was final, queueing rewatch');
++            delete self.watching[f];
++            self.watch(f);
++        }
++
++        if (obj.changes.indexOf('FILE_MODIFIED') !== -1)
++            obj.type = 'change';
++        if (obj.changes.indexOf('FILE_RENAME_TO') !== -1)
++            obj.type = 'change';
++        if (obj.changes.indexOf('FILE_TRUNC') !== -1)
++            obj.type = 'change';
++        if (obj.changes.indexOf('FILE_DELETE') !== -1)
++            obj.type = 'delete';
++        if (obj.changes.indexOf('UNMOUNTED') !== -1)
++            obj.type = 'delete';
++
++        if (obj.final && obj.type !== 'delete') {
++            /*
++             * An event marked as "final" means that fswatcher.c will not
++             * attempt to rewatch the file.  It's possible that a file could
++             * be marked as "final" without a "delete" event being seen,
++             * because of the asynchronous nature of filesystem events.
++             *
++             * In this case, we log a warning, and pretend it was a delete -
++             * since the file is effectively gone for our purposes.
++             */
++            self.log.warn({obj: obj}, 'final event seen for non-delete type');
++            obj.type = 'delete';
++        }
++
++        if (obj.type !== 'event')
++            self.emit(obj.type, obj);
++        self.emit('event', obj);
++        cb();
++    }
++
++    function handleResponse(obj, cb) {
++        assert.number(obj.key, 'obj.key');
++        assert.number(obj.code, 'obj.code');
++        assert.string(obj.result, 'obj.result');
++        assert.optionalString(obj.pathname, 'obj.pathname');
++        assert.optionalString(obj.message, 'obj.message');
++        assert.optionalObject(obj.data, 'obj.data');
++
++        var pa = self.pending_actions[obj.key];
++
++        assert.object(pa, 'pending_action ' + obj.key);
++        assert.func(pa.cb, 'pending_action.cb ' + obj.key);
++
++        pa.cb(obj);
++        delete self.pending_actions[obj.key];
++        cb();
++    }
++};
++
++// stop watching everything
++FsWatcher.prototype.stop = function stop() {
++    var self = this;
++
++    assert.ok(!self.stopped, 'not running');
++
++    self.stopped = true;
++
++    // stop the watcher
++    self.watcher.kill();
++
++    // clear all watches that haven't been established yet
++    Object.keys(self.not_yet_watching).forEach(function (f) {
++        var o = self.not_yet_watching[f];
++
++        if (o.timeout) {
++            clearTimeout(o.timeout);
++            o.timeout = null;
++        }
++
++        delete self.not_yet_watching[f];
++    });
++
++    // clear all existing watches
++    self.watching = {};
++
++    // stop the long_watch_interval
++    clearTimeout(self.long_watch_timeout);
++    self.long_watch_timeout = null;
++};
++
++// watch a file
++FsWatcher.prototype.watch = function watch(f, cb) {
++    var self = this;
++    cb = cb || noop;
++
++    var initial = true;
++
++    assert.string(f, 'filename unspecified');
++    assert.ok(!self.stopped, 'not running');
++    assert.func(cb, 'cb');
++
++    // validate filename
++    var e = self._valid_filename(f);
++    if (e) {
++        cb(e);
++        return;
++    }
++
++    // callback with an error if we've already been instructed to watch this
++    // file
++    if (self._is_watching(f)) {
++        cb(new Error('already watchng ' + f));
++        return;
++    }
++
++    // all new files start off in the 'not_yet_watching' bucket and are moved
++    // to the 'watching' bucket when/if a call to `fs.watch(f)` is successful
++    self.not_yet_watching[f] = {
++        tries: 0,
++        timeout: null,
++        long_watch: false
++    };
++
++    // try to watch the file - this function will call itself multiple times
++    // based on the values set in the constructor if it fails before moving
++    // the file to the long interval
++    try_watching();
++
++    function try_watching() {
++        var o = self.not_yet_watching[f];
++
++        // watch was cancelled (probably shutting down or told to unwatch),
++        // just give up
++        if (!o) {
++            if (initial) {
++                initial = false;
++                cb();
++            }
++            return;
++        }
++
++        o.timeout = null;
++
++        // we've tried too many times, just give up and let the long
++        // interval catch it
++        if (o.tries >= self.initial_watch_tries) {
++            self.log.trace('%s exceeded max tries, moving to long interval', f);
++            o.long_watch = true;
++            if (initial) {
++                initial = false;
++                cb();
++            }
++            return;
++        }
++
++        self._try_watching(f, function (err) {
++            if (err) {
++                o.tries++;
++                o.timeout = setTimeout(try_watching, self.initial_watch_delay);
++                self.log.trace('%d/%d %s watch failed',
++                    o.tries, self.initial_watch_tries, f);
++                if (initial) {
++                    initial = false;
++                    cb();
++                }
++                return;
++            }
++
++            // watch succeeded!
++            self.watching[f] = {
++                active: true
++            };
++            delete self.not_yet_watching[f];
++
++            var obj = {
++                type: 'create',
++                date: new Date(),
++                pathname: f
++            };
++
++            if (!initial) {
++                self.emit('create', obj);
++                self.emit('event', obj);
++            }
++
++            self.log.trace('%d/%d %s watch succeeded',
++                o.tries, self.initial_watch_tries, f);
++
++            if (initial) {
++                initial = false;
++                cb();
++            }
++        });
++    }
++};
++
++// stop watching a file
++FsWatcher.prototype.unwatch = function unwatch(f, cb) {
++    var self = this;
++    cb = cb || noop;
++
++    assert.string(f, 'filename unspecified');
++    assert.ok(!self.stopped, 'not running');
++    assert.func(cb, 'cb');
++
++    // validate filename
++    var e = self._valid_filename(f);
++    if (e) {
++        cb(e);
++        return;
++    }
++
++    if (self.watching[f]) {
++        if (self.watching[f].active) {
++            self.watching[f].active = false;
++            var cmd = util.format('UNWATCH %s', f);
++            self._send_command(cmd, function (obj) {
++                delete self.watching[f];
++                // assert.equal(obj.result, 'SUCCESS', 'unwatch success');
++                cb();
++            });
++        } else {
++            delete self.watching[f];
++            cb();
++        }
++    } else if (self.not_yet_watching[f]) {
++        if (self.not_yet_watching[f].timeout) {
++            clearTimeout(self.not_yet_watching[f].timeout);
++            self.not_yet_watching[f].timeout = null;
++        }
++        delete self.not_yet_watching[f];
++        cb();
++    } else {
++        throw new Error('not watching ' + f);
++    }
++};
++
++// get program status
++FsWatcher.prototype.status = function status(cb) {
++    var self = this;
++
++    assert.ok(!self.stopped, 'not running');
++    assert.func(cb, 'cb');
++
++    self._send_command('STATUS', function (obj) {
++        cb(null, obj);
++    });
++};
++
++// send stdin to the watcher program and callback when stdout
++// is receieved.  the `cmd` arg should look something like this:
++//
++//   'WATCH /path/to/file|12345'
++//   'UNWATCH /other/path'
++//
++// a trailing newline character will be added if it is not present, and
++// a key will be prepended to track the request as well.
++FsWatcher.prototype._send_command = function _send_command(cmd, cb) {
++    var self = this;
++
++    assert.ok(!self.stopped, 'not running');
++
++    // ensure the command has a trailing newline
++    if (cmd[cmd.length - 1] !== '\n')
++        cmd += '\n';
++
++    // generate a unique key for the request, this will let us know
++    // which response is meant for us
++    var key = self._next_request_key();
++
++    assert(!self.pending_actions[key], 'key already used: ' + key);
++
++    cmd = util.format('%d %s', key, cmd);
++
++    // when the response for this key is received, the callback will be called
++    self.pending_actions[key] = {
++        cmd: cmd,
++        cb: cb
++    };
++
++    // write the command to the watcher
++    self.log.trace({cmd: cmd.trim()}, 'writing to fswatcher stdin');
++    self.watcher.stdin.write(cmd);
++};
++
++// generate the next index to use for a request
++FsWatcher.prototype._next_request_key = function _next_request_key() {
++    var self = this;
++
++    self.cur_request_key = (self.cur_request_key + 1) % FSWATCHER_MAX_KEY;
++
++    return self.cur_request_key;
++};
++
++
++// check if we are, or were instructed to, watch a file
++FsWatcher.prototype._is_watching = function _is_watching(f) {
++    var self = this;
++
++    return self.watching.hasOwnProperty(f)
++        || self.not_yet_watching.hasOwnProperty(f);
++};
++
++// validate a filename string - returns null on success and an
++// Error object on failure
++FsWatcher.prototype._valid_filename = function _valid_filename(f) {
++    try {
++        ILLEGAL_FILENAME_CHARS.forEach(function (c) {
++            assert.equal(f.indexOf(c), -1, 'filename contains bad char ' + c);
++        });
++    } catch (e) {
++        return e;
++    }
++    return null;
++};
++
++// try to watch all unwatched files - this will be called
++// at an interval specified in the constructor options or at
++// a default of every 5 seconds
++FsWatcher.prototype._watch_unwatched_files =
++    function _watch_unwatched_files(cb) {
++
++    var self = this;
++
++    var started = 0;
++    var still_waiting = 0;
++
++    vasync.forEachPipeline({
++        inputs: Object.keys(self.not_yet_watching),
++        func: function (f, cb2) {
++            var o = self.not_yet_watching[f];
++
++            // this interval only looks for files that are in the "long_watch"
++            // bucket
++            if (!o || !o.long_watch) {
++                cb2();
++                return;
++            }
++
++            self._try_watching(f, function (err) {
++                if (err) {
++                    // watch failed, still waiting for this file to exist
++                    still_waiting++;
++                    cb2();
++                    return;
++                }
++
++                // watch succeeded! we can now emit a 'create' event
++                // and stop waiting on this file to exist
++                self.watching[f] = {
++                    active: true
++                };
++                delete self.not_yet_watching[f];
++                started++;
++
++                var obj = {
++                    type: 'create',
++                    date: new Date(),
++                    pathname: f
++                };
++
++                self.emit('create', obj);
++                self.emit('event', obj);
++
++                cb2();
++            });
++        }
++    }, function (err) {
++        if (started > 0 || still_waiting > 0) {
++            self.log.debug('FsWatcher _watch_unwatched_files: '
++                + 'started watching: %d, still waiting: %d',
++                started, still_waiting);
++        }
++
++        cb();
++    });
++};
++
++// send a command to watch the filename given, and callback when the response
++// is seen.  an error is set if the file fails to watch, and no error on
++// success
++FsWatcher.prototype._try_watching = function _try_watching(f, cb) {
++    var self = this;
++
++    var cmd = util.format('WATCH %s', f);
++
++    self._send_command(cmd, function (obj) {
++        switch (obj.result) {
++        case 'SUCCESS':
++            cb(null, obj);
++            break;
++        case 'FAIL':
++            cb(new Error(obj.message), obj);
++            break;
++        default:
++            throw new Error('unknown result: ' + obj.result);
++        }
++    });
++};
++
++// dump current state
++FsWatcher.prototype.dump = function _dump() {
++var self = this;
++
++    return {
++        watching: Object.keys(self.watching),
++        not_yet_watching: Object.keys(self.not_yet_watching),
++        pending_actions: self.pending_actions,
++        watcher_pid: self.watcher_pid,
++        stopped: self.stopped
++    };
++};
++
++module.exports.FsWatcher = FsWatcher;
++
++function deepClone(src) {
++    var dst;
++    var key;
++
++    if (src instanceof Date) {
++        dst = src;
++    } else if (Array.isArray(src)) {
++        dst = [];
++        src.forEach(function (e) {
++            dst.push(deepClone(e));
++        });
++    } else if (typeof (src) === 'object') {
++        dst = {};
++        for (key in src) {
++            dst[key] = deepClone(src[key]);
++        }
++    } else {
++        dst = src;
++    }
++
++    return dst;
++}
++
++if (require.main === module) {
++    var _f = process.argv[2];
++    var fsw = new FsWatcher();
++    fsw.once('ready', function (obj) {
++        fsw.watch(_f, function () {
++            console.log('watching %s', _f);
++        });
++    });
++    fsw.on('event', function (ev) {
++        console.log('new event: %j', ev);
++    });
++    fsw.start();
++}
+diff --git a/src/vm/tests/test-fswatcher.js b/src/vm/tests/test-fswatcher.js
+new file mode 100644
+index 00000000..0fdf59aa
+--- /dev/null
++++ b/src/vm/tests/test-fswatcher.js
+@@ -0,0 +1,511 @@
++/*
++ * CDDL HEADER START
++ *
++ * The contents of this file are subject to the terms of the
++ * Common Development and Distribution License, Version 1.0 only
++ * (the "License").  You may not use this file except in compliance
++ * with the License.
++ *
++ * You can obtain a copy of the license at http://smartos.org/CDDL
++ *
++ * See the License for the specific language governing permissions
++ * and limitations under the License.
++ *
++ * When distributing Covered Code, include this CDDL HEADER in each
++ * file.
++ *
++ * If applicable, add the following below this CDDL HEADER, with the
++ * fields enclosed by brackets "[]" replaced with your own identifying
++ * information: Portions Copyright [yyyy] [name of copyright owner]
++ *
++ * CDDL HEADER END
++ *
++ * Copyright 2017, Joyent, Inc.
++ */
++
++var assert = require('assert');
++var execFile = require('child_process').execFile;
++var fs = require('fs');
++var path = require('path');
++var util = require('util');
++
++var bunyan = require('/usr/vm/node_modules/bunyan');
++var FsWatcher = require('/usr/vm/node_modules/fswatcher').FsWatcher;
++var vasync = require('/usr/vm/node_modules/vasync');
++
++// this puts test stuff in global, so we need to tell jsl about that:
++/* jsl:import ../node_modules/nodeunit-plus/index.js */
++require('/usr/vm/node_modules/nodeunit-plus');
++
++var log = bunyan.createLogger({
++    level: 'error',
++    name: 'fswatcher-test-dummy',
++    streams: [ { stream: process.stderr, level: 'error' } ],
++    serializers: bunyan.stdSerializers
++});
++var testdir = path.join('/tmp', 'test-fswatcher-' + process.pid);
++
++test('try creating temp directory', function (t) {
++    execFile('/usr/bin/mkdir', ['-p', testdir], function (err, stdout, stderr) {
++        assert(!err);
++        t.end();
++    });
++});
++
++test('try starting and stopping watcher', function (t) {
++    var fsw = new FsWatcher({log: log});
++    t.ok(fsw, 'created watcher');
++    t.ok(fsw.stopped, 'watcher not running');
++
++    fsw.once('ready', function () {
++        t.ok(!fsw.stopped, 'watcher running');
++        fsw.stop();
++        t.end();
++    });
++
++    fsw.start();
++});
++
++test('try starting already running watcher', function (t) {
++    var fsw = new FsWatcher({log: log});
++    t.ok(fsw, 'created watcher');
++
++    fsw.once('ready', function () {
++        t.ok(!fsw.stopped, 'watcher running');
++        t.throws(function () {
++            fsw.start();
++        }, null, 'start twice');
++
++        fsw.stop();
++        t.end();
++    });
++
++    fsw.start();
++});
++
++test('try stopping a stopped watcher', function (t) {
++    var fsw = new FsWatcher({log: log});
++    t.ok(fsw, 'created watcher');
++    t.ok(fsw.stopped, 'watcher not running');
++
++    t.throws(function () {
++        fsw.stop();
++    }, null, 'stop stopped');
++
++    t.end();
++});
++
++test('try watching files with illegal characters', function (t) {
++    var fsw = new FsWatcher({log: log});
++
++
++    fsw.once('ready', function () {
++        vasync.forEachPipeline({
++            inputs: ['newline\nchar', 'nulbyte\0char'],
++            func: function (f, cb) {
++                fsw.watch(f, function (err) {
++                    t.ok(err, 'error is expected: '
++                        + JSON.stringify((err || {}).message));
++                    cb();
++                });
++            }
++        }, function (err) {
++            fsw.stop();
++            t.end();
++        });
++    });
++
++    fsw.start();
++});
++
++test('try watching an existent file and catching CHANGE and DELETE',
++    function (t) {
++        var filename = path.join(testdir, 'hello.txt');
++        var saw_change = false;
++        var saw_delete = false;
++
++        var fsw = new FsWatcher({log: log});
++
++        fs.writeFileSync(filename, 'hello world\n');
++        t.ok(fs.existsSync(filename), 'file was created');
++
++        fsw.on('delete', function (evt) {
++            t.equal(evt.pathname, filename, 'delete was for correct filename');
++            t.ok(saw_change, 'at delete time, already saw change');
++            saw_delete = true;
++            cleanup();
++        });
++
++        fsw.on('change', function (evt) {
++            t.equal(evt.pathname, filename, 'change was for correct filename');
++            t.ok(!saw_delete, 'at change time, did not yet see delete');
++            if (!saw_change) {
++                // avoid doing twice if there are multiple changes
++                saw_change = true;
++                fs.unlinkSync(filename); // should trigger DELETE
++            }
++        });
++
++        fsw.once('ready', function (evt) {
++            fsw.watch(filename, watchcb);
++        });
++
++        fsw.start();
++
++        function watchcb(err) {
++            t.ok(!err, (err ? err.message : 'started watching ' + filename));
++            if (err) {
++                cleanup();
++                return;
++            }
++
++            // should trigger CHANGE
++            fs.writeFileSync(filename, 'goodbye world\n');
++        }
++
++        function cleanup() {
++            fsw.unwatch(filename, function () {
++                fsw.stop();
++                t.ok(saw_change, 'saw change event at cleanup');
++                t.ok(saw_delete, 'saw delete event at cleanup');
++                t.end();
++            });
++        }
++    }
++);
++
++test('try watching a non-existent file then create it', function (t) {
++    var filename = path.join(testdir, '/file/that/shouldnt/exist.txt');
++    var dirname = path.dirname(filename);
++    var saw_create = false;
++
++    var fsw = new FsWatcher({log: log});
++
++    fsw.once('ready', function (evt) {
++        vasync.pipeline({funcs: [
++            function (_, cb) {
++                fsw.watch(filename, cb);
++            }, function (_, cb) {
++                // create directory
++                execFile('/usr/bin/mkdir', ['-p', dirname],
++                    function (err, stdout, stderr) {
++                        t.ok(!err, 'mkdir -p ' + dirname);
++                        cb(err);
++                    }
++                );
++            }, function (_, cb) {
++                t.ok(!saw_create, 'haven\'t seen "create" event yet');
++                // create file
++                fs.writeFile(filename, 'hello world\n', function (err) {
++                    t.ok(!err, 'wrote "hello world" to ' + filename);
++                    cb(err);
++                });
++            }
++        ]}, function (err) {
++            if (err) {
++                t.ok(!err, err.message);
++                cleanup();
++            }
++        });
++    });
++
++    fsw.on('create', function (evt) {
++        t.equal(evt.pathname, filename, 'saw create event for ' + filename);
++        saw_create = true;
++        cleanup();
++    });
++
++    fsw.start();
++
++    function cleanup() {
++        fsw.unwatch(filename, function () {
++            fsw.stop();
++            t.ok(saw_create, 'saw create event at cleanup');
++            t.end();
++        });
++    }
++});
++
++test('try watching an existent file, unwatching and ensure no events',
++    function (t) {
++
++    var events_after_stop = 0;
++    var filename = path.join(testdir, 'tricky.txt');
++    var saw_change = false;
++    var stopped_watching = false;
++
++    var fsw = new FsWatcher({log: log});
++
++    fs.writeFileSync(filename, 'look at me, I\'m so tricky!\n');
++    t.ok(fs.existsSync(filename), 'file was created');
++
++    fsw.on('event', function (evt) {
++        if (stopped_watching) {
++            events_after_stop++;
++        }
++    });
++
++    fsw.on('change', function (evt) {
++        t.equal(evt.pathname, filename, 'change was for correct filename');
++        t.ok(!stopped_watching, 'when change event happened, we have not '
++            + 'stopped watching');
++
++        // avoid doing twice if there are multiple changes
++        if (saw_change)
++            return;
++
++        saw_change = true;
++
++        if (stopped_watching)
++            return;
++
++        fsw.unwatch(filename, function () {
++            stopped_watching = true;
++
++            // would trigger DELETE, but we shouldn't get it.
++            fs.unlinkSync(filename);
++
++            // leave some time for rogue events to show up
++            setTimeout(function () {
++                fsw.stop();
++                t.equal(events_after_stop, 0, 'should not see events '
++                    + 'after stopping');
++                t.end();
++            }, 2000);
++        });
++    });
++
++    fsw.once('ready', function (evt) {
++        fsw.watch(filename, function (err) {
++            fs.writeFileSync(filename, 'now we are writing junk!\n');
++            // now change event should have been triggered and we should
++            //  have stopped watcher. Control should pass to
++            // fsw.on('change'... above.
++            return;
++        });
++    });
++
++    fsw.start();
++});
++
++test('create a file and ensure we get multiple modify events',
++    function (t) {
++
++    var changes = 0;
++    var filename = path.join(testdir, 'changeme.txt');
++
++    var fsw = new FsWatcher({log: log});
++
++    fs.writeFileSync(filename, 'initial data\n');
++    t.ok(fs.existsSync(filename), 'file was created');
++
++    fsw.on('event', function (evt) {
++        t.ok(evt.changes.indexOf('FILE_MODIFIED') > -1,
++            'type of "event" event is "change"');
++    });
++
++    fsw.on('change', function (evt) {
++        t.equal(evt.pathname, filename, 'change was for correct filename');
++        changes++;
++        if (changes > 0) {
++            fsw.stop();
++            t.end();
++        }
++    });
++
++    fsw.once('ready', function (evt) {
++        fsw.watch(filename, function (err) {
++            fs.writeFileSync(filename, 'first modification!\n');
++            return;
++        });
++    });
++
++    fsw.start();
++});
++
++test('watch 10000 non-existent files, create them, modify them and delete them',
++    function (t) {
++
++    var then = new Date();
++
++    var count = 10000;
++    var fsw = new FsWatcher({log: log});
++    var files = [];
++
++    // events seen per file
++    var events = {};
++
++    // events seen
++    var seen = {
++        create: 0,
++        change: 0,
++        delete: 0
++    };
++
++    // array of filenames to watch and manage
++    for (var i = 0; i < count; i++) {
++        var filename = path.join(testdir, 'testfile.' + i);
++        files.push(filename);
++        events[filename] = [];
++    }
++
++    // Because we are managing a large number of files, a vasync queue is used
++    // to manage all file creations, modifications, and deletions.
++    var q = vasync.queue(function (task, cb) {
++        task(cb);
++    }, 100);
++
++    // deadman switch - we stop this if it takes too long
++    var timeout = setTimeout(function () {
++        var e = new Error('timeout exceeded');
++        cleanup(e);
++    }, 60 * 1000);
++
++    vasync.pipeline({funcs: [
++        function (_, cb) {
++            // start the FsWatcher
++            fsw.once('ready', function (evt) {
++                cb();
++            });
++            fsw.start();
++        }, function (_, cb) {
++            // start watching for events
++            var done = 0;
++
++            fsw.on('create', function (evt) {
++                if (!evt.pathname.match(/\/testfile.[0-9]+$/)) {
++                    log.error({evt: evt},
++                        'throwing out event for file %s',
++                        evt.pathname);
++                    return;
++                }
++
++                seen.create++;
++                events[evt.pathname].push('create-seen');
++
++                // modify the file - triggers 'change' event
++                q.push(function (cb2) {
++                    events[evt.pathname].push('change');
++                    fs.truncate(evt.pathname, 0, cb2);
++                });
++            });
++
++            fsw.on('change', function (evt) {
++                if (!evt.pathname.match(/\/testfile.[0-9]+$/)) {
++                    log.error({evt: evt},
++                        'throwing out event for file %s',
++                        evt.pathname);
++                    return;
++                }
++
++                if (events[evt.pathname].indexOf('change-seen') > -1) {
++                    log.error({evt: evt},
++                        'change event already seen for file %s',
++                        evt.pathname);
++                    return;
++                }
++
++                seen.change++;
++                events[evt.pathname].push('change-seen');
++
++                // delete the file - triggers 'delete' event
++                q.push(function (cb2) {
++                    events[evt.pathname].push('delete');
++                    fs.unlink(evt.pathname, cb2);
++                });
++            });
++
++            fsw.on('delete', function (evt) {
++                if (!evt.pathname.match(/\/testfile.[0-9]+$/)) {
++                    log.error({evt: evt},
++                        'throwing out event for file %s',
++                        evt.pathname);
++                    return;
++                }
++
++                seen.delete++;
++                events[evt.pathname].push('delete-seen');
++
++                fsw.unwatch(evt.pathname, function () {
++                    delete events[evt.pathname];
++                    // check if we're done
++                    if (++done === count) {
++                        clearTimeout(timeout);
++                        cleanup();
++                    }
++                });
++            });
++
++            cb();
++        }, function (_, cb) {
++            // add watches for all non-existent files
++            vasync.forEachParallel({
++                func: function (f, cb2) {
++                    events[f].push('watch');
++                    fsw.watch(f, cb2);
++                },
++                inputs: files
++            }, function (err) {
++                t.ok(!err, (err ? err.message : 'no errors'));
++                cb();
++            });
++        }, function (_, cb) {
++            // all files are being watched, create them
++            vasync.forEachParallel({
++                func: function (f, cb2) {
++                    q.push(function (cb3) {
++                        var data = 'foo ' + f;
++                        fs.writeFile(f, data, function (err) {
++                            events[f].push('create');
++                            cb3(err); // tell queue we're done
++                            cb2(err); // tell forEachParallel we're done
++                        });
++                    });
++                },
++                inputs: files
++            }, function (err) {
++                t.ok(!err, (err ? err.message : 'no errors'));
++                cb();
++            });
++        }
++    ]}, function (err) {
++        // control is passed onto fsw events now
++    });
++
++    function cleanup(err) {
++        var now = new Date();
++        var delta = now - then;
++        t.ok(!err, (err ? err.message : 'no errors'));
++        t.ok(true, 'took ' + delta + 'ms to complete');
++
++        Object.keys(seen).forEach(function (ev) {
++            t.equal(seen[ev], count,
++                util.format('have seen %d / %d %s events',
++                seen[ev], count, ev));
++        });
++
++        var keys = Object.keys(events);
++        t.equal(keys.length, 0, '0 files left');
++        if (keys.length > 0) {
++            console.error(events);
++        }
++
++        fsw.status(function (_, obj) {
++            if (err) {
++                log.error({obj: obj}, 'fswatcher status before exit');
++            }
++            fsw.stop();
++            t.end();
++        });
++    }
++});
++
++test('cleanup', function (t) {
++    t.ok(true, 'cleaning up');
++    execFile('/usr/bin/rm', ['-rf', testdir],
++        function (err, stdout, stderr) {
++            t.ok(!err, (err ? err.message : 'cleaned up'));
++            t.end();
++        }
++    );
++});

@@ -1,0 +1,174 @@
+commit 158a98a469e30601a05e1935ddbac9d0737047d6 (refs/changes/95/3995/5)
+Author: Robert Bogart <robert.bogart@joyent.com>
+Date:   2018-05-31T18:56:03+00:00 (1 year, 4 months ago)
+    
+    MANTA-3596 binder could export metrics via artedi
+
+diff --git a/lib/client.js b/lib/client.js
+index d0d1b91..7296fcf 100644
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -10,6 +10,7 @@ module.exports = { Client: ZKClient };
+ 
+ const mod_fsm = require('mooremachine');
+ const mod_assert = require('assert-plus');
++const mod_artedi = require('artedi');
+ const mod_consts = require('./zk-consts');
+ const mod_util = require('util');
+ const mod_stream = require('stream');
+@@ -25,6 +26,8 @@ const mod_verror = require('verror');
+ const mod_vasync = require('vasync');
+ const mod_cfsm = require('./connection-fsm');
+ 
++var METRIC_ZK_CONNECTION_COUNTER = 'zookeeper_connection_count';
++
+ function ZKClient(opts) {
+ 	mod_assert.object(opts, 'options');
+ 
+@@ -40,6 +43,30 @@ function ZKClient(opts) {
+ 		});
+ 	}
+ 
++	/*
++	 * If the caller did not supply a collector for tracking metrics, then
++	 * create one internally.  At least for now, it is not a requirement
++	 * for all consumers to provide one.
++	 */
++	mod_assert.optionalObject(opts.collector);
++	if (opts.collector === undefined || opts.collector === null) {
++		this.zc_collector = mod_artedi.createCollector();
++	} else {
++		this.zc_collector = opts.collector;
++	}
++
++	/*
++	 * The name of this metric can be misleading as the client is
++	 * monogomous.  That is, at any point in time, we only ever have one
++	 * connection with a ZooKeeper server.  This is intended to track the
++	 * total number of times that we have had to establish (or re-establish)
++	 * a connection with a ZooKeeper server.
++	 */
++	this.zc_collector.counter({
++		name: METRIC_ZK_CONNECTION_COUNTER,
++		help: 'Total number of connections established'
++	});
++
+ 	mod_assert.optionalArrayOfObject(opts.servers, 'options.servers');
+ 	if (opts.servers === undefined || opts.servers === null) {
+ 		mod_assert.string(opts.address, 'options.address');
+@@ -168,7 +195,8 @@ ZKClient.prototype._newSession = function () {
+ 		return;
+ 	var s = new mod_zks.ZKSession({
+ 		timeout: this.zc_sessionTimeout,
+-		log: this.zc_log
++		log: this.zc_log,
++		collector: this.zc_collector
+ 	});
+ 	this.zc_session = s;
+ 	function initialHandler(st) {
+@@ -196,6 +224,18 @@ ZKClient.prototype.isConnected = function () {
+ 	return (conn !== undefined && conn.isInState('connected'));
+ };
+ 
++ZKClient.prototype._emitImpl = function (evt) {
++	var self = this;
++
++	if (evt === 'session') {
++		var connection_count = self.zc_collector.getCollector(
++		    METRIC_ZK_CONNECTION_COUNTER);
++		connection_count.increment();
++	}
++
++	self.emit(evt);
++};
++
+ ZKClient.prototype._emitAfterConnected = function (evt) {
+ 	/*
+ 	 * We don't want to emit 'connect' until someone can safely call
+@@ -207,7 +247,7 @@ ZKClient.prototype._emitAfterConnected = function (evt) {
+ 	var c = this.currentConnection();
+ 	if (c.isInState('connected')) {
+ 		setImmediate(function () {
+-			self.emit(evt);
++			self._emitImpl(evt);
+ 		});
+ 	} else {
+ 		c.on('stateChanged', onConnCh);
+@@ -215,7 +255,7 @@ ZKClient.prototype._emitAfterConnected = function (evt) {
+ 			if (cst === 'connected') {
+ 				c.removeListener(
+ 				    'stateChanged', onConnCh);
+-				self.emit(evt);
++				self._emitImpl(evt);
+ 			}
+ 		}
+ 	}
+diff --git a/lib/zk-session.js b/lib/zk-session.js
+index a3489d5..75c4472 100644
+--- a/lib/zk-session.js
++++ b/lib/zk-session.js
+@@ -22,10 +22,13 @@ const mod_events = require('events');
+ const mod_bunyan = require('bunyan');
+ const mod_verror = require('verror');
+ 
++var METRIC_ZK_NOTIFICATION_COUNTER = 'zookeeper_notifications';
++
+ function ZKSession(opts) {
+ 	mod_assert.object(opts, 'options');
+ 	mod_assert.number(opts.timeout, 'options.timeout');
+ 	mod_assert.object(opts.log, 'options.log');
++	mod_assert.object(opts.collector, 'options.collector');
+ 
+ 	this.zs_conn = undefined;
+ 	this.zs_oldConn = undefined;
+@@ -37,11 +40,18 @@ function ZKSession(opts) {
+ 	this.zs_log = opts.log.child({
+ 		component: 'ZKSession'
+ 	});
++	this.zs_collector = opts.collector;
+ 
+ 	this.zs_lastZxid = new mod_jsbn.BigInteger('0');
+ 	this.zs_sessionId = new mod_jsbn.BigInteger('0');
+ 	this.zs_passwd = new Buffer(8).fill(0);
+ 
++	/* Create a counter for tracking ZooKeeper notifications. */
++	this.zs_collector.counter({
++		name: METRIC_ZK_NOTIFICATION_COUNTER,
++		help: 'Notifications received from ZooKeeper'
++	});
++
+ 	mod_fsm.FSM.call(this, 'detached');
+ }
+ mod_util.inherits(ZKSession, mod_fsm.FSM);
+@@ -158,6 +168,7 @@ ZKSession.prototype.state_attaching = function (S) {
+ 		self.zs_sessionId = sid;
+ 		self.zs_passwd = pkt.passwd;
+ 		self.resetExpiryTimer();
++
+ 		S.gotoState('attached');
+ 	});
+ 
+@@ -351,6 +362,11 @@ ZKSession.prototype.processNotification = function (pkt) {
+ 		zxid: pkt.zxid.toString('hex'),
+ 		type: pkt.type
+ 	}, 'notification %s for %s', evt, pkt.path);
++
++	var notifications = this.zs_collector.getCollector(
++	    METRIC_ZK_NOTIFICATION_COUNTER);
++	notifications.increment({event: evt});
++
+ 	if (watcher)
+ 		watcher.emit(evt);
+ };
+diff --git a/package.json b/package.json
+index 23daeef..347e68e 100644
+--- a/package.json
++++ b/package.json
+@@ -8,6 +8,7 @@
+   },
+   "main": "lib/index.js",
+   "dependencies": {
++    "artedi": "1.3.0",
+     "assert-plus": "^1.0.0",
+     "bunyan": "^1.8.10",
+     "cueball": "^2.2.7",

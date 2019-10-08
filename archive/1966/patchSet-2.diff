@@ -1,0 +1,515 @@
+commit 9a3ad8a5a8b8f0bb8eca6bc572ae7c7bc5c3654e (refs/changes/66/1966/2)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2017-05-24T13:13:51-07:00 (2 years, 5 months ago)
+    
+    DOCKER-725 support `docker network ls`
+    Reviewed by: Cody Peter Mello <cody.mello@joyent.com>
+
+diff --git a/lib/backends/sdc/index.js b/lib/backends/sdc/index.js
+index 6cf17d9..12efd46 100644
+--- a/lib/backends/sdc/index.js
++++ b/lib/backends/sdc/index.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -18,6 +18,7 @@ var build = require('./build');
+ var containers = require('./containers');
+ var sysinfo = require('./sysinfo');
+ var images = require('./images');
++var networks = require('./networks');
+ 
+ 
+ 
+@@ -80,5 +81,8 @@ SdcBackend.prototype.tagImage = images.tagImage;
+ SdcBackend.prototype.buildImage = build.buildImage;
+ SdcBackend.prototype.commitImage = build.commitImage;
+ 
++// networks.js
++SdcBackend.prototype.listNetworks = networks.listNetworks;
++
+ 
+ module.exports = SdcBackend;
+diff --git a/lib/backends/sdc/networks.js b/lib/backends/sdc/networks.js
+new file mode 100644
+index 0000000..7d0c7e3
+--- /dev/null
++++ b/lib/backends/sdc/networks.js
+@@ -0,0 +1,232 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * Triton networks use a uuid as the identifier, whilst docker generally uses
++ * a 64 character length string for the identifier. To make them compatible,
++ * we double-up the Triton uuid and remove the dashes to create a 64-char id.
++ */
++
++var assert = require('assert-plus');
++var NAPI = require('sdc-clients').NAPI;
++var vasync = require('vasync');
++
++var utils = require('./utils');
++
++//---- globals
++
++var ADMIN_NIC_TAG = 'admin';
++
++var _napiClientCache; // set in `getNapiClient`
++
++
++//---- internal support routines
++
++function getNapiClient(config) {
++    if (!_napiClientCache) {
++        // intentionally global
++        _napiClientCache = new NAPI(config);
++    }
++    return _napiClientCache;
++}
++
++// Convert the list of Triton networks into docker format.
++//
++// Example of docker network object:
++//
++// {
++//    "Name": "bridge",
++//    "Id": "f2de39df4171b0dc8...63041c0f34030aa3977566",
++//    "Created": "2016-10-19T06:21:00.416543526Z",
++//    "Scope": "local",
++//    "Driver": "bridge",
++//    "EnableIPv6": false,
++//    "Internal": false,
++//    "IPAM": {
++//        "Driver": "default",
++//        "Options": null,
++//        "Config": [{
++//                "Subnet": "172.17.0.0/16",
++//                "Gateway": "172.17.0.1"
++//        }]
++//    },
++//    "Containers": {
++//        "39b69226f9d79f5fb...90bcc167065867": {
++//            "EndpointID": "ed2419a97c1d995b4...36b80a7db8d98b442eda",
++//            "MacAddress": "02:42:ac:11:00:02",
++//            "IPv4Address": "172.17.0.2/16",
++//            "IPv6Address": ""
++//        }
++//    },
++//    "Options": {
++//        "com.docker.network.bridge.default_bridge": "true",
++//        "com.docker.network.bridge.enable_icc": "true",
++//        "com.docker.network.bridge.enable_ip_masquerade": "true",
++//        "com.docker.network.bridge.host_binding_ipv4": "0.0.0.0",
++//        "com.docker.network.bridge.name": "docker0",
++//        "com.docker.network.driver.mtu": "1500"
++//    },
++//    "Labels": null
++// }
++function napiNetworkToDockerNetwork(net, opts, callback) {
++
++    // TODO: Lookup 'Containers' that are using this network. Note that
++    // `docker network ls` doesn't display these containers, it will be visible
++    // in `docker network inspect foo`, though docker is sending the same JSON
++    // data for both ls and inspect.
++
++    callback(null, {
++        Driver: 'Triton',
++        Id: utils.networkUuidToDockerId(net.uuid),
++        IPAM: {
++            Driver: 'default',
++            Options: null,
++            Config: [ {
++                Subnet: net.subnet,
++                Gateway: net.gateway
++            } ]
++        },
++        Name: net.name,
++        Options: {
++            'com.docker.network.driver.mtu': net.mtu.toString()
++        },
++        Scope: net.fabric ? 'overlay' : 'external'
++    });
++}
++
++/**
++ * Return the networks that are provisionable by the given account.
++ * This includes network pools, but not the networks that belong to a pool.
++ *
++ * Dev note: This is the same approach/code that CloudAPI uses.
++ *
++ * @param {Object} opts Options.
++ * @param {Function} callback (err, networks) Array of NAPI network objects.
++ */
++function getNapiNetworksForAccount(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.config, 'opts.config');
++    assert.object(opts.config.napi, 'opts.config.napi');
++    assert.object(opts.log, 'opts.log');
++    assert.uuid(opts.reqId, 'opts.reqId');
++    assert.uuid(opts.accountUuid, 'opts.accountUuid');
++
++    var accountUuid = opts.accountUuid;
++    var log = opts.log;
++    var napi = getNapiClient(opts.config.napi);
++    var reqOpts = {headers: {'x-request-id': opts.reqId}};
++
++    function listNetworkPoolsCb(err, pools) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        var networks = [];
++        var networksInPools = {};
++
++        // Always skip admin network pools:
++        pools = pools.filter(function (pool) {
++            return (pool.nic_tag !== ADMIN_NIC_TAG);
++        });
++
++        // Add pools to the list of networks, track networks in the pool, as we
++        // want to later filter out all networks that are in a pool.
++        pools.forEach(function (pool) {
++            networks.push(pool);
++            pool.networks.forEach(function (net) {
++                networksInPools[net.uuid] = true;
++            });
++        });
++
++        function listNetworksCb(err2, nets) {
++            if (err2) {
++                callback(err2);
++                return;
++            }
++
++            // Always skip admin networks, and don't add networks which are
++            // already in contained pools:
++            nets = nets.filter(function (net) {
++                if (net.nic_tag === ADMIN_NIC_TAG) {
++                    return false;
++                }
++                if (networksInPools[net.uuid]) {
++                    return false;
++                }
++                return true;
++            });
++
++            networks = networks.concat(nets);
++
++            log.debug({
++                networks: networks
++            }, 'getNapiNetworksForAccount');
++
++            callback(null, networks);
++        }
++
++        napi.listNetworks({provisionable_by: accountUuid}, reqOpts,
++            listNetworksCb);
++    }
++
++    napi.listNetworkPools({provisionable_by: accountUuid}, reqOpts,
++        listNetworkPoolsCb);
++}
++
++
++/**
++ * List networks available to the req account holder.
++ *
++ * @param {Object} opts Options.
++ * @param {Function} callback (err, networks) Array of docker network objects.
++ */
++function listNetworks(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.req, 'opts.req');
++    assert.object(opts.req.account, 'opts.req.account');
++    assert.object(opts.req.app, 'opts.req.app');
++    assert.object(opts.req.app.config, 'opts.req.app.config');
++    assert.object(opts.req.log, 'opts.req.log');
++
++    var req = opts.req;
++    var reqId = req.getId();
++    var log = req.log;
++    var params = {
++        accountUuid: req.account.uuid,
++        config: req.app.config,
++        log: log,
++        reqId: reqId
++    };
++
++    function getNapiNetworksForAccountCb(err, networks) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        log.debug('listNetworks: %d networks found', networks.length);
++        // Convert networks into the docker format.
++        vasync.forEachParallel({
++            inputs: networks,
++            func: function (net, cb) {
++                napiNetworkToDockerNetwork(net, opts, cb);
++            }
++        }, function (verr, results) {
++            callback(verr, results && results.successes);
++        });
++    }
++
++    getNapiNetworksForAccount(params, getNapiNetworksForAccountCb);
++}
++
++
++module.exports = {
++    listNetworks: listNetworks
++};
+diff --git a/lib/endpoints/networks.js b/lib/endpoints/networks.js
+index 2337c08..9a9e19c 100644
+--- a/lib/endpoints/networks.js
++++ b/lib/endpoints/networks.js
+@@ -20,7 +20,22 @@ var errors = require('../errors');
+  * GET /networks
+  */
+ function networkList(req, res, next) {
+-    return next(new errors.NotImplementedError('network ls'));
++    var log = req.log;
++    var opts = {req: req};
++
++    req.backend.listNetworks(opts, function (err, networks) {
++        if (err) {
++            if (!(err instanceof errors.DockerError)) {
++                log.error({err: err}, 'Problem loading networks');
++                err = new errors.DockerError(err, 'problem loading networks');
++            }
++            next(err);
++            return;
++        }
++
++        res.send(networks);
++        next();
++    });
+ }
+ 
+ 
+diff --git a/test/integration/api-create.test.js b/test/integration/api-create.test.js
+index ca507f1..567ddd3 100644
+--- a/test/integration/api-create.test.js
++++ b/test/integration/api-create.test.js
+@@ -102,6 +102,16 @@ test('setup', function (tt) {
+         });
+     });
+ 
++    tt.test('check if fabrics are enabled', function (t) {
++        h.isFabricNetworkingEnabled(NAPI, ALICE.account,
++            function (err, enabled) {
++                t.ifErr(err, 'check isFabricNetworkingEnabled');
++                FABRICS = enabled;
++                t.end();
++            }
++        );
++    });
++
+     tt.test('pull nginx image', function (t) {
+         h.ensureImage({
+             name: 'nginx:latest',
+@@ -346,26 +356,6 @@ test('api: create with env var that has no value (DOCKER-741)', function (tt) {
+     });
+ });
+ 
+-test('ensure fabrics enabled', function (tt) {
+-    tt.test('fabric configuration', function (t) {
+-        var listOpts = {};
+-        var listParams = {};
+-        NAPI.listFabricVLANs(ALICE.account.uuid, listOpts, listParams,
+-            function (err, vlans) {
+-                if (err) {
+-                    FABRICS = false;
+-                    if (err.restCode !== 'PreconditionRequiredError') {
+-                        t.ifErr(err);
+-                    }
+-                } else {
+-                    FABRICS = true;
+-                }
+-                t.end();
+-        });
+-    });
+-});
+-
+-
+ /*
+  * Tests for `docker run --net`
+  *
+diff --git a/test/integration/api-network.test.js b/test/integration/api-network.test.js
+new file mode 100644
+index 0000000..989ed6d
+--- /dev/null
++++ b/test/integration/api-network.test.js
+@@ -0,0 +1,100 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017, Joyent, Inc.
++ */
++
++/*
++ * Integration tests for `docker create` using the Remote API directly.
++ */
++
++var test = require('tape');
++
++var h = require('./helpers');
++
++
++// --- Globals
++var ALICE;
++var DOCKER_ALICE;
++var FABRICS_ENABLED;
++var NAPI;
++var STATE = {
++    log: require('../lib/log')
++};
++
++
++// --- Tests
++
++
++test('setup', function (tt) {
++
++    tt.test('docker env', function (t) {
++        h.initDockerEnv(t, STATE, {}, function (err, accounts) {
++            t.ifErr(err);
++            ALICE = accounts.alice;
++            t.end();
++        });
++    });
++
++    tt.test('docker client init', function (t) {
++        h.createDockerRemoteClient({user: ALICE},
++            function (err, client) {
++                t.ifErr(err, 'docker client init for alice');
++                DOCKER_ALICE = client;
++                t.end();
++            }
++        );
++    });
++
++    tt.test('napi client init', function (t) {
++        h.createNapiClient(function (err, client) {
++            t.ifErr(err, 'napi client');
++            NAPI = client;
++            t.end();
++        });
++    });
++
++    tt.test('check if fabrics are enabled', function (t) {
++        h.isFabricNetworkingEnabled(NAPI, ALICE.account,
++            function (err, enabled) {
++                t.ifErr(err, 'check isFabricNetworkingEnabled');
++                FABRICS_ENABLED = enabled;
++                t.end();
++            }
++        );
++    });
++});
++
++
++test('docker network ls', function (tt) {
++    tt.test('list networks', function (t) {
++        DOCKER_ALICE.get('/networks', function (err, res, req, networks) {
++            t.ifErr(err, 'check /networks err');
++            t.ok(Array.isArray(networks), 'check /networks returned an array');
++            t.ok(networks.length >= 1, 'array contains at least one network');
++            networks.forEach(function (net) {
++                t.ok(net.Id.match(/^[0-9a-f]{64}$/),
++                    'checking net.Id is hex-char string of 64 length');
++                t.equal(net.Driver, 'Triton', 'checking net.Driver');
++                t.ok(net.IPAM, 'checking net.IPAM existance');
++                t.ok(net.Options, 'checking net.Options existance');
++                t.ok(net.Scope, 'checking net.Scope existance');
++            });
++            if (FABRICS_ENABLED) {
++                var aliceMyFabricNetworks = networks.filter(function (net) {
++                    return net.Name === 'My-Fabric-Network';
++                });
++
++                t.equal(aliceMyFabricNetworks.length, 1,
++                    'expect 1 My-Fabric-Network');
++                t.equal(aliceMyFabricNetworks[0].Scope, 'Overlay',
++                    'Ensure Scope === Overlay');
++            }
++            t.end();
++        });
++    });
++});
+diff --git a/test/integration/helpers.js b/test/integration/helpers.js
+index bd64fc7..24579b5 100644
+--- a/test/integration/helpers.js
++++ b/test/integration/helpers.js
+@@ -70,6 +70,7 @@ var CLIENT_ZONE_PAYLOAD = {
+     ]
+ };
+ 
++var FABRICS_ENABLED = null;
+ 
+ 
+ // --- internal support routines
+@@ -1875,6 +1876,37 @@ function getNicsByVm(client, vm, callback) {
+ }
+ 
+ 
++/**
++ * Check if fabric networking is enabled.
++ *
++ * @param {Function} callback (err, enabled)
++ */
++function isFabricNetworkingEnabled(client, account, callback) {
++    assert.object(client, 'napi client');
++    assert.object(client, 'user account');
++    assert.func(callback, 'callback function');
++
++    if (FABRICS_ENABLED !== null) {
++        setImmediate(callback, null, FABRICS_ENABLED);
++        return;
++    }
++    client.listFabricVLANs(account.uuid, {}, {},
++        function (err, vlans) {
++            if (err) {
++                if (err.restCode !== 'PreconditionRequiredError') {
++                    callback(err);
++                    return;
++                }
++                FABRICS_ENABLED = false;
++            } else {
++                FABRICS_ENABLED = true;
++            }
++            callback(null, FABRICS_ENABLED);
++        }
++    );
++}
++
++
+ /*
+  * Return the array of active packages in sorted (smallest to largest) order.
+  *
+@@ -1940,6 +1972,7 @@ module.exports = {
+     getOrCreateFabricNetwork: getOrCreateFabricNetwork,
+     getNetwork: getNetwork,
+     getNicsByVm: getNicsByVm,
++    isFabricNetworkingEnabled: isFabricNetworkingEnabled,
+     getSortedPackages: getSortedPackages,
+ 
+     getDockerEnv: getDockerEnv,

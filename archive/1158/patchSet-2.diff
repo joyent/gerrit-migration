@@ -1,0 +1,527 @@
+commit ea6cc1da196ffdb018ef7c7157066d40e229cf00 (refs/changes/58/1158/2)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-12-21T16:43:18-08:00 (2 years, 10 months ago)
+    
+    joyent/node-cueball#64 Resolver should keep cached A/AAAA records from last SRV
+    joyent/node-cueball#63 NIC_CACHE expiring causes re-do of A lookups before real TTL
+
+diff --git a/lib/resolver.js b/lib/resolver.js
+index f53c358..cf15e6e 100644
+--- a/lib/resolver.js
++++ b/lib/resolver.js
+@@ -172,6 +172,67 @@ CueBallResolver.prototype.state_stopping = function (S) {
+  * provided name. In this way, HA setups can remove and drain nameservers with
+  * zero impact just like any other service, by removing them from DNS and
+  * waiting until traffic subsides.
++ *
++ * This is the state diagram for the DNSResolver:
++ *
++ *    +------+
++ *    | init |
++ *    +---+--+
++ *        |
++ *        |                                      Startup and bootstrap.
++ *        v
++ *    +---+------+     +------------+
++ *    | check_ns +---> |bootstrap_ns|
++ *    +---+------+     +-----+------+
++ *        |                  |
++ *        v                  |                  . . . . . . . . . . . . . . . .
++ *     +--+--+               |
++ * +-->+ srv | <-------------+
++ * |   +--+--+                                   The SRV section sets up
++ * |      |                                      this.r_srvs, array of objs
++ * |      v                                      with name+port. Each will
++ * |  +---------+ <----------------+             become at least one backend.
++ * |  | srv_try +--------+         |
++ * |  +--+------+        v         |             If no SRV records, we supply a
++ * |     |         +-----+-----+   |             single dummy entry with the
++ * |     | +-------+ srv_error |   |             resolver domain and default
++ * |     | |giveup +-----+-----+   |             port.
++ * |   ok| |             |         |
++ * |     | |             +---------+            . . . . . . . . . . . . . . . .
++ * |     v v                retry
++ * |   +-+-+--+                                  The AAAA section deals with
++ * +-->+ aaaa |                                  IPv6 lookups for each backend.
++ * |   +--+---+
++ * |      |                     +---------------------------+
++ * |      v                     v                           |    We take the
++ * |   +--+--------+       +----+-----+                     |    r_srvs and
++ * |   | aaaa_next +-----> | aaaa_try +----------+          |    iterate over
++ * |   +--+---+--+-+       +----+-----+          |          |    them, filling
++ * |      |   ^  ^              |                v          |    out addresses
++ * |      |   |  |              |ok         +----+-------+  |    and expiry
++ * |  done|   |  +--------------+           | aaaa_error |  |    times.
++ * |      |   |                             +--+--+------+  |
++ * |      |   |                                |  |         |    Current srv
++ * |      |   +--------------------------------+  +---------+    goes in
++ * |      v             give up                      retry       this.r_srv.
++ * |   +--++
++ * +-->+ a |                                    . . . . . . . . . . . . . . . .
++ * |   +-+-+                                     A section for IPv4.
++ * |     |
++ * |    ....   (same structure as AAAA: a_next, a_try, a_error)
++ * | done|                                      . . . . . . . . . . . . . . . .
++ * |     v
++ * |   +-+-------+                               Processing and sleep section.
++ * |   | process |   (emits 'added', 'removed')  We go through the r_srvs that
++ * |   +--+------+                               have been filled out and make
++ * |      |                                      backends, then emit events.
++ * |      v
++ * |   +--+----+                                 Then we find the next upcoming
++ * |   | sleep |                                 expiry time and sleep until
++ * |   +--+----+                                 then. When we wake up we go
++ * |      |                                      back to the state that will
++ * +------+                                      refresh the expired info.
++ *
+  */
+ function CueBallDNSResolver(options) {
+ 	mod_assert.object(options);
+@@ -394,6 +455,26 @@ CueBallDNSResolver.prototype.state_srv_try = function (S) {
+ 		d.setTime(d.getTime() + 1000*ttl);
+ 		self.r_nextService = d;
+ 
++		var oldLookup = {};
++		self.r_srvs.forEach(function (srv) {
++			if (oldLookup[srv.name] === undefined)
++				oldLookup[srv.name] = {};
++			oldLookup[srv.name][srv.port] = srv;
++		});
++		ans.forEach(function (srv) {
++			var old = (oldLookup[srv.name] || {})[srv.port];
++			if (old === undefined)
++				return;
++			if (old.expiry_v4 !== undefined)
++				srv.expiry_v4 = old.expiry_v4;
++			if (old.addresses_v4 !== undefined)
++				srv.addresses_v4 = old.addresses_v4;
++			if (old.expiry_v6 !== undefined)
++				srv.expiry_v6 = old.expiry_v6;
++			if (old.addresses_v6 !== undefined)
++				srv.addresses_v6 = old.addresses_v6;
++		});
++
+ 		self.r_srvs = ans;
+ 		S.gotoState('aaaa');
+ 	});
+@@ -499,6 +580,7 @@ CueBallDNSResolver.prototype.state_aaaa = function (S) {
+ 		d.setTime(
+ 		    CueBallDNSResolver._nicCacheUpdated + NIC_CACHE_TTL + 1);
+ 		this.r_nextV6 = d;
++
+ 		S.gotoState('a');
+ 	}
+ };
+@@ -532,13 +614,27 @@ CueBallDNSResolver.prototype.state_aaaa_try = function (S) {
+ 		return;
+ 	}
+ 
++	var now = new Date();
++	if (srv.expiry_v6 !== undefined &&
++	    srv.expiry_v6.getTime() > now.getTime()) {
++		if (self.r_nextV6 === undefined ||
++		    srv.expiry_v6.getTime() <= self.r_nextV6.getTime()) {
++			self.r_nextV6 = srv.expiry_v6;
++		}
++		S.gotoState('aaaa_next');
++		return;
++	}
++
+ 	var req = this.resolve(srv.name, 'AAAA', this.r_retry.timeout);
+ 	S.on(req, 'answers', function (ans, ttl) {
+ 		var d = new Date();
+ 		d.setTime(d.getTime() + 1000*ttl);
+-		if (self.r_nextV6 === undefined || d <= self.r_nextV6)
++		if (self.r_nextV6 === undefined ||
++		    d.getTime() <= self.r_nextV6.getTime()) {
+ 			self.r_nextV6 = d;
++		}
+ 
++		srv.expiry_v6 = d;
+ 		srv.addresses_v6 = ans.map(function (v) {
+ 			return (v.address);
+ 		});
+@@ -554,7 +650,13 @@ CueBallDNSResolver.prototype.state_aaaa_try = function (S) {
+ 			 * to aaaa_next will skip over this name.
+ 			 *
+ 			 * Same goes for NOTIMP responses (from old binder).
++			 *
++			 * Cache these for the same length of time we cache
++			 * the NIC_CACHE data (NOTIMP doesn't have a TTL).
+ 			 */
++			var d = new Date();
++			d.setTime(d.getTime() + NIC_CACHE_TTL);
++			srv.expiry_v6 = d;
+ 			S.gotoState('aaaa_next');
+ 			return;
+ 		}
+@@ -591,8 +693,8 @@ CueBallDNSResolver.prototype.state_aaaa_error = function (S) {
+ };
+ 
+ CueBallDNSResolver.prototype.state_a = function (S) {
+-	this.r_srvRem = this.r_srvs.slice();
+ 	this.r_nextV4 = undefined;
++	this.r_srvRem = this.r_srvs.slice();
+ 	S.gotoState('a_next');
+ };
+ 
+@@ -625,6 +727,17 @@ CueBallDNSResolver.prototype.state_a_try = function (S) {
+ 		return;
+ 	}
+ 
++	var now = new Date();
++	if (srv.expiry_v4 !== undefined &&
++	    srv.expiry_v4.getTime() > now.getTime()) {
++		if (self.r_nextV4 === undefined ||
++		    srv.expiry_v4.getTime() <= self.r_nextV4.getTime()) {
++			self.r_nextV4 = srv.expiry_v4;
++		}
++		S.gotoState('a_next');
++		return;
++	}
++
+ 	var req = this.resolve(srv.name, 'A', this.r_retry.timeout);
+ 	S.on(req, 'answers', function (ans, ttl) {
+ 		var d = new Date();
+@@ -632,6 +745,7 @@ CueBallDNSResolver.prototype.state_a_try = function (S) {
+ 		if (self.r_nextV4 === undefined || d <= self.r_nextV4)
+ 			self.r_nextV4 = d;
+ 
++		srv.expiry_v4 = d;
+ 		srv.addresses_v4 = ans.map(function (v) {
+ 			return (v.address);
+ 		});
+diff --git a/package.json b/package.json
+index 940ef84..e14bf6d 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "cueball",
+-  "version": "1.2.1",
++  "version": "1.2.2",
+   "description": "",
+   "main": "lib/index.js",
+   "dependencies": {
+diff --git a/test/dns.test.js b/test/dns.test.js
+index 7e24c23..9008947 100644
+--- a/test/dns.test.js
++++ b/test/dns.test.js
+@@ -26,6 +26,11 @@ var recovery = {
+ 	default: {timeout: 1000, retries: 3, delay: 100 }
+ };
+ 
++var log = mod_bunyan.createLogger({
++	name: 'pool-test',
++	level: process.env.LOGLEVEL || 'debug'
++});
++
+ var INT_NO_V6 = {
+ 	'lo0': [
+ 		{ address: '::1', family: 'IPv6' }
+@@ -47,6 +52,9 @@ var INT_V6 = {
+ 
+ var interfaces = INT_V6;
+ 
++var use_a2 = false;
++var srv_ttl = 3600;
++
+ function emptyPacket() {
+ 	return ({
+ 		header: {
+@@ -107,7 +115,7 @@ DummyDnsClient.prototype.lookup = function (options, cb) {
+ 				name: options.domain,
+ 				rtype: mod_proto.queryTypes.SRV,
+ 				rclass: mod_proto.qClasses.IN,
+-				rttl: 3600,
++				rttl: srv_ttl,
+ 				rdata: {
+ 					priority: 0,
+ 					weight: 10,
+@@ -120,7 +128,7 @@ DummyDnsClient.prototype.lookup = function (options, cb) {
+ 				name: options.domain,
+ 				rtype: mod_proto.queryTypes.SRV,
+ 				rclass: mod_proto.qClasses.IN,
+-				rttl: 3600,
++				rttl: srv_ttl,
+ 				rdata: {
+ 					priority: 0,
+ 					weight: 10,
+@@ -129,6 +137,21 @@ DummyDnsClient.prototype.lookup = function (options, cb) {
+ 				}
+ 			});
+ 			reply.header.anCount++;
++			if (use_a2) {
++				reply.answer.push({
++					name: options.domain,
++					rtype: mod_proto.queryTypes.SRV,
++					rclass: mod_proto.qClasses.IN,
++					rttl: srv_ttl,
++					rdata: {
++						priority: 0,
++						weight: 10,
++						port: 111,
++						target: 'a2.ok'
++					}
++				});
++				reply.header.anCount++;
++			}
+ 
+ 		} else if (parts[1] === 'a' && options.type === 'A') {
+ 			reply.header.flags.rcode = mod_proto.rCodes.NOERROR;
+@@ -140,6 +163,26 @@ DummyDnsClient.prototype.lookup = function (options, cb) {
+ 				rdata: { target: '1.2.3.4' }
+ 			});
+ 			reply.header.anCount++;
++		} else if (parts[1] === 'a2' && options.type === 'A') {
++			reply.header.flags.rcode = mod_proto.rCodes.NOERROR;
++			reply.answer.push({
++				name: options.domain,
++				rtype: mod_proto.queryTypes.A,
++				rclass: mod_proto.qClasses.IN,
++				rttl: 3600,
++				rdata: { target: '1.2.3.5' }
++			});
++			reply.header.anCount++;
++		} else if (parts[1] === 'a2' && options.type === 'AAAA') {
++			reply.header.flags.rcode = mod_proto.rCodes.NOERROR;
++			reply.answer.push({
++				name: options.domain,
++				rtype: mod_proto.queryTypes.AAAA,
++				rclass: mod_proto.qClasses.IN,
++				rttl: 1,
++				rdata: { target: '1234:abcd::2' }
++			});
++			reply.header.anCount++;
+ 		} else if (parts[1] === 'aaaa' && options.type === 'AAAA') {
+ 			reply.header.flags.rcode = mod_proto.rCodes.NOERROR;
+ 			reply.answer.push({
+@@ -150,7 +193,8 @@ DummyDnsClient.prototype.lookup = function (options, cb) {
+ 				rdata: { target: '1234:abcd::1' }
+ 			});
+ 			reply.header.anCount++;
+-		} else if (parts[1] === 'a' || parts[1] === 'aaaa') {
++		} else if (parts[1] === 'a' || parts[1] === 'aaaa' ||
++		    parts[1] === 'a2') {
+ 			reply.header.flags.rcode = mod_proto.rCodes.NOERROR;
+ 			/* send a NODATA response. */
+ 		}
+@@ -220,7 +264,8 @@ mod_tape.test('SRV lookup', function (t) {
+ 		service: '_foo._tcp',
+ 		defaultPort: 112,
+ 		resolvers: ['1.2.3.4'],
+-		recovery: recovery
++		recovery: recovery,
++		log: log
+ 	});
+ 	var backends = [];
+ 	res.on('added', function (key, backend) {
+@@ -265,7 +310,8 @@ mod_tape.test('plain A lookup', function (t) {
+ 		service: '_foo._tcp',
+ 		defaultPort: 112,
+ 		resolvers: ['1.2.3.4'],
+-		recovery: recovery
++		recovery: recovery,
++		log: log
+ 	});
+ 	var backends = [];
+ 	res.on('added', function (key, backend) {
+@@ -306,7 +352,8 @@ mod_tape.test('not found => failed', function (t) {
+ 		service: '_foo._tcp',
+ 		defaultPort: 112,
+ 		resolvers: ['1.2.3.4'],
+-		recovery: recovery
++		recovery: recovery,
++		log: log
+ 	});
+ 	var backends = [];
+ 	res.on('added', function (key, backend) {
+@@ -333,7 +380,8 @@ mod_tape.test('notimp => failed', function (t) {
+ 		service: '_foo._tcp',
+ 		defaultPort: 112,
+ 		resolvers: ['1.2.3.4'],
+-		recovery: recovery
++		recovery: recovery,
++		log: log
+ 	});
+ 	var backends = [];
+ 	res.on('added', function (key, backend) {
+@@ -360,7 +408,8 @@ mod_tape.test('SRV ok, notimp on A => failed', function (t) {
+ 		service: '_foo._tcp',
+ 		defaultPort: 112,
+ 		resolvers: ['1.2.3.4'],
+-		recovery: recovery
++		recovery: recovery,
++		log: log
+ 	});
+ 	var backends = [];
+ 	res.on('added', function (key, backend) {
+@@ -387,7 +436,8 @@ mod_tape.test('short TTL', function (t) {
+ 		service: '_foo._tcp',
+ 		defaultPort: 112,
+ 		resolvers: ['1.2.3.4'],
+-		recovery: recovery
++		recovery: recovery,
++		log: log
+ 	});
+ 	var backends = [];
+ 	res.on('added', function (key, backend) {
+@@ -436,6 +486,148 @@ mod_tape.test('short TTL', function (t) {
+ 	res.start();
+ });
+ 
++mod_tape.test('SRV lookup, only one record expire', function (t) {
++	use_a2 = true;
++	var res = new mod_resolver.DNSResolver({
++		domain: 'srv.ok',
++		service: '_foo._tcp',
++		defaultPort: 112,
++		resolvers: ['1.2.3.4'],
++		recovery: recovery,
++		log: log
++	});
++	var backends = [];
++	res.on('added', function (key, backend) {
++		backends.push(backend);
++	});
++	res.on('stateChanged', function (st) {
++		if (st === 'failed') {
++			t.fail();
++			res.stop();
++			t.end();
++		} else if (st === 'running') {
++			t.equal(backends.length, 4);
++			var addrs = backends.map(function (b) {
++				return (b.address);
++			}).sort();
++			t.deepEqual(addrs, ['1.2.3.4', '1.2.3.5',
++			    '1234:abcd::1', '1234:abcd::2']);
++
++			t.equal(nsclients.length, 1);
++			var history = nsclients[0].history.map(function (f) {
++				return (f.domain + '/' + f.type);
++			});
++			t.deepEqual(history, [
++				'_foo._tcp.srv.ok/SRV',
++				'a.ok/AAAA', /* 1 try, got NODATA */
++				'aaaa.ok/AAAA',
++				'a2.ok/AAAA',
++				'a.ok/A',
++				'aaaa.ok/A',  /* 1 try, got NODATA */
++				'a2.ok/A'
++			]);
++
++			nsclients[0].history = [];
++
++			setTimeout(checkAgain, 1500);
++		}
++	});
++	function checkAgain() {
++		t.equal(nsclients.length, 1);
++		var history = nsclients[0].history.map(function (f) {
++			return (f.domain + '/' + f.type);
++		});
++		t.deepEqual(history, [
++			'a2.ok/AAAA',
++			'aaaa.ok/A' /* we didn't give a -ve cache TTL */
++		]);
++
++		nsclients[0].history = [];
++
++		use_a2 = false;
++		srv_ttl = 3600;
++
++		res.stop();
++		t.end();
++	}
++	res.start();
++});
++
++mod_tape.test('SRV lookup, only services expire', function (t) {
++	use_a2 = false;
++	srv_ttl = 1;
++	var res = new mod_resolver.DNSResolver({
++		domain: 'srv.ok',
++		service: '_foo._tcp',
++		defaultPort: 112,
++		resolvers: ['1.2.3.4'],
++		recovery: recovery,
++		log: log
++	});
++	var backends = [];
++	res.on('added', function (key, backend) {
++		backends.push(backend);
++	});
++	res.on('stateChanged', function (st) {
++		if (st === 'failed') {
++			t.fail();
++			res.stop();
++			t.end();
++		} else if (st === 'running') {
++			t.equal(backends.length, 2);
++			var addrs = backends.map(function (b) {
++				return (b.address);
++			}).sort();
++			t.deepEqual(addrs, ['1.2.3.4', '1234:abcd::1']);
++
++			t.equal(nsclients.length, 1);
++			var history = nsclients[0].history.map(function (f) {
++				return (f.domain + '/' + f.type);
++			});
++			t.deepEqual(history, [
++				'_foo._tcp.srv.ok/SRV',
++				'a.ok/AAAA', /* 1 try, got NODATA */
++				'aaaa.ok/AAAA',
++				'a.ok/A',
++				'aaaa.ok/A'  /* 1 try, got NODATA */
++			]);
++
++			nsclients[0].history = [];
++
++			use_a2 = true;
++			setTimeout(checkAgain, 1500);
++		}
++	});
++	function checkAgain() {
++		t.equal(backends.length, 4);
++		var addrs = backends.map(function (b) {
++			return (b.address);
++		}).sort();
++		t.deepEqual(addrs, ['1.2.3.4', '1.2.3.5',
++		    '1234:abcd::1', '1234:abcd::2']);
++
++		t.equal(nsclients.length, 1);
++		var history = nsclients[0].history.map(function (f) {
++			return (f.domain + '/' + f.type);
++		});
++		t.deepEqual(history, [
++			'_foo._tcp.srv.ok/SRV',
++			'a2.ok/AAAA',
++			'aaaa.ok/A', /* we didn't give a -ve cache TTL */
++			'a2.ok/A'
++		]);
++
++		nsclients[0].history = [];
++
++		use_a2 = false;
++		srv_ttl = 3600;
++
++		res.stop();
++		t.end();
++	}
++	res.start();
++});
++
+ mod_tape.test('short-cut on non-ipv6', function (t) {
+ 	interfaces = INT_NO_V6;
+ 	mod_resolver.DNSResolver._nicCacheUpdated = undefined;
+@@ -444,7 +636,8 @@ mod_tape.test('short-cut on non-ipv6', function (t) {
+ 		service: '_foo._tcp',
+ 		defaultPort: 112,
+ 		resolvers: ['1.2.3.4'],
+-		recovery: recovery
++		recovery: recovery,
++		log: log
+ 	});
+ 	var backends = [];
+ 	res.on('added', function (key, backend) {

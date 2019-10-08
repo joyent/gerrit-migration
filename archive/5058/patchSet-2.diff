@@ -1,0 +1,1323 @@
+commit 3d471b8184729f7d00256801f27e064a967f8a9b (refs/changes/58/5058/2)
+Author: Mike Gerdts <mike.gerdts@joyent.com>
+Date:   2018-11-16T05:03:04+00:00 (11 months ago)
+    
+    OS-7353 bhyve support for persistent pci slots for disks
+    OS-7004 support adding new disks to bhyve VMs via 'vmadm update'
+
+diff --git a/src/Makefile b/src/Makefile
+index f402ccd5..9266ed8f 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -104,6 +104,8 @@ JS_CHECK_TARGETS=\
+ 	vm/common/nictag.js \
+ 	vm/tests/common.js \
+ 	vm/tests/test-alias.js \
++	vm/tests/test-bhyve-pci.js \
++	vm/tests/test-bhyve-pci_slot.js \
+ 	vm/tests/test-cleanup-on-failure.js \
+ 	vm/tests/test-create-filesystems.js \
+ 	vm/tests/test-create.js \
+diff --git a/src/vm/node_modules/VM.js b/src/vm/node_modules/VM.js
+index 710ce962..99d0a057 100644
+--- a/src/vm/node_modules/VM.js
++++ b/src/vm/node_modules/VM.js
+@@ -1299,16 +1299,8 @@ exports.validate = function (brand, action, payload, options, callback)
+ 
+                 if (!dev.hasOwnProperty('pci_slot')) {
+                     errors.missing_properties.push(prop_prefix + '.pci_slot');
+-                } else {
+-                    var a = dev.pci_slot.split(':');
+-                    if (a.length < 1 || a.length > 3
+-                        || isNaN(a[0]) || a[0] < 0 || a[0] > 255
+-                        || (a.length > 1
+-                        && (isNaN(a[1]) || a[1] < 0 || a[1] > 31))
+-                        || (a.length > 2
+-                        && (isNaN(a[2]) || a[2] < 0 || a[2] > 7))) {
+-                        errors.bad_values.push(prop_prefix + '.pci_slot');
+-                    }
++                } else if (util.isError(parse_pci_slot(dev.pci_slot))) {
++                    errors.bad_values.push(prop_prefix + '.pci_slot');
+                 }
+ 
+                 if (dev.hasOwnProperty('model') && dev.model !== 'passthru') {
+@@ -5843,6 +5835,11 @@ function buildDiskZonecfg(vmobj, payload)
+                 + disk.image_name + '")\n';
+         }
+ 
++        if (disk.hasOwnProperty('pci_slot')) {
++            zcfg = zcfg + 'add property (name=pci-slot, value="'
++                + disk.pci_slot + '")\n';
++        }
++
+         zcfg = zcfg + 'end\n';
+     }
+ 
+@@ -9235,6 +9232,69 @@ function normalizeNics(payload, vmobj)
+     }
+ }
+ 
++/*
++ * Ensure all disks being added have pci_slot set. This is called during create
++ * and update.  During create, vmobj is null.
++ */
++function normalizeDisks(payload, vmobj, log, cb)
++{
++    var brand;
++    if (vmobj && vmobj.brand) {
++        brand = vmobj.brand;
++    } else {
++        brand = payload.brand;
++    }
++    if (brand !== 'bhyve' || !payload.hasOwnProperty('add_disks')) {
++        cb();
++        return;
++    }
++    var slots = {};
++    var err;
++    var opts;
++
++    // First gather up the list of slots already in use by the VM. We won't
++    // make an attempt to fix them because that would get messy. A previously
++    // created instance may lack static assignments, but those will get fixed
++    // the next time that VM.start() is called.
++    if (vmobj) {
++        opts = {
++            brand: brand,
++            disks: vmobj.disks,
++            slots: slots,
++            log: log
++        };
++
++        assignBhyvePCIslots(opts, function _gatherVM(_err, disk, slot) {
++            if (_err) {
++                err = _err;
++                return;
++            }
++            log.debug({disk: disk}, 'temporary occument in slot ' + slot);
++        });
++        if (err) {
++            cb(err);
++            return;
++        }
++    }
++
++    // Now see what needs to be fixed in the add_disks array.
++    opts = {
++        brand: brand,
++        disks: payload.add_disks,
++        slots: slots,
++        log: log
++    };
++    assignBhyvePCIslots(opts, function _gatherPayload(_err, disk, slot) {
++        if (_err) {
++            err = _err;
++            return;
++        }
++        log.debug({disk: disk}, 'setting pci_slot to ' + slot);
++        disk.pci_slot = slot;
++    });
++    cb(err);
++}
++
+ /*
+  * This is called for both create and update, everything here should be safe for
+  * both. The vmobj will be set if it's an update.
+@@ -9586,6 +9646,16 @@ function normalizePayload(payload, vmobj, log, callback)
+         // this will ensure we've got a MAC, etc.
+         normalizeNics(payload, vmobj);
+ 
++        // ensure that pci slots are assigned for bhyve disks
++        var err;
++        normalizeDisks(payload, vmobj, log, function _normalizeDisksCb(_err) {
++            err = _err;
++        });
++        if (err) {
++            callback(err);
++            return;
++        }
++
+         vasync.pipeline({
+             arg: payload,
+             funcs: [
+@@ -13737,6 +13807,152 @@ function setDockerRestartOpts(uuid, options, callback) {
+     });
+ }
+ 
++/*
++ * Calls `cb(err, disk, pci_slot)` for each disk-like device that lacks
++ * pci_slot.  @disk is a member of the @opts.disks array.  PCI slot allocations
++ * for bhyve disk-like devices use the same algorithm that was used prior to
++ * static PCI slot assignment.
++ *
++ * If a caller needs to figure out slot assignments from multiple source (e.g.
++ * vmobj and payload), the same @opts.slots should be passed for multiple calls.
++ * The first time it should be {}.
++ *
++ * In the event of an error, `cb(err)` is called.
++ */
++function assignBhyvePCIslots(opts, cb)
++{
++    var brand = opts.brand;
++    var disks = opts.disks;
++    var log = opts.log;
++    var unassigned = [];
++    var name2slot = {cdrom: 3, disk: 4};
++    var slots = opts.slots || {};
++    var err;
++
++    log.debug({disks: disks, slots: slots}, 'assignBhyvePCIslots() starting');
++
++    assert.equal(brand, 'bhyve', 'brand must be bhyve');
++    assert.arrayOfObject(disks, 'disks must be as in vmobj or payload');
++    assert.object(log, 'log');
++
++    // slots may be remembered across calls
++    if (Object.keys(slots).length === 0) {
++        Object.keys(name2slot).forEach(function (name) {
++            slots[name2slot[name]] = {};
++        });
++    }
++
++    /*
++     * Determine which functions in the cdrom and disk slots (3 and 4) are in
++     * use. Use the `unassigned` array to keep track of those disk and cdrom
++     * devices that lack `pci_slot`.
++     *
++     * If an error is encountered, call the callback with an Error and bail out.
++     */
++    disks.some(function _gather_slots(dev) {
++        if (dev.hasOwnProperty('pci_slot')) {
++            var bsf = parse_pci_slot(dev.pci_slot);
++            if (util.isError(bsf)) {
++                err = bsf;
++                return true;
++            }
++            if (bsf.bus === 0 && slots.hasOwnProperty(bsf.slot)) {
++                if (slots[bsf.slot].hasOwnProperty(bsf.fn)) {
++                    err = new Error('VM has multiple disks in pci_slot "'
++                        + dev.pci_slot + '": "' + slots[bsf.slot][bsf.fn].path
++                        + '" and "' + dev.path);
++                    log.error({err: err, disks: disks},
++                        'failed to assign PCI slots');
++                    return true;
++                }
++                slots[bsf.slot][bsf.fn] = dev;
++                log.debug({dev: dev}, '0:' + bsf.slot + ':' + bsf.fn
++                    + ' already occupied');
++            }
++        } else if (!dev.hasOwnProperty('media')
++            || Object.keys(name2slot).indexOf(dev.media) !== -1) {
++            // Be sure the boot device gets slot 0 if available.
++            if (dev.boot) {
++                unassigned.splice(0, 0, dev);
++            } else {
++                unassigned.push(dev);
++            }
++        }
++        return false;
++    });
++    if (err) {
++        cb(err);
++        return;
++    }
++
++    /*
++     * Create the update list. The lowest unused function number is used in each
++     * slot.
++     */
++    log.debug({slots: slots}, 'slots before assignments');
++    unassigned.some(function _generate_updates(dev) {
++        var media = dev.media || 'disk';
++        var slot = name2slot[media];
++        var fn = 0;
++
++        if (slot === undefined) {
++            err = new Error('VM has no PCI bus or slot assigned for ' + media
++                + ' devices; automatic pci_slot assignment not possible');
++            log.error({err: err, slots: slots}, 'failed to assign PCI slots');
++            return true;
++        }
++        while (slots[slot].hasOwnProperty(fn)) {
++            log.debug({disk: slots[slot][fn]}, '0:' + slot + ':' + fn
++                + ' already assigned');
++            fn += 1;
++        }
++        if (fn > 7) {
++            err = new Error('VM has more than 8 ' + media + ' devices');
++            log.error({err: err, slots: slots}, 'failed to assign PCI slots');
++            return true;
++        }
++        slots[slot][fn] = dev;
++        log.debug({disk: slots[slot][fn]},
++            '0:' + slot + ':' + fn + ' now assigned');
++
++        cb(null, dev, '0:' + slot + ':' + fn);
++        return false;
++    });
++    log.debug({slots: slots}, 'slots after assignments');
++    if (err) {
++        cb(err);
++    }
++}
++
++function updateBhyvePCIslots(opts, cb)
++{
++    var vmobj = opts.vmobj;
++    var log = opts.log;
++    if (vmobj.brand !== 'bhyve') {
++        cb();
++        return;
++    }
++    var err;
++    var updates = [];
++    assignBhyvePCIslots({brand: vmobj.brand, disks: vmobj.disks, log: log},
++        function _gather_updates(_err, disk, slot) {
++            if (_err) {
++                err = _err;
++                return;
++            }
++            updates.push({path: disk.path, pci_slot: slot});
++        });
++    if (err) {
++        cb(err);
++        return;
++    }
++    if (updates.length === 0) {
++        cb();
++        return;
++    }
++    VM.update(vmobj.uuid, {update_disks: updates}, {log: log}, cb);
++}
++
+ exports.start = function (uuid, extra, options, callback)
+ {
+     var load_fields;
+@@ -13834,7 +14050,7 @@ exports.start = function (uuid, extra, options, callback)
+     log.info('Starting VM ' + uuid);
+ 
+     async.series([
+-        function (cb) {
++        function _loadVM(cb) {
+             /*
+              * If we're being called by something that just loaded the object,
+              * we can use that instead of loading again ourselves.
+@@ -13874,7 +14090,7 @@ exports.start = function (uuid, extra, options, callback)
+                 vmobj = obj;
+                 cb();
+             });
+-        }, function (cb) {
++        }, function _validateNicTags(cb) {
+             validateNicTags(vmobj.nics, log, function (e) {
+                 if (e) {
+                     cb(e);
+@@ -13882,7 +14098,7 @@ exports.start = function (uuid, extra, options, callback)
+                 }
+                 cb();
+             });
+-        }, function (cb) {
++        }, function _getDockerDeps(cb) {
+             var im;
+             var to_download = [];
+ 
+@@ -13919,7 +14135,7 @@ exports.start = function (uuid, extra, options, callback)
+                 cb();
+                 return;
+             }
+-        }, function (cb) {
++        }, function _restartDocker(cb) {
+             if (!vmobj.docker || !vmobj.zonepath) {
+                 cb();
+                 return;
+@@ -13940,7 +14156,9 @@ exports.start = function (uuid, extra, options, callback)
+                     value: 0
+                 }, cb);
+             }
+-        }, function (cb) {
++        }, function _persistBhyveDevs(cb) {
++            updateBhyvePCIslots({vmobj: vmobj, log: log}, cb);
++        }, function _start(cb) {
+             var err;
+             var vm_type = BRAND_OPTIONS[vmobj.brand].features.type;
+ 
+@@ -15872,6 +16090,7 @@ exports.update = function (uuid, payload, options, callback)
+         callback(e);
+     });
+ 
++
+     function doupdate(done) {
+         async.series([
+             function (cb) {
+@@ -15928,7 +16147,13 @@ exports.update = function (uuid, payload, options, callback)
+                 // use in createVolume()
+                 if (vmobj.hasOwnProperty('disks')) {
+                     for (n in vmobj.disks) {
+-                        matches = vmobj.disks[n].path.match(/^.*-disk(\d+)$/);
++                        if (vmobj.brand === 'bhyve') {
++                            matches =
++                                vmobj.disks[n].path.match(/^.*\/disk(\d+)$/);
++                        } else {
++                            matches =
++                                vmobj.disks[n] .path.match(/^.*-disk(\d+)$/);
++                        }
+                         if (matches) {
+                             used_disk_indexes.push(Number(matches[1]));
+                         }
+@@ -17715,3 +17940,37 @@ function zoneConfigLockpath(uuid) {
+ 
+     return sprintf('/var/run/vm.%s.config.lockfile', uuid);
+ }
++
++/*
++ * Returns object with {bus, slot, fn} or an Error. slotstr is of the form
++ * bus:slot:fn, slot:fn, or slot.  If bus and/or fn are not specified, they will
++ * be returned as 0.
++ */
++function parse_pci_slot(slotstr) {
++    var bsf = slotstr.split(':');
++    var bus, slot, fn;
++
++    if (bsf.length === 1) {
++        bus = 0;
++        slot = parseInt(bsf[0], 10);
++        fn = 0;
++    } else if (bsf.length === 2) {
++        bus = 0;
++        slot = parseInt(bsf[0], 10);
++        fn = parseInt(bsf[1], 10);
++    } else if (bsf.length === 3) {
++        bus = parseInt(bsf[0], 10);
++        slot = parseInt(bsf[1], 10);
++        fn = parseInt(bsf[2], 10);
++    } else {
++        return new Error(sprintf('pci_slot "%s" is not valid', slotstr));
++    }
++
++    if (Number.isNaN(bus) || bus < 0 || bus > 255
++        || Number.isNaN(slot) || slot < 0 || slot > 31
++        || Number.isNaN(fn) || fn < 0 || fn > 7) {
++        return new Error(sprintf('pci_slot "%s" is not valid', slotstr));
++    }
++
++    return {bus: bus, slot: slot, fn: fn};
++}
+diff --git a/src/vm/node_modules/proptable.js b/src/vm/node_modules/proptable.js
+index d0865f2a..4b9786a0 100644
+--- a/src/vm/node_modules/proptable.js
++++ b/src/vm/node_modules/proptable.js
+@@ -655,6 +655,15 @@ exports.properties = {
+             type: 'string'
+         },
+         zonexml: 'zone.device.match'
++    }, 'disks.*.pci_slot': {
++        payload: {
++            allowed: {
++                'bhyve': ['add', 'update']
++            },
++            type: 'string'
++        },
++        updatable: true,
++        zonexml: 'zone.device.net-attr.pci-slot'
+     }, 'disks.*.refreservation': {
+         payload: {
+             allowed: {
+diff --git a/src/vm/tests/test-bhyve-pci.js b/src/vm/tests/test-bhyve-pci.js
+index 6f9aa445..50481bcf 100644
+--- a/src/vm/tests/test-bhyve-pci.js
++++ b/src/vm/tests/test-bhyve-pci.js
+@@ -39,11 +39,11 @@ require('nodeunit-plus');
+ VM.loglevel = 'DEBUG';
+ 
+ var payload = {
+-    alias: 'test-create-bhyve-' + process.pid,
++    alias: 'test-bhyve-pci-' + process.pid,
+     autoboot: false,
+     brand: 'bhyve',
+-    ram: "1024",
+-    vcpus: "2",
++    ram: 1024,
++    vcpus: 2,
+     do_not_inventory: true,
+     nics: [
+         {
+@@ -56,7 +56,7 @@ var payload = {
+         {
+             image_uuid: vmtest.CURRENT_BHYVE_CENTOS_UUID,
+             boot: true,
+-            model: "virtio"
++            model: 'virtio'
+         }
+     ]
+ };
+@@ -91,92 +91,92 @@ function validate_missing_property(t, prop, devs) {
+     });
+ }
+ 
+-test('test validate with bad pci_device path', function(t) {
++test('test validate with bad pci_device path', function (t) {
+     validate_bad_value(t, 'path', [
+         {
+-            path: "/notdevices/pci@0,0/",
+-            pci_slot: "5:0:0"
++            path: '/notdevices/pci@0,0/',
++            pci_slot: '5:0:0'
+         }
+     ]);
+ });
+ 
+-test('test validate with bad pci_slot', function(t) {
++test('test validate with bad pci_slot', function (t) {
+     validate_bad_value(t, 'pci_slot', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
+-            pci_slot: "foo"
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1',
++            pci_slot: 'foo'
+         }
+     ]);
+ });
+ 
+-test('test validate with bad pci_slot (2)', function(t) {
++test('test validate with bad pci_slot (2)', function (t) {
+     validate_bad_value(t, 'pci_slot', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
+-            pci_slot: "4:0:0:0"
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1',
++            pci_slot: '4:0:0:0'
+         }
+     ]);
+ });
+ 
+-test('test validate with bad pci_slot (3)', function(t) {
++test('test validate with bad pci_slot (3)', function (t) {
+     validate_bad_value(t, 'pci_slot', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
+-            pci_slot: "256:0:0"
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1',
++            pci_slot: '256:0:0'
+         }
+     ]);
+ });
+ 
+-test('test validate with bad pci_slot (4)', function(t) {
++test('test validate with bad pci_slot (4)', function (t) {
+     validate_bad_value(t, 'pci_slot', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
+-            pci_slot: "-1:0:0"
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1',
++            pci_slot: '-1:0:0'
+         }
+     ]);
+ });
+ 
+ 
+-test('test validate with bad pci_slot (4)', function(t) {
++test('test validate with bad pci_slot (4)', function (t) {
+     validate_bad_value(t, 'pci_slot', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
+-            pci_slot: "4:32:0"
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1',
++            pci_slot: '4:32:0'
+         }
+     ]);
+ });
+ 
+-test('test validate with bad pci_slot (5)', function(t) {
++test('test validate with bad pci_slot (5)', function (t) {
+     validate_bad_value(t, 'pci_slot', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
+-            pci_slot: "4:0:8"
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1',
++            pci_slot: '4:0:8'
+         }
+     ]);
+ });
+ 
+-test('test validate with bad model)', function(t) {
++test('test validate with bad model)', function (t) {
+     validate_bad_value(t, 'model', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
+-            pci_slot: "4:0:0",
+-            model: "passover"
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1',
++            pci_slot: '4:0:0',
++            model: 'passover'
+         }
+     ]);
+ });
+ 
+-test('test validate with missing path', function(t) {
++test('test validate with missing path', function (t) {
+     validate_missing_property(t, 'path', [
+         {
+-            pci_slot: "4:0:0"
++            pci_slot: '4:0:0'
+         }
+     ]);
+ });
+ 
+-test('test validate with missing pci_slot', function(t) {
++test('test validate with missing pci_slot', function (t) {
+     validate_missing_property(t, 'pci_slot', [
+         {
+-            path: "/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1",
++            path: '/devices/pci@0,0/pci8086,6f0a@3,2/pci15d9,1528@9,1'
+         }
+     ]);
+ });
+diff --git a/src/vm/tests/test-bhyve-pci_slot.js b/src/vm/tests/test-bhyve-pci_slot.js
+new file mode 100644
+index 00000000..8d3232c2
+--- /dev/null
++++ b/src/vm/tests/test-bhyve-pci_slot.js
+@@ -0,0 +1,744 @@
++/*
++ * CDDL HEADER START
++ *
++ * The contents of this file are subject to the terms of the
++ * Common Development and Distribution License, Version 1.0 only
++ * (the "License").  You may not use this file except in compliance
++ * with the License.
++ *
++ * You can obtain a copy of the license at http://smartos.org/CDDL
++ *
++ * See the License for the specific language governing permissions
++ * and limitations under the License.
++ *
++ * When distributing Covered Code, include this CDDL HEADER in each
++ * file.
++ *
++ * If applicable, add the following below this CDDL HEADER, with the
++ * fields enclosed by brackets "[]" replaced with your own identifying
++ * information: Portions Copyright [yyyy] [name of copyright owner]
++ *
++ * CDDL HEADER END
++ *
++ * Copyright (c) 2018, Joyent, Inc.
++ *
++ */
++
++var assert = require('/usr/node/node_modules/assert-plus');
++var bunyan = require('/usr/vm/node_modules/bunyan');
++var common = require('./common.js');
++var execFile = require('child_process').execFile;
++var fs = require('fs');
++var sprintf = require('/usr/node/node_modules/sprintf').sprintf;
++var vasync = require('/usr/vm/node_modules/vasync');
++var VM = require('/usr/vm/node_modules/VM');
++var vminfod = require('/usr/vm/node_modules/vminfod/client');
++var vmtest = require('../common/vmtest.js');
++var zonecfg = require('/usr/vm/node_modules/zonecfg');
++
++var log = bunyan.createLogger({
++    level: 'debug',
++    name: 'test-bhyve-pci_slot',
++    streams: [ { stream: process.stderr, level: 'error' } ],
++    serializers: bunyan.stdSerializers
++});
++
++// this puts test stuff in global, so we need to tell jsl about that:
++/* jsl:import ../node_modules/nodeunit-plus/index.js */
++require('nodeunit-plus');
++
++VM.loglevel = 'DEBUG';
++
++/*
++ * This is the main driver for the happy path tests.  It does the following:
++ *
++ *  - creates a VM using the specified payload
++ *  - optionally alters it with opts.damage (and verifies it is damaged)
++ *  - optionally updates it with an update payload
++ *  - optionally sets an operator script to collect PCI device info in guest
++ *  - if damaged or collecting guest info, it is booted
++ *  - PCI slot assignments are compared against expected
++ *  - if collecting guest info, that is verified against config in host
++ *  - if booted, it is stopped
++ *  - VM deletion is handled by after(), which is called after t.end().
++ *
++ * opts.t           test object
++ * opts.payload     VM.create payload. Most likely should have autoboot set to
++ *                  false.
++ * opts.update      Optional VM.update payload
++ * opts.damage      Optional dict with fn and check_disks keys. If present,
++ *                  `fn(opts, next)` will be called between create and update
++ *                  phases.  opts.vmobj will be automatically filled. This can
++ *                  be used to call zonecfg to alter the configuration in ways
++ *                  that VM.js will no longer do - such as to remove pci_slot
++ *                  from existing disks. If this is set, the VM will be started
++ *                  so that VM.start() may repair it.
++ * opts.disks       List of disks to compare to vmobj to ensure assignments are
++ *                  correct. Each disk.path is used to match the disk to the
++ *                  same in vmobj.disks. Set disk.mumble to undefined if wanting
++ *                  to ensure that vmobj does not have mumble set on a
++ *                  particular disk.
++ * opts.expect_bsf  Optional list of 'b:s:f' (bus slot function) elements
++ *                  (decimal) that should match up with virtio-blk devices the
++ *                  guest sees. If this is present, the VM will be booted and
++ *                  the root disk image must support bash scripts and lspci.
++ */
++function testCreateAndCheckDisks(opts) {
++    var t = opts.t;
++    var payload = opts.payload;
++    var expect_bsf = opts.expect_bsf;
++    var disks = opts.disks;
++    var update = opts.update;
++    var damage = opts.damage;
++    var need_start = (opts.hasOwnProperty('expect_bsf')
++        || opts.hasOwnProperty('damage'));
++    var lspci_md = 'lspci-output';
++    var guest_lspci = '#! /bin/bash\n'
++        + 'lspci -n -d 1af4:1001 | mdata-put ' + lspci_md + '\n'
++        + 'poweroff\n';
++
++    vasync.waterfall([
++        function _create(next) {
++            VM.create(payload, function _create_cb(err, obj) {
++                if (err) {
++                    t.ok(false, 'error creating VM: ' + err);
++                } else {
++                    t.ok(true, 'VM created with uuid ' + obj.uuid);
++                }
++                vmobj = obj;
++                next(err);
++            });
++        },
++        function _damage(next) {
++            if (!damage) {
++                t.ok(true, 'Skipping damage - nothing to do');
++                next();
++                return;
++            }
++            assert.func(damage.fn, 'damage.fn must be a function');
++            assert.arrayOfObject(damage.check_disks,
++                'damage.check_disks must be an array of disks');
++
++            t.ok(true, 'damaging zone');
++            vasync.waterfall([
++                function _do_damage(dnext) {
++                    damage.opts.vmobj = vmobj;
++                    damage.fn(damage.opts, dnext);
++                },
++                function _load_damage(dnext) {
++                    VM.load(vmobj.uuid, function _load_damage_cb(err, obj) {
++                        if (err) {
++                            t.ok(false, 'error creating VM: ' + err);
++                        } else {
++                            t.ok(true, 'damaged VM loaded');
++                            vmobj = obj;
++                        }
++                        dnext(err);
++                    });
++                },
++                function _check_damage(dnext) {
++                    t.ok(true, 'Checking damage');
++                    var err = checkDisks({
++                        t: t,
++                        haves: vmobj.disks,
++                        wants: damage.check_disks,
++                        uuid: vmobj.uuid
++                    });
++                    dnext(err);
++                }
++            ],
++            function _damage_done(err) {
++                if (err) {
++                    t.ok(false, 'damage failed; aborting test');
++                } else {
++                    t.ok(true, 'damage done and verified');
++                }
++                next(err);
++            });
++        },
++        function _update(next) {
++            if (!update) {
++                t.ok(true, 'Skipping update - nothing to do');
++                next();
++                return;
++            }
++            VM.update(vmobj.uuid, update, function _update_cb(err) {
++                if (err) {
++                    t.ok(false, 'error updating VM: ' + err);
++                } else {
++                    t.ok(true, 'VM updated');
++                }
++                next(err);
++            });
++        },
++        function _add_operator_script(next) {
++            if (!expect_bsf) {
++                t.ok(true, 'Skipping guest PCI slot check');
++                next();
++                return;
++            }
++            var _payload = {
++                set_internal_metadata: {
++                    'operator-script': guest_lspci
++                }
++            };
++            VM.update(vmobj.uuid, _payload, function _update_cb(err) {
++                if (err) {
++                    t.ok(false, 'error updating VM with operator script: '
++                        + err);
++                } else {
++                    t.ok(true, 'VM updated with operator script');
++                }
++                next(err);
++            });
++        },
++        function _start(next) {
++            if (!need_start) {
++                t.ok(true, 'Skipping guest start');
++                next();
++                return;
++            }
++            VM.start(vmobj.uuid, {}, function _start_cb(err) {
++                if (err) {
++                    t.ok(false, 'error starting VM: ' + err);
++                } else {
++                    t.ok(true, 'VM started');
++                }
++                next(err);
++            });
++        },
++        function _wait_operator_script(next) {
++            if (!expect_bsf) {
++                next();
++                return;
++            }
++            VM.waitForZoneState(payload, 'installed', function (err) {
++                t.ok(!err, 'zone stopped after running operator script');
++                next(err);
++            });
++        },
++        function _load(next) {
++            VM.load(vmobj.uuid, function _load_cb(err, obj) {
++                if (err) {
++                    t.ok(false, 'error creating VM: ' + err);
++                } else {
++                    t.ok(true, 'VM loaded uuid ' + obj.uuid);
++                    vmobj = obj;
++                }
++                next(err);
++            });
++        },
++        function _check(next) {
++            next(checkDisks({
++                t: t,
++                haves: vmobj.disks,
++                wants: disks,
++                uuid: vmobj.uuid
++            }));
++        },
++        function _check_lspci_md(next) {
++            if (!expect_bsf) {
++                next();
++                return;
++            }
++            var cm = vmobj.customer_metadata;
++            if (!cm.hasOwnProperty(lspci_md)) {
++                t.ok(false, 'customer_metadata["' + lspci_md
++                    + '"] not found');
++                next();
++                return;
++            }
++            var guest_bsf = [];
++            var lines = cm[lspci_md].trim().split('\n');
++            lines.forEach(function _gather_guest_pci(line) {
++                /* lspci reports bb:ss.f, with each number in hex */
++                var bsf = line.split(' ')[0].replace('.', ':').split(':');
++                guest_bsf.push(sprintf('%d:%d:%d', parseInt(bsf[0], 16),
++                    parseInt(bsf[1], 16), parseInt(bsf[2], 16)));
++            });
++            t.equal(guest_bsf.sort().join(' '), expect_bsf.sort().join(' '),
++                'PCI slots occupied: ' + expect_bsf.sort().join(' '));
++            next();
++        }
++    ], function _done(err) {
++        t.end();
++    });
++}
++
++function dup(thing) {
++    return JSON.parse(JSON.stringify(thing));
++}
++
++/*
++ * Runs zonecfg and waits for vminfod to pick up the changes. If you are having
++ * troubles figuring out what should go into the changes array, set log.level to
++ * debug and observe the bunyan logs that appear in test output.  There are
++ * hints, but not answers, in that output.
++ */
++function zonecfgSync(uuid, args, opts, changes, cb)
++{
++    var vs = new vminfod.VminfodEventStream({
++        name: sprintf('test-bhyve-pci_slot (%s)', uuid),
++        log: log
++    });
++    var cancelFn;
++
++    vs.once('ready', function () {
++        vasync.parallel({funcs: [
++            function (cb2) {
++                var obj = {
++                    uuid: uuid
++                };
++                var _opts = {
++                    timeout: 5000,
++                    catchErrors: true,
++                    teardown: true
++                };
++                cancelFn = vs.watchForChanges(obj, changes, _opts, cb2);
++            },
++            function (cb2) {
++                zonecfg(uuid, args, opts, function (err, fds) {
++                    if (err) {
++                        cancelFn();
++                        cb(err);
++                        return;
++                    }
++                    cb2();
++                });
++            }
++        ]}, function (err, results) {
++            cb(err);
++        });
++    });
++}
++
++function checkDisks(opts) {
++    var t = opts.t;
++    var haves = opts.haves;
++    var uuid = opts.uuid;
++    var wants = opts.wants;
++    var errors = 0;
++
++    wants.forEach(function _check_disk(want) {
++        var found = false;
++        var path = sprintf(want.path, uuid);
++
++        t.ok(true, 'Checking disk ' + path);
++
++        haves.forEach(function _select_disk(have) {
++            if (path !== have.path) {
++                return;
++            }
++            found = true;
++            Object.keys(want).forEach(function _check_prop(prop) {
++                if (prop === 'path') {
++                    return;
++                }
++                t.equal(have[prop], want[prop], 'matching prop: ' + prop
++                    + '=' + have[prop]);
++                if (have[prop] !== want[prop]) {
++                    errors++;
++                }
++            });
++        });
++        t.ok(found, 'disk ' + path + ' found');
++        if (!found) {
++            errors++;
++        }
++    });
++    if (errors !== 0) {
++        return new Error('checkDisks encountered ' + errors + 'error(s)');
++    }
++    return null;
++}
++
++/*
++ * Tests that create a VM should be setting vmobj so that the after hook can
++ * clean up the VM when the test finishes or gives up.  If a test uses vmobj
++ * then deletes the VM on its own, it should set vmobj to undefined.
++ */
++var vmobj;
++
++before(function (cb) {
++    vmobj = undefined;
++    cb();
++});
++
++after(function (cb) {
++    if (vmobj) {
++        VM.delete(vmobj.uuid, {}, function _delete_cb(err) {
++            if (err) {
++                console.log(sprintf('Could not delete vm %s: %s', vmobj.uuid,
++                    err.message));
++            }
++            vmobj = undefined;
++            cb();
++        });
++    } else {
++        cb();
++    }
++});
++
++/*
++ * Common payload elements
++ */
++var image_uuid = vmtest.CURRENT_BHYVE_CENTOS_UUID;
++
++var base_payload = {
++    alias: 'test-bhyve-pci_slot-' + process.pid,
++    brand: 'bhyve',
++    do_not_inventory: true,
++    autoboot: false,
++    ram: 1024,
++    vcpus: 1,
++    disks: [
++        {
++            image_uuid: image_uuid,
++            boot: true,
++            model: 'virtio'
++        },
++        {
++            size: 512,
++            model: 'virtio'
++        }
++    ]
++};
++
++/*
++ * Tests, finally!
++ */
++test('Verify disk.*.pci_slot are populated by VM.configure',
++    function _verify_populate_on_boot(t) {
++        var payload = dup(base_payload);
++        var check_disks = [
++            {
++                path: '/dev/zvol/rdsk/zones/%s/disk0',
++                image_uuid: image_uuid,
++                boot: true,
++                model: 'virtio',
++                pci_slot: '0:4:0'
++            }, {
++                path: '/dev/zvol/rdsk/zones/%s/disk1',
++                image_uuid: undefined,
++                model: 'virtio',
++                pci_slot: '0:4:1'
++            }
++        ];
++
++        testCreateAndCheckDisks({
++            t: t,
++            payload: payload,
++            disks: check_disks,
++            expect_bsf: ['0:4:0', '0:4:1']
++        });
++    });
++
++test('Verify cdrom is in PCI slot 3:0',
++    function _verify_cdrom_on_boot(t) {
++        var payload = dup(base_payload);
++
++        payload.disks.pop();
++        payload.disks.push({
++            // cdrom media is not created. Choose a file that exists.
++            path: '/usr/share/bhyve/uefi-rom.bin',
++            model: 'ahci',
++            media: 'cdrom'
++        });
++
++        var check_disks = [
++            {
++                path: '/dev/zvol/rdsk/zones/%s/disk0',
++                image_uuid: image_uuid,
++                boot: true,
++                model: 'virtio',
++                pci_slot: '0:4:0'
++            }, {
++                path: '/usr/share/bhyve/uefi-rom.bin',
++                image_uuid: undefined,
++                model: 'ahci',
++                pci_slot: '0:3:0',
++                media: 'cdrom'
++            }
++        ];
++
++        testCreateAndCheckDisks({
++            t: t,
++            payload: payload,
++            disks: check_disks
++        });
++    });
++
++test('Verify 8 disks assigned properly',
++    function _verify_8_disks(t) {
++        var payload = dup(base_payload);
++        var check_disks = [
++            {
++                path: '/dev/zvol/rdsk/zones/%s/disk0',
++                image_uuid: image_uuid,
++                boot: true,
++                model: 'virtio',
++                pci_slot: '0:4:0'
++            }
++        ];
++        var i;
++
++        payload.disks.pop();
++        for (i = 1; i < 8; i++) {
++            payload.disks.push({
++                size: 256,
++                model: 'virtio'
++            });
++            check_disks.push({
++                path: '/dev/zvol/rdsk/zones/%s/disk' + i,
++                pci_slot: '0:4:' + i
++            });
++        }
++
++        testCreateAndCheckDisks({
++            t: t,
++            payload: payload,
++            disks: check_disks,
++            expect_bsf: [
++                '0:4:0', '0:4:1', '0:4:2', '0:4:3',
++                '0:4:4', '0:4:5', '0:4:6', '0:4:7'
++            ]});
++    });
++
++test('Verify create time assignments are sticky',
++    function _verify_create_sticky_disks(t) {
++        var payload = dup(base_payload);
++        var check_disks = [
++            {
++                path: '/dev/zvol/rdsk/zones/%s/disk0',
++                image_uuid: image_uuid,
++                boot: true,
++                model: 'virtio',
++                pci_slot: '0:4:0'
++            }
++        ];
++        var i;
++
++        payload.disks.pop();
++        for (i = 1; i < 4; i++) {
++            payload.disks.push({
++                size: 256,
++                model: 'virtio',
++                pci_slot: '0:4:' + (i + 4)
++            });
++            check_disks.push({
++                path: '/dev/zvol/rdsk/zones/%s/disk' + i,
++                pci_slot: '0:4:' + (i + 4)
++            });
++        }
++
++        testCreateAndCheckDisks({
++            t: t,
++            payload: payload,
++            disks: check_disks,
++            expect_bsf: [ '0:4:0', '0:4:5', '0:4:6', '0:4:7' ]
++        });
++    });
++
++/*
++ * Verifies that "slot:fn" and "slot" are accepted and placed in the right
++ * places.
++ */
++test('Verify alternate slot schemes are allowed',
++    function _verify_partial_bsf_disks(t) {
++        var check_disks = [
++            {path: '/dev/zvol/rdsk/zones/%s/disk0', pci_slot: '0:4:0'},
++            {path: '/dev/zvol/rdsk/zones/%s/disk1', pci_slot: '4:1'},
++            {path: '/dev/zvol/rdsk/zones/%s/disk2', pci_slot: '5'}
++        ];
++        var payload = dup(base_payload);
++        payload.disks.pop();
++        payload.disks.push({size: 256, model: 'virtio', pci_slot: '4:1'});
++        payload.disks.push({size: 256, model: 'virtio', pci_slot: '5'});
++
++        testCreateAndCheckDisks({
++            t: t,
++            payload: payload,
++            disks: check_disks,
++            expect_bsf: [ '0:4:0', '0:4:1', '0:5:0' ]
++        });
++    });
++
++test('Verify holes are filled',
++    function _verify_holes_filled(t) {
++        var check_disks = [
++            {path: '/dev/zvol/rdsk/zones/%s/disk0', pci_slot: '0:4:0'},
++            {path: '/dev/zvol/rdsk/zones/%s/disk1', pci_slot: '0:4:2'},
++            {path: '/dev/zvol/rdsk/zones/%s/disk2', pci_slot: '0:4:1'}
++        ];
++        var payload = dup(base_payload);
++        payload.flexible_disk_size = 13 * 1024;
++        payload.disks.pop();
++        payload.disks.push({size: 256, model: 'virtio', pci_slot: '0:4:2'});
++
++        var update_payload = {
++            add_disks: [ {
++                size: 512,
++                model: 'virtio'
++            } ]
++        };
++
++        testCreateAndCheckDisks({
++            t: t,
++            payload: payload,
++            update: update_payload,
++            disks: check_disks,
++            expect_bsf: [ '0:4:0', '0:4:1', '0:4:2' ]
++        });
++    });
++
++/*
++ * When coming from an old PI, disks.*.pci_slot is probably not set.
++ * `vmadm start` should fix that.
++ */
++test('Verify VM.start performs static assignment',
++    function _start_static_assignment(t) {
++        var check_disks = [
++            {path: '/dev/zvol/rdsk/zones/%s/disk0', pci_slot: '0:4:0'},
++            {path: '/dev/zvol/rdsk/zones/%s/disk1', pci_slot: '0:4:1'}
++        ];
++        var payload = dup(base_payload);
++
++        var damage_fn = function (opts, cb) {
++            var uuid = opts.vmobj.uuid;
++            var zcfg = '';
++            var changes = [];
++
++            check_disks.forEach(function _damageDisk(disk) {
++                zcfg += 'select device match=' + sprintf(disk.path, uuid)
++                    + ';\nremove property(name=pci-slot,value="'
++                    + disk.pci_slot + '");\nend;\n';
++                changes.push({
++                    path: [ 'disks', null, 'pci_slot' ],
++                    action: 'removed',
++                    oldValue: disk.pci_slot
++                });
++            });
++            zonecfgSync(opts.vmobj.uuid, [], {log: log, stdin: zcfg},
++                changes, function _zonecfg_cb(zcfg_err, fds) {
++                    if (zcfg_err) {
++                        t.ok(false, 'zonecfg failed: ' + zcfg_err);
++                    } else {
++                        t.ok(true, 'zone config succeeded');
++                    }
++                    cb(zcfg_err);
++                });
++        };
++        var damage_check = dup(check_disks);
++        damage_check.forEach(function (disk) {
++            disk.pci_slot = undefined;
++        });
++
++        testCreateAndCheckDisks({
++            t: t,
++            payload: payload,
++            damage: {
++                fn: damage_fn,
++                check_disks: damage_check,
++                opts: {}
++            },
++            disks: check_disks,
++            expect_bsf: [ '0:4:0', '0:4:1' ]
++        });
++    });
++
++/*
++ * If two disks try to share the same slot during create, the create should
++ * fail.
++ */
++test('Conflict during create',
++    function _conflict_during_create(t) {
++        var payload = dup(base_payload);
++        payload.disks[0].pci_slot = '0:4:0';
++        payload.disks[1].pci_slot = '0:4:0';
++
++        vasync.waterfall([
++            function _create(next) {
++                VM.create(payload, function _create_cb(err, obj) {
++                    var expect = 'VM has multiple disks in pci_slot "0:4:0"';
++                    if (err) {
++                        t.equal(err.message.substring(0, expect.length), expect,
++                            'conflict detected');
++                    } else {
++                        t.ok(false, 'No error detected');
++                    }
++                    // This is just a stub right now. We need to try a load to
++                    // see if it was really created.
++                    vmobj = obj;
++
++                    next();
++                });
++            },
++            function _load(next) {
++                VM.load(vmobj.uuid, function _load_cb(err, obj) {
++                    vmobj = obj;
++                    t.ok(err, 'VM load should fail');
++                    if (err) {
++                        err = next();
++                        return;
++                    }
++                    next(new Error('VM ' + vmobj.uuid
++                        + '  unexpectedly exists'));
++                });
++            }
++            ], function _done(err) {
++                t.end();
++            });
++    });
++
++/*
++ * If an update tries to put a disk into an occupied slot, it should fail.
++ */
++test('Conflict during update',
++    function _conflict_during_update(t) {
++        var payload = dup(base_payload);
++        payload.flexible_disk_size = 13 * 1024;
++
++        var disk0 = payload.disks[0];
++        var disk1 = payload.disks[1];
++        disk0.pci_slot = '0:4:0';
++        disk1.pci_slot = '0:4:0';
++
++        payload.disks = [ disk0 ];
++        var update = {add_disks: [ disk1 ]};
++        t.expect(3);
++
++        vasync.waterfall([
++            function _create(next) {
++                VM.create(payload, function _create_cb(err, obj) {
++                    if (err) {
++                        t.ok(false, 'VM create failed: ' + err);
++                        next(err);
++                        return;
++                    }
++                    t.ok(true, 'VM created with uuid ' + obj.uuid);
++                    vmobj = obj;
++                    next();
++                });
++            },
++            function _update(next) {
++                VM.update(vmobj.uuid, update, function _update_cb(err) {
++                    var expect = 'VM has multiple disks in pci_slot "0:4:0"';
++                    t.ok(err, 'update should not succeed');
++                    if (!err) {
++                        next(new Error('update unexpectedly succeeded'));
++                        return;
++                    }
++                    t.equal(err.message.substring(0, expect.length), expect,
++                        'conflict detected');
++                    if (err.message.substring(0, expect.length) !== expect) {
++                        next(err);
++                        return;
++                    }
++                    next();
++                });
++            }
++            ], function _done(err) {
++                t.end();
++            }
++        );
++    });

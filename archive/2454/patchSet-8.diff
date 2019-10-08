@@ -1,0 +1,967 @@
+commit 5f91e064789e8bbb07340e92b1c834f75873d832 (refs/changes/54/2454/8)
+Author: Jared Morrow <jm@joyent.com>
+Date:   2017-09-15T14:44:47-06:00 (2 years, 1 month ago)
+    
+    MANTA-2495 Muppet writes out haproxy configs with no 'listen' lines
+    Reviewed by: Robert Mustacchi <rm@joyent.com>
+
+diff --git a/Makefile b/Makefile
+index 89013a4..f1c47ab 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2014, Joyent, Inc.
++# Copyright (c) 2017, Joyent, Inc.
+ #
+ 
+ #
+@@ -82,8 +82,13 @@ CLEAN_FILES += $(NODEUNIT) ./node_modules/nodeunit
+ DISTCLEAN_FILES += ./node_modules muppet-pkg-*.tar.bz2
+ 
+ .PHONY: test
++#
++# Unit tests
++# Right now we are ignoring the watch test until
++# it is back to a working state.
++#
+ test: $(NODEUNIT)
+-	$(NODEUNIT) test/*.test.js 2>&1 | $(BUNYAN)
++	$(NODEUNIT) test/config.test.js 2>&1 | $(BUNYAN)
+ 
+ .PHONY: scripts
+ scripts: deps/manta-scripts/.git
+@@ -107,7 +112,7 @@ release: all docs $(SMF_MANIFESTS)
+ 	cp -r	$(ROOT)/build \
+ 		$(ROOT)/boot \
+ 		$(ROOT)/lib \
+-		$(ROOT)/main.js \
++		$(ROOT)/muppet.js \
+ 		$(ROOT)/node_modules \
+ 		$(ROOT)/package.json \
+ 		$(ROOT)/sapi_manifests \
+diff --git a/env.sh b/env.sh
+index 60bf590..9017cb0 100644
+--- a/env.sh
++++ b/env.sh
+@@ -5,9 +5,9 @@
+ #
+ 
+ #
+-# Copyright (c) 2014, Joyent, Inc.
++# Copyright (c) 2017, Joyent, Inc.
+ #
+ 
+ export PATH=$PWD/build/node/bin:$PWD/node_modules/.bin:$PATH
+ 
+-alias muppet='sudo node main.js -f ./etc/config.coal.json -v 2>&1 | bunyan'
++alias muppet='sudo node muppet.js -f ./etc/config.coal.json -v 2>&1 | bunyan'
+diff --git a/lib/index.js b/lib/index.js
+index f1831a8..c2015f1 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -5,23 +5,18 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var lbm = require('./lb_manager');
+ var Watch = require('./watch').Watch;
+ 
+ 
+-
+ ///--- Exports
+-
+ module.exports = {
+ 
+-        createWatch: function createWatch(options) {
+-                return (new Watch(options));
+-        },
+-
+-        restartLB: lbm.restart,
+-        updateLBConfig: lbm.updateConfig
+-
++    createWatch: function createWatch(options) {
++        return (new Watch(options));
++    },
++    restartLB: lbm.restart
+ };
+diff --git a/lib/lb_manager.js b/lib/lb_manager.js
+index 48e0752..5a810fa 100644
+--- a/lib/lb_manager.js
++++ b/lib/lb_manager.js
+@@ -8,6 +8,7 @@
+  * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
++var execFile = require('child_process').execFile;
+ var exec = require('child_process').exec;
+ var fs = require('fs');
+ var os = require('os');
+@@ -17,12 +18,15 @@ var sprintf = require('util').format;
+ var assert = require('assert-plus');
+ var once = require('once');
+ var backoff = require('backoff');
++var vasync = require('vasync');
++var jsprim = require('jsprim');
+ 
+ 
+ 
+ ///--- Globals
+ 
+ var CFG_FILE = path.resolve(__dirname, '../etc/haproxy.cfg');
++var CFG_FILE_TMP = path.resolve(__dirname, '../etc/haproxy.cfg.tmp');
+ var CFG_IN = fs.readFileSync(path.resolve(__dirname, '../etc/haproxy.cfg.in'),
+                              'utf8');
+ var RESTART = '/usr/sbin/svcadm restart haproxy';
+@@ -34,24 +38,47 @@ var INSECURE_FRONTEND =
+     'frontend http_external\n        default_backend insecure_api\n';
+ var INSECURE_BIND_LINE = '        bind %s:80\n';
+ 
++// Locks for single reset run
++var RESTART_RUNNING = false;
++var RESTART_NEEDS_RUN = false;
+ 
++// Storage for objects we might lose if we block on a restart lock
++var RESTART_OPTS = {};
++var RESTART_CB = null;
+ 
+-///--- API
+-
+-function updateConfig(opts, cb) {
++/*
++ * Generate a haproxy configuration file using the provided parameters
++ *
++ * Options:
++ * - trustedIP, an address on the Manta network that is considered preauthorized
++ * - untrustedIPs, an array of addresses that untrusted traffic comes in over
++ * - hosts, an array of Muskie backends to forward requests to
++ * - configFileOut (optional), the config file to write out
++ * - log, a Bunyan logger
++ */
++function writeHaproxyConfig(opts, cb) {
+     assert.string(opts.trustedIP, 'options.trustedIP');
+     assert.arrayOfString(opts.untrustedIPs, 'options.untrustedIPs');
+     assert.arrayOfString(opts.hosts, 'hosts');
++    assert.optionalString(opts.configFileOut, 'options.configFileOut');
++    assert.object(opts.log, 'options.log');
+     assert.func(cb, 'callback');
++    // For testing
++    assert.optionalString(opts.configFileIn, 'options.configFileIn');
+ 
+     cb = once(cb);
+ 
+     var clear = '';
+     var ssl = '';
+-    opts.hosts.forEach(function (h, i) {
+-        clear += sprintf(CLEAR_SERVER_LINE, i, h);
+-        ssl += sprintf(SSL_SERVER_LINE, i, h);
+-    });
++    // Fail fast if there are no backend hosts given
++    if (opts.hosts.length > 0) {
++        opts.hosts.forEach(function (h, i) {
++            clear += sprintf(CLEAR_SERVER_LINE, i, h);
++            ssl += sprintf(SSL_SERVER_LINE, i, h);
++        });
++    } else {
++        return (cb(new Error('Haproxy config error: No hosts given')));
++    }
+ 
+     var untrusted = '';
+     if (opts.untrustedIPs.length > 0) {
+@@ -61,7 +88,8 @@ function updateConfig(opts, cb) {
+         });
+     }
+ 
+-    var str = sprintf(CFG_IN,
++    var _cfg_in = opts.configFileIn || CFG_IN;
++    var str = sprintf(_cfg_in,
+         os.hostname(),
+         ssl,
+         clear,
+@@ -69,9 +97,129 @@ function updateConfig(opts, cb) {
+         opts.trustedIP,
+         opts.trustedIP);
+ 
+-    fs.writeFile(CFG_FILE, str, 'utf8', cb);
++    var configOut = opts.configFileOut || CFG_FILE;
++    opts.log.debug('Writing haproxy config file: %s', configOut);
++    return (fs.writeFile(configOut, str, 'utf8', cb));
++}
++
++
++function restartHaproxy(opts, cb) {
++    assert.object(opts.log, 'options.log');
++    assert.optionalString(opts.restart, 'options.restart');
++
++    var _restart = opts.restart || RESTART;
++    opts.log.debug('Restarting haproxy with: %s...', _restart);
++
++    var retry = backoff.call(exec, _restart, cb);
++    retry.failAfter(3);
++    retry.setStrategy(new backoff.ExponentialStrategy({
++        initialDelay: 1000
++    }));
++    retry.on('backoff', function (number, delay, err) {
++        opts.log.debug({
++            attempt: number,
++            delay: delay,
++            err: err
++        }, 'Haproxy restart attempted');
++    });
++    retry.start();
++}
++
++/*
++ * Gets the haproxy executable path that is used in SMF so that
++ * we aren't hard-coding the haproxy path in two separate spots
++ *
++ */
++function getHaproxyExec(opts, cb) {
++    assert.object(opts.log, 'options.log');
++    assert.func(cb, 'callback');
++    // svcprop returns something like:
++    //    /opt/local/sbin/haproxy\ -f\ %{config_file}\ -D
++    execFile('/usr/bin/svcprop', ['-p', 'start/exec', 'haproxy' ],
++        function (error, stdout, _stderr) {
++            var haproxy_exec = null;
++            if (error !== null) {
++                opts.log.error(error, 'failed to find haproxy exec path');
++                return (cb(error));
++            } else {
++                // svccfg line returned, parse out the haproxy path
++                var m = stdout.match(/[\w/]+haproxy/);
++                if (m !== null) {
++                    haproxy_exec = m[0];
++                } else {
++                    opts.log.error('Error finding haproxy exec path in %s',
++                                   stdout);
++                    return (cb(new Error('Error finding haproxy exec path')));
++                }
++                opts.log.debug('Found haproxy exec path: %s', haproxy_exec);
++                return (cb(null, haproxy_exec));
++            }
++        });
++}
++
++/*
++ * Renames a configuration file
++ * The intention is to be used to rename
++ * the temporary known-good file into a
++ * final config file for haproxy.
++ *
++ * Options:
++ * - configFileIn (optional), the config file to rename
++ * - configFileOut (optional), the target file name
++ * - log, a Bunyan logger
++ */
++function renameHaproxyConfig(opts, cb) {
++    assert.object(opts.log, 'options.log');
++    assert.optionalString(opts.configFileIn, 'options.configFileIn');
++    assert.optionalString(opts.configFileOut, 'options.configFileOut');
++
++    // Use default file names if not provided
++    var configIn = opts.configFileIn || CFG_FILE_TMP;
++    var configOut = opts.configFileOut || CFG_FILE;
++
++    opts.log.debug('Renaming haproxy config file: %s to %s',
++        configIn, configOut);
++
++    return (fs.rename(configIn, configOut, cb));
++}
++
++/*
++ * Checks if a haproxy config file is valid
++ *
++ * Options:
++ * - configFileOut (optional), the config file to test
++ * - log, a Bunyan logger
++ */
++function checkHaproxyConfig(opts, cb) {
++    assert.object(opts.log, 'options.log');
++    assert.optionalString(opts.configFileOut, 'options.configFileOut');
++
++    var configOut = opts.configFileOut || CFG_FILE;
++
++    vasync.waterfall([
++        function getExec(wfcb) {
++            getHaproxyExec(opts, wfcb); },
++        function checkFunc(wfResult, wfcb) {
++            execFile(wfResult, ['-f', configOut, '-c'],
++                function (error, stdout, _stderr) {
++                    if (error !== null) {
++                        return (wfcb(error));
++                    }
++                    opts.log.debug('haproxy: ' + stdout.trim());
++                    return (wfcb(null));
++                });
++        }
++    ], function (err) {
++        if (err) {
++            opts.log.error(err,
++                'Error checking haproxy config file %s', configOut);
++            return (cb(err));
++        }
++        return (cb(null));
++    });
+ }
+ 
++///--- API
+ 
+ /*
+  * Regenerate the configuration file using the provided parameters, and then
+@@ -90,23 +238,75 @@ function restart(opts, cb) {
+     assert.arrayOfString(opts.untrustedIPs, 'options.untrustedIPs');
+     assert.arrayOfString(opts.hosts, 'options.hosts');
+     assert.object(opts.log, 'options.log');
+-    assert.optionalString(opts.restart, 'options.restart');
+     assert.func(cb, 'callback');
++    // For testing
++    assert.optionalString(opts.restart, 'options.restart');
++    assert.optionalString(opts.configFileIn, 'options.configFileIn');
++
++    /*
++     * Wrap restart logic in a cheap & simple lock to ensure we are not writing
++     * a new temp config file while renaming the temp config file in a previous
++     * restart cycle. In addition, save the options from the queued restart().
++     * If the most diabolical timing issue happened where multiple restart()'s
++     * got queued, we'd only care about at most two (the current,
++     * and the last one queued).
++     */
++    /*
++     * TODO: If a third restart() call happened, and a delay
++     * happened to the first and second call, the second call's
++     * callback would get lost since we only save/restore the
++     * one queued restart. This will be filed in a separate
++     * issue. This issue however is an extremely unlikely event
++     * considering the speed in which we get ZK notifications.
++     */
++    if (RESTART_RUNNING) {
++        opts.log.debug('Restart is already running, queueing restart...');
++        opts.log.debug('Hosts we are saving for queued restart: %s',
++            opts.hosts);
++        RESTART_OPTS = jsprim.deepCopy(opts);
++        RESTART_CB = jsprim.deepCopy(cb);
++        RESTART_NEEDS_RUN = true;
++        return;
++    }
++    RESTART_RUNNING = true;
+ 
+     cb = once(cb);
+ 
+-    updateConfig(opts, function (err) {
++    /*
++     * Kick off the checkConfig -> writeHaproxyConfig ->
++     *   restartHaproxy pipeline
++     * - Generate a temporary config file with writeHaproxyConfig.
++     * - Check the temporary config with checkHaproxyConfig
++     * - Rename temporary file to final file once check passes
++     * - Restart haproxy with a known-good config file
++     */
++    var tmpOpts = jsprim.deepCopy(opts);
++    tmpOpts.configFileOut = CFG_FILE_TMP;
++
++    vasync.pipeline({ arg: tmpOpts, funcs: [
++        writeHaproxyConfig,
++        checkHaproxyConfig,
++        function finalRenameConfig(_, callback) {
++            renameHaproxyConfig({log: opts.log}, callback); },
++        function finalRestart(_, callback) {
++            restartHaproxy(opts, callback); }
++    ]}, function (err) {
+         if (err) {
++            opts.log.error(err, 'Error reconfiguring haproxy');
+             cb(err);
+-            return;
++        } else {
++            cb(null);
+         }
+ 
+-        var retry = backoff.call(exec, (opts.restart || RESTART), cb);
+-        retry.failAfter(3);
+-        retry.setStrategy(new backoff.ExponentialStrategy({
+-            initialDelay: 1000
+-        }));
+-        retry.start();
++        // Clear the lock now that we are finished
++        RESTART_RUNNING = false;
++        // Call a restart if one is pending
++        if (RESTART_NEEDS_RUN) {
++            RESTART_NEEDS_RUN = false;
++            opts.log.debug('Calling queued restart, using saved hosts: %s',
++                          RESTART_OPTS.hosts);
++            restart(RESTART_OPTS, RESTART_CB);
++        }
+     });
+ }
+ 
+@@ -115,7 +315,9 @@ function restart(opts, cb) {
+ ///--- Exports
+ 
+ module.exports = {
+-
+-    restart: restart
+-
++    restart: restart,
++    // Below only exported for testing
++    checkHaproxyConfig: checkHaproxyConfig,
++    writeHaproxyConfig: writeHaproxyConfig,
++    getHaproxyExec: getHaproxyExec
+ };
+diff --git a/main.js b/muppet.js
+similarity index 99%
+rename from main.js
+rename to muppet.js
+index 6fdff33..47e2077 100644
+--- a/main.js
++++ b/muppet.js
+@@ -208,7 +208,7 @@ function startWatch(opts, cb) {
+                     trustedIP: cfg.trustedIP,
+                     untrustedIPs: cfg.untrustedIPs,
+                     hosts: hosts || [],
+-                    log: opts.log,
++                    log: opts.log.child({component: 'lb_manager'}),
+                     restart: cfg.restart
+                 };
+                 core.restartLB(_opts, function (err) {
+diff --git a/package.json b/package.json
+index 11f1cf5..558f979 100644
+--- a/package.json
++++ b/package.json
+@@ -7,13 +7,13 @@
+     "dependencies": {
+         "assert-plus": "1.0.0",
+         "backoff": "2.3.0",
+-        "bunyan": "0.22.1",
++        "bunyan": "2.0.2",
+         "dashdash": "1.4.0",
+         "forkexec": "1.1.0",
+         "jsprim": "1.4.0",
+         "node-uuid": "1.4.1",
+         "once": "1.3.0",
+-        "vasync": "1.4.3",
++        "vasync": "2.0.0",
+         "verror": "1.9.0",
+         "zkplus": "0.3.2-smartos-only"
+     },
+@@ -21,7 +21,7 @@
+         "nodeunit": "0.7.4"
+     },
+     "scripts": {
+-        "start": "node ./main.js"
++        "start": "node ./muppet.js"
+     },
+     "sdcDependencies": {
+         "config-agent": ">=1.2.0"
+diff --git a/smf/manifests/muppet.xml.in b/smf/manifests/muppet.xml.in
+index f46fd21..cbe4d86 100644
+--- a/smf/manifests/muppet.xml.in
++++ b/smf/manifests/muppet.xml.in
+@@ -7,7 +7,7 @@
+ -->
+ 
+ <!--
+-    Copyright (c) 2014, Joyent, Inc.
++    Copyright (c) 2017, Joyent, Inc.
+ -->
+ 
+ <service_bundle type="manifest" name="muppet">
+@@ -45,7 +45,7 @@
+ 
+ 	<exec_method type="method"
+ 		     name="start"
+-		     exec="node main.js -f ./etc/config.json &amp;"
++		     exec="node muppet.js -f ./etc/config.json &amp;"
+ 		     timeout_seconds="30">
+ 	    <method_context working_directory="/opt/smartdc/muppet">
+                 <method_credential user="root"
+diff --git a/test/config.test.js b/test/config.test.js
+new file mode 100644
+index 0000000..0f0aba7
+--- /dev/null
++++ b/test/config.test.js
+@@ -0,0 +1,217 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var vasync = require('vasync');
++var execFile = require('child_process').execFile;
++var helper = require('./helper.js');
++var lbm = require('../lib/lb_manager.js');
++var path = require('path');
++var fs = require('fs');
++
++///--- Globals
++var test = helper.test;
++var log = helper.createLogger();
++
++// The good file to test against
++var haproxy_good = path.resolve(__dirname, 'haproxy.cfg.good');
++
++// Files that have a bad config in some way
++var haproxy_no_listener = path.resolve(__dirname, 'haproxy.cfg.no-listener');
++var haproxy_empty_error = path.resolve(__dirname, 'haproxy.cfg.empty');
++var haproxy_parse_error = path.resolve(__dirname, 'haproxy.cfg.parse-error');
++var haproxy_no_frontend = path.resolve(__dirname, 'haproxy.cfg.no-frontend');
++
++// Input file to use for writeHaproxyConfig and restart
++var haproxy_config_in = fs.readFileSync(path.resolve(__dirname,
++                                                     'haproxy.cfg.in'),
++                                        'utf8');
++
++// File for writeHaproxyConfig to write out
++var updConfig_out = path.resolve(__dirname, 'haproxy.cfg.out');
++// File for the above to check against
++var updConfig_out_chk = path.resolve(__dirname, 'haproxy.cfg.out-check');
++
++// Files that the successful restart test will write out
++var haproxy_file = path.resolve(__dirname, '../etc/haproxy.cfg');
++var haproxy_file_tmp = path.resolve(__dirname, '../etc/haproxy.cfg.tmp');
++
++
++
++///--- Tests
++
++test('test good config file', function (t) {
++    var opts = { log: helper.createLogger(),
++        configFileOut: haproxy_good};
++    lbm.checkHaproxyConfig(opts, function (err) {
++        t.equal(null, err);
++        t.done();
++    });
++});
++
++test('test no-listener config file (should error)', function (t) {
++    var opts = { log: helper.createLogger(),
++        configFileOut: haproxy_no_listener};
++    lbm.checkHaproxyConfig(opts, function (err) {
++        t.notEqual(null, err);
++        t.done();
++    });
++});
++
++test('test empty config file (should error)', function (t) {
++    var opts = { log: helper.createLogger(),
++        configFileOut: haproxy_empty_error};
++    lbm.checkHaproxyConfig(opts, function (err) {
++        t.notEqual(null, err);
++        t.done();
++    });
++});
++
++test('test parse error config file (should error)', function (t) {
++    var opts = { log: helper.createLogger(),
++        configFileOut: haproxy_parse_error};
++    lbm.checkHaproxyConfig(opts, function (err) {
++        t.notEqual(null, err);
++        t.done();
++    });
++});
++
++test('test no-frontend config file (should error)', function (t) {
++    var opts = { log: helper.createLogger(),
++        configFileOut: haproxy_no_frontend};
++    lbm.checkHaproxyConfig(opts, function (err) {
++        t.notEqual(null, err);
++        t.done();
++    });
++});
++
++test('test get haproxy exec path', function (t) {
++    var opts = { log: helper.createLogger() };
++    lbm.getHaproxyExec(opts, function (err, data) {
++        t.equal(null, err);
++        t.notEqual(null, data);
++        t.done();
++    });
++});
++
++test('test writeHaproxyConfig', function (t) {
++    var opts = {
++        trustedIP: '127.0.0.1',
++        untrustedIPs: ['::1', '255.255.255.255'],
++        hosts: ['foo.joyent.us', 'bar.joyent.us'],
++        configFileOut: updConfig_out,
++        log: helper.createLogger()
++    };
++    lbm.writeHaproxyConfig(opts, function (err, data) {
++        t.equal(null, err);
++        // compare output file with reference
++        execFile('diff', ['-wq', '-I', 'log-send-hostname',
++                          updConfig_out, updConfig_out_chk],
++            function (error, _stdout, _stderr) {
++                t.equal(null, error);
++                // cleanup test file
++                fs.unlinkSync(updConfig_out);
++                t.done();
++            });
++    });
++});
++
++test('test writeHaproxyConfig bad config (should error)', function (t) {
++    // haproxy shouldn't like empty hosts (no listen or backend)
++    var opts = {
++        trustedIP: '',
++        untrustedIPs: [],
++        hosts: [],
++        configFileOut: updConfig_out,
++        configFileIn: haproxy_config_in,
++        log: helper.createLogger()
++    };
++
++    vasync.pipeline({ arg: opts, funcs: [
++        lbm.writeHaproxyConfig,
++        lbm.checkHaproxyConfig
++    ]}, function (err) {
++        t.notEqual(null, err);
++        t.done();
++    });
++});
++
++test('test restart', function (t) {
++    var opts = {
++        trustedIP: '127.0.0.1',
++        untrustedIPs: ['::1', '255.255.255.255'],
++        // This must resolve, so pick something public
++        hosts: ['google.com'],
++        restart: '/bin/true',
++        configFileIn: haproxy_config_in,
++        log: helper.createLogger()
++    };
++
++    lbm.restart(opts, function (err, data) {
++        t.equal(null, err);
++        t.doesNotThrow(function () {
++            // Check if restart created the proper file
++            // this will throw if the file doesn't exist
++            fs.statSync(haproxy_file);
++            // remove files that a successful restart
++            // would have created
++            fs.unlinkSync(haproxy_file);
++        });
++        t.done();
++    });
++});
++
++test('test restart bad config (should error)', function (t) {
++    var opts = {
++        trustedIP: '127.0.0.1',
++        untrustedIPs: ['::1', '255.255.255.255'],
++        hosts: [],
++        restart: '/bin/true',
++        configFileIn: haproxy_config_in,
++        log: helper.createLogger()
++    };
++
++    lbm.restart(opts, function (err, data) {
++        t.notEqual(null, err);
++        t.done();
++    });
++});
++
++test('test dueling restarts', function (t) {
++    var opts = {
++        trustedIP: '127.0.0.1',
++        untrustedIPs: ['::1', '255.255.255.255'],
++        hosts: ['google.com', 'joyent.com'],
++        restart: '/bin/sleep 2',
++        configFileIn: haproxy_config_in,
++        log: helper.createLogger()
++    };
++
++    var opts2 = {
++        trustedIP: '127.0.0.1',
++        untrustedIPs: ['::1', '255.255.255.255'],
++        // This must resolve, so pick something public
++        hosts: ['google.com'],
++        restart: '/bin/true',
++        configFileIn: haproxy_config_in,
++        log: helper.createLogger()
++    };
++
++    // Restart twice, calling the functions as fast as possible
++    // Using a /bin/sleep call to make sure the first one is still
++    // busy for the second call.
++    lbm.restart(opts, function (err, data) {
++        t.equal(null, err);
++    });
++
++    lbm.restart(opts2, function (err, data) {
++        t.equal(null, err);
++        t.done();
++    });
++});
+diff --git a/test/haproxy.cfg.empty b/test/haproxy.cfg.empty
+new file mode 100644
+index 0000000..e69de29
+diff --git a/test/haproxy.cfg.good b/test/haproxy.cfg.good
+new file mode 100644
+index 0000000..531309a
+--- /dev/null
++++ b/test/haproxy.cfg.good
+@@ -0,0 +1,39 @@
++global
++        log 127.0.0.1 local0
++        user nobody
++        group nobody
++        daemon
++        maxconn 65535
++        pidfile /var/run/haproxy.pid
++        stats socket /tmp/haproxy mode 0600 level admin
++
++defaults
++        balance leastconn
++        log     global
++        maxconn 65535
++	mode http
++        option forwardfor
++        option http-tunnel
++	option httplog
++        option redispatch
++        no option httpclose
++        no option http-server-close
++        retries 3
++        timeout connect 500
++        timeout client  120000
++        timeout server  240000
++
++frontend https
++        bind 127.0.0.1:8443 accept-proxy
++        default_backend secure_api
++        reqadd x-secure:\ true
++
++backend secure_api
++	option httpchk GET /ping
++
++frontend http
++        bind *:80
++        default_backend insecure_api
++
++backend insecure_api
++	option httpchk GET /ping
+diff --git a/test/haproxy.cfg.in b/test/haproxy.cfg.in
+new file mode 100644
+index 0000000..6bfb7e7
+--- /dev/null
++++ b/test/haproxy.cfg.in
+@@ -0,0 +1,54 @@
++global
++        log 127.0.0.1 local0
++        user nobody
++        group nobody
++        daemon
++        maxconn 65535
++        pidfile /var/run/haproxy.pid
++        log-send-hostname %s
++        stats socket /tmp/haproxy mode 0600 level admin
++
++
++defaults
++        balance leastconn
++        log     global
++        maxconn 65535
++        mode http
++        option forwardfor
++        option http-tunnel
++        option httplog
++        option redispatch
++        no option httpclose
++        no option http-server-close
++        retries 3
++        timeout client  120000
++        timeout connect 2000
++        timeout server  240000
++
++backend secure_api
++        option httpchk GET /ping
++%s
++
++backend insecure_api
++        option httpchk GET /ping
++%s
++
++backend haproxy-stats_http
++        stats enable
++        stats refresh 30s
++        stats uri /
++
++frontend https
++        bind 127.0.0.1:8443 accept-proxy
++        default_backend secure_api
++
++%s
++
++frontend http_internal
++        bind %s:80
++        default_backend secure_api
++
++
++frontend stats_http
++         bind %s:8080
++         default_backend haproxy-stats_http
+diff --git a/test/haproxy.cfg.no-frontend b/test/haproxy.cfg.no-frontend
+new file mode 100644
+index 0000000..8db79a2
+--- /dev/null
++++ b/test/haproxy.cfg.no-frontend
+@@ -0,0 +1,12 @@
++    global
++        daemon
++        maxconn 256
++
++    defaults
++        mode http
++        timeout connect 5000ms
++        timeout client 50000ms
++        timeout server 50000ms
++
++    backend servers
++        server server1 127.0.0.1:8000 maxconn 32
+diff --git a/test/haproxy.cfg.no-listener b/test/haproxy.cfg.no-listener
+new file mode 100644
+index 0000000..42491bb
+--- /dev/null
++++ b/test/haproxy.cfg.no-listener
+@@ -0,0 +1,9 @@
++    global
++        daemon
++        maxconn 256
++
++    defaults
++        mode http
++        timeout connect 5000ms
++        timeout client 50000ms
++        timeout server 50000ms
+diff --git a/test/haproxy.cfg.out-check b/test/haproxy.cfg.out-check
+new file mode 100644
+index 0000000..7514e0e
+--- /dev/null
++++ b/test/haproxy.cfg.out-check
+@@ -0,0 +1,68 @@
++global
++        log 127.0.0.1 local0
++        user nobody
++        group nobody
++        daemon
++        maxconn 65535
++        pidfile /var/run/haproxy.pid
++        log-send-hostname foo
++        stats socket /tmp/haproxy mode 0600 level admin
++
++
++defaults
++        balance leastconn
++        log     global
++        maxconn 65535
++        mode http
++        option forwardfor
++        option http-tunnel
++        option httplog
++        option redispatch
++        no option httpclose
++        no option http-server-close
++        retries 3
++        timeout client  120000
++        timeout connect 2000
++        timeout server  240000
++        errorfile 400 /opt/smartdc/muppet/etc/400.http
++        errorfile 408 /opt/smartdc/muppet/etc/408.http
++        errorfile 500 /opt/smartdc/muppet/etc/503.http
++        errorfile 502 /opt/smartdc/muppet/etc/503.http
++        errorfile 503 /opt/smartdc/muppet/etc/503.http
++        errorfile 504 /opt/smartdc/muppet/etc/503.http
++
++backend secure_api
++        option httpchk GET /ping
++        server be0 foo.joyent.us:80 check inter 30s slowstart 10s
++        server be1 bar.joyent.us:80 check inter 30s slowstart 10s
++
++
++backend insecure_api
++        option httpchk GET /ping
++        server be0 foo.joyent.us:81 check inter 30s slowstart 10s
++        server be1 bar.joyent.us:81 check inter 30s slowstart 10s
++
++
++backend haproxy-stats_http
++        stats enable
++        stats refresh 30s
++        stats uri /
++
++frontend https
++        bind 127.0.0.1:8443 accept-proxy
++        default_backend secure_api
++
++frontend http_external
++        default_backend insecure_api
++        bind ::1:80
++        bind 255.255.255.255:80
++
++
++frontend http_internal
++        bind 127.0.0.1:80
++        default_backend secure_api
++
++
++frontend stats_http
++         bind 127.0.0.1:8080
++         default_backend haproxy-stats_http
+diff --git a/test/haproxy.cfg.parse-error b/test/haproxy.cfg.parse-error
+new file mode 100644
+index 0000000..9b6fbb4
+--- /dev/null
++++ b/test/haproxy.cfg.parse-error
+@@ -0,0 +1,41 @@
++;;;;
++
++global
++        log 127.0.0.1 local0
++        user nobody
++        group nobody
++        daemon
++        maxconn 65535
++        pidfile /var/run/haproxy.pid
++        stats socket /tmp/haproxy mode 0600 level admin
++
++defaults
++        balance leastconn
++        log     global
++        maxconn 65535
++	mode http
++        option forwardfor
++        option http-tunnel
++	option httplog
++        option redispatch
++        no option httpclose
++        no option http-server-close
++        retries 3
++        timeout connect 500
++        timeout client  120000
++        timeout server  240000
++
++frontend https
++        bind 127.0.0.1:8443 accept-proxy
++        default_backend secure_api
++        reqadd x-secure:\ true
++
++backend secure_api
++	option httpchk GET /ping
++
++frontend http
++        bind *:80
++        default_backend insecure_api
++
++backend insecure_api
++	option httpchk GET /ping

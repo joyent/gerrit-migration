@@ -1,0 +1,1460 @@
+commit a1e9dd637f293ae4cf0f2666d6e3fcbc2d3bc112 (refs/changes/55/1655/6)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2017-03-20T17:21:24-07:00 (2 years, 7 months ago)
+    
+    ZAPI-770 changefeed events should be published for every changes made to VM objects in moray
+
+diff --git a/lib/apis/moray.js b/lib/apis/moray.js
+index d90b310..d25e8b9 100644
+--- a/lib/apis/moray.js
++++ b/lib/apis/moray.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -17,8 +17,9 @@ var assert = require('assert-plus');
+ var async = require('async');
+ var backoff = require('backoff');
+ var bunyan = require('bunyan');
++var deepDiff = require('deep-diff');
+ var EventEmitter = require('events').EventEmitter;
+-var jsprint = require('jsprim');
++var jsprim = require('jsprim');
+ var ldapjs = require('ldap-filter');
+ var restify = require('restify');
+ var sprintf = require('sprintf').sprintf;
+@@ -104,6 +105,9 @@ var VM_ROLE_TAGS_BUCKET = {
+  * Moray constructor
+  */
+ function Moray(options) {
++    assert.object(options, 'options');
++    assert.object(options.changefeedPublisher, 'options.changefeedPublisher');
++
+     EventEmitter.call(this);
+     // this.log = options.log;
+     // this.log.level(options.logLevel || 'info');
+@@ -113,11 +117,25 @@ function Moray(options) {
+         serializers: restify.bunyan.serializers
+     });
+     this.options = options;
++    this.changefeedPublisher = options.changefeedPublisher;
+ }
+ 
+ util.inherits(Moray, EventEmitter);
+ 
++/*
++ * Sets the changefeed publisher instance that is used by the moray storage
++ * layer to publish changes to changefeed when a `putVm` call is made.
++ *
++ * @param {Object} cfPublisher: the changefeed publisher to use to publish
++ * changes.
++ *
++ * Returns undefined.
++ */
++Moray.prototype.setCfPublisher = function setCfPublisher(cfPublisher) {
++    assert.object(cfPublisher, 'cfPublisher');
+ 
++    this.changefeedPublisher = cfPublisher;
++};
+ 
+ /*
+  * Attempts to connect to moray, retrying until connection is established. After
+@@ -620,15 +638,94 @@ Moray.prototype.countVms = function countVms(params, cb) {
+     });
+ };
+ 
++/*
++ * Takes two objects, "oldObject" and "newObject" and computes the differences
++ * between them. Returns an array that contains the properties that are not
++ * equal in oldObject and newObject. If there's no difference between oldObject
++ * and newObject, it returns an empty array.
++ *
++ * @param {Object} oldObject
++ * @param {Object} newObject
++ * @param {Object} log - the log instance used to log messages.
++ */
++function computeDiff(oldObject, newObject, log) {
++    assert.object(oldObject, 'oldObject');
++    assert.object(newObject, 'newObject');
++    assert.object(log, 'log');
++
++    var diffs = [];
++    var diffResults = deepDiff.diff(oldObject, newObject);
++    if (diffResults && diffResults.length) {
++        for (var i = 0; i < diffResults.length; i++) {
++            var path = diffResults[i].path;
++            if (path && path[0]) {
++                diffs.push(path[0]);
++            } else {
++                log.warn('diffResult path not properly set: %j',
++                    diffResults[i]);
++            }
++        }
++    }
+ 
++    return diffs;
++}
+ 
+ /*
+  * Puts a VM. If it doesn't exist it gets created, if it does exist it gets
+  * updated. We no longer need to execute partial updates
+  */
+-Moray.prototype.putVm = function (uuid, vm, cb) {
+-    var object = this._toMorayVm(vm);
+-    this.connection.putObject(VMS_BUCKET_NAME, uuid, object, cb);
++Moray.prototype.putVm = function (uuid, vm, oldVm, cb) {
++    var self = this;
++
++    assert.uuid(uuid, 'uuid');
++    assert.object(vm, 'vm');
++    assert.object(oldVm, 'oldVm');
++    assert.func(cb, 'cb');
++
++    assert.object(self.changefeedPublisher, 'self.changefeedPublisher');
++
++    var VM_CHANGEFEED_RESOURCE_NAME = 'vm';
++    var vmObject = self._toMorayVm(vm);
++
++    oldVm = common.translateVm(oldVm, true);
++    self.log.debug({oldVm: oldVm, vm: vm}, 'putting VM');
++
++    self.connection.putObject(VMS_BUCKET_NAME, uuid, vmObject,
++        function onPutObj(putObjErr) {
++            var diffs;
++
++            if (!putObjErr) {
++                self.log.debug('VM successfully put to moray');
++
++                if (oldVm && self.changefeedPublisher) {
++                    diffs = computeDiff(oldVm, vm, self.log);
++                    self.log.debug({diffs: diffs},
++                        'publishing change to changefeed');
++                    common.publishChange(self.changefeedPublisher,
++                        VM_CHANGEFEED_RESOURCE_NAME, diffs, vm.uuid,
++                        function onChangePublished(publishErr) {
++                            if (publishErr) {
++                                self.log.error({
++                                    err: publishErr
++                                }, 'error when publishing change to ' +
++                                    'changefeed');
++                            } else {
++                                self.log.debug('change published to ' +
++                                    'changefeed successfully');
++                            }
++
++                            cb(publishErr);
++                        });
++                } else {
++                    self.log.debug('not publishing change to changefeed');
++                    cb(putObjErr);
++                }
++            } else {
++                self.log.error({err: putObjErr},
++                    'error when putting VM to moray');
++                cb(putObjErr);
++            }
++        });
+ };
+ 
+ /*
+@@ -656,8 +753,12 @@ Moray.prototype.delVms = function delVms(params, cb) {
+  * Marks a VM as destroyed
+  */
+ Moray.prototype.markAsDestroyed = function (vm, callback) {
++    assert.object(vm, 'vm');
++    assert.func(callback, 'callback');
++
+     var self = this;
+ 
++    var oldVm = jsprim.deepCopy(vm);
+     var state = (vm.state === 'provisioning') ? 'failed' : 'destroyed';
+ 
+     vm.state = state;
+@@ -666,7 +767,7 @@ Moray.prototype.markAsDestroyed = function (vm, callback) {
+         vm.destroyed = new Date();
+     }
+ 
+-    self.putVm(vm.uuid, vm, function (err) {
++    self.putVm(vm.uuid, vm, oldVm, function (err) {
+         if (err) {
+             callback(err);
+         } else {
+diff --git a/lib/common/util.js b/lib/common/util.js
+index 394f809..5adcd64 100644
+--- a/lib/common/util.js
++++ b/lib/common/util.js
+@@ -122,6 +122,12 @@ exports.timestamp = function (aDate) {
+  * @param  {function}  cb           callback function which takes err param
+  */
+ function publishChange(publisher, resource, subResources, uuid, cb) {
++    assert.object(publisher, 'publisher');
++    assert.string(resource, 'resource');
++    assert.arrayOfString(subResources, 'subResources');
++    assert.uuid(uuid, 'uuid');
++    assert.func(cb, 'cb');
++
+     var changeItem = {
+         changeKind: {
+             resource: resource,
+diff --git a/lib/endpoints/jobs.js b/lib/endpoints/jobs.js
+index 46bb28a..f0f1f50 100644
+--- a/lib/endpoints/jobs.js
++++ b/lib/endpoints/jobs.js
+@@ -5,15 +5,15 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+  * A brief overview of this source file: what is its purpose.
+  */
+ 
+-var restify = require('restify');
+ var assert = require('assert');
++var restify = require('restify');
+ 
+ var common = require('../common');
+ var interceptors = require('../interceptors');
+@@ -58,9 +58,6 @@ function listJobs(req, res, next) {
+ 
+ 
+ 
+-/*
+- * GET /job_results
+- */
+ function jobResults(req, res, next) {
+     req.log.trace('JobResults start');
+     req.log.info('Received post back job results', req.params);
+@@ -80,7 +77,7 @@ function jobResults(req, res, next) {
+             var vm = common.simpleMerge(obj, req.params);
+             vm = common.translateVm(vm, false);
+ 
+-            req.app.moray.putVm(req.params.vm_uuid, vm, function (err2) {
++            req.app.moray.putVm(req.params.vm_uuid, vm, obj, function (err2) {
+                 if (err2) {
+                     return next(err2);
+                 } else {
+diff --git a/lib/endpoints/vms.js b/lib/endpoints/vms.js
+index 63fe178..b90cb73 100644
+--- a/lib/endpoints/vms.js
++++ b/lib/endpoints/vms.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -42,7 +42,10 @@ var VALID_VM_ACTIONS = [
+ 
+ var DEFAULT_LIST_VM_LIMIT = common.MAX_LIST_VMS_LIMIT;
+ var DEFAULT_LIST_VM_OFFSET = 0;
+-var VM = 'vm';
++
++var VIRTUAL_FIELDS = common.VM_FIELDS.filter(function isVirtual(field) {
++    return field.virtual === true;
++});
+ 
+ function validAction(action) {
+     return VALID_VM_ACTIONS.indexOf(action) != -1;
+@@ -320,7 +323,7 @@ function getVm(req, res, next) {
+ 
+         if (vm) {
+             var newVm = common.translateVm(vm, true);
+-            req.app.moray.putVm(newVm.uuid, newVm, function (putErr) {
++            req.app.moray.putVm(newVm.uuid, newVm, req.vm, function (putErr) {
+                 if (putErr) {
+                     req.log.error({ err: putErr, uuid: newVm.uuid },
+                         'Error storing VM on moray');
+@@ -785,17 +788,7 @@ function deleteVm(req, res, next) {
+     // for the workflow to fail, just mark the VM as destroyed in moray.
+     // It's faster, and uses far less resources of the overall system.
+     if (req.vm.server_uuid === undefined || req.vm.server_uuid === null) {
+-        _destroyVm(req.vm, {
+-            publisher: req.app.changefeedPublisher,
+-            moray: req.app.moray
+-        }, function (err, destroyedVm) {
+-            if (err) {
+-                return next(err);
+-            }
+-
+-            res.send(200, destroyedVm);
+-            return next();
+-        });
++        req.app.moray.markAsDestroyed(req.vm, onVmMarkedDestroyed);
+     } else {
+         req.app.cnapi.getServer(req.vm.server_uuid,
+             function onGetServer(err, server) {
+@@ -805,17 +798,7 @@ function deleteVm(req, res, next) {
+                 }
+ 
+                 if (serverNotFoundError) {
+-                    _destroyVm(req.vm, {
+-                        publisher: req.app.changefeedPublisher,
+-                        moray: req.app.moray
+-                    }, function (destroyErr, destroyedVm) {
+-                        if (destroyErr) {
+-                            return next(err);
+-                        }
+-
+-                        res.send(200, destroyedVm);
+-                        return next();
+-                    });
++                    req.app.moray.markAsDestroyed(req.vm, onVmMarkedDestroyed);
+                 } else {
+                     return req.app.wfapi.createDestroyJob(req,
+                         function (jobErr, juuid) {
+@@ -829,38 +812,21 @@ function deleteVm(req, res, next) {
+                 }
+             });
+     }
++
++    function onVmMarkedDestroyed(markDestroyedErr, destroyedVm) {
++        if (markDestroyedErr) {
++            return next(markDestroyedErr);
++        }
++
++        res.send(200, destroyedVm);
++        return next();
++    }
+ }
+ 
+ function _cnapiServerNotFoundError(err) {
+     return err && err.body && err.body.code === 'ResourceNotFound';
+ }
+ 
+-function _destroyVm(vm, options, cb) {
+-    assert.object(vm, 'vm must be an object');
+-    assert.object(options, 'options must be an object');
+-    assert.object(options.publisher, 'publisher must be an object');
+-    assert.object(options.moray, 'moray must be an object');
+-    assert.func(cb, 'cb must be a function');
+-
+-    vasync.waterfall([
+-        function markVmAsDestroyed(next) {
+-            options.moray.markAsDestroyed(vm, next);
+-        },
+-        function publishVmChange(destroyedVm, next) {
+-            common.publishChange(options.publisher, VM,
+-                [destroyedVm.state], destroyedVm.uuid,
+-                function onChangePublished(err) {
+-                    next(err, destroyedVm);
+-                    return;
+-                });
+-        }
+-    ], function vmDestroyed(err, destroyedVm) {
+-        cb(err, destroyedVm);
+-        return;
+-    });
+-}
+-
+-
+ /*
+  * Optional when role_tags are passed to the provision request
+  */
+@@ -958,7 +924,7 @@ function createVm(req, res, next) {
+ 
+         // Write the provisioning VM to moray
+         var vm = common.translateVm(req.params, false);
+-        req.app.moray.putVm(vmuuid, vm, function (err2) {
++        req.app.moray.putVm(vmuuid, vm, {}, function (err2) {
+             if (err2) {
+                 // When provision has been queued and moray fails putobject
+                 // we should be able to see the VM show up eventually when
+@@ -1127,38 +1093,12 @@ function putVms(req, res, next) {
+     async.eachSeries(Object.keys(req.params.vms), function (uuid, cb) {
+         var vm = common.translateVm(req.params.vms[uuid], false);
+         var oldVm = req.vms[uuid] || {};
+-        async.waterfall([
+-            function _morayPut(cb2) {
+-                req.app.moray.putVm(uuid, vm, cb2);
+-            },
+-            function _diffVms(etag, cb2) {
+-                var diffs = [];
+-                var diffResults = deepDiff.diff(oldVm, vm);
+-                if (diffResults && diffResults.length) {
+-                    for (var i = 0; i < diffResults.length; i++) {
+-                        var path = diffResults[i].path;
+-                        if (path && path[0]) {
+-                            diffs.push(path[0]);
+-                        } else {
+-                            req.log.warn('diffResult path not properly set: %j',
+-                                diffResults[i]);
+-                        }
+-                    }
+-                }
+-                cb2(null, diffs);
+-            },
+-            function _pub(diffs, cb2) {
+-                if (diffs && diffs.length != 0) {
+-                    var publisher = req.app.changefeedPublisher;
+-                    common.publishChange(publisher, VM, diffs, uuid, cb2);
+-                } else {
+-                    cb2(null);
+-                }
+-            }
+-        ], function _waterfallEnd(err) {
+-            cb(err);
++
++        VIRTUAL_FIELDS.forEach(function setVirtualField(field) {
++            vm[field.name] = oldVm[field.name];
+         });
+ 
++        req.app.moray.putVm(uuid, vm, oldVm, cb);
+     }, function (err) {
+         if (err) {
+             return next(err);
+@@ -1186,61 +1126,33 @@ function putVm(req, res, next) {
+ 
+     // Parse whatever is needed before putting a raw object from vm-agent
+     var vm = common.translateVm(req.params, false);
+-    var publisher = req.app.changefeedPublisher;
++
++    var oldVm = req.vm || {};
++
++    VIRTUAL_FIELDS.forEach(function setVirtualField(field) {
++        vm[field.name] = oldVm[field.name];
++    });
+ 
+     if (vm.state === 'destroyed') {
+-        _destroyVm(vm, {
+-            publisher: req.app.changefeedPublisher,
+-            moray: req.app.moray
+-        }, function vmDestroyed(err, destroyedVm) {
+-            if (err) {
+-                return next(err);
+-            }
++        req.app.moray.markAsDestroyed(vm,
++            function vmDestroyed(err, destroyedVm) {
++                if (err) {
++                    return next(err);
++                }
+ 
+-            res.send(200, vm);
+-            return next();
+-        });
++                res.send(200, vm);
++                return next();
++            });
+     } else {
+-        var oldVm = req.vm || {};
+-        async.waterfall([
+-            function _morayPut(cb) {
+-                req.app.moray.putVm(req.params.uuid, vm, cb);
+-            },
+-            function _diffVms(etag, cb) {
+-                var diffs = [];
+-                var diffResults = deepDiff.diff(oldVm, vm);
+-                if (diffResults && diffResults.length) {
+-                    for (var i = 0; i < diffResults.length; i++) {
+-                        var path = diffResults[i].path;
+-                        // Ignore destroyed as it is handled above, and also
+-                        // because the input data may have it not set when
+-                        // existing data has it set to null. This generates
+-                        // false positives.
+-                        if (path && path[0] && path !== 'destroyed') {
+-                            diffs.push(path[0]);
+-                        } else {
+-                            req.log.warn('diffResult not properly set: %j',
+-                                diffResults[i]);
+-                        }
+-                    }
+-                }
+-                cb(null, diffs);
+-            },
+-            function _pub2(diffs, cb) {
+-                if (diffs && diffs.length != 0) {
+-                    common.publishChange(publisher, VM, diffs, vm.uuid, cb);
+-                } else {
+-                    cb(null);
++        req.app.moray.putVm(req.params.uuid, vm, oldVm,
++            function onPutVm(putVmErr) {
++                if (putVmErr) {
++                    return next(putVmErr);
+                 }
+-            }
+-        ], function waterfallEnd2(err) {
+-            if (err) {
+-                return next(err);
+-            }
+ 
+-            res.send(200, vm);
+-            return next();
+-        });
++                res.send(200, vm);
++                return next();
++            });
+     }
+ }
+ 
+diff --git a/lib/vmapi.js b/lib/vmapi.js
+index 60e72fa..0a6c4e1 100644
+--- a/lib/vmapi.js
++++ b/lib/vmapi.js
+@@ -17,7 +17,6 @@
+ var assert = require('assert-plus');
+ var async = require('async');
+ var bunyan = require('bunyan');
+-var changefeed = require('changefeed');
+ var EffluentLogger = require('effluent-logger');
+ var EventEmitter = require('events').EventEmitter;
+ var once = require('once');
+@@ -87,7 +86,9 @@ function VMAPI(options) {
+     assert.object(options.moray, 'options.moray');
+     this.moray = options.moray;
+ 
+-    assert.optionalObject(options.changefeed, 'options.changefeed');
++    assert.optionalObject(options.changefeedPublisher,
++        'options.changefeedPublisher');
++    this.changefeedPublisher = options.changefeedPublisher;
+ 
+     if (options.log === undefined) {
+         this.log = bunyan.createLogger({
+@@ -100,7 +101,6 @@ function VMAPI(options) {
+     }
+ 
+     this.options = options;
+-    this.changefeedOptions = options.changefeed;
+ 
+     validations.init(options);
+     this._initApis(options);
+@@ -211,34 +211,9 @@ VMAPI.prototype._initApis = function _initApis(options) {
+     this.setMiddleware();
+     this.setStaticRoutes();
+     this.setRoutes();
+-};
+-
+-VMAPI.prototype.init = function init(callback) {
+-    assert.func(callback, 'callback');
+-
+-    var callbackOnce = once(callback);
+-    var changefeedPublisher;
+-
+-    if (this.changefeedOptions) {
+-        /*
+-         * Add restify server to changefeed config so that it can
+-         * add routes.
+-         */
+-        this.changefeedOptions.restifyServer = this.server;
+-
+-        changefeedPublisher =
+-            changefeed.createPublisher(this.changefeedOptions);
+-
+-        changefeedPublisher.on('moray-ready',
+-            function onChangefeedReady() {
+-                callbackOnce();
+-            });
+ 
+-        changefeedPublisher.start();
+-
+-        this.changefeedPublisher = changefeedPublisher;
+-    } else {
+-        callback();
++    if (this.changefeedPublisher) {
++        this.changefeedPublisher.mountRestifyServerRoutes(this.server);
+     }
+ };
+ 
+@@ -246,10 +221,6 @@ VMAPI.prototype.close = function close() {
+     if (this.server) {
+         this.server.close();
+     }
+-
+-    if (this.changefeedPublisher) {
+-        this.changefeedPublisher.close();
+-    }
+ };
+ 
+ /*
+diff --git a/package.json b/package.json
+index 8342ebf..44f2ece 100644
+--- a/package.json
++++ b/package.json
+@@ -9,7 +9,7 @@
+     "async": "0.7.0",
+     "backoff": "2.5.0",
+     "bunyan": "1.8.1",
+-    "changefeed": "1.2.2",
++    "changefeed": "git+https://github.com/misterdjules/node-sdc-changefeed.git#node-sdc-changefeed-issue-2",
+     "dashdash": "1.14.1",
+     "deep-diff": "0.3.3",
+     "effluent-logger": "git+https://github.com/joshwilsdon/effluent-logger.git#d662f161a07f94045ad2afb45442931511c40e51",
+diff --git a/server.js b/server.js
+index 8bac9c3..051d88a 100644
+--- a/server.js
++++ b/server.js
+@@ -13,6 +13,7 @@
+  */
+ 
+ var assert = require('assert-plus');
++var changefeed = require('changefeed');
+ var fs = require('fs');
+ var http = require('http');
+ var https = require('https');
+@@ -101,10 +102,14 @@ function createApiClients(config, parentLog) {
+ }
+ 
+ function startVmapiService() {
++    var apiClients;
++    var changefeedPublisher;
+     var configFilePath = path.join(__dirname, 'config.json');
+     var config = configLoader.loadConfig(configFilePath);
+     config.version = version() || '7.0.0';
+ 
++    var morayApi;
++
+     var vmapiLog = new Logger({
+         name: 'vmapi',
+         level: config.logLevel,
+@@ -117,16 +122,29 @@ function startVmapiService() {
+     http.globalAgent.maxSockets = config.maxSockets || 100;
+     https.globalAgent.maxSockets = config.maxSockets || 100;
+ 
+-    var changefeedOptions = jsprim.deepCopy(config.changefeed);
+-    changefeedOptions.log =
+-        vmapiLog.child({ component: 'changefeed' }, true);
++    apiClients = createApiClients(config, vmapiLog);
+ 
+-    var morayApi = new MORAY(config.moray);
++    vasync.parallel({funcs: [
++        function initChangefeedPublisher(done) {
++            var changefeedOptions = jsprim.deepCopy(config.changefeed);
++            changefeedOptions.log = vmapiLog.child({ component: 'changefeed' },
++                true);
+ 
+-    var apiClients = createApiClients(config, vmapiLog);
++            changefeedPublisher =
++                changefeed.createPublisher(changefeedOptions);
+ 
+-    vasync.parallel({funcs: [
+-        function connectToMoray(done) {
++            changefeedPublisher.on('moray-ready', function onMorayReady() {
++                changefeedPublisher.start();
++                done();
++            });
++        },
++        function initMorayApi(done) {
++            assert.object(changefeedPublisher, 'changefeedPublisher');
++
++            var morayConfig = jsprim.deepCopy(config.moray);
++            morayConfig.changefeedPublisher = changefeedPublisher;
++
++            morayApi = new MORAY(morayConfig);
+             morayApi.connect();
+ 
+             morayApi.on('moray-ready', function onMorayReady() {
+@@ -159,14 +177,12 @@ function startVmapiService() {
+                 },
+                 apiClients: apiClients,
+                 moray: morayApi,
+-                changefeed: changefeedOptions,
++                changefeedPublisher: changefeedPublisher,
+                 overlay: config.overlay,
+                 reserveKvmStorage: config.reserveKvmStorage
+             });
+ 
+-            vmapiService.init(function onVmapiInitialized() {
+-                vmapiService.listen();
+-            });
++            vmapiService.listen();
+         }
+     });
+ }
+diff --git a/test/fixtures/vmapi-server-throwing-expected-stderr.txt b/test/fixtures/vmapi-server-throwing-expected-stderr.txt
+index 84f1533..9108884 100644
+--- a/test/fixtures/vmapi-server-throwing-expected-stderr.txt
++++ b/test/fixtures/vmapi-server-throwing-expected-stderr.txt
+@@ -1,6 +1,6 @@
+-/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:16
++/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:28
+     throw new Error('boom');
+     ^
+ 
+ Error: boom
+-    at Server.throwingRestifyHandler (/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:16:11)
+\ No newline at end of file
++    at Server.throwingRestifyHandler (/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:28:11)
+\ No newline at end of file
+diff --git a/test/fixtures/vmapi-server-with-throwing-handler.js b/test/fixtures/vmapi-server-with-throwing-handler.js
+index b168278..b250290 100644
+--- a/test/fixtures/vmapi-server-with-throwing-handler.js
++++ b/test/fixtures/vmapi-server-with-throwing-handler.js
+@@ -1,10 +1,22 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
+ var libuuid = require('libuuid');
+ var mod_vmapiClient = require('sdc-clients').VMAPI;
+ var path = require('path');
+ var vasync = require('vasync');
+ 
++var changefeedTest = require('../lib/changefeed');
+ var configLoader = require('../../lib/config-loader');
+ var MORAY = require('../../lib/apis/moray');
++var morayTest = require('../lib/moray');
+ var vmapi = require('../../lib/vmapi');
+ 
+ var UNIQUE_ENDPOINT_PATH = '/' + libuuid.create();
+@@ -32,7 +44,7 @@ vasync.pipeline({funcs: [
+     function initMoray(arg, next) {
+         console.log('initializing moray...');
+ 
+-        morayApi = new MORAY(CONFIG.moray);
++        morayApi = morayTest.createMorayClient();
+         morayApi.connect();
+ 
+         morayApi.on('moray-ready', function onMorayReady() {
+@@ -47,10 +59,11 @@ vasync.pipeline({funcs: [
+             apiClients: {
+                 wfapi: mockedWfapiClient
+             },
+-            moray: morayApi
++            moray: morayApi,
++            chanfeedPublisher: changefeedTest.createNoopCfPublisher()
+         });
+ 
+-        vmapiService.init(next);
++        next();
+     },
+     function addThrowingHandler(arg, next) {
+         console.log('adding throwing restify handler...');
+diff --git a/test/lib/changefeed.js b/test/lib/changefeed.js
+new file mode 100644
+index 0000000..2244209
+--- /dev/null
++++ b/test/lib/changefeed.js
+@@ -0,0 +1,31 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++function createNoopCfPublisher() {
++    var noopChangefeedPublisher = {
++        publish: function publish(item, cb) {
++            assert.object(item, 'item');
++            assert.func(cb, 'cb');
++            cb();
++        },
++        mountRestifyServerRoutes:
++            function mountRestifyServerRoutes(restifyServer) {
++                assert.object(restifyServer, 'restifyServer');
++            }
++    };
++
++    return noopChangefeedPublisher;
++}
++
++module.exports = {
++    createNoopCfPublisher: createNoopCfPublisher
++};
+\ No newline at end of file
+diff --git a/test/lib/moray.js b/test/lib/moray.js
+new file mode 100644
+index 0000000..7234b36
+--- /dev/null
++++ b/test/lib/moray.js
+@@ -0,0 +1,29 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017 Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var jsprim = require('jsprim');
++
++var changefeedTest = require('./changefeed');
++var common = require('../common');
++var MORAY = require('../../lib/apis/moray');
++
++function createMorayClient() {
++    var morayConfig = jsprim.deepCopy(common.config.moray);
++
++    morayConfig.changefeedPublisher = changefeedTest.createNoopCfPublisher();
++
++    var moray = new MORAY(morayConfig);
++    return moray;
++}
++
++module.exports = {
++    createMorayClient: createMorayClient
++};
+\ No newline at end of file
+diff --git a/test/lib/vm.js b/test/lib/vm.js
+index 88d2db5..5f26a53 100644
+--- a/test/lib/vm.js
++++ b/test/lib/vm.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+@@ -57,7 +57,7 @@ function createTestVm(moray, options, vmParams, callback) {
+     vmParams = common.translateVm(vmParams, false);
+     log.debug({vmParams: vmParams}, 'params after translation');
+ 
+-    moray.putVm(vmParams.uuid, vmParams, function (err) {
++    moray.putVm(vmParams.uuid, vmParams, {}, function (err) {
+         if (err) {
+             log.error({ err: err, vmParams: vmParams },
+                 'Error storing VM %s in moray', vmParams.uuid);
+diff --git a/test/vms.changefeed.test.js b/test/vms.changefeed.test.js
+index 804092c..d8154b9 100644
+--- a/test/vms.changefeed.test.js
++++ b/test/vms.changefeed.test.js
+@@ -635,3 +635,98 @@ exports.put_new_vms = function (t) {
+     });
+ 
+ };
++
++/*
++ * This test is a regression test for https://smartos.org/bugview/ZAPI-770. It
++ * purposely provisions a VM on a non-existent network so that the provisioning
++ * workflow fails. It then tests that at least one changefeed event is emitted
++ * and that after this event was emitted the newly created VM's state is
++ * 'failed'. Before the fix for https://smartos.org/bugview/ZAPI-770, no
++ * changefeed event would be emitted for this VM.
++ *
++ * Unfortunately this test relies on the implementation detail that sending a
++ * request to VMAPI's CreateVm endpoint with a non-existent network creates a
++ * workflow and doesn't error right away. As a result, this test might not work
++ * as expected in the future, and might not prevent further regressions.
++ */
++exports.create_vm_that_fails_provisioning_workflow = function (t) {
++
++    var listener = changefeed.createListener(listenerOpts);
++    var nonExistentNetworkUuid = uuid.create();
++    var vmParams = {
++        owner_uuid: CUSTOMER,
++        image_uuid: IMAGE,
++        server_uuid: SERVER.uuid,
++        networks: [ { uuid: nonExistentNetworkUuid } ],
++        brand: 'joyent-minimal',
++        billing_id: '00000000-0000-0000-0000-000000000000',
++        ram: 64,
++        quota: 10,
++        creator_uuid: CUSTOMER
++    };
++    var vmLocation;
++
++    var vmCreationOpts = createOpts('/vms', vmParams);
++
++    VM = null;
++
++    listener.register();
++
++    listener.on('bootstrap', function onCfBootstrap() {
++        client.post(vmCreationOpts, vmParams,
++            function onVmCreated(vmCreateErr, req, res, vmCreationObj) {
++                common.ifError(t, vmCreateErr);
++
++                t.equal(res.statusCode, 202, '202 Accepted');
++                common.checkHeaders(t, res.headers);
++
++                t.ok(vmCreationObj, 'vm ok');
++
++                jobLocation = '/jobs/' + vmCreationObj.job_uuid;
++                vmLocation = '/vms/' + vmCreationObj.vm_uuid;
++
++                // GetVm should not fail after provision has been queued
++                client.get(vmLocation,
++                    function onGetVm(vmGetErr, vmGetReq, vmGetRes, vm) {
++                        common.ifError(t, vmGetErr);
++                        t.equal(vmGetRes.statusCode, 200, '200 OK');
++                        common.checkHeaders(t, vmGetRes.headers);
++                        t.ok(vm, 'provisioning vm ok');
++                        VM = vm;
++                    });
++            });
++    });
++
++    listener.on('readable', function onCfListenerReadable() {
++        var changeItem;
++        var changeKind;
++        var expectedStates = ['provisioning', 'failed'];
++
++        while ((changeItem = listener.read()) !== null) {
++            changeKind = changeItem.changeKind;
++            if (VM && changeItem.changedResourceId === VM.uuid &&
++                changeKind.subResources &&
++                changeKind.subResources.indexOf('state') !== -1) {
++                t.ok(true, 'state received');
++
++                client.get(vmLocation,
++                    function onGetVm(vmGetErr, vmGetReq, vmGetRes, vm) {
++                        common.ifError(t, vmGetErr);
++
++                        t.equal(vmGetRes.statusCode, 200, '200 OK');
++                        common.checkHeaders(t, vmGetRes.headers);
++
++                        t.ok(vm, 'provisioning vm ok');
++                        t.ok(expectedStates.indexOf(vm.state) !== -1,
++                            'VM is in one of the following states: ' +
++                                expectedStates.join(', '));
++                        if (vm.state === 'failed') {
++                            t.ok(true, 'VM eventually reached state failed');
++                            listener._endSocket();
++                            t.done();
++                        }
++                    });
++            }
++        }
++    });
++};
+\ No newline at end of file
+diff --git a/test/vms.delete_non_existing_no_workflow.test.js b/test/vms.delete_non_existing_no_workflow.test.js
+index f0cf9b0..e1c5b6e 100644
+--- a/test/vms.delete_non_existing_no_workflow.test.js
++++ b/test/vms.delete_non_existing_no_workflow.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ // The goal of this test is to make sure that, when sending a DELETE request
+@@ -18,6 +18,7 @@ var libuuid = require('libuuid');
+ 
+ var common = require('./common');
+ var moray = require('../lib/apis/moray');
++var morayTest = require('./lib/moray');
+ var vmTest = require('./lib/vm');
+ 
+ var client;
+@@ -114,7 +115,7 @@ exports.delete_provisioning_vm = function (t) {
+ };
+ 
+ exports.cleanup_test_vms = function (t) {
+-    var morayClient = new moray(common.config.moray);
++    var morayClient = morayTest.createMorayClient();
+     morayClient.connect();
+ 
+     morayClient.once('moray-ready', function () {
+diff --git a/test/vms.list.test.js b/test/vms.list.test.js
+index e4cc723..c4dc34b 100644
+--- a/test/vms.list.test.js
++++ b/test/vms.list.test.js
+@@ -13,7 +13,7 @@ var assert = require('assert-plus');
+ var async = require('async');
+ 
+ var common = require('./common');
+-
++var morayTest = require('./lib/moray');
+ var validation = require('../lib/common/validation');
+ var vmTest = require('./lib/vm');
+ 
+@@ -309,7 +309,7 @@ function testValidLimit(limit, t, callback) {
+         EXPECTED_NB_VMS_RETURNED = NB_TEST_VMS_TO_CREATE;
+     }
+ 
+-    var moray = new MORAY(common.config.moray);
++    var moray = morayTest.createMorayClient();
+     moray.connect();
+ 
+     moray.once('moray-ready', function () {
+@@ -380,7 +380,7 @@ exports.list_vms_valid_limit = function (t) {
+  * (list_vms_valid_limit).
+  */
+ exports.delete_list_vms_valid_limit = function (t) {
+-    var moray = new MORAY(common.config.moray);
++    var moray = morayTest.createMorayClient();
+     moray.connect();
+ 
+     moray.once('moray-ready', function () {
+diff --git a/test/vms.marker.test.js b/test/vms.marker.test.js
+index 9bc654f..5806d74 100644
+--- a/test/vms.marker.test.js
++++ b/test/vms.marker.test.js
+@@ -15,10 +15,12 @@ var url = require('url');
+ 
+ var common = require('./common');
+ var MORAY = require('../lib/apis/moray');
++var morayTest = require('./lib/moray');
+ var sortValidation = require('../lib/validation/sort.js');
+ var vmCommon = require('../lib/common/vm-common.js');
+ var vmTest = require('./lib/vm');
+ 
++
+ var client;
+ 
+ exports.setUp = function (callback) {
+@@ -71,7 +73,8 @@ function testMarkerPagination(options, t, callback) {
+     var NB_TEST_VMS_TO_CREATE = options.nbTestVms || 200;
+     var LIMIT = NB_TEST_VMS_TO_CREATE / 2;
+ 
+-    var moray = new MORAY(common.config.moray);
++    var moray = morayTest.createMorayClient();
++
+     moray.connect();
+ 
+     var vmsCreationParams = options.vmsCreationParams || {};
+@@ -296,7 +299,7 @@ exports.list_vms_marker_ok = function (t) {
+  * Cleanup test VMs created by the previous test (list_vms_marker_ok).
+  */
+ exports.delete_test_vms_marker_ok = function (t) {
+-    var moray = new MORAY(common.config.moray);
++    var moray = morayTest.createMorayClient();
+     moray.connect();
+ 
+     moray.once('moray-ready', function () {
+@@ -326,7 +329,7 @@ exports.list_vms_marker_and_sort_on_uuid_asc_ok = function (t) {
+  * (list_vms_marker_and_sort_on_uuid_asc_ok).
+  */
+ exports.delete_test_vms_marker_and_sort_on_uuid_asc_ok = function (t) {
+-    var moray = new MORAY(common.config.moray);
++    var moray = morayTest.createMorayClient();
+     moray.connect();
+ 
+     moray.once('moray-ready', function () {
+@@ -356,7 +359,7 @@ exports.list_vms_marker_and_sort_on_uuid_desc_ok = function (t) {
+  * (list_vms_marker_and_sort_on_uuid_desc_ok).
+  */
+ exports.delete_test_vms_marker_and_sort_on_uuid_desc_ok = function (t) {
+-    var moray = new MORAY(common.config.moray);
++    var moray = morayTest.createMorayClient();
+     moray.connect();
+ 
+     moray.once('moray-ready', function () {
+@@ -479,7 +482,7 @@ function createDeleteVMsTest(sortKey, sortOrder, exports) {
+     var clearVmsTestName = 'delete_test_vms_marker_with_identical_' + sortKey +
+             '_' + sortOrder + '_ok';
+     exports[clearVmsTestName] = function (t) {
+-        var moray = new MORAY(common.config.moray);
++        var moray = morayTest.createMorayClient();
+         moray.connect();
+ 
+         moray.once('moray-ready', function () {
+diff --git a/tools/add-test-vms.js b/tools/add-test-vms.js
+index cc5225e..882af6b 100755
+--- a/tools/add-test-vms.js
++++ b/tools/add-test-vms.js
+@@ -80,7 +80,20 @@ function addTestVms(nbVms, concurrency, data) {
+     assert.ok(concurrency > 0, 'concurrency must be a positive number');
+ 
+     assert.optionalObject(data, 'data must be an optional object');
+-    var moray = new MORAY(config.moray);
++    var morayConfig = jsprim.deepCopy(config.moray);
++
++    var noopChangefeedPublisher = {
++        publish: function publish(item, cb) {
++            assert.object(item, 'item');
++            assert.func(cb, 'cb');
++            cb();
++        }
++    };
++
++    morayConfig.changefeedPublisher = noopChangefeedPublisher;
++    morayConfig.reconnect = true;
++
++    var moray = new MORAY(morayConfig);
+ 
+     data = data || {};
+ 
+diff --git a/tools/fix-no-owner.js b/tools/fix-no-owner.js
+index dae6514..ee554f5 100644
+--- a/tools/fix-no-owner.js
++++ b/tools/fix-no-owner.js
+@@ -12,15 +12,19 @@
+ 
+ var async = require('async');
+ var bunyan = require('bunyan');
++var changefeed = require('changefeed');
+ var fs = require('fs');
++var jsprim = require('jsprim');
+ var path = require('path');
+ var restify = require('restify');
+ var util = require('util');
++var vasync = require('vasync');
+ 
+ var common = require('../lib/common');
+ var MORAY = require('../lib/apis/moray');
+ var WFAPI = require('../lib/apis/wfapi');
+ 
++var changefeedPublisher;
+ var config;
+ 
+ // If you don't pass this flag the script will read in test mode
+@@ -43,6 +47,8 @@ function loadConfig() {
+ }
+ 
+ config = loadConfig();
++var moray;
++var wfapi;
+ 
+ var log = this.log = new bunyan({
+     name: 'fix-no-owner',
+@@ -51,17 +57,31 @@ var log = this.log = new bunyan({
+ });
+ config.wfapi.log = log;
+ 
+-var moray = new MORAY(config.moray);
+-var wfapi = new WFAPI(config.wfapi);
+-
+-moray.connect();
+-moray.once('moray-ready', function () {
++vasync.pipeline({funcs: [
++    function initChangefeed(ctx, next) {
++        var changefeedOptions;
++
++        changefeedOptions = jsprim.deepCopy(config.changefeed);
++        changefeedOptions.log = log.child({ component: 'changefeed' },
++            true);
++
++        changefeedPublisher = changefeed.createPublisher(changefeedOptions);
++        changefeedPublisher.on('moray-ready', next);
++    },
++    function initMoray(ctx, next) {
++        var morayConfig = jsprim.deepCopy(config.moray);
++        morayConfig.changefeedPublisher = changefeedPublisher;
++        moray = new MORAY(morayConfig);
++        moray.connect();
++        moray.once('moray-ready', next);
++    },
++    function initWfApi(ctx, next) {
++        wfapi = new WFAPI(config.wfapi);
++        wfapi.connect();
++        next();
++    }
++]}, function onInitDone(initErr) {
+     var listVmsParams = { query: '(&(state=destroyed)!(owner_uuid=*))' };
+-
+-    log.info('Connected to moray, listing all VMs');
+-
+-    wfapi.connect();
+-
+     moray.listVms(listVmsParams, function onListVms(err, vms) {
+         if (err) {
+             log.error({err: err}, 'Error when listing VMs');
+@@ -89,6 +109,8 @@ moray.once('moray-ready', function () {
+         // Each VM should only have one destroy job
+         // Just be careful and re-check the job is a destroy task
+         wfapi.listJobs(listJobsParams, function (err, jobs) {
++            var fixedVm = jsprim.deepCopy(vm);
++
+             if (err) {
+                 return next(err);
+             }
+@@ -108,14 +130,14 @@ moray.once('moray-ready', function () {
+                     new Error('Expecting owner_uuid for VM ' + vm.uuid));
+             }
+ 
+-            vm.owner_uuid = job.params.owner_uuid;
+-            var m = common.translateVm(vm, false);
++            fixedVm.owner_uuid = job.params.owner_uuid;
++            fixedVm = common.translateVm(fixedVm, false);
+             if (!force) {
+-                log.debug({ vm: m }, 'Going to fix VM %s', vm.uuid);
++                log.debug({ vm: fixedVm }, 'Going to fix VM %s', vm.uuid);
+                 return next();
+             }
+ 
+-            moray.putVm(vm.uuid, m, function (merr) {
++            moray.putVm(vm.uuid, fixedVm, vm, function (merr) {
+                 if (merr) {
+                     return next(merr);
+                 }
+diff --git a/tools/kvm-backfill.js b/tools/kvm-backfill.js
+index 2b6ee26..9753b38 100644
+--- a/tools/kvm-backfill.js
++++ b/tools/kvm-backfill.js
+@@ -11,14 +11,18 @@
+ // Backfill image_uuid for KVM VMs
+ var assert = require('assert-plus');
+ var bunyan = require('bunyan');
++var changefeed = require('changefeed');
+ var fs = require('fs');
+ var jsprim = require('jsprim');
+ var path = require('path');
+ var util = require('util');
++var vasync = require('vasync');
+ 
+ var configLoader = require('../lib/config-loader');
+ var MORAY = require('../lib/apis/moray');
+ 
++var changefeedPublisher;
++
+ var configFilePath = path.resolve(__dirname, '..', 'config.json');
+ var config = configLoader.loadConfig(configFilePath);
+ 
+@@ -37,130 +41,144 @@ var log = new bunyan({
+     }]
+ });
+ 
+-var moray = new MORAY(config.moray);
++var moray;
+ 
+-moray.connect();
++vasync.pipeline({funcs: [
++    function initChangefeedPublisher(ctx, next) {
++        var changefeedOptions;
+ 
+-moray.once('moray-ready', function onMorayReady() {
+-    startProcessingVMs(moray);
+-});
++        changefeedOptions = jsprim.deepCopy(config.changefeed);
++        changefeedOptions.log = log.child({ component: 'changefeed' },
++            true);
+ 
+-function startProcessingVMs(morayClient) {
+-    assert.object(morayClient, 'morayClient');
++        changefeedPublisher = changefeed.createPublisher(changefeedOptions);
++        changefeedPublisher.on('moray-ready', next);
++    },
++    function initMoray(ctx, next) {
++        var morayConfig = jsprim.deepCopy(config.moray);
++        morayConfig.changefeedPublisher = changefeedPublisher;
+ 
+-    processVms(0, VMS_LIMIT, processCb);
++        moray = new MORAY(morayConfig);
+ 
+-    function processVms(offset, limit, cb) {
+-        var done = 0;
++        moray.connect();
++        moray.once('moray-ready', next);
++    }
++]}, function onInitDone(initErr) {
++    processVms(0, VMS_LIMIT, processCb);
++});
+ 
+-        function wait() {
+-            log.info({done: done, limit: limit}, 'inside wait');
++function processVms(offset, limit, cb) {
++    var done = 0;
+ 
+-            if (done === limit) {
+-                return cb();
+-            } else {
+-                return setTimeout(wait, 1000);
+-            }
++    function wait() {
++        log.info('inside wait %d %d', done, limit);
++        if (done === limit) {
++            return cb();
++        } else {
++            return setTimeout(wait, 1000);
+         }
++    }
+ 
+-        morayClient.countVms({ brand: 'kvm' }, onCount);
++    moray.countVms({ brand: 'kvm' }, onCount);
+ 
+-        function onCount(countVmsErr, count) {
+-            if (countVmsErr) {
+-                log.error({err: countVmsErr}, 'Could not get count of vms');
+-                process.exit(1);
++    function onCount(countVmsErr, count) {
++        if (countVmsErr) {
++            log.error({err: countVmsErr}, 'Could not get count of vms');
++            process.exit(1);
++        }
++
++        var query = { brand: 'kvm', offset: offset, limit: limit };
++        moray.listVms(query, true, function (err, vms) {
++            if (err) {
++                log.error({err: err}, 'Error fetching VMs');
++                return processCb(err);
++            }
++            // Should happen just on first pass
++            if (totalNbKvmVms === 0) {
++                totalNbKvmVms = count;
++            }
++            if (count < limit) {
++                limit = count;
+             }
+ 
+-            var query = { brand: 'kvm', offset: offset, limit: limit };
+-            morayClient.listVms(query, true, function (err, vms) {
+-                if (err) {
+-                    log.error({err: err}, 'Error fetching VMs');
+-                    return processCb(err);
+-                }
+-                // Should happen just on first pass
+-                if (totalNbKvmVms === 0) {
+-                    totalNbKvmVms = count;
++            vms.forEach(processVm);
++            function processVm(vm) {
++                var disks = vm.disks;
++                var fixedVm = jsprim.deepCopy(vm);
++
++                // If VM has a value here then it's already good
++                if (vm.image_uuid) {
++                    nbProcessedVms += 1;
++                    done += 1;
++                    log.info('VM %d of %d already processed',
++                        nbProcessedVms, totalNbKvmVms);
++                    return;
+                 }
+-                if (count < limit) {
+-                    limit = count;
+-                }
+-
+-                vms.forEach(processVm);
+-                function processVm(vm) {
+-                    var disks = vm.disks;
+ 
+-                    // If VM has a value here then it's already good
+-                    if (vm.image_uuid) {
+-                        nbProcessedVms += 1;
+-                        done += 1;
+-                        log.info('VM %d of %d already processed',
+-                            nbProcessedVms, totalNbKvmVms);
+-                        return;
++                try {
++                    if (typeof (disks) == 'string') {
++                        disks = JSON.parse(disks);
+                     }
++                } catch (e) {
++                    nbProcessedVms += 1;
+ 
+-                    try {
+-                        if (typeof (disks) == 'string') {
+-                            disks = JSON.parse(disks);
+-                        }
+-                    } catch (e) {
+-                        nbProcessedVms += 1;
+-                        done += 1;
++                    done += 1;
+ 
+-                        log.error({
+-                            err: e,
+-                            vm_uuid: vm.uuid
+-                        }, 'Error parsing VM disks, skipping.');
+-                        return;
+-                    }
++                    log.error({
++                        err: e,
++                        vm_uuid: vm.uuid
++                    }, 'Error parsing VM disks, skipping.');
++                    return;
++                }
+ 
+-                    if (disks && disks[0] && disks[0].image_uuid) {
+-                        vm.image_uuid = disks[0].image_uuid;
+-
+-                        morayClient.putVm(vm.uuid, vm, function (perr) {
+-                            nbProcessedVms += 1;
+-                            done += 1;
+-
+-                            if (perr) {
+-                                log.error({
+-                                    err: perr,
+-                                    vm_uuid: vm.uuid
+-                                }, 'Error updating VM');
+-                            } else {
+-                                log.info({
+-                                    vm_uuid: vm.uuid,
+-                                    server_uuid: vm.server_uuid
+-                                },
+-                                util.format('VM %d of %d updated',
+-                                    nbProcessedVms, totalNbKvmVms));
+-                            }
+-                        });
+-
+-                    // This should never happen
+-                    } else {
++                if (disks && disks[0] && disks[0].image_uuid) {
++                    fixedVm.image_uuid = disks[0].image_uuid;
++
++                    moray.putVm(vm.uuid, fixedVm, vm, function (perr) {
+                         nbProcessedVms += 1;
+                         done += 1;
+-                        log.warn({ vm_uuid: vm.uuid }, 'Error does not ' +
+-                        'have standard disks array, skipping.');
+-                    }
++
++                        if (perr) {
++                            log.error({
++                                err: perr,
++                                vm_uuid: vm.uuid
++                            }, 'Error updating VM');
++                        } else {
++                            log.info({
++                                vm_uuid: vm.uuid,
++                                server_uuid: vm.server_uuid
++                            },
++                            util.format('VM %d of %d updated',
++                                nbProcessedVms, totalNbKvmVms));
++                        }
++                    });
++
++                // This should never happen
++                } else {
++                    nbProcessedVms += 1;
++                    done += 1;
++                    log.warn({ vm_uuid: vm.uuid }, 'Error does not ' +
++                    'have standard disks array, skipping.');
+                 }
++            }
+ 
+-                return wait();
+-            });
+-        }
++            return wait();
++        });
+     }
++}
+ 
+-    function processCb(err) {
+-        if (err) {
+-            console.log(err.message);
+-        }
++function processCb(err) {
++    if (err) {
++        console.log(err.message);
++    }
+ 
+-        if (nbProcessedVms < totalNbKvmVms) {
+-            log.info('% %d', nbProcessedVms, totalNbKvmVms);
+-            return processVms(nbProcessedVms, VMS_LIMIT, processCb);
+-        } else {
+-            log.info('%d VMS nbProcessedVms. DONE!', totalNbKvmVms);
+-            morayClient.connection.close();
+-            return (true);
+-        }
++    if (nbProcessedVms < totalNbKvmVms) {
++        log.info('% %d', nbProcessedVms, totalNbKvmVms);
++        return processVms(nbProcessedVms, VMS_LIMIT, processCb);
++    } else {
++        log.info('%d VMS nbProcessedVms. DONE!', totalNbKvmVms);
++        changefeedPublisher.stop();
++        moray.connection.close();
++        return (true);
+     }
+-}
++}
+\ No newline at end of file

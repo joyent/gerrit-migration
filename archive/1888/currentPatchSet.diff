@@ -1,0 +1,412 @@
+commit 54c1dc509d097aeb0fe123c92c9396217ed24b02 (refs/changes/88/1888/4)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2017-06-15T09:16:22-07:00 (2 years, 4 months ago)
+    
+    AGENT-1064 cn-agent should maintain a persistent connection to CNAPI
+
+diff --git a/lib/app.js b/lib/app.js
+index 9443dda..05954f9 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -8,6 +8,7 @@
+  * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
++var vasync = require('vasync');
+ var async = require('async');
+ var cp = require('child_process');
+ var dns = require('dns');
+@@ -18,9 +19,11 @@ var path = require('path');
+ var restify = require('restify');
+ var tty = require('tty');
+ var verror = require('verror');
++var VError = verror.VError;
+ var assert = require('assert-plus');
+ var http = require('http');
+ var once = require('once');
++var Watershed = require('watershed').Watershed;
+ var StatusReporter = require('./heartbeater');
+ 
+ 
+@@ -30,6 +33,12 @@ var sdcconfig = require('./smartdc-config');
+ var TaskAgent = require('./task_agent/task_agent');
+ 
+ 
++var HEARTBEAT_CHARACTER = '•';
++var HEARTBEAT_PERIOD_MS = 1000;
++var UPGRADE_TIMEOUT_MS = 5000;
++var UPGRADE_RETRY_MS = 1000;
++
++
+ function App(options) {
+     assert.object(options, 'options');
+     assert.object(options.log, 'options.log');
+@@ -44,11 +53,20 @@ function App(options) {
+         options.env = {};
+     }
+ 
++
+     this.sdc_config = options.sdc_config;
+     this.uuid = options.uuid;
+     this.log = options.log.child();
+     this.agentserver = options.agentserver;
++
++    this.log.level('info');
+     this.log.info('started cn-agent for %s', this.uuid);
++
++    this.agentserver.on('heartbeatTargetChange',
++        this.onHeartbeatTargetChange.bind(this));
++
++    this.watershedConnection = null;
++    this.cnapiUrl = null;
+ }
+ 
+ 
+@@ -63,6 +81,13 @@ function shuffleArray(array) {
+ }
+ 
+ 
++App.prototype.getDomainName = function AppGetDomainName() {
++    var self = this;
++    var domainName = 'cnapi.' + self.sdc_config.datacenter_name + '.' +
++            self.sdc_config.dns_domain;
++    return domainName;
++};
++
+ /**
+  * Return a list of addresses of CNAPI instances for this particular
+  * datacentre.
+@@ -75,9 +100,11 @@ App.prototype.retrieveCnapiAddresses = function (callback) {
+     assert.string(self.sdc_config.datacenter_name,
+         'options.sdc_config.datacenter_name');
+ 
+-    var domainName
+-        = 'cnapi.' + self.sdc_config.datacenter_name + '.' +
+-            self.sdc_config.dns_domain;
++//     var domainName
++//         = 'cnapi.' + self.sdc_config.datacenter_name + '.' +
++//             self.sdc_config.dns_domain;
++
++    var domainName = self.getDomainName();
+ 
+     self.log.info({ domainName: domainName }, 'cnapi domain name');
+ 
+@@ -88,6 +115,8 @@ App.prototype.retrieveCnapiAddresses = function (callback) {
+             return;
+         }
+ 
++        self.cnapiAddresses = addrs;
++
+         callback(null, addrs);
+     });
+ };
+@@ -115,8 +144,17 @@ App.prototype.ensureCnapiLookedUp = function (callback) {
+                 return;
+             }
+ 
+-            self.cnapiAddr = addr;
+-            self.agentserver.setCnapiAddress(addr);
++            self.cnapiUrl = 'http://' + addr;
++
++            var restifyOptions = {
++                log: self.log,
++                url: self.cnapiUrl,
++                connectTimeout: 5000,
++                requestTimeout: 5000
++            };
++
++            self.log.info('cnapi url was %s', self.cnapiUrl);
++            self.client = restify.createJsonClient(restifyOptions);
+             callback();
+         });
+     }
+@@ -134,6 +172,8 @@ App.prototype.ensureCnapiLookedUp = function (callback) {
+                 return;
+             }
+ 
++            self.agentserver.setCnapiAddresses(addrs);
++
+             cb(null, addrs[0]);
+         });
+     }
+@@ -232,21 +272,171 @@ App.prototype.updateAgents = function (callback) {
+ };
+ 
+ 
+-App.prototype.startHeartbeater = function () {
++App.prototype.startServerRosterConnection = function () {
+     var self = this;
+-    var statusReporter = new StatusReporter({ log: self.log });
+-    var cnapiAddr = self.cnapiAddr;
+-
+-    var url = 'http://' + cnapiAddr;
+ 
++    var myid = Math.floor(Math.random() * 10000);
+     var restifyOptions = {
+-        url: url,
++        log: self.log,
+         connectTimeout: 5000,
+         requestTimeout: 5000
+     };
+ 
+-    self.log.info('cnapi ip was %s', cnapiAddr);
+-    self.client = restify.createJsonClient(restifyOptions);
++    var shed = self.shed = new Watershed();
++    var wskey = shed.generateKey();
++
++    var urlPath = '/servers/' + self.uuid + '/roster';
++    var getOptions = {
++        path: urlPath,
++        headers: {
++            host: self.getDomainName(),
++            connection: 'upgrade',
++            upgrade: 'websocket',
++            'sec-websocket-key': wskey
++        }
++    };
++
++//     var upgradeTimeout;
++    var upgradeRetryTimeout;
++    var response;
++
++    vasync.waterfall([
++        function lookupCNAPI(next) {
++            if (self.cnapiUrl) {
++                restifyOptions.url = self.cnapiUrl;
++                next();
++                return;
++            }
++
++            self.retrieveCnapiAddresses(function onGetCNAPIAddrs(err, addrs) {
++                if (err) {
++                    next(err);
++                    return;
++                }
++
++                self.cnapiUrl = 'http://' + addrs[0];
++
++                restifyOptions.url = self.cnapiUrl;
++                next();
++            });
++        },
++        function createWebsocket(next) {
++            self.log.info('initiating websocket connection to CNAPI');
++            self.rosterClient = restify.createClient(restifyOptions);
++            self.rosterClient.get(getOptions, onGetUpgrade);
++            next();
++        }
++    ], function onFinish(err) {
++        if (err) {
++            self.log.error(err);
++        }
++    });
++
++    function onGetUpgrade(err, res, _socket, _head) {
++        response = res;
++        // If we get a 404 error, the CNAPI instance we're talking to doesn't
++        // support our websocket roster mechanism, so we use the older method
++        // of heartbeats instead.
++        if (err && VError.hasCauseWithName(err, 'NotFoundError')) {
++            self.log.warn(
++                'CNAPI instance at %s does not support roster connections');
++            self.log.warn(
++                'falling back to perioridc HTTP messages');
++            self.startHeartbeater();
++            return;
++        } else if (err) {
++            self.log.error({ err: err },
++                'websocket error: reattempting connection %s', myid);
++
++            self.upgradeRetryTimeout = upgradeRetryTimeout = setTimeout(
++                function onUpgradeErrorRetry() {
++                    self.startServerRosterConnection(); },
++                UPGRADE_RETRY_MS).unref();
++            return;
++        }
++
++        self.log.info('websocket: endpoint connection succeeded %s', myid);
++
++        // Sometimes when we try to connect, if CNAPI isn't ready, this part
++        // hangs and we never get the `upgradeResult` event. So we set a timer
++        // to retry.
++        self.upgradeTimeout = setTimeout(
++            onUpgradeTimeout, UPGRADE_TIMEOUT_MS).unref();
++
++        res.once('upgradeResult', onUpgradeResult);
++    }
++
++    function onUpgradeTimeout() {
++        self.log.warn('timed out waiting for upgradeResult; retrying %s', myid);
++        response.removeListener('upgradeResult', onUpgradeResult);
++        self.startServerRosterConnection();
++    }
++
++    function onUpgradeResult(err, res, socket, head) {
++        assert.ifError(err);
++        clearTimeout(self.upgradeTimeout);
++
++        self.log.warn('websocket event: upgrade result event %s', myid);
++
++        self.watershedConnection = shed.connect(res, socket, head, wskey);
++
++        self.watershedConnection.on('text', onWebsocketText);
++        self.watershedConnection.on('end', onWebsocketEnd);
++        self.watershedConnection.on('ping', function onPong() {
++            self.log.warn('ping %s', myid);
++        });
++        self.watershedConnection.on('connectionReset',
++            onWebsocketConnectionReset);
++
++//         self.heartbeatInterval = setInterval(function onHeartbeatInterval() {
++//             self.log.info('ws ping %s', myid);
++//             self.watershedConnection.send(HEARTBEAT_CHARACTER);
++//         }, HEARTBEAT_PERIOD_MS).unref();
++    }
++
++    function onWebsocketText(msg) {
++        self.log.warn('message from server: ' + msg);
++    }
++
++    function onWebsocketEnd(_msg) {
++        self.log.warn('websocket connection end %s', myid);
++        self.cleanupWebsocketConnection();
++        self.startServerRosterConnection();
++    }
++
++    function onWebsocketConnectionReset(_msg) {
++        self.log.warn('websocket connection reset %s', myid);
++        self.cleanupWebsocketConnection();
++    }
++};
++
++App.prototype.cleanupWebsocketConnection = function (ip) {
++    var self = this;
++
++    clearTimeout(self.upgradeTimeout);
++    clearTimeout(self.upgradeRetryTimeout);
++    clearInterval(self.heartbeatInterval);
++
++    if (self.watershedConnection) {
++        self.watershedConnection.end();
++        self.watershedConnection = null;
++    }
++//         self.watershedConnection.destroy();
++};
++
++
++App.prototype.onHeartbeatTargetChange = function (url) {
++    var self = this;
++    self.log.warn('heartbeat target changing to %s', url);
++    self.cnapiUrl = url;
++    self.cleanupWebsocketConnection();
++    self.startServerRosterConnection();
++};
++
++
++App.prototype.startHeartbeater = function () {
++    var self = this;
++    var statusReporter = new StatusReporter({ log: self.log });
+     var statusurlpath = '/servers/' + self.uuid + '/events/status';
+     var hburlpath = '/servers/' + self.uuid + '/events/heartbeat';
+ 
+@@ -481,7 +671,7 @@ App.prototype.start = function () {
+             if (!self.uuid) {
+                 self.uuid = self.sysinfo.UUID;
+             }
+-            self.startHeartbeater();
++            self.startServerRosterConnection();
+ 
+             // AGENT-640: Ensure we clean up any stale machine creation guard
+             // files, then set queues up as per usual.
+diff --git a/lib/server.js b/lib/server.js
+index d88f5b9..deab63f 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -111,8 +111,17 @@ AgentHttpServer.prototype.init = function () {
+ 
+     self.server.use(function validateIpAddresses(req, res, next) {
+         // Should we periodically refresh the CNAPI IP address we have?
+-        if (req.method === 'POST' && [self.cnapiAddr, self.bindip].indexOf(
++
++        var addrs = [self.bindip];
++
++        Array.prototype.push.apply(addrs, self.cnapiAddresses);
++
++        if (req.method === 'POST' && addrs.indexOf(
+                 req.connection.remoteAddress) === -1) {
++
++            self.log.warn(
++                { addrs: addrs, remote: req.connection.remoteAddress },
++                'allowed/remote mismatch');
+             next(new restify.NotAuthorizedError(
+                 'requests must originate from CNAPI address'));
+             return;
+@@ -123,7 +132,7 @@ AgentHttpServer.prototype.init = function () {
+ 
+     self.server.on('uncaughtException', function (req, res, route, err) {
+         req.log.error(err);
+-        res.send(err);
++//         res.send(err);
+     });
+ 
+     self.server.post('/tasks', function (req, res, next) {
+@@ -163,6 +172,14 @@ AgentHttpServer.prototype.init = function () {
+         return;
+     });
+ 
++    self.server.post('/roster-authority', function (req, res, next) {
++        assert.string(req.params.cnapi_url, 'cnapi_url');
++
++        self.emit('heartbeatTargetChange', req.params.cnapi_url);
++        res.send(200);
++        next();
++    });
++
+     // Stop accepting new tasks, probably b/c we're gonna update
+     // the agent itself or reboot the server where the agent is
+     // running:
+@@ -194,16 +211,16 @@ AgentHttpServer.prototype.registerTaskHandler = function (uuid, handler) {
+ };
+ 
+ 
+-AgentHttpServer.prototype.setCnapiAddress = function (ip) {
++AgentHttpServer.prototype.setTaskHistory = function (history) {
+     var self = this;
+-    assert.string(ip, 'ip');
+-    self.cnapiAddr = ip;
++    self.taskHistory = history;
+ };
+ 
+ 
+-AgentHttpServer.prototype.setTaskHistory = function (history) {
++AgentHttpServer.prototype.setCnapiAddresses = function (addrs) {
+     var self = this;
+-    self.taskHistory = history;
++    assert.array(addrs, 'addrs');
++    self.cnapiAddresses = addrs;
+ };
+ 
+ 
+diff --git a/package.json b/package.json
+index d708cf2..9ba0c9d 100644
+--- a/package.json
++++ b/package.json
+@@ -32,6 +32,7 @@
+     "vasync": "1.6.4",
+     "verror": "1.9.0",
+     "vmadm": "git+https://github.com/joyent/node-vmadm.git#94e95c6b96c2c5947281a5ea3df763928a65219c",
++    "watershed": "^0.3.3",
+     "zfs": "git+https://github.com/joyent/node-zfs.git#657a90d9424c45066e3e0919dfe9b34f5636e0e9"
+   },
+   "sdcDependencies": {
+diff --git a/tools/rsync-to b/tools/rsync-to
+index 2b0173f..bc01e06 100755
+--- a/tools/rsync-to
++++ b/tools/rsync-to
+@@ -41,4 +41,4 @@ if [[ "$state" == "maintenance" ]]; then
+     ssh ${NODE} svcadm clear cn-agent
+ else
+     ssh ${NODE} svcadm restart cn-agent
+-fi
+\ No newline at end of file
++fi

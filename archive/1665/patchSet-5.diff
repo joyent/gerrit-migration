@@ -1,0 +1,524 @@
+commit fb30abdfa3ac03f23ec268cd694b8da8dc44a17b (refs/changes/65/1665/5)
+Author: Pedro Palazon Candel <pedro@joyent.com>
+Date:   2017-04-05T13:50:55+02:00 (2 years, 6 months ago)
+    
+    TOOLS-1715 sdcadm: reprovisionRemote can timeout too easily
+
+diff --git a/lib/cli/do_create.js b/lib/cli/do_create.js
+index 00e6a54..6f3e3de 100644
+--- a/lib/cli/do_create.js
++++ b/lib/cli/do_create.js
+@@ -111,6 +111,16 @@ Create.prototype.execute = function cExecute(opts, args, cb) {
+                 change.image = svcFromName[service].params.image_uuid;
+             }
+ 
++            /*
++             * TOOLS-1719: Fail graceful if service doesn't have an associated
++             * image, instead of downloading the latest available image for
++             * service
++             */
++            if (!change.image) {
++                return next(new errors.ValidationError(util.format(
++                    'Missing image_uuid for service %s in SAPI.', service)));
++            }
++
+             if (!opts.server) {
+                 return next(new errors.UsageError(
+                     'Must specify server uuid or hostname'));
+diff --git a/lib/cli/do_update_other.js b/lib/cli/do_update_other.js
+index 7e33b65..f019750 100644
+--- a/lib/cli/do_update_other.js
++++ b/lib/cli/do_update_other.js
+@@ -643,13 +643,16 @@ function do_update_other(subcmd, opts, args, cb) {
+                     var curImg = parts[parts.length - 2];
+                     if (curImg >= '20141030T234934Z') {
+                         progress('Running VMAPI migrations');
+-                        var argv = [
+-                            '/usr/sbin/zlogin',
+-                            vmapi.uuid,
+-                            'cd /opt/smartdc/vmapi && ./build/node/bin/node ' +
+-                                'tools/migrations/add-docker-index.js'
+-                        ];
+-                        common.spawnRun({argv: argv, log: log}, next);
++                        var cmd = 'cd /opt/smartdc/vmapi && ' +
++                            './build/node/bin/node ' +
++                            'tools/migrations/add-docker-index.js';
++
++                        common.execRemote({
++                            server: vmapi.server_uuid,
++                            vm: vmapi.uuid,
++                            cmd: cmd,
++                            log: log
++                        }, next);
+                     } else {
+                         return next();
+                     }
+diff --git a/lib/procedures/shared.js b/lib/procedures/shared.js
+index e4c34d0..f0632a4 100644
+--- a/lib/procedures/shared.js
++++ b/lib/procedures/shared.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ var path = require('path');
+@@ -23,6 +23,7 @@ var common = require('../common');
+ var errors = require('../errors'),
+     InternalError = errors.InternalError,
+     SDCClientError = errors.SDCClientError;
++var ur = require('../ur');
+ 
+ 
+ 
+@@ -783,7 +784,9 @@ function disableVMRegistrarRemote(arg, callback) {
+     });
+ }
+ 
+-// Reprovision through sdc-oneachnode
++/*
++ * Reprovision into any server via Ur command
++ */
+ function reprovisionRemote(opts, callback) {
+     common.assertStrictOptions('reprovisionRemote', opts, {
+         server: 'uuid',
+@@ -802,9 +805,10 @@ function reprovisionRemote(opts, callback) {
+         server: opts.server
+     });
+ 
+-    opts.progress('Reprovisioning %s VM %s', opts.zonename, opts.server);
+-    log.trace('reprovision VM inst');
++    var sdcadm = opts.sdcadm;
++    var progress = opts.progress;
+ 
++    progress('Reprovisioning VM %s on server %s', opts.zonename, opts.server);
+     /*
+      * Construct a JSON string that we can embed in single quotes (') in a
+      * shell script.
+@@ -813,58 +817,37 @@ function reprovisionRemote(opts, callback) {
+         image_uuid: opts.img.uuid
+     }).replace(/'/g, '\'"\'"\'');
+ 
+-    var child = spawn('/opt/smartdc/bin/sdc-oneachnode', [
+-        '-n',
+-        opts.server,
+-        format('/usr/sbin/vmadm reprovision %s <<< \'%s\'', opts.zonename,
+-            reproJSON)
+-    ]);
+-
+-    /*
+-     * Collect stdout and stderr from the child process.
+-     */
+-    var stdout = '';
+-    var stderr = '';
+-    child.stdout.setEncoding('utf8');
+-    child.stdout.on('data', function (so) {
+-        stdout += so;
+-    });
+-    child.stderr.setEncoding('utf8');
+-    child.stderr.on('data', function (se) {
+-        stderr += se;
+-    });
++    ur.exec({
++        sdcadm: sdcadm,
++        server: opts.server,
++        execTimeout: 300,
++        cmd: format('/usr/sbin/vmadm reprovision %s <<< \'%s\'',
++                opts.zonename, reproJSON)
++    }, function (execErr, result) {
++        if (execErr) {
++            callback(execErr);
++            return;
++        }
+ 
+-    child.on('close', function vmadmDone(code, signal) {
+         log.debug({
+-            execResult: {
+-                code: code,
+-                signal: signal,
+-                stdout: stdout,
+-                stderr: stderr
+-            }
++            execResult: result
+         }, 'reprovisioned VM inst');
+ 
+-        if (code === 0 && signal === null) {
+-            /*
+-             * Execution was successful.
+-             */
++        if (result.exit_status === 0) {
+             callback();
+             return;
+         }
+ 
+-        /*
+-         * Report the execution failure to our caller and take the
+-         * reprovision failure lock.
+-         */
+         var msg = [
+-            format('error reprovisioning VM %s: exit code %s, signal %s',
+-                opts.zonename, code, signal),
++            format('error reprovisioning VM %s: exit code %s',
++                opts.zonename, result.exit_status),
+             common.indent('stdout:', 4),
+-            common.indent(stdout, 8),
++            common.indent(result.stdout.trim(), 8),
+             common.indent('stderr:', 4),
+-            common.indent(stderr, 8)
++            common.indent(result.stderr.trim(), 8)
+         ].join('\n');
+-        opts.sdcadm.reprovFailLock_Lock(msg, function (err) {
++
++        sdcadm.reprovFailLock_Lock(msg, function (err) {
+             if (err) {
+                 log.error(err, 'reprovFailLock_Lock failure');
+             }
+diff --git a/lib/sdcadm.js b/lib/sdcadm.js
+index 46e87c8..3b99fbd 100644
+--- a/lib/sdcadm.js
++++ b/lib/sdcadm.js
+@@ -770,73 +770,119 @@ SdcAdm.prototype.listInsts = function listInsts(opts, cb) {
+             if (opts.svcs && opts.svcs.indexOf('dockerlogger') === -1) {
+                 return next();
+             }
+-            self.getSvc({
+-                app: self.sdc.uuid,
+-                svc: 'dockerlogger',
+-                allowNone: true
+-            }, function (svcErr, dlSvc) {
+-                if (svcErr) {
+-                    return next(new errors.SDCClientError(svcErr, 'sapi'));
+-                }
+ 
+-                if (!dlSvc) {
+-                    return next();
+-                }
++            var dlCtx = {};
++
++            vasync.pipeline({
++                arg: dlCtx,
++                funcs: [
++                    function getDockerLoggerService(arg, nextFun) {
++                        self.getSvc({
++                            app: self.sdc.uuid,
++                            svc: 'dockerlogger',
++                            allowNone: true
++                        }, function (svcErr, dlSvc) {
++                            if (svcErr) {
++                                nextFun(new errors.SDCClientError(
++                                    svcErr, 'sapi'));
++                                return;
++                            }
++                            if (dlSvc) {
++                                arg.service = dlSvc;
++                            }
++                            nextFun();
++                        });
++                    },
++
++                    function getDockerLoggerImage(arg, nextFun) {
++                        if (!arg.service ||
++                            !arg.service.params.image_uuid) {
++                            nextFun();
++                            return;
++                        }
+ 
+-                var imgUuid = dlSvc.params.image_uuid;
+-                self.imgapi.getImage(imgUuid, function (imgErr, img) {
+-                    if (imgErr) {
+-                        return next(new errors.SDCClientError(
++                        var imgUuid = arg.service.params.image_uuid;
++                        self.imgapi.getImage(imgUuid, function (imgErr, img) {
++                            if (imgErr) {
++                                nextFun(new errors.SDCClientError(
+                                     imgErr, 'imgapi'));
+-                    }
++                                return;
++                            }
+ 
+-                    if (!img) {
+-                        return next();
+-                    }
++                            if (img) {
++                                arg.image = img;
++                            }
++                            nextFun();
++                        });
++                    },
+ 
+-                    self.sapi.listInstances({
+-                        service_uuid: dlSvc.uuid
+-                    }, function (instErr, dlInsts) {
+-                        if (instErr) {
+-                            return next(new errors.SDCClientError(
+-                                        instErr, 'sapi'));
++                    function getDockerloggerInsts(arg, nextFun) {
++                        if (!arg.service) {
++                            nextFun();
++                            return;
+                         }
+ 
+-                        dlInsts = dlInsts.map(function (ins) {
+-                            var d = {
+-                                type: ins.type,
+-                                instance: ins.uuid,
+-                                service: 'dockerlogger',
+-                                image: imgUuid,
+-                                version: img.version
+-                            };
+-                            if (ins.params && ins.params.server_uuid) {
+-                                var id = ins.params.server_uuid;
+-                                d.server = id;
+-                                /*
+-                                 * If a compute node has been removed from
+-                                 * CNAPI, there may still be a dangling
+-                                 * SAPI instance -- if the server no
+-                                 * longer exists, skip it.
+-                                 */
+-                                if (!ctx.serverFromUuid[id]) {
+-                                    self.log.warn({
+-                                        instance: ins
+-                                    }, 'Skipping dockerlogger instance ' +
+-                                    'for unknown server');
+-                                    return null;
+-                                }
+-                                d.hostname = ctx.serverFromUuid[id].hostname;
+-                                d.server_ip = ctx.serverAdminIpFromUuid[id];
++                        self.sapi.listInstances({
++                            service_uuid: arg.service.uuid
++                        }, function (instErr, dlInsts) {
++                            if (instErr) {
++                                nextFun(new errors.SDCClientError(
++                                            instErr, 'sapi'));
++                                return;
+                             }
+-                            return (d);
+-                        }).filter(function (ins) {
+-                            return (ins !== null);
++
++                            arg.insts = dlInsts;
++                            nextFun();
+                         });
+-                        ctx.insts = ctx.insts.concat(dlInsts);
+-                        next();
+-                    });
++                    }
++
++                ]
++            }, function (pipeErr) {
++                if (pipeErr) {
++                    next(pipeErr);
++                    return;
++                }
++
++                if (!dlCtx.insts) {
++                    next();
++                    return;
++                }
++
++                var dlInsts = dlCtx.insts.map(function (ins) {
++                    var d = {
++                        type: ins.type,
++                        instance: ins.uuid,
++                        service: 'dockerlogger'
++                    };
++                    if (dlCtx.image) {
++                        d.image = dlCtx.image.uuid;
++                        d.version = dlCtx.image.version;
++                    }
++                    if (ins.params && ins.params.server_uuid) {
++                        var id = ins.params.server_uuid;
++                        d.server = id;
++                        /*
++                         * If a compute node has been removed from
++                         * CNAPI, there may still be a dangling
++                         * SAPI instance -- if the server no
++                         * longer exists, skip it.
++                         */
++                        if (!ctx.serverFromUuid[id]) {
++                            self.log.warn({
++                                instance: ins
++                            }, 'Skipping dockerlogger instance ' +
++                            'for unknown server');
++                            return null;
++                        }
++                        d.hostname = ctx.serverFromUuid[id].hostname;
++                        d.server_ip = ctx.serverAdminIpFromUuid[id];
++                    }
++                    return (d);
++                }).filter(function (ins) {
++                    return (ins !== null);
+                 });
++                ctx.insts = ctx.insts.concat(dlInsts);
++                next();
+             });
+         }
+     ]}, function (err) {
+@@ -3589,6 +3635,10 @@ SdcAdm.prototype.genUpdatePlan = function genUpdatePlan(options, cb) {
+ 
+             for (var i = 0; i < changes.length; i++) {
+                 var ch = changes[i];
++                if (ch.type !== 'update-instance' &&
++                    ch.type !== 'update-service') {
++                    continue;
++                }
+                 if (ch.service && dataPath.indexOf(ch.service.name) !== -1 &&
+                     !options.forceDataPath)
+                 {
+diff --git a/lib/steps/agent-services.js b/lib/steps/agent-services.js
+index afd2df0..39914f1 100644
+--- a/lib/steps/agent-services.js
++++ b/lib/steps/agent-services.js
+@@ -99,14 +99,14 @@ function agentServicesEnsureCreated(arg, cb) {
+         vasync.forEachPipeline({
+             func: function (agent, next) {
+                 var name = agent.name;
+-                var imgUUIDPath = util.format(
+-                    '/opt/smartdc/agents/lib/node_modules/%s/image_uuid',
+-                    name);
+-                fs.readFile(imgUUIDPath, {
++                var imageUuidPath = '/opt/smartdc/agents/lib/node_modules/' +
++                    name + '/image_uuid';
++                fs.readFile(imageUuidPath, {
+                     encoding: 'utf8'
+                 }, function (err, data) {
+                     if (err) {
+-                        log.error({err: err}, 'Error reading agent image uuid');
++                        log.warn({err: err, name: name, path: imageUuidPath},
++                            'could not read agent image_uuid file');
+                         next();
+                         return;
+                     }
+@@ -135,6 +135,7 @@ function agentServicesEnsureCreated(arg, cb) {
+                 return next();
+             });
+         },
++
+         function checkMinSapiVersion(_, next) {
+             var splitVersion = img.version.split('-');
+             var validSapi = false;
+@@ -180,10 +181,6 @@ function agentServicesEnsureCreated(arg, cb) {
+             }, next);
+         },
+ 
+-        function getAgentImgVersions(_, next) {
+-            getAgentImages(next);
+-        },
+-
+         function saveChangesToHistory(_, next) {
+             var changes = [];
+             newAgentServices.forEach(function (s) {
+@@ -222,29 +219,54 @@ function agentServicesEnsureCreated(arg, cb) {
+                 next();
+             }
+         },
++
++        /*
++         * TOOLS-1716: We'll create agents w/o image_uuids first, in order
++         * to workaround SAPI verification of local IMGAPI images when creating
++         * a service. Then, we'll queue these services for update, given SAPI's
++         * update service will not validate the image uuids.
++         *
++         * This approach could be removed once SAPI-285 is implemented, and we
++         * could save services including image_uuid from the beginning.
++         */
+         function addAgentsServices(_, next) {
+             vasync.forEachParallel({
+                 inputs: newAgentServices,
+-                func: function addAgentSvc(agent, callback) {
++                func: function addAgentSvc(agent, nextAgent) {
+                     progress('Adding service for agent \'%s\'', agent);
+                     log.trace({
+                         service: agent,
+                         params: agentServices[agent]
+                     }, 'Adding new agent service');
+                     if (DRY_RUN) {
+-                        callback();
++                        nextAgent();
+                     } else {
+                         sdcadm.sapi.createService(agent, app.uuid,
+-                            agentServices[agent], callback);
++                            agentServices[agent], function (sErr, newSvc) {
++                                if (sErr) {
++                                    nextAgent(sErr);
++                                    return;
++                                }
++                                updateAgentServices.push(newSvc);
++                                nextAgent();
++                            });
+                     }
+                 }
+             }, next);
+         },
+ 
++        function getAgentImgVersions(_, next) {
++            getAgentImages(next);
++        },
++
+         function updateAgentsServices(_, next) {
+             vasync.forEachParallel({
+                 inputs: updateAgentServices,
+                 func: function updateAgentSvc(agent, callback) {
++                    if (!agentServices[agent]) {
++                        callback();
++                        return;
++                    }
+                     progress('Updating service for agent \'%s\'', agent);
+                     log.trace({
+                         service: agent,
+diff --git a/lib/ur.js b/lib/ur.js
+index fbffb94..281985e 100644
+--- a/lib/ur.js
++++ b/lib/ur.js
+@@ -66,8 +66,8 @@ function execOnAllNodes(opts, cb) {
+  *      - cmd {String} The command/script to run.
+  *      - server {UUID} The UUID of the server on which to run.
+  *      - log {Bunyan Logger} Optional.
+- *      - connectTimeout {Number} Optional. Default 5s.
+  *      - execTimeout {Number} Optional. Default 30s.
++ *      - env {Object} Optional. Default '{}'.
+  * @param cb {Function} `function (err, result)`
+  */
+ function exec(opts, cb) {
+@@ -76,21 +76,26 @@ function exec(opts, cb) {
+     assert.string(opts.cmd, 'opts.cmd');
+     assert.string(opts.server, 'opts.server');
+     assert.optionalObject(opts.log, 'opts.log');
+-    assert.optionalNumber(opts.connectTimeout, 'opts.connectTimeout');
++    assert.optionalNumber(opts.execTimeout, 'opts.execTimeout');
++    assert.optionalObject(opts.env, 'opts.env');
+     assert.func(cb, 'cb');
+     var cb_ = once(cb);
+ 
+     opts.sdcadm.getUrConnection(function (urErr, urClient) {
+         if (urErr) {
+-            cb_(urErr);
++            cb_(new errors.InternalError({
++                cause: urErr,
++                message: 'ur failure'
++            }));
+             return;
+         }
++        assert.object(urClient, 'urClient');
+         urClient.exec({
+             script: opts.cmd,
+             server_uuid: opts.server,
+             timeout: (opts.execTimeout === undefined ?
+                 30 * 1000 : opts.execTimeout),
+-            env: {}
++            env: (opts.env === undefined ? {} : opts.env)
+         }, function (err, result) {
+             if (err) {
+                 cb_(err);
+@@ -99,7 +104,7 @@ function exec(opts, cb) {
+                     'error running "%s" on server "%s": %s',
+                     opts.cmd, opts.server, result.stderr) }));
+             } else {
+-                cb_(null, result.stdout);
++                cb_(null, result);
+             }
+         });
+     });

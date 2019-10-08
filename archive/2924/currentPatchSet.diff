@@ -1,0 +1,1756 @@
+commit c5128f07e3697a5845fb4a8b48c9bfd935848581 (refs/changes/24/2924/4)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2017-11-21T02:04:27+00:00 (1 year, 11 months ago)
+    
+    MORAY-445 Update Electric Moray to node-fast v2
+    Reviewed by: Cody Peter Mello <cody.mello@joyent.com>
+    Approved by: Cody Peter Mello <cody.mello@joyent.com>
+
+diff --git a/boot/setup.sh b/boot/setup.sh
+index b48f280..e422780 100755
+--- a/boot/setup.sh
++++ b/boot/setup.sh
+@@ -114,8 +114,10 @@ function manta_setup_leveldb_hash_ring {
+ function manta_setup_electric_moray {
+     #Build the list of ports.  That'll be used for everything else.
+     local ports
++    local kangs
+     for (( i=1; i<=$ELECTRIC_MORAY_INSTANCES; i++ )); do
+         ports[$i]=`expr 2020 + $i`
++        kangs[$i]=`expr 3020 + $i`
+     done
+ 
+     #Regenerate the registrar config with the real ports included
+@@ -151,10 +153,13 @@ function manta_setup_electric_moray {
+ 
+     #electric-moray instances
+     local electric_moray_xml_in=$SVC_ROOT/smf/manifests/electric-moray.xml.in
+-    for port in "${ports[@]}"; do
++    for (( i=1; i<=$ELECTRIC_MORAY_INSTANCES; i++ )); do
++        local port=${ports[$i]}
++        local kang=${kangs[$i]}
+         local electric_moray_instance="electric-moray-$port"
+         local electric_moray_xml_out=$SVC_ROOT/smf/manifests/electric-moray-$port.xml
+         sed -e "s#@@ELECTRIC-MORAY_PORT@@#$port#g" \
++            -e "s#@@KANG_PORT@@#$kang#g" \
+             -e "s#@@ELECTRIC-MORAY_INSTANCE_NAME@@#$electric_moray_instance#g" \
+             $electric_moray_xml_in  > $electric_moray_xml_out || \
+             fatal "could not process $electric_moray_xml_in to $electric_moray_xml_out"
+diff --git a/lib/dtrace.js b/lib/dtrace.js
+index df6d81a..f2a3f9c 100644
+--- a/lib/dtrace.js
++++ b/lib/dtrace.js
+@@ -20,7 +20,7 @@ var PROBES = {
+     // msgid, req_id, bucket, key, value
+     'putobject-start': ['int', 'char *', 'char *', 'char *', 'char *'],
+ 
+-    // msgid, req_id
++    // msgid
+     'putobject-done': ['int'],
+ 
+     // msgid, req_id
+diff --git a/lib/errors.js b/lib/errors.js
+index e68eda8..101abd9 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -20,6 +20,7 @@ var verror = require('verror');
+ ///--- Globals
+ 
+ var WError = verror.WError;
++var VError = verror.VError;
+ 
+ var slice = Function.prototype.call.bind(Array.prototype.slice);
+ 
+@@ -47,6 +48,12 @@ function ISODateString(d) {
+ 
+ ///--- Errors
+ 
++function InvocationError() {
++        VError.apply(this, arguments);
++        this.name = this.constructor.name;
++}
++util.inherits(InvocationError, VError);
++
+ function ReadOnlyError(cause) {
+         if (arguments.length === 0) {
+                 cause = {};
+@@ -60,18 +67,7 @@ util.inherits(ReadOnlyError, WError);
+ 
+ ///--- Exports
+ 
+-// Auto export all Errors defined in this file
+-fs.readFileSync(__filename, 'utf8').split('\n').forEach(function (l) {
+-        /* JSSTYLED */
+-        var match = /^function\s+(\w+)\(.*/.exec(l);
+-        if (match !== null && Array.isArray(match) && match.length > 1) {
+-                if (/\w+Error$/.test(match[1])) {
+-                        module.exports[match[1]] = eval(match[1]);
+-                }
+-        }
+-});
+-
+-
+-Object.keys(module.exports).forEach(function (k) {
+-        global[k] = module.exports[k];
+-});
++module.exports = {
++    InvocationError: InvocationError,
++    ReadOnlyError: ReadOnlyError
++};
+diff --git a/lib/server.js b/lib/server.js
+index 567ed8b..c37e52d 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -9,20 +9,28 @@
+  */
+ 
+ var assert = require('assert-plus');
++var artedi = require('artedi');
+ var clone = require('clone');
+ var fast = require('fast');
+ var fs = require('fs');
++var kang = require('kang');
+ var moray_client = require('moray'); // client
++var net = require('net');
++var os = require('os');
++var restify = require('restify');
+ var uuid = require('node-uuid');
+ var url = require('url');
++var util = require('util');
+ var vasync = require('vasync');
+ var verror = require('verror');
+ 
+ var dtrace = require('./dtrace');
++var errors = require('./errors');
+ var schema = require('./schema');
+ var ring = require('./ring');
+-require('./errors');
+ 
++var InvocationError = errors.InvocationError;
++var ReadOnlyError = errors.ReadOnlyError;
+ 
+ 
+ ///--- GLOBALS
+@@ -34,6 +42,82 @@ var ALLOWED_BATCH_OPS = [
+ 
+ var READ_ONLY = 'ro';
+ 
++var KANG_VERSION = '1.2.0';
++
++var B_ARGS_SCHEMA = [
++    { name: 'requests', type: 'array' },
++    { name: 'options', type: 'object' }
++];
++
++var CB_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'config', type: 'object' },
++    { name: 'options', type: 'object' }
++];
++
++var DB_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'options', type: 'object' }
++];
++
++var DO_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'key', type: 'string' },
++    { name: 'options', type: 'object' }
++];
++
++var DM_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'filter', type: 'string' },
++    { name: 'options', type: 'object' }
++];
++
++var FO_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'filter', type: 'string' },
++    { name: 'options', type: 'object' }
++];
++
++var GB_ARGS_SCHEMA = [
++    { name: 'options', type: 'object' },
++    { name: 'bucket', type: 'string' }
++];
++
++var GO_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'key', type: 'string' },
++    { name: 'options', type: 'object' }
++];
++
++var GT_ARGS_SCHEMA = [
++    { name: 'options', type: 'object' }
++];
++
++var PO_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'key', type: 'string' },
++    { name: 'value', type: 'object' },
++    { name: 'options', type: 'object' }
++];
++
++var SQL_ARGS_SCHEMA = [
++    { name: 'statement', type: 'string' },
++    { name: 'values', type: 'array' },
++    { name: 'options', type: 'object' }
++];
++
++var UB_ARGS_SCHEMA = [
++    { name: 'name', type: 'string' },
++    { name: 'config', type: 'object' },
++    { name: 'options', type: 'object' }
++];
++
++var UO_ARGS_SCHEMA = [
++    { name: 'bucket', type: 'string' },
++    { name: 'fields', type: 'object' },
++    { name: 'filter', type: 'string' },
++    { name: 'options', type: 'object' }
++];
+ 
+ ///--- API
+ 
+@@ -70,50 +154,93 @@ function createServer(options) {
+             ring: opts.ring,
+             morayOptions: options.morayOptions,
+             log: options.log
+-        }, function (_err, clients) {
+-            if (_err) {
+-                throw new verror.VError(_err, 'unable to create moray clients');
++        }, function (cErr, clients) {
++            if (cErr) {
++                throw new verror.VError(cErr, 'unable to create moray clients');
+             }
+ 
+             opts.clients = clients;
+ 
+-            var server = fast.createServer(opts);
+-
+-            server.rpc('batch', batch(opts));
+-            server.rpc('createBucket', createBucket(opts));
+-            server.rpc('delBucket', delBucket(opts));
+-            server.rpc('delObject', delObject(opts));
+-            server.rpc('deleteMany', deleteMany(opts));
+-            server.rpc('findObjects', findObjects(opts));
+-            server.rpc('getBucket', getBucket(opts));
+-            server.rpc('getObject', getObject(opts));
+-            server.rpc('getTokens', getTokens(opts));
+-            server.rpc('putObject', putObject(opts));
+-            server.rpc('sql', sql(opts));
+-            server.rpc('updateBucket', updateBucket(opts));
+-            server.rpc('updateObjects', updateObjects(opts));
+-
+-            if (options.audit !== false) {
+-                server.on('after', function (name, req, res) {
+-                    var t = Math.floor(res.elapsed / 1000);
+-                    var obj = {
+-                        method: name,
+-                        'arguments': req,
+-                        serverTime: t + 'ms'
+-                    };
+-
+-                    log.info(obj, 'request handled');
+-                });
+-            }
++            var collector = artedi.createCollector();
++
++            var socket = net.createServer({ 'allowHalfOpen': true });
++            var server = new fast.FastServer({
++                collector: collector,
++                log: log.child({ component: 'fast' }),
++                server: socket
++            });
+ 
+-            server.on('error', function (__err) {
+-                log.error(__err, 'server error');
+-                process.exit(1);
++            var methods = [
++                { rpcmethod: 'batch', rpchandler: batch(opts) },
++                { rpcmethod: 'createBucket', rpchandler: createBucket(opts) },
++                { rpcmethod: 'delBucket', rpchandler: delBucket(opts) },
++                { rpcmethod: 'delObject', rpchandler: delObject(opts) },
++                { rpcmethod: 'deleteMany', rpchandler: deleteMany(opts) },
++                { rpcmethod: 'findObjects', rpchandler: findObjects(opts) },
++                { rpcmethod: 'getBucket', rpchandler: getBucket(opts) },
++                { rpcmethod: 'getObject', rpchandler: getObject(opts) },
++                { rpcmethod: 'getTokens', rpchandler: getTokens(opts) },
++                { rpcmethod: 'putObject', rpchandler: putObject(opts) },
++                { rpcmethod: 'sql', rpchandler: sql(opts) },
++                { rpcmethod: 'updateBucket', rpchandler: updateBucket(opts) },
++                { rpcmethod: 'updateObjects', rpchandler: updateObjects(opts) }
++            ];
++
++            methods.forEach(function (rpc) {
++                server.registerRpcMethod(rpc);
+             });
+ 
+-            server.listen(options.port, function () {
++            var kangOpts = {
++                service_name: 'electric-moray',
++                version: KANG_VERSION,
++                uri_base: '/kang',
++                ident: os.hostname + '/' + process.pid,
++                list_types: server.kangListTypes.bind(server),
++                list_objects: server.kangListObjects.bind(server),
++                get: server.kangGetObject.bind(server),
++                stats: server.kangStats.bind(server)
++            };
++
++            var monitorServer = restify.createServer({
++                name: 'Monitor'
++            });
++
++            monitorServer.get('/kang/.*', kang.knRestifyHandler(kangOpts));
++
++            monitorServer.get('/metrics',
++                function getMetricsHandler(req, res, next) {
++                    req.on('end', function () {
++                        assert.ok(collector, 'collector');
++                        collector.collect(artedi.FMT_PROM,
++                            function (cerr, metrics) {
++                                if (cerr) {
++                                    next(new verror.VError(err));
++                                    return;
++                                }
++                                res.setHeader('Content-Type',
++                                    'text/plain; version 0.0.4');
++                                res.send(metrics);
++                        });
++                        next();
++                    });
++                    req.resume();
++            });
++
++            monitorServer.listen(options.monitorPort, options.bindip,
++                function () {
++                    log.info('monitor server started on port %d',
++                        options.monitorPort);
++            });
++
++            socket.on('listening', function () {
+                 log.info('moray listening on %d', options.port);
+             });
++
++            socket.on('error', function (serr) {
++                log.error(serr, 'server error');
++            });
++
++            socket.listen(options.port, options.bindip);
+         });
+     });
+ }
+@@ -130,13 +257,69 @@ module.exports = {
+ 
+ ///--- Privates
+ 
++function invalidArgs(rpc, argv, types) {
++    var route = rpc.methodName();
++    var len = types.length;
++
++    if (argv.length !== len) {
++        rpc.fail(new InvocationError(
++            '%s expects %d argument%s', route, len, len === 1 ? '' : 's'));
++        return true;
++    }
++
++    for (var i = 0; i < len; i++) {
++        var name = types[i].name;
++        var type = types[i].type;
++        var val = argv[i];
++
++        // 'array' is not a primitive type in javascript, but certain
++        // rpcs expect them. Since typeof ([]) === 'object', we need to
++        // special case this check to account for these expectations.
++        if (type === 'array') {
++            if (!Array.isArray(val)) {
++                rpc.fail(new InvocationError('%s expects "%s" (args[%d]) to ' +
++                            'be of type array but received type %s instead',
++                            route, name, i, typeof (val)));
++                return true;
++            }
++            continue;
++        }
++
++        if (type === 'object' && val === null) {
++            rpc.fail(new InvocationError('%s expects "%s" (args[%d]) to ' +
++                        'be an object but received the value "null"', route,
++                        name, i));
++            return true;
++        }
++
++        if (typeof (argv[i]) !== types[i].type) {
++            rpc.fail(new InvocationError('%s expects "%s" (args[%d]) to be ' +
++                'of type %s but received type %s instead', route, name, i,
++                type, typeof (val)));
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ //TODO; No bucket modification can occur whilst re-sharding.
+ function createBucket(options) {
+     assert.object(options, 'options');
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _createBucket(name, cfg, opts, res) {
++    function _createBucket(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, CB_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var name = argv[0];
++        var cfg = argv[1];
++        var opts = argv[2];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -155,10 +338,12 @@ function createBucket(options) {
+                 opts: opts,
+                 ro: options.ring.ro_
+             }, 'createBucket: failed shard is read only');
+-            return res.end(new ReadOnlyError());
++            rpc.fail(new ReadOnlyError());
++            return;
+         }
+         var err = [];
+         var done = 0;
++
+         options.clients.array.forEach(function (client) {
+             client.createBucket(name, cfg, opts, function (err2) {
+                 log.debug({
+@@ -176,12 +361,14 @@ function createBucket(options) {
+                         err: multiError
+                     }, 'createBucket: finished all shards');
+ 
+-                    res.end(multiError);
++                    if (multiError) {
++                        rpc.fail(multiError);
++                    } else {
++                        rpc.end();
++                    }
+                 }
+             });
+         });
+-
+-        return (undefined);
+     }
+ 
+     return _createBucket;
+@@ -192,7 +379,16 @@ function getBucket(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _getBucket(opts, bucket, res) {
++    function _getBucket(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, GB_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var opts = argv[0];
++        var bucket = argv[1];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -206,16 +402,16 @@ function getBucket(options) {
+         // randomly pick a client -- since all bucket configs are the same;
+         options.ring.getNode(uuid(), uuid(), function (err, hNode) {
+             if (err) {
+-                res.end(err);
+-                return (undefined);
++                rpc.fail(err);
++                return;
+             }
+ 
+             var pnode = hNode.pnode;
+             options.clients.map[pnode].getBucket(bucket,
+-                                                 function (_err, rbucket)
++                                                 function (gErr, rbucket)
+             {
+                 log.debug({
+-                    err: _err,
++                    err: gErr,
+                     bucket: rbucket
+                 }, 'getBucket: returned');
+ 
+@@ -226,8 +422,8 @@ function getBucket(options) {
+                  * 2) directly hook up the streams by modifying the underlying
+                  * node-fast stream.
+                  */
+-                if (_err) {
+-                    res.end(_err);
++                if (gErr) {
++                    rpc.fail(gErr);
+                 } else {
+                     rbucket.index = JSON.stringify(rbucket.index);
+                     rbucket.pre.forEach(function (fn, index) {
+@@ -245,7 +441,8 @@ function getBucket(options) {
+                             rbucket.reindex_active);
+                     }
+ 
+-                    res.end(rbucket);
++                    rpc.write(rbucket);
++                    rpc.end();
+                 }
+             });
+         });
+@@ -259,7 +456,17 @@ function updateBucket(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _updateBucket(name, cfg, opts, res) {
++    function _updateBucket(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, UB_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var name = argv[0];
++        var cfg = argv[1];
++        var opts = argv[2];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -278,11 +485,13 @@ function updateBucket(options) {
+                 opts: opts,
+                 ro: options.ring.ro_
+             }, 'updateBucket: failed shard is read only');
+-            return res.end(new ReadOnlyError());
++            rpc.fail(new ReadOnlyError());
++            return;
+         }
+ 
+         var err = [];
+         var done = 0;
++
+         options.clients.array.forEach(function (client) {
+             client.updateBucket(name, cfg, function (err2) {
+                 log.debug({
+@@ -299,12 +508,14 @@ function updateBucket(options) {
+                         err: multiError
+                     }, 'updateBucket: finished all shards');
+ 
+-                    res.end(multiError);
++                    if (multiError) {
++                        rpc.fail(multiError);
++                    } else {
++                        rpc.end();
++                    }
+                 }
+             });
+         });
+-
+-        return (undefined);
+     }
+ 
+     return _updateBucket;
+@@ -315,7 +526,16 @@ function delBucket(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _delBucket(name, opts, res) {
++    function _delBucket(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, DB_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var name = argv[0];
++        var opts = argv[1];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -332,11 +552,13 @@ function delBucket(options) {
+                 opts: opts,
+                 ro: options.ring.ro_
+             }, 'deleteBucket: failed shard is read only');
+-            return res.end(new ReadOnlyError());
++            rpc.fail(new ReadOnlyError());
++            return;
+         }
+ 
+         var err = [];
+         var done = 0;
++
+         options.clients.array.forEach(function (client) {
+             client.delBucket(name, function (err2) {
+                 log.debug({
+@@ -353,12 +575,14 @@ function delBucket(options) {
+                         err: multiError
+                     }, 'delBucket: finished all shards');
+ 
+-                    res.end(multiError);
++                    if (multiError) {
++                        rpc.fail(multiError);
++                    } else {
++                        rpc.end();
++                    }
+                 }
+             });
+         });
+-
+-        return (undefined);
+     }
+ 
+     return _delBucket;
+@@ -369,11 +593,23 @@ function putObject(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _putObject(b, k, v, opts, res) {
++    function _putObject(rpc) {
++        var msgid = rpc.requestId();
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, PO_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var b = argv[0];
++        var k = argv[1];
++        var v = argv[2];
++        var opts = argv[3];
++
+         var id = opts.req_id || uuid.v1();
+ 
+         dtrace['putobject-start'].fire(function () {
+-            return ([res.msgid, id, b, k, opts._value]);
++            return ([msgid, id, b, k, opts._value]);
+         });
+ 
+         var log = options.log.child({
+@@ -389,8 +625,8 @@ function putObject(options) {
+ 
+         options.ring.getNode(b, k, function (err, node) {
+             if (err) {
+-                res.end(err);
+-                return (undefined);
++                rpc.fail(err);
++                return;
+             }
+             if (node.data && node.data === READ_ONLY) {
+                 log.debug({
+@@ -400,24 +636,29 @@ function putObject(options) {
+                     opts: opts,
+                     node: node
+                 }, 'putObject: failed vnode is read only');
+-                return res.end(new ReadOnlyError());
++                rpc.fail(new ReadOnlyError());
++                return;
+             }
+             v.vnode = node.vnode;
+             var pnode = node.pnode;
+             var client = options.clients.map[pnode];
+-            client.putObject(b, k, v, opts, function (_err, meta) {
++            client.putObject(b, k, v, opts, function (pErr, meta) {
+                 log.debug({
+-                    err: _err,
++                    err: pErr,
+                     meta: meta
+                 }, 'putObject: returned');
+ 
+                 dtrace['putobject-done'].fire(function () {
+-                    return ([res.msgid]);
++                    return ([msgid]);
+                 });
+-                res.end(_err ? _err : meta);
+-            });
+ 
+-            return (undefined);
++                if (pErr) {
++                    rpc.fail(pErr);
++                } else {
++                    rpc.write(meta);
++                    rpc.end();
++                }
++            });
+         });
+     }
+ 
+@@ -430,11 +671,22 @@ function getObject(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _getObject(b, k, opts, res) {
++    function _getObject(rpc) {
++        var msgid = rpc.requestId();
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, GO_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var b = argv[0];
++        var k = argv[1];
++        var opts = argv[2];
++
+         var id = opts.req_id || uuid.v1();
+ 
+         dtrace['getobject-start'].fire(function () {
+-            return ([res.msgid, id, b, k]);
++            return ([msgid, id, b, k]);
+         });
+ 
+         var log = options.log.child({
+@@ -449,14 +701,14 @@ function getObject(options) {
+ 
+         options.ring.getNode(b, k, function (err, node) {
+             if (err) {
+-                res.end(err);
+-                return (undefined);
++                rpc.fail(err);
++                return;
+             }
+             var pnode = node.pnode;
+             var client = options.clients.map[pnode];
+-            client.getObject(b, k, opts, function (_err, obj) {
++            client.getObject(b, k, opts, function (gErr, obj) {
+                 log.debug({
+-                    err: _err,
++                    err: gErr,
+                     obj: obj
+                 }, 'getObject: returned');
+ 
+@@ -479,9 +731,15 @@ function getObject(options) {
+                 }, 'sanitized object');
+ 
+                 dtrace['getobject-done'].fire(function () {
+-                    return ([res.msgid, obj]);
++                    return ([msgid, obj]);
+                 });
+-                res.end(_err ? _err : obj);
++
++                if (gErr) {
++                    rpc.fail(gErr);
++                } else {
++                    rpc.write(obj);
++                    rpc.end();
++                }
+             });
+         });
+     }
+@@ -494,11 +752,22 @@ function delObject(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _delObject(b, k, opts, res) {
++    function _delObject(rpc) {
++        var msgid = rpc.requestId();
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, DO_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var b = argv[0];
++        var k = argv[1];
++        var opts = argv[2];
++
+         var id = opts.req_id || uuid.v1();
+ 
+         dtrace['delobject-start'].fire(function () {
+-            return ([res.msgid, id, b, k]);
++            return ([msgid, id, b, k]);
+         });
+ 
+         var log = options.log.child({
+@@ -513,8 +782,8 @@ function delObject(options) {
+ 
+         options.ring.getNode(b, k, function (err, node) {
+             if (err) {
+-                res.end(err);
+-                return (undefined);
++                rpc.fail(err);
++                return;
+             }
+             if (node.data && node.data === READ_ONLY) {
+                 log.debug({
+@@ -523,21 +792,25 @@ function delObject(options) {
+                     opts: opts,
+                     node: node
+                 }, 'delObject: failed vnode is read only');
+-                return res.end(new ReadOnlyError());
++                rpc.fail(new ReadOnlyError());
++                return;
+             }
+             var client = options.clients.map[node.pnode];
+-            client.delObject(b, k, opts, function (_err) {
++            client.delObject(b, k, opts, function (dErr) {
+                 log.debug({
+-                    err: _err
++                    err: dErr
+                 }, 'delObject: returned');
+ 
+                 dtrace['delobject-done'].fire(function () {
+-                    return ([res.msgid]);
++                    return ([msgid]);
+                 });
+-                res.end(_err);
+-            });
+ 
+-            return (undefined);
++                if (dErr) {
++                    rpc.fail(dErr);
++                } else {
++                    rpc.end();
++                }
++            });
+         });
+     }
+ 
+@@ -550,11 +823,22 @@ function findObjects(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _findObjects(b, f, opts, res) {
++    function _findObjects(rpc) {
++        var msgid = rpc.requestId();
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, FO_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var b = argv[0];
++        var f = argv[1];
++        var opts = argv[2];
++
+         var id = opts.req_id || uuid.v1();
+ 
+         dtrace['findobjects-start'].fire(function () {
+-            return ([res.msgid, id, b, f]);
++            return ([msgid, id, b, f]);
+         });
+ 
+         var log = options.log.child({
+@@ -577,11 +861,11 @@ function findObjects(options) {
+             }, errMsg);
+ 
+             dtrace['findobjects-done'].fire(function () {
+-                return ([res.msgid, -1]);
++                return ([msgid, -1]);
+             });
+ 
+-            res.end(new Error(errMsg));
+-            return (undefined);
++            rpc.fail(new Error(errMsg));
++            return;
+         }
+ 
+         var client;
+@@ -590,10 +874,10 @@ function findObjects(options) {
+             if (!client) {
+                 log.debug({token: opts.token}, 'findObject: Invalid Token');
+                 dtrace['findobjects-done'].fire(function () {
+-                    return ([res.msgid, -1]);
++                    return ([msgid, -1]);
+                 });
+-                res.end(new Error('Invalid Token ' + opts.token));
+-                return (undefined);
++                rpc.fail(new Error('Invalid Token ' + opts.token));
++                return;
+             }
+             processRequest();
+         } else {
+@@ -606,10 +890,10 @@ function findObjects(options) {
+                 }, 'find: returned from getNodeNoSchema');
+                 if (err) {
+                     dtrace['findobjects-done'].fire(function () {
+-                        return ([res.msgid, -1]);
++                        return ([msgid, -1]);
+                     });
+-                    res.end(err);
+-                    return (undefined);
++                    rpc.fail(err);
++                    return;
+                 }
+                 client = options.clients.map[node.pnode];
+                 processRequest();
+@@ -624,9 +908,9 @@ function findObjects(options) {
+                     err: err
+                 }, 'findObject: done');
+                 dtrace['findobjects-done'].fire(function () {
+-                    return ([res.msgid, -1]);
++                    return ([msgid, -1]);
+                 });
+-                res.end(err);
++                rpc.fail(err);
+             });
+ 
+             var total = 0;
+@@ -644,26 +928,23 @@ function findObjects(options) {
+                     delete obj._value.vnode;
+                 }
+                 dtrace['findobjects-record'].fire(function () {
+-                    return ([res.msgid,
++                    return ([msgid,
+                         obj.key,
+                         obj._id,
+                         obj._etag,
+                     obj._value]);
+                 });
+-                res.write(obj);
++                rpc.write(obj);
+             });
+ 
+             req.on('end', function () {
+                 log.debug('findObject: done');
+                 dtrace['findobjects-done'].fire(function () {
+-                    return ([res.msgid, total]);
++                    return ([msgid, total]);
+                 });
+-                res.end();
++                rpc.end();
+             });
+-
+-            return (undefined);
+         }
+-        return (undefined);
+     }
+ 
+     return _findObjects;
+@@ -674,7 +955,17 @@ function deleteMany(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _deleteMany(b, f, opts, res) {
++    function _deleteMany(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, DM_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var b = argv[0];
++        var f = argv[1];
++        var opts = argv[2];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -685,7 +976,7 @@ function deleteMany(options) {
+             filter: f,
+             opts: opts
+         }, 'deleteMany: entered');
+-        res.end(new Error('Operation not supported'));
++        rpc.fail(new Error('Operation not supported'));
+     }
+ 
+     return _deleteMany;
+@@ -696,27 +987,35 @@ function getTokens(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _getTokens(opts, res) {
++    function _getTokens(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, GT_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var opts = argv[0];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+         });
+ 
+         log.debug({
+-            opts: opts,
+-            res: res
++            opts: opts
+         }, 'getTokens: entered');
+ 
+         options.ring.getPnodes(function (err, pnodes) {
+             if (err) {
+-                return res.end(new verror.VError(err, 'unable to get pnodes'));
++                rpc.fail(new verror.VError(err, 'unable to get pnodes'));
++                return;
+             }
+             log.debug({
+                 pnodes: pnodes
+             }, 'getTokens: returned');
+-            res.end(pnodes);
++            rpc.write(pnodes);
++            rpc.end();
+         });
+-
+     }
+ 
+     return _getTokens;
+@@ -789,7 +1088,17 @@ function sql(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _sql(stmt, values, opts, res) {
++    function _sql(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, SQL_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var stmt = argv[0];
++        var values = argv[1];
++        var opts = argv[2];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -806,7 +1115,8 @@ function sql(options) {
+                 opts: opts,
+                 ro: options.ring.ro_
+             }, 'sql: failed shard is read only');
+-            return res.end(new ReadOnlyError());
++            rpc.fail(new ReadOnlyError());
++            return;
+         }
+ 
+         var err = [];
+@@ -820,7 +1130,11 @@ function sql(options) {
+                 values: values,
+                 opts: opts
+             }, 'sql: finished all shards');
+-            res.end(multiError);
++            if (multiError) {
++                rpc.fail(multiError);
++            } else {
++                rpc.end();
++            }
+         });
+ 
+         options.clients.array.forEach(function (client, index) {
+@@ -828,7 +1142,7 @@ function sql(options) {
+             var req = client.sql(stmt, values, opts);
+ 
+             req.on('record', function (rec) {
+-                res.write(rec);
++                rpc.write(rec);
+             });
+ 
+             req.on('error', function (err2) {
+@@ -840,8 +1154,6 @@ function sql(options) {
+                 barrier.done(index);
+             });
+         });
+-
+-        return (undefined);
+     }
+ 
+     return _sql;
+@@ -853,7 +1165,18 @@ function updateObjects(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _updateObjects(b, fields, f, opts, res) {
++    function _updateObjects(rpc) {
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, UO_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var b = argv[0];
++        var fields = argv[1];
++        var f = argv[2];
++        var opts = argv[3];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -866,7 +1189,7 @@ function updateObjects(options) {
+             opts: opts
+         }, 'update: entered');
+ 
+-        res.end(new Error('Operation not supported'));
++        rpc.fail(new Error('Operation not supported'));
+     }
+ 
+     return _updateObjects;
+@@ -887,7 +1210,17 @@ function batch(options) {
+     assert.object(options.log, 'options.log');
+     assert.object(options.clients, 'options.clients');
+ 
+-    function _batch(requests, opts, res) {
++    function _batch(rpc) {
++        var msgid = rpc.requestId();
++        var argv = rpc.argv();
++
++        if (invalidArgs(rpc, argv, B_ARGS_SCHEMA)) {
++            return;
++        }
++
++        var requests = argv[0];
++        var opts = argv[1];
++
+         var id = opts.req_id || uuid.v1();
+         var log = options.log.child({
+             req_id: id
+@@ -899,25 +1232,28 @@ function batch(options) {
+         }, 'batch: entered');
+ 
+         dtrace['batch-start'].fire(function () {
+-            return ([res.msgid, id]);
++            return ([msgid, id]);
+         });
+ 
+         function done(err, meta) {
+             dtrace['batch-done'].fire(function () {
+-                return ([res.msgid]);
++                return ([msgid]);
+             });
+ 
+             if (err) {
+                 log.debug(err, 'batch: failed');
+-                res.end(err);
++                rpc.fail(err);
+             } else {
+                 log.debug({ meta: meta }, 'batch: done');
+-                res.end(meta);
++                rpc.write(meta);
++                rpc.end();
+             }
+         }
+ 
+         if (!Array.isArray(requests) || requests.length === 0) {
+-            done(new Error('must specify an array with at least one request'));
++            done(new InvocationError('%s expects "requests" (args[0]) to be ' +
++                        'an array with at least one request but received an ' +
++                        'empty array', rpc.methodName()));
+             return;
+         }
+ 
+@@ -956,10 +1292,10 @@ function batch(options) {
+                 }, 'batch: failed vnode is read only');
+ 
+                 dtrace['batch-done'].fire(function () {
+-                    return ([res.msgid]);
++                    return ([msgid]);
+                 });
+ 
+-                res.end(new ReadOnlyError());
++                rpc.fail(new ReadOnlyError());
+                 return;
+             }
+ 
+diff --git a/main.js b/main.js
+index 96dc0bb..29bbe3c 100644
+--- a/main.js
++++ b/main.js
+@@ -15,7 +15,9 @@ var assert = require('assert-plus');
+ var bsyslog = require('bunyan-syslog');
+ var bunyan = require('bunyan');
+ var clone = require('clone');
++var jsprim = require('jsprim');
+ var getopt = require('posix-getopt');
++var VError = require('verror');
+ var extend = require('xtend');
+ 
+ var app = require('./lib');
+@@ -24,9 +26,14 @@ var app = require('./lib');
+ 
+ ///--- Globals
+ 
++var MIN_PORT = 1;
++var MAX_PORT = 65535;
++
+ var DEFAULTS = {
+     file: process.cwd() + '/etc/config.json',
+-    port: 2020
++    port: 2020,
++    monitorPort: 3020,
++    bindip: '0.0.0.0'
+ };
+ var NAME = 'electric-moray';
+ var LOG_SERIALIZERS = {
+@@ -83,10 +90,28 @@ function setupLogger(config) {
+ }
+ 
+ 
++function parsePort(str) {
++    var port = jsprim.parseInteger(str);
++
++    if (port instanceof Error) {
++        LOG.fatal({ port: str }, 'Invalid port - failed to parse');
++        throw new VError(port, 'Invalid port %j', str);
++    }
++
++    if (port < MIN_PORT || port > MAX_PORT) {
++        LOG.fatal({ port: str }, 'Invalid port - out of range');
++        throw new VError(port, 'Invalid port %j, should be in range %d-%d',
++                str, MIN_PORT, MAX_PORT);
++    }
++
++    return port;
++}
++
++
+ function parseOptions() {
+     var option;
+     var opts = {};
+-    var parser = new getopt.BasicParser('cvf:r:p:', process.argv);
++    var parser = new getopt.BasicParser('cvf:r:p:k:', process.argv);
+ 
+     while ((option = parser.getopt()) !== undefined) {
+         switch (option.option) {
+@@ -100,13 +125,10 @@ function parseOptions() {
+                 opts.ringLocation = option.optarg;
+                 break;
+             case 'p':
+-                opts.port = parseInt(option.optarg, 10);
+-                if (isNaN(opts.port)) {
+-                    LOG.fatal({
+-                        port: option.optarg
+-                    }, 'Invalid port.');
+-                    process.exit(1);
+-                }
++                opts.port = parsePort(option.optarg);
++                break;
++            case 'k':
++                opts.monitorPort = parsePort(option.optarg);
+                 break;
+             case 'v':
+                 // Allows us to set -vvv -> this little hackery just ensures
+diff --git a/package.json b/package.json
+index dd75ce4..065e3bd 100644
+--- a/package.json
++++ b/package.json
+@@ -9,18 +9,22 @@
+         "url": "git+https://github.com/joyent/electric-moray.git"
+     },
+     "dependencies": {
+-        "assert-plus": "0.1.5",
++        "artedi": "1.1.0",
++        "assert-plus": "1.0.0",
+         "bunyan": "0.22.1",
+         "bunyan-syslog": "0.2.2",
+         "clone": "0.1.9",
+         "dtrace-provider": "0.2.8",
+         "fash": "2.5.0",
+-        "fast": "0.3.8",
++        "fast": "2.3.0",
++        "jsprim": "2.0.0",
++        "kang": "1.2.0",
+         "ldapjs": "0.6.3",
+         "imgapi-cli": "git+https://github.com/joyent/sdc-imgapi-cli.git#db3efc1",
+-        "moray": "^3.0.0",
++        "moray": "^3.4.0",
+         "node-uuid": "1.4.0",
+         "posix-getopt": "^1.0.0",
++        "restify": "5.2.0",
+         "strsplit": "1.0.0",
+         "vasync": "^1.4.3",
+         "verror": "1.9.0",
+diff --git a/smf/manifests/electric-moray.xml.in b/smf/manifests/electric-moray.xml.in
+index eebdad5..e810c3e 100644
+--- a/smf/manifests/electric-moray.xml.in
++++ b/smf/manifests/electric-moray.xml.in
+@@ -44,7 +44,7 @@
+         <exec_method
+             type="method"
+             name="start"
+-            exec="node --abort-on-uncaught-exception main.js -f etc/config.json -r %{electric-moray/ring-location} -p %{electric-moray/port} &amp;"
++            exec="node --abort-on-uncaught-exception main.js -f etc/config.json -r %{electric-moray/ring-location} -p %{electric-moray/port} -k %{electric-moray/kang} &amp;"
+             timeout_seconds="30">
+             <method_context working_directory="/opt/smartdc/electric-moray">
+                 <method_credential user="root" group="nobody" />
+@@ -68,6 +68,7 @@
+         <instance name="@@ELECTRIC-MORAY_INSTANCE_NAME@@" enabled="true">
+             <property_group name="electric-moray" type="application">
+                 <propval name="port" type="astring" value="@@ELECTRIC-MORAY_PORT@@" />
++                <propval name="kang" type="astring" value="@@KANG_PORT@@" />
+                 <propval name="ring-location" type="astring" value="/electric-moray/chash/leveldb-@@ELECTRIC-MORAY_PORT@@" />
+             </property_group>
+         </instance>
+diff --git a/test/helper.js b/test/helper.js
+index d90f354..16219c6 100644
+--- a/test/helper.js
++++ b/test/helper.js
+@@ -10,7 +10,9 @@
+ 
+ var bunyan = require('bunyan');
+ var deepEqual = require('deep-equal');
++var fast = require('fast');
+ var moray = require('moray'); // client
++var net = require('net');
+ 
+ 
+ 
+@@ -76,6 +78,32 @@ module.exports = {
+                         log: module.exports.createLogger()
+                 });
+                 return (client);
++        },
++
++        makeFastRequest: function makeFastRequest(opts, cb) {
++                var host, port;
++                host = (process.env.MORAY_IP || '127.0.0.1');
++                port = (parseInt(process.env.MORAY_PORT, 10) || 2020);
++
++                var socket = net.connect(port, host);
++
++                socket.on('error', cb);
++
++                socket.on('connect', function () {
++                    socket.removeListener('error', cb);
++                    var client = new fast.FastClient({
++                        log: opts.log,
++                        nRecentRequests: 100,
++                        transport: socket
++                    });
++
++                    client.rpcBufferAndCallback(opts.call,
++                        function (err, data, ndata) {
++                        client.detach();
++                        socket.destroy();
++                        cb(err, data, ndata);
++                    });
++                });
+         }
+ 
+ };
+diff --git a/test/invalid-fast.test.js b/test/invalid-fast.test.js
+new file mode 100644
+index 0000000..f47fdf8
+--- /dev/null
++++ b/test/invalid-fast.test.js
+@@ -0,0 +1,409 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var util = require('util');
++var VError = require('verror');
++
++var helper = require('./helper');
++
++var after = helper.after;
++var before = helper.before;
++var test = helper.test;
++
++var LOG = helper.createLogger('electric-moray-invalid-fast');
++
++var BAD_RPCS = [
++    {
++        method: 'fakerpc',
++        args: [],
++        errname: 'FastError',
++        errmsg: 'unsupported RPC method: "fakerpc"'
++    },
++    {
++        method: 'batch',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'batch expects 2 arguments'
++    },
++    {
++        method: 'batch',
++        args: [ {}, [] ],
++        errname: 'InvocationError',
++        errmsg: 'batch expects "requests" (args[0]) to be of type array but ' +
++            'received type object instead'
++    },
++    {
++        method: 'batch',
++        args: [[ {} ], 0],
++        errname: 'InvocationError',
++        errmsg: 'batch expects "options" (args[1]) to be of type object but ' +
++            'received type number instead'
++    },
++    {
++        method: 'batch',
++        args: [[ {} ], null],
++        errname: 'InvocationError',
++        errmsg: 'batch expects "options" (args[1]) to be an object but ' +
++            'received the value "null"'
++    },
++    {
++        method: 'batch',
++        args: [[], {}],
++        errname: 'InvocationError',
++        errmsg: 'batch expects "requests" (args[0]) to be an array with at ' +
++            'least one request but received an empty array'
++    },
++    {
++        method: 'createBucket',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'createBucket expects 3 arguments'
++    },
++    {
++        method: 'createBucket',
++        args: [0, 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'createBucket expects "bucket" (args[0]) to be of type ' +
++            'string but received type number instead'
++    },
++    {
++        method: 'createBucket',
++        args: ['0', 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'createBucket expects "config" (args[1]) to be of type ' +
++            'object but received type number instead'
++    },
++    {
++        method: 'createBucket',
++        args: ['0', {}, 2],
++        errname: 'InvocationError',
++        errmsg: 'createBucket expects "options" (args[2]) to be of type ' +
++            'object but received type number instead'
++    },
++    {
++        method: 'delBucket',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'delBucket expects 2 arguments'
++    },
++    {
++        method: 'delBucket',
++        args: [0, 1],
++        errname: 'InvocationError',
++        errmsg: 'delBucket expects "bucket" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'delBucket',
++        args: ['0', 1],
++        errname: 'InvocationError',
++        errmsg: 'delBucket expects "options" (args[1]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'delObject',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'delObject expects 3 arguments'
++    },
++    {
++        method: 'delObject',
++        args: [0, 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'delObject expects "bucket" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'delObject',
++        args: ['0', 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'delObject expects "key" (args[1]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'delObject',
++        args: ['0', '1', 2],
++        errname: 'InvocationError',
++        errmsg: 'delObject expects "options" (args[2]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'deleteMany',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'deleteMany expects 3 arguments'
++    },
++    {
++        method: 'deleteMany',
++        args: [0, 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'deleteMany expects "bucket" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'deleteMany',
++        args: ['0', 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'deleteMany expects "filter" (args[1]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'deleteMany',
++        args: ['0', '1', 2],
++        errname: 'InvocationError',
++        errmsg: 'deleteMany expects "options" (args[2]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'findObjects',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'findObjects expects 3 arguments'
++    },
++    {
++        method: 'findObjects',
++        args: [0, 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'findObjects expects "bucket" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'findObjects',
++        args: ['0', 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'findObjects expects "filter" (args[1]) to be of type ' +
++            'string but received type number instead'
++
++    },
++    {
++        method: 'findObjects',
++        args: ['0', '1', 2],
++        errname: 'InvocationError',
++        errmsg: 'findObjects expects "options" (args[2]) to be of type ' +
++            'object but received type number instead'
++    },
++    {
++        method: 'getBucket',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'getBucket expects 2 arguments'
++    },
++    {
++        method: 'getBucket',
++        args: [0, 1],
++        errname: 'InvocationError',
++        errmsg: 'getBucket expects "options" (args[0]) to be of type ' +
++            'object but received type number instead'
++    },
++    {
++        method: 'getBucket',
++        args: [ {}, 1],
++        errname: 'InvocationError',
++        errmsg: 'getBucket expects "bucket" (args[1]) to be of type ' +
++            'string but received type number instead'
++    },
++    {
++        method: 'getObject',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'getObject expects 3 arguments'
++    },
++    {
++        method: 'getObject',
++        args: [0, 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'getObject expects "bucket" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'getObject',
++        args: ['0', 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'getObject expects "key" (args[1]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'getObject',
++        args: ['0', '1', 2],
++        errname: 'InvocationError',
++        errmsg: 'getObject expects "options" (args[2]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'getTokens',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'getTokens expects 1 argument'
++    },
++    {
++        method: 'getTokens',
++        args: [0],
++        errname: 'InvocationError',
++        errmsg: 'getTokens expects "options" (args[0]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'putObject',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'putObject expects 4 argument'
++    },
++    {
++        method: 'putObject',
++        args: [0, 1, 2, 3],
++        errname: 'InvocationError',
++        errmsg: 'putObject expects "bucket" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'putObject',
++        args: ['0', 1, 2, 3],
++        errname: 'InvocationError',
++        errmsg: 'putObject expects "key" (args[1]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'putObject',
++        args: ['0', '1', 2, 3],
++        errname: 'InvocationError',
++        errmsg: 'putObject expects "value" (args[2]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'putObject',
++        args: ['0', '1', {}, 3],
++        errname: 'InvocationError',
++        errmsg: 'putObject expects "options" (args[3]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'sql',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'sql expects 3 arguments'
++    },
++    {
++        method: 'sql',
++        args: [0, 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'sql expects "statement" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'sql',
++        args: ['0', 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'sql expects "values" (args[1]) to be of type array ' +
++            'but received type number instead'
++    },
++    {
++        method: 'sql',
++        args: ['0', [], 2],
++        errname: 'InvocationError',
++        errmsg: 'sql expects "options" (args[2]) to be of type object ' +
++            'but received type number instead'
++    },
++    {
++        method: 'updateBucket',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'updateBucket expects 3 arguments'
++    },
++    {
++        method: 'updateBucket',
++        args: [0, 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'updateBucket expects "name" (args[0]) to be of type string ' +
++            'but received type number instead'
++    },
++    {
++        method: 'updateBucket',
++        args: ['0', 1, 2],
++        errname: 'InvocationError',
++        errmsg: 'updateBucket expects "config" (args[1]) to be of type ' +
++            'object but received type number instead'
++    },
++    {
++        method: 'updateBucket',
++        args: ['0', {}, 2],
++        errname: 'InvocationError',
++        errmsg: 'updateBucket expects "options" (args[2]) to be of type ' +
++            'object but received type number instead'
++    },
++    {
++        method: 'updateObjects',
++        args: [],
++        errname: 'InvocationError',
++        errmsg: 'updateObjects expects 4 arguments'
++    },
++    {
++        method: 'updateObjects',
++        args: [0, 1, 2, 3],
++        errname: 'InvocationError',
++        errmsg: 'updateObjects expects "bucket" (args[0]) to be of type ' +
++            'string but received type number instead'
++    },
++    {
++        method: 'updateObjects',
++        args: ['0', 1, 2, 3],
++        errname: 'InvocationError',
++        errmsg: 'updateObjects expects "fields" (args[1]) to be of type ' +
++            'object but received type number instead'
++    },
++    {
++        method: 'updateObjects',
++        args: ['0', {}, 2, 3],
++        errname: 'InvocationError',
++        errmsg: 'updateObjects expects "filter" (args[2]) to be of type ' +
++            'string but received type number instead'
++    },
++    {
++        method: 'updateObjects',
++        args: ['0', {}, '2', 3],
++        errname: 'InvocationError',
++        errmsg: 'updateObjects expects "options" (args[3]) to be of type ' +
++            'object but received type number instead'
++    }
++];
++
++BAD_RPCS.forEach(function (rpc) {
++    assert.string(rpc.method, 'method name');
++    assert.array(rpc.args, 'argument array');
++    assert.string(rpc.errname, 'error name');
++    assert.string(rpc.errmsg, 'error message');
++
++    test(rpc.errname + ':' + rpc.errmsg, function (t) {
++        helper.makeFastRequest({
++            log: LOG,
++            call: {
++                rpcmethod: rpc.method,
++                rpcargs: rpc.args,
++                maxObjectsToBuffer: 100
++            }
++        }, function (err, data, ndata) {
++            t.ok(err, 'expected error');
++            t.deepEqual([], data, 'expected no data');
++            t.deepEqual(0, ndata, 'expected no results');
++
++            if (err) {
++                var cause = VError.findCauseByName(err, rpc.errname);
++                t.ok(cause, 'expected a ' + rpc.errname);
++                if ((cause && cause.message.indexOf(rpc.errmsg) !== -1) ||
++                    (err.message.indexOf(rpc.errmsg) !== -1)) {
++                    t.ok(true, 'correct error message');
++                } else {
++                    t.equal(err.message, rpc.errmsg, 'correct error message');
++                }
++            }
++            t.end();
++        });
++    });
++});
+diff --git a/tools/jsl.node.conf b/tools/jsl.node.conf
+index 097beee..46b0077 100644
+--- a/tools/jsl.node.conf
++++ b/tools/jsl.node.conf
+@@ -126,8 +126,6 @@
+ +define JSON
+ +define Math
+ 
+-# Custom Globals (Errors)
+-+define ReadOnlyError
+ 
+ ### JavaScript Version
+ # To change the default JavaScript version:

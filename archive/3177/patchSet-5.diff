@@ -1,0 +1,565 @@
+commit b9c4dcc5d726d04c7d1357cdae6cf06bd1ca1d86 (refs/changes/77/3177/5)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2018-01-12T13:22:41-08:00 (1 year, 9 months ago)
+    
+    AGENT-1036 cn-agent should use 'zlogin -S' instead of chroot-gtar if available
+
+diff --git a/bin/docker-copy.js b/bin/docker-copy.js
+index 4d9f0af..f32141b 100644
+--- a/bin/docker-copy.js
++++ b/bin/docker-copy.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var net = require('net');
+@@ -21,7 +21,8 @@ process.on('message', function (message) {
+         mode: message.mode,
+         admin_ip: message.admin_ip,
+         no_overwrite_dir: message.no_overwrite_dir,
+-        timeoutSeconds: message.timeoutSeconds || SERVER_CLOSE_TIMEOUT
++        timeoutSeconds: message.timeoutSeconds || SERVER_CLOSE_TIMEOUT,
++        sysinfo: message.sysinfo
+     };
+ 
+     dockerstdio.setupDockerFileStream(opts, function (err, response) {
+diff --git a/lib/app.js b/lib/app.js
+index a5a1069..1f4d890 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var async = require('async');
+@@ -448,6 +448,7 @@ App.prototype.start = function () {
+                     return;
+                 }
+                 self.sysinfo = sysinfo;
++                agent.setSysinfo(sysinfo);
+                 cb();
+             });
+         },
+diff --git a/lib/docker-stdio.js b/lib/docker-stdio.js
+index bf7f4df..c4e8191 100644
+--- a/lib/docker-stdio.js
++++ b/lib/docker-stdio.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -27,6 +27,7 @@ var path = require('path');
+ var pty = require('pty.js');
+ var spawn = child_process.spawn;
+ var execFile = child_process.execFile;
++var vasync = require('vasync');
+ var vmadm = require('vmadm');
+ 
+ var LineStream = require('lstream');
+@@ -37,6 +38,7 @@ var DATA_TIMEOUT_MS = 30 * 1000;
+ var commands = {};
+ var CTRL_P = '\u0010';
+ var CTRL_Q = '\u0011';
++var ZLOGINS_PI = '20160922T144810Z';
+ 
+ /**
+  * Sets up a mechanism for starting a server to relay the contents of a file.
+@@ -50,6 +52,7 @@ function setupDockerFileStream(opts, callback) {
+     assert.optionalBool(opts.no_overwrite_dir, 'opts.no_overwrite_dir');
+     assert.string(opts.mode, 'opts.mode');
+     assert.string(opts.req_id, 'opts.req_id');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
+ 
+     opts.log = bunyan.createLogger({name: 'docker-stdio', req_id: opts.req_id});
+ 
+@@ -188,6 +191,7 @@ function createDockerFileReadStreamServer(opts, callback) {
+     assert.string(opts.uuid, 'opts.uuid');
+     assert.string(opts.admin_ip, 'opts.admin_ip');
+     assert.object(opts.log, 'opts.log');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
+ 
+     var log = opts.log;
+     var uuid = opts.uuid;
+@@ -235,6 +239,17 @@ function createDockerFileReadStreamServer(opts, callback) {
+         uuid: opts.uuid
+     };
+ 
++    var tryUnmount = once(
++        function _tryUnmount() {
++            var args = { uuid: uuid, operation: 'unmount', log: log };
++            zoneadm(args, function (err, stdout, stderr) {
++                if (err) {
++                    log.warn('error (%s) running zoneadm unmount on %s',
++                        err.code, uuid);
++                }
++            });
++        });
++
+     async.waterfall([
+         /**
+          * Capture zone state, as this will dictate which method we use to do
+@@ -250,7 +265,18 @@ function createDockerFileReadStreamServer(opts, callback) {
+                 next();
+             });
+         },
+-
++        function (next) {
++            if (zoneState !== 'running' &&
++                opts.sysinfo['Live Image'] < ZLOGINS_PI)
++            {
++                next(getDockerCopyStoppedContainerNoPlatformSupportError(
++                    opts.sysinfo['Live Image']));
++                return;
++            } else {
++                next();
++                return;
++            }
++        },
+         /**
+          * Create TCP Server which will output the archive stream
+          */
+@@ -284,7 +310,10 @@ function createDockerFileReadStreamServer(opts, callback) {
+     ], function (err) {
+         if (err) {
+             clearTimeout(serverTimeout);
+-            tcpServer.close();
++            tryUnmount();
++            if (tcpServer) {
++                tcpServer.close();
++            }
+             callback(err);
+             return;
+         }
+@@ -296,6 +325,7 @@ function createDockerFileReadStreamServer(opts, callback) {
+         log.error('onConnectionZoneRunning(read): ' +
+                 'data timeout; terminating archive process');
+         streamProc.kill();
++        tryUnmount();
+     }
+ 
+     function onReadConnectionZoneRunning(socket) {
+@@ -342,43 +372,57 @@ function createDockerFileReadStreamServer(opts, callback) {
+         clearTimeout(serverTimeout);
+ 
+         socket.on('close', function () {
++            tryUnmount();
+             tcpServer.close();
+         });
+ 
+-        var chrootTarCmd = __dirname + '/../bin/chroot-gtar';
+-        var chrootTarArgs = [
+-            '-r', zonepath,
+-            '-t', '-',
+-            '-m', 'create'
+-        ];
+-
+-        if (norm.match(new RegExp('^/'))) {
+-            norm = norm.slice(1);
+-        }
++        var tar = ['/usr/bin/gtar', 'cf', '-'];
+ 
+-        chrootTarArgs.push('-C', path.join('root', path.dirname(norm)),
+-                           path.basename(norm));
++        tar.push('-C', '/a' + path.dirname(norm), path.basename(norm));
+ 
+-        log.info({ norm: norm, chrootTarArgs: chrootTarArgs }, 'tar args');
++        var zloginTarCmd = '/usr/sbin/zlogin';
++        var zloginTarArgs = ['-S', '-Q', uuid];
+ 
+-        streamProc =
+-            spawn(chrootTarCmd, chrootTarArgs, { encoding: 'binary' });
++        Array.prototype.push.apply(zloginTarArgs, tar);
+ 
+-        streamProc.stderr.on('data', function (data) {
+-            log.error({ errorOutput: data.toString() },
+-                      'chroot-gtar error output');
+-        });
++        log.info({ zloginTarArgs: zloginTarArgs },
++                 'createDockerFileReadStreamServer ' +
++                 'onConnectionZoneNotRunning zloginTarArgs');
++
++        vasync.waterfall([
++            function _doReadZoneadmMount(next) {
++                zoneadm({ uuid: uuid, operation: 'mount', log: log },
++                    function (err) {
++                        if (err) {
++                            log.warn({ err: err }, 'error zoneadm mounting');
++                        }
++                        next();
++                    });
++            },
++            function _doReadStream(next) {
++                streamProc =
++                    spawn(zloginTarCmd, zloginTarArgs, { encoding: 'binary' });
++
++                streamProc.stderr.on('data', function (data) {
++                    log.error({ errorOutput: data.toString() },
++                              'zlogin error output');
++                });
++
++                streamProc.on('exit', function (err) {
++                    tcpServer.close();
++                    if (err) {
++                        log.error(err);
++                    }
++                    next(err);
++                });
+ 
+-        streamProc.on('exit', function (err) {
+-            tcpServer.close();
+-            if (err) {
+-                log.error(err);
++                streamProc.stdout.setTimeout(DATA_TIMEOUT_MS);
++                streamProc.stdout.on('timeout', onDataTimeout);
++                streamProc.stdout.pipe(socket);
+             }
++        ], function (err) {
++            tryUnmount();
+         });
+-
+-        streamProc.stdout.setTimeout(DATA_TIMEOUT_MS);
+-        streamProc.stdout.on('timeout', onDataTimeout);
+-        streamProc.stdout.pipe(socket);
+     }
+ }
+ 
+@@ -397,6 +441,7 @@ function createDockerFileWriteStreamServer(opts, callback) {
+     assert.string(opts.admin_ip, 'opts.admin_ip');
+     assert.optionalBool(opts.no_overwrite_dir, 'opts.no_overwrite_dir');
+     assert.object(opts.log, 'log');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
+ 
+     var log = opts.log;
+     var uuid = opts.uuid;
+@@ -446,6 +491,17 @@ function createDockerFileWriteStreamServer(opts, callback) {
+         uuid: opts.uuid
+     };
+ 
++    var tryUnmount = once(
++        function _tryUnmount() {
++            var args = { uuid: uuid, operation: 'unmount', log: log };
++            zoneadm(args, function (err, stdout, stderr) {
++                if (err) {
++                    log.warn('error (%s) running zoneadm unmount on %s',
++                        err.code, uuid);
++                }
++            });
++        });
++
+     async.waterfall([
+         /**
+          * Capture zone state, as this will dictate which method we use to do
+@@ -461,6 +517,18 @@ function createDockerFileWriteStreamServer(opts, callback) {
+                 next();
+             });
+         },
++        function (next) {
++            if (zoneState !== 'running' &&
++                opts.sysinfo['Live Image'] < ZLOGINS_PI)
++            {
++                next(getDockerCopyStoppedContainerNoPlatformSupportError(
++                    opts.sysinfo['Live Image']));
++                return;
++            } else {
++                next();
++                return;
++            }
++        },
+         /**
+          * Create TCP Server which will receive the archive stream
+          */
+@@ -477,9 +545,9 @@ function createDockerFileWriteStreamServer(opts, callback) {
+             }, timeoutSeconds * 1000);
+ 
+             if (zoneState === 'running') {
+-                tcpServer.on('connection', onConnectionZoneRunning);
++                tcpServer.on('connection', onWriteConnectionZoneRunning);
+             } else {
+-                tcpServer.on('connection', onConnectionZoneNotRunning);
++                tcpServer.on('connection', onWriteConnectionZoneNotRunning);
+             }
+             tcpServer.listen(0, opts.admin_ip);
+             tcpServer.on('error', function (err) {
+@@ -494,7 +562,9 @@ function createDockerFileWriteStreamServer(opts, callback) {
+     ], function (err) {
+         if (err) {
+             clearTimeout(serverTimeout);
+-            tcpServer.close();
++            if (tcpServer) {
++                tcpServer.close();
++            }
+             callback(err);
+             return;
+         }
+@@ -503,7 +573,8 @@ function createDockerFileWriteStreamServer(opts, callback) {
+ 
+     return;
+ 
+-    function onConnectionZoneRunning(socket) {
++
++    function onWriteConnectionZoneRunning(socket) {
+         clearTimeout(serverTimeout);
+ 
+         var overwrite = opts.no_overwrite_dir ?
+@@ -537,48 +608,59 @@ function createDockerFileWriteStreamServer(opts, callback) {
+         });
+     }
+ 
+-    function onConnectionZoneNotRunning(socket) {
++    function onWriteConnectionZoneNotRunning(socket) {
+         clearTimeout(serverTimeout);
+ 
+-        var overwrite = opts.no_overwrite_dir ?
+-        '--no-overwrite-dir' : '--overwrite';
+-
+-        var chrootTarCmd = __dirname + '/../bin/chroot-gtar';
+-        var chrootTarArgs = [
+-            '-r', zonepath,
+-            '-t', '-',
+-            '-m', 'extract',
+-            '-C', path.join('root', norm)
+-            ];
++        socket.on('close', function () {
++            tryUnmount();
++            tcpServer.close();
++        });
+ 
+-        chrootTarArgs.push(overwrite);
++        var overwrite = opts.no_overwrite_dir ?
++            '--no-overwrite-dir' : '--overwrite';
+ 
++        var tar = ['/usr/bin/gtar', 'xf', '-', overwrite, '-C', '/a' + norm];
+ 
+-        log.info({ chroot: chrootTarArgs }, 'chroot-gtar args');
++        var zloginTarCmd = '/usr/sbin/zlogin';
++        var zloginTarArgs = ['-S', '-Q', uuid];
+ 
+-        var streamProc =
+-            spawn(chrootTarCmd, chrootTarArgs, { encoding: 'binary' });
++        Array.prototype.push.apply(zloginTarArgs, tar);
+ 
+-        streamProc.stderr.on('data', function (data) {
+-            log.error({ errorOutput: data.toString() },
+-                      'chroot-gtar error output');
+-        });
++        vasync.waterfall([
++            function _doReadZoneadmMount(next) {
++                zoneadm({ uuid: uuid, operation: 'mount', log: log },
++                    function (err) {
++                        if (err) {
++                            log.warn({ err: err }, 'error zoneadm mounting');
++                        }
++                        next();
++                    });
++            },
++            function _doWriteStream(next) {
++                var streamProc =
++                    spawn(zloginTarCmd, zloginTarArgs,
++                        { encoding: 'binary' });
++
++                streamProc.stderr.on('data', function (data) {
++                    log.error({ errorOutput: data.toString() },
++                        'zlogin error output');
++                });
++
++                streamProc.on('exit', function (err) {
++                    if (err) {
++                        log.error(err);
++                    }
++                    tcpServer.close();
++                });
+ 
+-        streamProc.stdout.on('data', function (data) {
+-            console.log(data.toString());
+-        });
++                socket.pipe(streamProc.stdin);
+ 
+-        streamProc.on('exit', function (err) {
+-            if (err) {
+-                log.error(err);
++                socket.on('close', function () {
++                    tcpServer.close();
++                });
+             }
+-            tcpServer.close();
+-        });
+-
+-        socket.pipe(streamProc.stdin);
+-
+-        socket.on('close', function () {
+-            tcpServer.close();
++        ], function (err) {
++            tryUnmount();
+         });
+     }
+ }
+@@ -1315,6 +1397,32 @@ function dockerPathStatFromPath(opts) {
+ }
+ 
+ 
++function zoneadm(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.string(opts.operation, 'opts.operation');
++    assert.optionalFunc(callback, 'callback');
++
++    var ZONEADM = '/usr/sbin/zoneadm';
++    var args = ['-z', opts.uuid, opts.operation];
++
++    execFile(ZONEADM, args, function (err, stdout, stderr) {
++        if (callback) {
++            callback(err, stdout, stderr);
++        }
++    });
++}
++
++function getDockerCopyStoppedContainerNoPlatformSupportError(version) {
++    var err = new Error(
++        'docker cp on stopped container not supported ' +
++        'on platform image ' + version);
++    err.restCode = 'DockerCopyStoppedContainerNoPlatformSupport';
++    return err;
++}
++
++
+ module.exports = {
+     setupDockerExecution: setupDockerExecution,
+     setupDockerFileStream: setupDockerFileStream
+diff --git a/lib/task_agent/task_agent.js b/lib/task_agent/task_agent.js
+index 1438d84..41c53fa 100644
+--- a/lib/task_agent/task_agent.js
++++ b/lib/task_agent/task_agent.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var util = require('util');
+@@ -16,6 +16,7 @@ var TaskRunner = require('./task_runner');
+ var imgadm = require('../imgadm');
+ var bunyan = require('bunyan');
+ var restify = require('restify');
++var jsprim = require('jsprim');
+ var os = require('os');
+ var async = require('async');
+ var EventEmitter = require('events').EventEmitter;
+@@ -140,6 +141,7 @@ TaskAgent.prototype.setupTaskRoutes = function (defns) {
+             req_host: req.headers.host,
+             task: req.params.task,
+             params: req.params.params,
++            sysinfo: self.sysinfo,
+             finish: function () {
+                 fcb();
+             },
+@@ -181,4 +183,16 @@ TaskAgent.prototype.setupTaskHistory = function () {
+ };
+ 
+ 
++TaskAgent.prototype.setSysinfo = function (sysinfo) {
++    var self = this;
++    self.sysinfo = jsprim.deepCopy(sysinfo);
++};
++
++
++TaskAgent.prototype.getSysinfo = function (sysinfo) {
++    var self = this;
++    return jsprim.deepCopy(self.sysinfo);
++};
++
++
+ module.exports = TaskAgent;
+diff --git a/lib/task_agent/task_runner.js b/lib/task_agent/task_runner.js
+index f8d6e11..7a049ce 100644
+--- a/lib/task_agent/task_runner.js
++++ b/lib/task_agent/task_runner.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -35,6 +35,7 @@ function TaskRunner(options) {
+     this.log = options.log;
+     this.env = options.env;
+     this.timeoutSeconds = options.timeoutSeconds;
++    this.sysinfo = options.sysinfo;
+ 
+     if (!fs.existsSync(this.logdir)) {
+         mkdirp.sync(this.logdir, parseInt('0755', 8));
+diff --git a/lib/task_agent/task_worker.js b/lib/task_agent/task_worker.js
+index cfa5a3a..2ee6eab 100644
+--- a/lib/task_agent/task_worker.js
++++ b/lib/task_agent/task_worker.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var taskModule = process.argv[2];
+@@ -92,6 +92,7 @@ function start(req, taskspath) {
+     task = new TaskClass(req);
+     task.req = req;
+     task.taskspath = taskspath;
++    task.sysinfo = req.sysinfo;
+ 
+     task.on('event', function (name, event) {
+         log.info({
+diff --git a/lib/tasks/docker_copy.js b/lib/tasks/docker_copy.js
+index 84f267a..490c765 100644
+--- a/lib/tasks/docker_copy.js
++++ b/lib/tasks/docker_copy.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var Task = require('../task_agent/task');
+@@ -61,7 +61,8 @@ function start(callback) {
+             admin_ip: adminIp,
+             path: path,
+             mode: mode,
+-            no_overwrite_dir: self.req.params.no_overwrite_dir
++            no_overwrite_dir: self.req.params.no_overwrite_dir,
++            sysinfo: self.sysinfo
+         });
+ 
+         dockerCopy.on('message', once(function (message) {
+diff --git a/package.json b/package.json
+index 8c123f6..a0c0e0b 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "cn-agent",
+   "description": "Triton Compute Node Agent",
+-  "version": "2.0.1",
++  "version": "2.1.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {

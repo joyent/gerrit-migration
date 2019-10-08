@@ -1,0 +1,649 @@
+commit 90245ae8344b92175c1c9c40880eddd9d8da070d (refs/changes/26/2826/10)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2017-12-12T02:15:11+00:00 (1 year, 10 months ago)
+    
+    MANTA-3223 Registrar should stop relying on node-zkplus
+
+diff --git a/lib/index.js b/lib/index.js
+index d83ada1..6cb05c7 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -11,10 +11,10 @@
+ var EventEmitter = require('events').EventEmitter;
+ 
+ var assert = require('assert-plus');
++var zkstream = require('zkstream');
+ 
+ var health = require('./health');
+ var register = require('./register');
+-var zk = require('./zk');
+ 
+ 
+ 
+@@ -30,11 +30,53 @@ function _export(obj) {
+ 
+ ///--- API
+ 
+-function register_plus(opts) {
++function createZKClient(opts, cb) {
++    assert.object(opts, 'options');
++    assert.object(opts.log, 'options.log');
++    assert.arrayOfObject(opts.servers, 'options.servers');
++    assert.func(cb, 'callback');
++
++    assert.ok((opts.servers.length > 0), 'options.servers empty');
++
++    opts.servers.forEach(function (s) {
++        assert.string(s.address, 'servers.address');
++        assert.number(s.port, 'servers.port');
++    });
++
++    cb(new zkstream.Client(opts));
++}
++
++
++function Registrar(opts) {
+     assert.object(opts, 'options');
+     assert.object(opts.log, 'options.log');
+     assert.object(opts.zk, 'options.zk');
+ 
++    this.options = opts;
++    this.zk = opts.zk;
++    this.ephemerals = {};
++    this.expired = false;
++}
++
++
++Registrar.prototype.recreateEphemerals = function recreateEphemerals() {
++    var self = this;
++    var log = this.options.log;
++    Object.keys(self.ephemerals).forEach(function (key) {
++        var ephem = self.ephemerals[key];
++        self.zk.create(key, ephem.data, ephem.flags, function (err, p) {
++            if (err) {
++               log.warn(err, 'failed to create ephemeral node');
++
++            } else {
++                log.info('created ephemeral %s', p);
++            }
++        });
++    });
++};
++
++Registrar.prototype.registerAndCreateHealthCheck = function () {
++    var opts = this.options;
+     var check;
+     var ee = new EventEmitter();
+     var log = opts.log.child({component: 'registrar'}, true);
+@@ -43,9 +85,9 @@ function register_plus(opts) {
+     var zk = opts.zk;
+     var znodes;
+ 
+-    register.register(opts, function (err, _znodes) {
++    register.register(opts, this, function (err, _znodes) {
+         if (err) {
+-            log.debug(err, 'registration(%j): failed', cfg.registration);
++            log.debug(err, 'registration(%j): failed', opts.registration);
+             ee.emit('error', err);
+             return;
+         }
+@@ -92,7 +134,6 @@ function register_plus(opts) {
+                         var u_opts = {
+                             log: log,
+                             zk: zk,
+-                            znodes: znodes
+                         };
+                         register.unregister(u_opts, function (u_err) {
+                             if (u_err) {
+@@ -128,36 +169,6 @@ function register_plus(opts) {
+                 check.start();
+         }
+ 
+-        (function zkHeartbeat() {
+-            var heartbeatInterval = opts.heartbeatInterval || 3000;
+-            var hCfg = opts.heartbeat || {};
+-
+-            (function checkZK() {
+-                log.debug('zk.heartbeat(%j): starting', znodes);
+-                zk.heartbeat({nodes: znodes}, function (check_err) {
+-                    var _data;
+-                    var _event;
+-                    var _to;
+-
+-                    if (check_err) {
+-                        log.debug(check_err, 'zk.heartbeat(%j) failed', znodes);
+-                        _data = check_err;
+-                        _event = 'heartbeatFailure';
+-                        _to = Math.max(heartbeatInterval, 60000);
+-                    } else {
+-                        log.debug('zk.heartbeat(%j): ok', znodes);
+-                        _data = znodes;
+-                        _event = 'heartbeat';
+-                        _to = heartbeatInterval;
+-                    }
+-
+-                    if (!stop)
+-                        zk_timer = setTimeout(checkZK, _to);
+-                    ee.emit(_event, _data);
+-                });
+-            })();
+-        })();
+-
+         if (opts.healthCheck)
+             healthcheck();
+ 
+@@ -176,11 +187,14 @@ function register_plus(opts) {
+     return (ee);
+ }
+ 
+-
+ ///--- Exports
+ 
+-module.exports = register_plus;
++module.exports = {
++    createRegistrar: function (opts) {
++        return (new Registrar(opts));
++    },
++    createZKClient: createZKClient
++};
+ 
+ _export(health);
+ _export(register);
+-_export(zk);
+diff --git a/lib/register.js b/lib/register.js
+index b956d78..fe7ef10 100644
+--- a/lib/register.js
++++ b/lib/register.js
+@@ -55,11 +55,11 @@ function registerService(opts, cb) {
+ 
+     log.debug('registerService(%s): entered', opts.path);
+ 
+-    var obj = {
++    var data = new Buffer(JSON.stringify({
+         type: 'service',
+         service: opts.registration.service
+-    };
+-    opts.zk.put(opts.path, obj, function (err) {
++    }), 'utf8');
++    zk.set(opts.path, data, opts.version, function (err) {
+         if (err) {
+             log.error(err, 'registerService: put failed');
+             cb(err);
+@@ -83,9 +83,13 @@ function cleanupPreviousEntries(opts, cb) {
+ 
+     log.debug('cleanupPreviousEntries(%j): entered', opts.nodes);
+     vasync.forEachParallel({
+-        func: function _unlink(n, _cb) {
+-            zk.unlink(n, function (err) {
+-                if (err && err.name !== 'NO_NODE') {
++        func: function _delete(n, _cb) {
++            if (opts.registrar.ephemerals[n])
++                delete opts.registrar.ephemerals[n];
++
++            var ver = opts.version !== undefined ? opts.version : -1;
++            zk.delete(n, ver, function (err) {
++                if (err && err.code !== 'NO_NODE') {
+                     _cb(err);
+                 } else {
+                     _cb();
+@@ -105,30 +109,6 @@ function cleanupPreviousEntries(opts, cb) {
+ }
+ 
+ 
+-function setupDirectories(opts, cb) {
+-    cb = once(cb);
+-
+-    var log = opts.log;
+-    var zk = opts.zk;
+-
+-    log.debug('setupDirectories(%j): entered', opts.nodes);
+-    vasync.forEachParallel({
+-        func: zk.mkdirp.bind(zk),
+-        inputs: opts.nodes.map(function (p) {
+-            return (path.dirname(p));
+-        })
+-    }, function (err) {
+-        if (err) {
+-            log.debug(err, 'setupDirectories: failed');
+-            cb(err);
+-        } else {
+-            log.debug(err, 'setupDirectories: done');
+-            cb();
+-        }
+-    });
+-}
+-
+-
+ function registerEntries(opts, cb) {
+     cb = once(cb);
+ 
+@@ -154,9 +134,22 @@ function registerEntries(opts, cb) {
+                 ports: ports
+             };
+             var _opts = {
+-                flags: ['ephemeral_plus']
++                flags: ['EPHEMERAL']
+             };
+-            zk.create(n, _obj, _opts, once(_cb));
++            var data = new Buffer(JSON.stringify(_obj), 'utf8');
++
++            zk.createWithEmptyParents(n, data, _opts, once(function (err) {
++                if (err) {
++                    _cb(err);
++                } else {
++                    opts.registrar.ephemerals[n] = {
++                        data: data,
++                        flags: _opts.flags,
++                        path: n
++                    };
++                    _cb();
++                }
++            }));
+         },
+         inputs: opts.nodes
+     }, function (err) {
+@@ -171,7 +164,7 @@ function registerEntries(opts, cb) {
+ }
+ 
+ 
+-function register(opts, cb) {
++function register(opts, registrar, cb) {
+     assert.object(opts, 'options');
+     assert.object(opts.log, 'options.log');
+     assert.optionalString(opts.adminIp, 'options.adminIp');
+@@ -179,6 +172,7 @@ function register(opts, cb) {
+     assert.string(opts.domain, 'options.domain');
+     assert.object(opts.registration, 'options.registration');
+     assert.string(opts.registration.type, 'options.registration.type');
++    assert.object(registrar, 'registrar');
+     assert.optionalNumber(opts.registration.ttl, 'options.registration.ttl');
+     assert.optionalArrayOfNumber(opts.registration.ports,
+                                  'options.registration.ports');
+@@ -223,6 +217,7 @@ function register(opts, cb) {
+         ].concat((opts.aliases || []).map(domainToPath)),
+         path: p,
+         registration: opts.registration,
++        registrar: registrar,
+         zk: opts.zk
+     };
+     vasync.pipeline({
+@@ -233,7 +228,6 @@ function register(opts, cb) {
+                 // Be nice to watchers and wait for them to catch up
+                 setTimeout(once(_cb), 1000);
+             },
+-            setupDirectories,
+             registerEntries,
+             registerService
+         ]
+@@ -255,43 +249,25 @@ function unregister(opts, cb) {
+     assert.object(opts, 'options');
+     assert.object(opts.log, 'options.log');
+     assert.object(opts.zk, 'options.zk');
+-    assert.arrayOfString(opts.znodes, 'options.znodes');
+     assert.func(cb, 'callback');
+ 
+     cb = once(cb);
+ 
+     var log = opts.log.child({
+         component: 'unregister',
+-        znodes: opts.znodes
+     }, true);
+     var zk = opts.zk;
+ 
+     log.debug('unregister: entered');
+-    vasync.forEachPipeline({
+-        func: function cleanup(n, _cb) {
+-            _cb = once(_cb);
+ 
+-            log.debug('unregister: deleting %s', n);
+-            zk.unlink(n, function (err) {
+-                if (err) {
+-                    log.debug(err, 'unregister: failed to delete %s', n);
+-                    _cb(err);
+-                } else {
+-                    log.debug('unregister: unlink(%s) done', n);
+-                    cb();
+-                }
+-            });
+-        },
+-        inputs: opts.znodes
+-    }, function (err) {
+-        if (err) {
+-            log.debug(err, 'unregister: failed');
+-            cb(err);
+-        } else {
+-            log.debug('unregister: done');
+-            cb();
+-        }
++    zk.on('close', function () {
++        opts.registrar.ephemerals = {};
++        opts.registrar.zk = null;
++        log.debug('unregister: done');
++        cb();
+     });
++
++    zk.close();
+ }
+ 
+ 
+diff --git a/lib/zk.js b/lib/zk.js
+deleted file mode 100644
+index 7ea4336..0000000
+--- a/lib/zk.js
++++ /dev/null
+@@ -1,135 +0,0 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- */
+-
+-/*
+- * Copyright (c) 2014, Joyent, Inc.
+- */
+-
+-var assert = require('assert-plus');
+-var backoff = require('backoff');
+-var once = require('once');
+-var vasync = require('vasync');
+-var zkplus = require('zkplus');
+-
+-
+-
+-///-- API
+-
+-function heartbeat(opts, cb) {
+-    assert.object(opts, 'options');
+-    assert.arrayOfString(opts.nodes, 'options.nodes');
+-    assert.optionalObject(opts.retry, 'options.retry');
+-    assert.object(opts.zk, 'options.zk');
+-    assert.func(cb, 'callback');
+-
+-    cb = once(cb);
+-
+-    function check(_, _cb) {
+-        vasync.forEachParallel({
+-            func: opts.zk.stat.bind(opts.zk),
+-            inputs: opts.nodes
+-        }, _cb);
+-    }
+-
+-    var retry = backoff.call(check, null, cb);
+-    retry.failAfter((opts.retry || {}).maxAttempts || 5);
+-    retry.setStrategy(new backoff.ExponentialStrategy({
+-        initialDelay: (opts.retry || {}).initialDelay || 1000,
+-        maxDelay: (opts.retry || {}).maxDelay || 30000
+-    }));
+-    retry.start();
+-}
+-
+-
+-function patchClient(zk) {
+-    zk.heartbeat = function _heartbeat(opts, cb) {
+-        assert.object(opts, 'options');
+-
+-        heartbeat({
+-            nodes: opts.nodes,
+-            retry: opts.retry,
+-            zk: zk
+-        }, cb);
+-    };
+-
+-    return (zk);
+-}
+-
+-
+-function createZKClient(opts, cb) {
+-    assert.object(opts, 'options');
+-    assert.object(opts.log, 'options.log');
+-    assert.arrayOfObject(opts.servers, 'options.servers');
+-    assert.func(cb, 'callback');
+-
+-    assert.ok((opts.servers.length > 0), 'options.servers empty');
+-    opts.servers.forEach(function (s) {
+-        assert.string(s.host, 'servers.host');
+-        assert.number(s.port, 'servers.port');
+-    });
+-
+-    cb = once(cb);
+-
+-    function create(_, _cb) {
+-        var client = zkplus.createClient(opts);
+-        client.connect(function (err) {
+-            if (err) {
+-                _cb(err);
+-            } else {
+-                _cb(null, patchClient(client));
+-            }
+-        });
+-    }
+-
+-    var log = opts.log.child({component: 'zookeeper'}, true);
+-    var retry = backoff.call(create, null, function (err, client) {
+-        if (err) {
+-            log.fatal(err, 'createClient: unable to create ZK client');
+-            cb(err);
+-        } else {
+-            log.info('ZK: connected: %s', client.toString());
+-            cb(null, client);
+-        }
+-    });
+-    retry.failAfter(Infinity);
+-    retry.setStrategy(new backoff.ExponentialStrategy({
+-        initialDelay: 1000,
+-        maxDelay: 90000
+-    }));
+-    setImmediate(retry.start.bind(retry));
+-
+-    retry.on('backoff', function (number, delay) {
+-        var level;
+-        if (number === 0) {
+-            level = 'info';
+-        } else if (number < 5) {
+-            level = 'warn';
+-        } else {
+-            level = 'error';
+-        }
+-        log[level]({
+-            attempt: number,
+-            delay: delay
+-        }, 'zookeeper: connection attempted (failed)');
+-
+-        retry.emit('attempt', number, delay);
+-    });
+-
+-    retry.stop = function () {
+-        retry.abort();
+-        cb(new Error('createZKClient: aborted'));
+-    };
+-
+-    return (retry);
+-}
+-
+-
+-
+-///--- Exports
+-
+-module.exports = {
+-    createZKClient: createZKClient
+-};
+diff --git a/main.js b/main.js
+index 3f9b4b3..7c1302d 100644
+--- a/main.js
++++ b/main.js
+@@ -121,32 +121,12 @@ function usage(help, msg) {
+ 
+     var cfg = configure(argv);
+ 
+-    app.createZKClient(cfg.zookeeper, function (init_err, zk) {
+-        if (init_err) {
+-            LOG.fatal(init_err, 'unable to create ZooKeeper client');
+-            process.exit(1);
+-        }
+-
+-        zk.on('close', function () {
+-            LOG.warn('zookeeper: disconnected');
+-        });
+-
+-        // annoyingly this fires twice, so ignore the first one
+-        zk.once('connect', function () {
+-            zk.on('connect', function () {
+-                LOG.info('zookeeper: reconnected');
+-            });
+-        });
+-
+-        zk.on('session_expired', function force_restart() {
+-            LOG.fatal('Zookeeper session_expired event; exiting');
+-            process.exit(1);
+-        });
++    app.createZKClient(cfg.zookeeper, function (zk) {
++        assert.object(zk, 'zk');
+ 
+         // backward compatible with top-level 'adminIp' in configs.
+         cfg.registration.adminIp = cfg.registration.adminIp || cfg.adminIp;
+ 
+-        var is_down = false;
+         var opts = clone(cfg.registration);
+         if (cfg.healthCheck) {
+             opts.healthCheck = clone(cfg.healthCheck);
+@@ -157,44 +137,101 @@ function usage(help, msg) {
+         opts.registration = cfg.registration;
+         opts.zk = zk;
+ 
+-        var eventStream = app(opts);
++        var registrar = app.createRegistrar(opts);
++
++        /*
++         * If registrar.zk is null, this meant that there has already been an
++         * event that triggered the termination of the session, and we can
++         * safely exit. Otherwise, the work has to be done here.
++         */
++        function unregisterAndExit(signal) {
++            if (registrar.zk === null) {
++                LOG.debug('registrar: received ' + signal + ', but the zk ' +
++                        'session is already terminated.');
++                process.exit(0);
++            }
++            LOG.info('registrar: received ' + signal + ', unregistering ' +
++                    'ephemeral nodes.');
++            var unregisterOpts = {
++                log: LOG,
++                zk: zk,
++                registrar: registrar
++            };
++            app.unregister(unregisterOpts, function (err) {
++                if (err) {
++                    LOG.debug(err, 'registrar: unexpected error ' +
++                        'unregistering nodes');
++                }
++                process.exit(0);
++            });
++        }
+ 
+-        eventStream.on('fail', function (err) {
+-            LOG.error(err, 'registrar: healthcheck failed');
+-        });
++        var exitSignals = [
++            'SIGTERM',
++            'SIGINT'
++        ];
+ 
+-        eventStream.on('ok', function () {
+-            LOG.info('registrar: healthcheck ok (was down)');
++        exitSignals.forEach(function (signal) {
++            process.on(signal, function () {
++                unregisterAndExit(signal);
++            });
+         });
+ 
+-        eventStream.on('error', function (err) {
+-            LOG.error(err, 'registrar: unexpected error');
++        // node-zkstream events
++        zk.on('connect', function () {
++            LOG.info('zookeeper: connected');
+         });
+ 
+-        eventStream.on('register', function (nodes) {
+-            LOG.info({
+-                znodes: nodes
+-            }, 'registrar: registered');
++        zk.on('close', function () {
++            LOG.warn('zookeeper: disconnected');
+         });
+ 
+-        eventStream.on('unregister', function (err, nodes) {
+-            LOG.warn({
+-                err: err,
+-                znodes: nodes
+-            }, 'registrar: unregistered');
+-        });
+ 
+-        eventStream.on('heartbeatFailure', function (err) {
+-            if (!is_down)
+-                LOG.error(err, 'zookeeper: heartbeat failed');
+-            is_down = true;
++        zk.on('session', function () {
++            LOG.info('zookeeper: session established');
++            // If recovering from session expiration,  recreate ephemerals
++            if (registrar.expired) {
++                registrar.recreateEphemerals();
++                registrar.expired = false;
++                return;
++            }
++
++            var eventStream = registrar.registerAndCreateHealthCheck();
++
++            // health-check events
++            eventStream.on('fail', function (err) {
++                LOG.error(err, 'registrar: healthcheck failed');
++            });
++
++            eventStream.on('ok', function () {
++                LOG.info('registrar: healthcheck ok (was down)');
++            });
++
++            eventStream.on('error', function (err) {
++                LOG.error(err, 'registrar: unexpected error');
++            });
++
++            eventStream.on('register', function (nodes) {
++                LOG.info({
++                    znodes: nodes
++                }, 'registrar: registered');
++            });
++
++            eventStream.on('unregister', function (err, nodes) {
++                LOG.warn({
++                    err: err,
++                    znodes: nodes
++                }, 'registrar: unregistered');
++            });
+         });
+ 
+-        eventStream.on('heartbeat', function () {
+-            if (is_down)
+-                LOG.info('zookeeper heartbeat ok');
++        zk.on('expire', function force_restart() {
++            registrar.expired = true;
++            LOG.warn('zookeeper: session expired');
++        });
+ 
+-            is_down = false;
++        zk.on('failed', function () {
++            LOG.warn('zookeeper: failed');
+         });
+     });
+ })();
+diff --git a/package.json b/package.json
+index afd4340..f728db5 100644
+--- a/package.json
++++ b/package.json
+@@ -18,7 +18,7 @@
+         "once": "1.3.0",
+         "vasync": "1.5.0",
+         "verror": "1.4.0",
+-        "zkplus": "git://github.com/mcavage/node-zkplus.git#master"
++        "zkstream": "0.10.0"
+     },
+     "devDependencies": {
+         "faucet": "0.0.1",

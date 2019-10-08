@@ -1,0 +1,377 @@
+commit 095fa47f89ee2b4e411eab292ff543db33f120c8 (refs/changes/49/5049/4)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2018-11-13T15:20:16-05:00 (11 months ago)
+    
+    OS-7365 vminfod crashes when restarting watches for nonexistent zone
+
+diff --git a/src/Makefile b/src/Makefile
+index 759a2a9a..f402ccd5 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -127,6 +127,7 @@ JS_CHECK_TARGETS=\
+ 	vm/tests/test-tmpfs.js \
+ 	vm/tests/test-update.js \
+ 	vm/tests/test-vrrp-nics.js \
++	vm/tests/test-vminfod.js \
+ 	vm/tests/test-vminfod-zonewatcher.js \
+ 	vm/tests/test-vminfod-zonewatcher-overflow.js \
+ 	vm/tests/test-vminfod-zpoolwatcher.js \
+diff --git a/src/vm/node_modules/vminfod/vminfod.js b/src/vm/node_modules/vminfod/vminfod.js
+index 9ea2bd69..b59a2e60 100644
+--- a/src/vm/node_modules/vminfod/vminfod.js
++++ b/src/vm/node_modules/vminfod/vminfod.js
+@@ -2149,6 +2149,19 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+         uuid = extractUUID(parts[1]);
+     }
+ 
++    /*
++     * If we extracted a UUID, we then check to see if it maps to a VM that
++     * we know about.  It can be the case where the ZFS dataset being
++     * modified here has a UUID as the second part of its name but does not
++     * belong to a VM (a simple example is the ZFS dataset of an image).  We
++     * unset the `uuid` variable if it does not belong to a valid VM and
++     * proceed as usual without refreshing a specific VM at the end.
++     */
++    if (uuid && !self.vmobjs.hasOwnProperty(uuid)) {
++        self.log.debug('UUID "%s" extracted for a non-vm', uuid);
++        uuid = null;
++    }
++
+     /*
+      * If the dataset name matches "/zones/<uuid>" exactly we use that as the
+      * zonepath argument to getDatasets.  Otherwise, we use the parent dataset.
+@@ -2203,6 +2216,19 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+                     description: util.format('zone %s restart watchers', uuid),
+                     timeout: QUEUE_TASK_TIMEOUT,
+                     func: function zfsRollbackRestartWatcher(extras, callback) {
++                        /*
++                         * Ensure the VM exists before trying to restart its
++                         * file watchers.  It can be the case that the VM
++                         * existed when the "rollback" event came in, but has
++                         * since been deleted.
++                         */
++                        if (!self.vmobjs.hasOwnProperty(uuid)) {
++                            extras.log.debug('vmobj doesn\'t exist for %s',
++                                uuid);
++                            callback();
++                            return;
++                        }
++
+                         self.restartVmWatchers(uuid, callback);
+                     }
+                 });
+@@ -2346,10 +2372,8 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+                     cb();
+                     return;
+                 }
+-                // if we happen to grab an image uuid here,
+-                // the refreshVmobj will return immediately
+-                extras.log.debug('refreshing vmobj %s after zfs event', uuid);
+ 
++                extras.log.debug('refreshing vmobj %s after zfs event', uuid);
+                 self.refreshVmobj(uuid, cb);
+             }
+         }
+diff --git a/src/vm/tests/test-vminfod.js b/src/vm/tests/test-vminfod.js
+index c8702057..81d7dbef 100644
+--- a/src/vm/tests/test-vminfod.js
++++ b/src/vm/tests/test-vminfod.js
+@@ -24,12 +24,30 @@
+  *
+  */
+ 
++var assert = require('/usr/node/node_modules/assert-plus');
++var common = require('./common');
++var f = require('util').format;
++var libuuid = require('/usr/node/node_modules/uuid');
++var VM = require('/usr/vm/node_modules/VM');
++var vasync = require('/usr/vm/node_modules/vasync');
+ var vminfod = require('/usr/vm/node_modules/vminfod/client');
++var vmtest = require('../common/vmtest.js');
+ 
+ // this puts test stuff in global, so we need to tell jsl about that:
+ /* jsl:import ../node_modules/nodeunit-plus/index.js */
+ require('nodeunit-plus');
+ 
++var IMAGE_UUID = vmtest.CURRENT_SMARTOS_UUID;
++var PAYLOAD = {
++    alias: f('test-vminfod-%d', process.pid),
++    autoboot: true,
++    brand: 'joyent-minimal',
++    do_not_inventory: true,
++    image_uuid: IMAGE_UUID,
++    quota: 5,
++    ram: 64
++};
++
+ test('create VminfodClient object and test /status', function (t) {
+     var vc = new vminfod.VminfodClient();
+     t.ok(vc, 'VminfodClient created');
+@@ -40,3 +58,267 @@ test('create VminfodClient object and test /status', function (t) {
+         t.end();
+     });
+ });
++
++/*
++ * OS-7365: vminfod crashes when restarting watches for nonexistent zone
++ *
++ * vminfod has relatively complex logic to handle a ZFS rollback of a dataset
++ * for a zone.  When a zone's dataset is rolled back, the state of the files in
++ * the dataset are now effectively unknown, so vminfod restarts the filesystem
++ * watches for each file related to the zone affected.  vminfod could crash,
++ * however, if the filesystem watches are attempted to be restarted for a
++ * zone that doesn't exist.
++ *
++ * This would happen (before OS-7365) 1. if the zone was deleted between when
++ * the rollback happened and when the event was processed or 2. if vminfod
++ * thinks the zfs event was for a zone when it actually wasn't.  This test
++ * ensures that vminfod doesn't crash as a result of a ZFS rollback.
++ *
++ * To accomplish this, the test first creates a VminfodEventStream and ensures
++ * that the stream stays open for the entire test.  If vminfod were to crash,
++ * the stream will break.  With this stream created, it then:
++ *
++ * 1. Creates an empty dataset with a random UUID to zones/<uuid>.
++ * 2. Creates a new VM.
++ * 3. Does a rollback on the empty dataset created in step 1.
++ * 4. Updates the new VM.
++ *
++ * As long as the stream stays up, then we know vminfod handled all of the
++ * events without error.
++ *
++ * The VM created in step 2 and updated in step 4 is to ensure that vminfod has
++ * handled the ZFS events from steps 1 and 3.  Because all events get serialized
++ * by vminfod, we can use this as a way to ensure certain events are processed
++ * in an order we expect.  We won't get any feedback from vminfod that it has
++ * seen the ZFS create event from step 1, but by following up with step 2 and
++ * ensuring its success we can know that the ZFS event from step 1 was
++ * processed - because of the order of events.  The same is true for steps 3 and
++ * 4: by updating something ZFS related of the VM (like quota), we can ensure
++ * that vminfod has seen the ZFS event generated by step 3.  As long as all VM
++ * operations are successful, and the vminfod streams stays up, we know that
++ * vminfod has handled these scenarios correctly without crashing.
++ *
++ * In the ideal scenario, vminfod will not crash and this test will run to
++ * completion.  However, when tested on a platform without the fix implemented,
++ * it can be the case that this test itself will crash and not finish
++ * gracefully.  This test creates an event stream and equips a handler for any
++ * "error" event emitted.  Immediately after the call to `zfs rollback` is
++ * successful, the test then tries to do a `VM.update`; `VM.update` will also
++ * open a vminfod event stream.  If `VM.update` opens its event stream before
++ * vminfod crashes, then it becomes a 50/50 shot (or so it seems) as to which
++ * will fail first: the stream opened by the test suite (with the error handler
++ * attached) or the stream opened by `VM.update` (without the error handler
++ * attached).  Because of this, if vminfod crashes, it's possible that this test
++ * will finish gracefully (with failures), or completely crash this test file.
++ * Errors being purposefully left unhandled by VM.js was intentional, as vminfod
++ * disappearing mid-task (typically invoked via `vmadm`) is a fatal condition
++ * and should result in a process crash.  Either way, regardless of which stream
++ * dies first, this test will result in a failure indicating there was an issue.
++ *
++ * The VM created for testing will be removed when the test is done.
++ *
++ */
++test('test vminfod zfs rollback', function (t) {
++    // ZFS dataset that *looks* like it would belong to a zone
++    var dataset = f('zones/%s', libuuid.create());
++    var snapshot = f('%s@snap', dataset);
++    var vmobj;
++    var vs;
++
++    vasync.pipeline({funcs: [
++        // Create a vminfod stream
++        function (_, cb) {
++            vs = new vminfod.VminfodEventStream({
++                name: 'test-vminfod.js'
++            });
++            vs.on('ready', function () {
++                cb();
++            });
++            vs.once('error', function (err) {
++                // This should not occur
++                common.ifError(t, err, 'VminfodEventStream error');
++                t.end();
++            });
++        },
++
++        /*
++         * Ensure that the generated ZFS dataset doesn't already exist.
++         *
++         * This is admittedly a paranoid thing to do, but in the off chance that
++         * we somehow generate a UUID that already exists as a dataset we should
++         * bail right here.  If this happens, the most probable reason is that
++         * the UUID generation library is flawed.
++         */
++        function (_, cb) {
++            var args = [
++                'get',
++                '-Ho',
++                'value',
++                'name',
++                dataset
++            ];
++            common.zfs(args, function (err, out) {
++                if (!err) {
++                    err = new Error(f('dataset %s already exists', dataset));
++                    common.ifError(t, err, 'dataset exists');
++                    cb(err);
++                }
++
++                assert.string(err.message, 'err.message');
++                var msg = err.message.trim();
++
++                if (!msg.match(/dataset does not exist$/)) {
++                    common.ifError(t, err, 'zfs error');
++                    cb(err);
++                }
++
++                cb();
++            });
++        },
++
++        // (Step 1): Create the new dataset
++        function (_, cb) {
++            var args = [
++                'create',
++                dataset
++            ];
++            common.zfs(args, function (err, out) {
++                common.ifError(t, err, f('zfs %s', args.join(' ')));
++                cb(err);
++            });
++        },
++
++        // Create a snapshot for the rollback on the new dataset
++        function (_, cb) {
++            var args = [
++                'snapshot',
++                snapshot
++            ];
++            common.zfs(args, function (err, out) {
++                common.ifError(t, err, f('zfs %s', args.join(' ')));
++                cb(err);
++            });
++        },
++
++        // (Step 2): Create a new VM
++        function (_, cb) {
++            VM.create(PAYLOAD, function (err, _vmobj) {
++                common.ifError(t, err, 'VM.create');
++
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                vmobj = _vmobj;
++                cb();
++            });
++        },
++
++        // Ensure the quota is properly set
++        function (_, cb) {
++            VM.load(vmobj.uuid, function (err, _vmobj) {
++                common.ifError(t, err, 'VM.load');
++
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                vmobj = _vmobj;
++
++                t.equal(vmobj.quota, 5, 'quota is 5');
++
++                cb();
++            });
++        },
++
++        // (Step 3): Rollback the dataset to the snapshot
++        function (_, cb) {
++            var args = [
++                'rollback',
++                snapshot
++            ];
++            common.zfs(args, function (err, out) {
++                common.ifError(t, err, f('zfs %s', args.join(' ')));
++                cb(err);
++            });
++        },
++
++        // (Step 4): Update the quota of the VM
++        function (_, cb) {
++            var payload = {
++                quota: 6
++            };
++            VM.update(vmobj.uuid, payload, function (err) {
++                common.ifError(t, err, 'VM.update');
++                cb(err);
++            });
++        },
++
++        // Ensure the quota is properly set
++        function (_, cb) {
++            VM.load(vmobj.uuid, function (err, _vmobj) {
++                common.ifError(t, err, 'VM.load');
++
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                vmobj = _vmobj;
++
++                t.equal(vmobj.quota, 6, 'quota is 6');
++
++                cb();
++            });
++        }
++    ]}, function (e) {
++        common.ifError(t, e, 'test-zfs-rollback');
++
++        /*
++         * Cleanup
++         *
++         * Errors are handled by the test suite but ignored inside this call to
++         * vasync.pipeline to ensure all tasks are run.
++         */
++        vasync.pipeline({funcs: [
++            // Stop the vminfod stream
++            function (_, cb) {
++                if (vs) {
++                    vs.stop();
++                    vs = null;
++                }
++                cb();
++            },
++
++            // Destroy the ZFS dataset
++            function (_, cb) {
++                var args = [
++                    'destroy',
++                    '-r',
++                    dataset
++                ];
++                common.zfs(args, function (err) {
++                    common.ifError(t, err, f('zfs %s', args.join(' ')));
++                    cb();
++                });
++            },
++
++            // Remove the VM
++            function (_, cb) {
++                if (!vmobj) {
++                    cb();
++                    return;
++                }
++
++                VM.delete(vmobj.uuid, function (err) {
++                    common.ifError(t, err, 'VM.delete');
++                    cb();
++                });
++            }
++        ]}, function () {
++            t.end();
++        });
++    });
++});

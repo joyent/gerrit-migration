@@ -1,0 +1,267 @@
+commit 0a4258970b75f5a6c403ab0e40e0b481ed6aa01b (refs/changes/10/1810/1)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2017-04-19T15:29:19-07:00 (2 years, 6 months ago)
+    
+    MORAY-104 moray: disallow filtering on non-indexed fields except interactively
+
+diff --git a/docs/index.md b/docs/index.md
+index d846480..2be9acf 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -572,7 +572,19 @@ expect to receive back up to N records from this call.
+ | ------- | ------ | ------------------------------------------------------ |
+ | bucket  | string | bucket to search in                                    |
+ | filter  | string | search filter string                                   |
+-| options | object | any optional parameters (req\_id, limit, offset, sort) |
++| options | object | any optional parameters (req\_id, limit, offset, sort, requireIndexes) |
++
++#### requireIndexes option
++
++When passing `requireIndexes: true`, `findObjects` requests will respond with a
++`NotIndexedError` error if at least one of the fields included in the search
++filter has an index that can't be used.
++
++When not passing any value for `requireIndexes`, the behavior depends on what
++`requireIndexes` value was passed to the moray client's constructor.
++
++Regardless of the moray client's configuration, passing `requireIndexes: false`
++to `findObjects` will disable this behavior.
+ 
+ ### Errors
+ 
+diff --git a/lib/objects/common.js b/lib/objects/common.js
+index fac5728..8f568b7 100644
+--- a/lib/objects/common.js
++++ b/lib/objects/common.js
+@@ -968,7 +968,107 @@ function indexObject(schema, object) {
+     return (ndx);
+ }
+ 
++/*
++ * Calls the function "func" on every non-composite sub-filter contained in the
++ * filter "filter". The function "func" is passed the following parameters when
++ * called, in this order:
++ *
++ *  1. a string representing the name of the field used in the non-composite
++ *     filter being visited.
++ *  2. a string representing the value of the field used in the non-composite
++ *     filter being visited.
++ *  3. an object that references the same object as the parameter "filter".
++ */
++function visitFilter(filter, func) {
++    assert.object(filter, 'filter');
++    assert.func(func, 'func');
++
++    switch (filter.type) {
++    case 'and':
++    case 'or':
++        filter.filters.forEach(function (subFilter) {
++            visitFilter(subFilter, func);
++        });
++        break;
+ 
++    case 'not':
++        visitFilter(filter.filter, func);
++        break;
++
++    case 'substring':
++    case 'present':
++    case 'ext':
++    case 'ge':
++    case 'le':
++    case 'equal':
++    default:
++        if (filter.value !== undefined && filter.value !== null) {
++            func(filter.attribute, filter.value, filter);
++        }
++        break;
++    }
++}
++
++/*
++ * Returns true if the filter "filter" uses a field whose index is not usable in
++ * bucket "bucket", otherwise returns false.
++ */
++function filterUsesOnlyUsableIndexes(filter, bucket, log) {
++    assert.object(filter, 'filter');
++    assert.object(bucket, 'bucket');
++
++    var bucketIndex = [];
++    var bucketReindexActive = [];
++    var bucketVersion;
++
++    log.debug({bucket: bucket}, 'bucket object');
++
++    if (bucket.index !== undefined) {
++        bucketIndex = Object.keys(bucket.index);
++    }
++
++    if (bucket.reindex_active !== undefined) {
++        for (bucketVersion in bucket.reindex_active) {
++            bucketReindexActive =
++                bucketReindexActive.concat(
++                    bucket.reindex_active[bucketVersion]);
++        }
++    }
++
++    var fieldsUsedInFilter = {};
++    var unusableIndexFound = false;
++
++    visitFilter(filter, function addUsedFields(attr) {
++        fieldsUsedInFilter[attr] = true;
++    });
++
++    log.debug({
++        fieldsUsedInFilter: fieldsUsedInFilter,
++        bucketIndex: bucketIndex,
++        bucketReindexActive: bucketReindexActive
++    }, 'fields used in filter');
++
++    unusableIndexFound =
++        Object.keys(fieldsUsedInFilter).some(function indexUnusable(fieldName) {
++            /*
++             * If the filter field is part of the set of indexes that are usable
++             * by any moray bucket from the time it's created (e.g _mtime, _key,
++             * etc.), early out and consider that field has a usable index.
++             */
++            if (INTERNAL_FIELDS.indexOf(fieldName) !== -1) {
++                return false;
++            }
++
++            if (bucketIndex.indexOf(fieldName) === -1 ||
++                bucketReindexActive.indexOf(fieldName) !== -1) {
++                return true;
++            } else {
++                return false;
++            }
++        });
++
++    return !unusableIndexFound;
++}
+ 
+ 
+ ///--- Exports
+@@ -986,5 +1086,6 @@ module.exports = {
+     rowToObject: rowToObject,
+     runPostChain: runPostChain,
+     selectForUpdate: selectForUpdate,
+-    indexObject: indexObject
++    indexObject: indexObject,
++    filterUsesOnlyUsableIndexes: filterUsesOnlyUsableIndexes
+ };
+diff --git a/lib/objects/find.js b/lib/objects/find.js
+index 1c34c38..15fe515 100644
+--- a/lib/objects/find.js
++++ b/lib/objects/find.js
+@@ -13,12 +13,55 @@ var util = require('util');
+ var control = require('../control');
+ var common = require('./common');
+ var dtrace = require('../dtrace');
+-require('../errors');
+-
++var errors = require('../errors');
+ 
++var HANDLED_FINDOBJECTS_OPTIONS = [
++    'req_id',
++    'limit',
++    'offset',
++    'sort',
++    'requireIndexes'
++];
+ 
+ ///--- Handlers
+ 
++/*
++ * Makes sure that all fields used in the findObjects request "req" have indexes
++ * that are usable and calls the function "cb". If at least one field has an
++ * underlying index that is not usable, "cb" is called with a NotIndexedError
++ * object as its first parameter.
++ */
++function checkRequiredIndexes(req, cb) {
++    var log = req.log;
++
++    if (req.opts && req.opts.requireIndexes === true) {
++        if (!common.filterUsesOnlyUsableIndexes(req.filter, req.bucket, log)) {
++            log.error('filter uses unusable indexes');
++            cb(new errors.NotIndexedError(req.bucket.name, req.rawFilter));
++            return;
++        } else {
++            log.debug('filter does not use unusable indexes');
++        }
++    }
++
++    cb();
++}
++
++/*
++ * Sends a record that contains the list of findObjects request options that the
++ * server handles. This allows moray clients to compare this set of handled
++ * options with what they expect the server to handle.
++ */
++function sendHandledOptions(req, cb) {
++    var res = req.res;
++
++    if (req.opts && req.opts.requireIndexes === true) {
++        res.write({_handledOptions: HANDLED_FINDOBJECTS_OPTIONS});
++    }
++
++    cb();
++}
++
+ function beginRepeatableRead(req, cb) {
+     req.pg.begin('REPEATABLE READ', cb);
+ }
+@@ -107,6 +150,9 @@ function getRecords(req, cb) {
+     });
+ 
+     query.on('row', function (row) {
++        var additionalFilterRequired = req.opts === undefined ||
++            req.opts.requireIndexes !== true;
++
+         log.debug({
+             row: row
+         }, 'getRecords: row found');
+@@ -137,6 +183,12 @@ function getRecords(req, cb) {
+         }
+ 
+         var v = obj.value;
++        /*
++         * Adding these properties on "v" is required so that search filters
++         * such as (_mtime>=x) and more generally any filter using records'
++         * metadata that is not part of the objects' value can match the filter
++         * "filter".
++         */
+         v._id = obj._id;
+         v._txn_snap = obj._txn_snap;
+         v._etag = obj._etag;
+@@ -144,7 +196,7 @@ function getRecords(req, cb) {
+         v._mtime = obj._mtime;
+         v._count = obj._count = req._count;
+ 
+-        if (filter.matches(v)) {
++        if (!additionalFilterRequired || filter.matches(v)) {
+             delete v._id;
+             delete v._txn_snap;
+             delete v._etag;
+@@ -210,6 +262,8 @@ function find(options) {
+                 }),
+                 beginRepeatableRead,
+                 common.loadBucket,
++                checkRequiredIndexes,
++                sendHandledOptions,
+                 common.decorateFilter,
+                 common.buildWhereClause,
+                 getCount,
+diff --git a/package.json b/package.json
+index 80a3b15..1318d6a 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+     "name": "moray-server",
+     "description": "SmartDataCenter H/A Key/Value store",
+-    "version": "2.1.0",
++    "version": "2.2.0",
+     "author": "Joyent (joyent.com)",
+     "private": true,
+     "main": "lib/index.js",

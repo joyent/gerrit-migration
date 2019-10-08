@@ -1,0 +1,209 @@
+commit 34fa4e0a402ac5b855e8cecbea00523170ef5e0d (refs/changes/72/4872/8)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2018-10-16T08:32:05-07:00 (12 months ago)
+    
+    TRITON-243 Change to using refquota instead of quota for zoneroots of bhyve VMs
+
+diff --git a/src/vm/man/vmadm.1m.md b/src/vm/man/vmadm.1m.md
+index 0417697d..78a3be8a 100644
+--- a/src/vm/man/vmadm.1m.md
++++ b/src/vm/man/vmadm.1m.md
+@@ -1751,11 +1751,9 @@ tab-complete UUIDs rather than having to type them out for every command.
+     quota:
+ 
+         This sets a quota on the zone filesystem. For OS VMs, this value is the
+-        space actually visible/usable in the guest. For kvm VMs, this value is
+-        the quota for the Zone containing the VM, which is not directly
+-        available to users. For bhyve VMs, disks are part of the zones/<uuid>
+-        dataset, as well as the zone itself, so the quota needs to be sized
+-        appropriately.
++        space actually visible/usable in the guest. For kvm and bhyve VMs, this
++        value is the quota (kvm) or refquota (bhyve) for the Zone containing
++        the VM, which is not directly available to users.
+ 
+         Set quota to 0 to disable (ie. for no quota).
+ 
+diff --git a/src/vm/node_modules/VM.js b/src/vm/node_modules/VM.js
+index ac72b7b2..9c9c9199 100644
+--- a/src/vm/node_modules/VM.js
++++ b/src/vm/node_modules/VM.js
+@@ -140,6 +140,7 @@ var DEFAULT_MAX_MSG_IDS = 4096;
+ var DEFAULT_MAX_SEM_IDS = 4096;
+ var DEFAULT_MAX_SHM_IDS = 4096;
+ var DEFAULT_MDATA_TIMEOUT = 300;
++var DEFAULT_BHYVE_QUOTA = (1024 * 1024 * 1024);
+ var DISABLED = 0;
+ var MAX_HOSTVOL_FILE_BYTES = (10 * 1024 * 1024);
+ var MAX_SNAPNAME_LENGTH = 64;
+@@ -1399,10 +1400,8 @@ function setQuota(opts, callback)
+     }
+ 
+     if (brand === 'bhyve') {
+-        // For bhyve we want to use refquota so that the quota only applies to
+-        // the zonepath dataset, and not the zvol 'disks' that are underneath as
+-        // zones/<uuid>/diskX
+-        quotaKey = 'refquota';
++        setQuotaBhyve(opts, callback);
++        return;
+     }
+ 
+     zfs(['set', quotaKey + '=' + newval, dataset], log, function (err, fds) {
+@@ -1416,6 +1415,158 @@ function setQuota(opts, callback)
+     });
+ }
+ 
++/*
++ * See: https://github.com/joyent/rfd/blob/master/rfd/0148/snapspace.md
++ *
++ * | Dataset              | refquota | quota | refreservation | reservation |
++ * | -------------------- | -------- | ----- | -------------- | ----------- |
++ * | zones/<uuid>         | [1]      | [2]   | [1]            | [2]         |
++ * | zones/<uuid>/disk<N> | none     | none  | [3]            | none        |
++ *
++ * 1. This matches the `quota` value described in `vmadm(1M)`. A default value
++ *    of 1 GiB is used when not specified in the `vmadm` payload.  Note that 1
++ *    GiB is overkill, as this space contains small amounts of configuration
++ *    data and logs.
++ *
++ * 2. This is the sum of [1] and all [3]s for this instance.  The vmadm payload
++ *    value of *quota* may override this value, but only if it is larger than
++ *    the calculated value.
++ *
++ * 3. The value calculated by the system when *refreservation* is set to
++ *    *auto*.
++ *
++ * Steps:
++ *   - Set refquota, refreservation to `DEFAULT_BHYVE_QUOTA`
++ *   - Set refreservation on instance volumes to 'auto'
++ *   - Read value which was calculated for refreservation (auto_refres)
++ *   - Set quota zone root dataset to (DEFAULT_BHYVE_QUOTA + auto_refres)
++ */
++
++function setQuotaBhyve(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.dataset, 'opts.dataset');
++    assert.object(opts.log, 'opts.log');
++    assert.func(callback, 'callback');
++    assert(opts.hasOwnProperty('quota'), 'opts.quota');
++
++    var log = opts.log;
++    var dataset = opts.dataset;
++    var volumes;
++    var sum;
++
++    vasync.waterfall([
++        function setRefQuotaRefRes(next) {
++            var zfsArgs = [
++                'set',
++                'refquota=' + DEFAULT_BHYVE_QUOTA,
++                'refreservation=' + DEFAULT_BHYVE_QUOTA,
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onSetQuotaRefRes(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve: "zfs set quota, refquota" '
++                        + 'cmd failed: ' + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                next();
++            });
++        },
++
++        function getVolumes(next) {
++            // Look up the refreservation value of all zone volumes
++            var zfsArgs = [
++                'list', '-Hrt', 'volume',
++                '-o', 'name',
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onGetVolumes(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve: "zfs get" cmd failed: '
++                        + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                volumes = fds.stdout.trim().split('\n');
++                next();
++            });
++        },
++
++        function setVolumesRefResAuto(next) {
++            // Set the 'refreservation' values on all the volumes to 'auto'
++            vasync.forEachPipeline({
++                inputs: volumes,
++                func: function (volume, cb) {
++                    var zfsArgs = ['set', 'refreservation=auto', volume];
++                    zfs(zfsArgs, log, function _onSetRefResAuto(err, fds) {
++                        if (err) {
++                            log.error(
++                                'setQuotaBhyve: "zfs set refres auto" '
++                                + 'cmd failed: ' + fds.stderr);
++                            cb(new Error(rtrim(fds.stderr)));
++                            return;
++                        }
++                        cb();
++                    });
++                }
++            }, next);
++        },
++
++        function getVolumeCalculatedRefRes(_, next) {
++            // Get the values which were calculated by the system when we set
++            // the refreservation to 'auto'
++            var zfsArgs = [
++                'list', '-Hpr', '-t', 'volume',
++                '-o', 'refreservation',
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onGetVolumesRefRes(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve() "zfs get" cmd failed: '
++                        + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++
++                sum = parseInt(fds.stdout.trim().split('\n').reduce(
++                    function (acc, cur) {
++                        return parseInt(acc, 10) + parseInt(cur, 10);
++                    }), 10);
++
++                next();
++            });
++        },
++
++        function setDatasetQuota(next) {
++            // Compare the quota value passed in to the one which we've
++            // computed based on volume refreservation values.
++
++            var quota =
++                (opts.quota * 1024 * 1024 * 1024) > (sum + DEFAULT_BHYVE_QUOTA)
++                ?  opts.quota + 'g' : (sum + DEFAULT_BHYVE_QUOTA);
++
++            var zfsArgs = [
++                'set',
++                'quota=' + quota,
++                'reservation=' + quota,
++                dataset
++            ];
++
++            zfs(zfsArgs, log, function _onSetDatasetQuota(err, fds) {
++                if (err) {
++                    log.error('setQuotaBhyve (setDatasetQuota): '
++                        + '"zfs set quota, reservation" '
++                        + 'cmd failed: ' + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                next();
++            });
++        }
++    ], callback);
++}
++
++
+ exports.flatten = function (vmobj, key)
+ {
+     var index;

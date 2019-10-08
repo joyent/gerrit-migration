@@ -1,0 +1,1263 @@
+commit 39dd31d6357ea572fcecbf203a3538a7065f31d0 (refs/changes/89/3189/1)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2018-01-10T21:27:55+00:00 (1 year, 9 months ago)
+    
+    MANTA-3223 Registrar should stop relying on node-zkplus
+
+diff --git a/Makefile b/Makefile
+index dc726e2..7016c5c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2017, Joyent, Inc.
++# Copyright (c) 2018, Joyent, Inc.
+ #
+ 
+ #
+@@ -36,7 +36,7 @@ SMF_MANIFESTS_IN = smf/manifests/registrar.xml.in
+ # Variables
+ #
+ NODE_PREBUILT_TAG	= zone
+-NODE_PREBUILT_VERSION	:= v0.10.26
++NODE_PREBUILT_VERSION	:= v0.12.9
+ NODE_PREBUILT_IMAGE     = fd2cc906-8938-11e3-beab-4359c665ac99
+ 
+ # RELENG-341: no npm cache is making builds unreliable
+diff --git a/README.md b/README.md
+index 050e749..f8065af 100644
+--- a/README.md
++++ b/README.md
+@@ -188,9 +188,9 @@ not recommended.
+ **zookeeper:** Service discovery records are maintained in a
+ ZooKeeper cluster.  The `"zookeeper"` top-level property describes how to reach
+ that cluster.  This should be a configuration block appropriate for
+-[node-zkplus](http://github.com/mcavage/node-zkplus).  See that project for
+-details, but there's an example below that includes `"timeout"` and `"servers"`
+-properties.
++[node-zkstream](http://github.com/joyent/node-zkstream).  See that project for
++details, but there's an example below that includes `"sessionTimeout"` and
++`"servers"` properties.
+ 
+ **registration:** The `"registration"` object describes the service discovery
+ records that will be inserted into ZooKeeper.  These control the DNS names that
+@@ -320,10 +320,10 @@ record.  This is not common.
+         },
+         "adminIp": "172.27.10.72",
+         "zookeeper": {
+-            "timeout": 60000,
+-            "servers": [ { "host": "172.27.10.35", "port": 2181 },
+-                         { "host": "172.27.10.32", "port": 2181 },
+-                         { "host": "172.27.10.33", "port": 2181 } ]
++            "sessionTimeout": 60000,
++            "servers": [ { "address": "172.27.10.35", "port": 2181 },
++                         { "address": "172.27.10.32", "port": 2181 },
++                         { "address": "172.27.10.33", "port": 2181 } ]
+         }
+     }
+ 
+@@ -392,10 +392,10 @@ Let's augment the configuration above to specify a service record:
+         },
+         "adminIp": "172.27.10.72",
+         "zookeeper": {
+-            "timeout": 60000,
+-            "servers": [ { "host": "172.27.10.35", "port": 2181 },
+-                         { "host": "172.27.10.32", "port": 2181 },
+-                         { "host": "172.27.10.33", "port": 2181 } ]
++            "sessionTimeout": 60000,
++            "servers": [ { "address": "172.27.10.35", "port": 2181 },
++                         { "address": "172.27.10.32", "port": 2181 },
++                         { "address": "172.27.10.33", "port": 2181 } ]
+         }
+     }
+ 
+diff --git a/etc/config.coal.json b/etc/config.coal.json
+index 4be4862..e7e3cb8 100644
+--- a/etc/config.coal.json
++++ b/etc/config.coal.json
+@@ -9,10 +9,10 @@
+     "zookeeper": {
+         "connectTimeout": 1000,
+         "servers": [ {
+-            "host": "10.99.99.11",
++            "address": "10.99.99.11",
+             "port": 2181
+         } ],
+-        "timeout": 6000
++        "sessionTimeout": 30000
+     },
+     "maxAttempts": 10
+ }
+diff --git a/lib/index.js b/lib/index.js
+index d83ada1..c3db54a 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -5,16 +5,16 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var EventEmitter = require('events').EventEmitter;
+ 
+ var assert = require('assert-plus');
++var zkstream = require('zkstream');
+ 
+ var health = require('./health');
+ var register = require('./register');
+-var zk = require('./zk');
+ 
+ 
+ 
+@@ -30,157 +30,180 @@ function _export(obj) {
+ 
+ ///--- API
+ 
+-function register_plus(opts) {
++function createZKClient(opts, cb) {
++    assert.object(opts, 'options');
++    assert.object(opts.log, 'options.log');
++    assert.arrayOfObject(opts.servers, 'options.servers');
++    assert.func(cb, 'callback');
++
++    assert.ok((opts.servers.length > 0), 'options.servers empty');
++
++    opts.servers.forEach(function (s) {
++        assert.string(s.address, 'servers.address');
++        assert.number(s.port, 'servers.port');
++    });
++
++    cb(new zkstream.Client(opts));
++}
++
++
++function Registrar(opts) {
+     assert.object(opts, 'options');
+     assert.object(opts.log, 'options.log');
+     assert.object(opts.zk, 'options.zk');
+ 
++    this.options = opts;
++    this.zk = opts.zk;
++    this.ephemerals = {};
++
++    /*
++     * Each ephemeral node that the registrar process attempts to create is
++     * given a watcher that subscribes to deletion notifications. As an
++     * implementation guideline, registrar does not delete ephemeral nodes when
++     * it does not have to. These watchers attempt to recreate nodes that it
++     * finds have dropped out of zookeeper for whatever reason.
++     */
++    this.watchers = {};
++    this.check = null;
++    this.sessionGeneration = 0;
++}
++
++Registrar.prototype.registerOnNewSession = function (callback) {
++    var self = this;
++    var opts = self.options;
++    var log = self.log;
++
++    function registerCallback(err, znodes) {
++        if (!err) {
++            self.sessionGeneration++;
++        }
++        callback(err);
++    }
++
++    /*
++     * Final argument indicate that we are registering nodes as part of a new
++     * session, and not as part of recovery from health check failure.
++     */
++    register.register(opts, this, registerCallback, true);
++}
++
++Registrar.prototype.getSessionGeneration = function () {
++    return (this.sessionGeneration);
++};
++
++Registrar.prototype.hasHealthCheck = function () {
++    return (this.check !== null);
++}
++
++Registrar.prototype.createHealthCheck = function () {
++    var opts = this.options;
+     var check;
+     var ee = new EventEmitter();
+     var log = opts.log.child({component: 'registrar'}, true);
+     var stop = false;
+-    var zk_timer;
+     var zk = opts.zk;
+     var znodes;
+ 
+-    register.register(opts, function (err, _znodes) {
+-        if (err) {
+-            log.debug(err, 'registration(%j): failed', cfg.registration);
++    var self = this;
++
++    function healthcheck() {
++        check = health.createHealthCheck(opts.healthCheck);
++        self.check = check;
++        var down = false;
++
++        check.on('data', function (obj) {
++            switch (obj.type) {
++            case 'ok':
++                if (down) {
++                    ee.emit('ok');
++
++                    register.register(opts, self, function (r_err, __znodes) {
++                        if (r_err) {
++                            log.debug(r_err, 'register: reregister failed');
++                            ee.emit('error', r_err);
++                        } else {
++                            znodes = __znodes;
++                            ee.emit('register', __znodes);
++                            setImmediate(function () {
++                                down = false;
++                            });
++                        }
++                    });
++                }
++                break;
++
++            case 'fail':
++                if (obj.err && obj.isDown && !down) {
++                    down = true;
++                    var e = obj.err;
++                    delete obj.err;
++                    log.debug(e, {
++                        check: obj,
++                        znodes: znodes
++                    }, 'healthcheck failed, unregistering')
++
++                    ee.emit('fail', e);
++
++                    var u_opts = {
++                        log: log,
++                        zk: zk,
++                    };
++                    register.unregister(u_opts, self, function (u_err) {
++                        if (u_err) {
++                            log.debug(u_err, 'healthcheck: unregister failed');
++                            ee.emit('error', u_err);
++                        } else {
++                            ee.emit('unregister', e, znodes);
++                        }
++                    });
++                }
++                break;
++
++            default:
++                log.debug({
++                    check: obj
++                }, 'healtcheck: unknown type encountered');
++                ee.emit('error',
++                        new Error('unknown check type: ' + obj.type));
++                break;
++            }
++        });
++
++        check.on('error', function (err) {
++            log.debug(err, 'healtcheck: unexpected error');
+             ee.emit('error', err);
+-            return;
+-        }
++        });
+ 
+-        znodes = _znodes;
+-
+-        function healthcheck() {
+-            check = health.createHealthCheck(opts.healthCheck);
+-            var down = false;
+-
+-            check.on('data', function (obj) {
+-                switch (obj.type) {
+-                case 'ok':
+-                    if (down) {
+-                        ee.emit('ok');
+-
+-                        register.register(opts, function (r_err, __znodes) {
+-                            if (r_err) {
+-                                log.debug(r_err, 'register: reregister failed');
+-                                ee.emit('error', r_err);
+-                            } else {
+-                                znodes = __znodes;
+-                                ee.emit('register', __znodes);
+-                                setImmediate(function () {
+-                                    down = false;
+-                                });
+-                            }
+-                        });
+-                    }
+-                    break;
+-
+-                case 'fail':
+-                    if (obj.err && obj.isDown && !down) {
+-                        down = true;
+-                        var e = obj.err;
+-                        delete obj.err;
+-                        log.debug(e, {
+-                            check: obj,
+-                            znodes: znodes
+-                        }, 'healthcheck failed, deregistering')
+-
+-                        ee.emit('fail', e);
+-
+-                        var u_opts = {
+-                            log: log,
+-                            zk: zk,
+-                            znodes: znodes
+-                        };
+-                        register.unregister(u_opts, function (u_err) {
+-                            if (u_err) {
+-                                log.debug(u_err, 'healthcheck: unregister failed');
+-                                ee.emit('error', u_err);
+-                            } else {
+-                                ee.emit('unregister', e, znodes);
+-                            }
+-                        });
+-                    }
+-                    break;
+-
+-                default:
+-                    log.debug({
+-                        check: obj
+-                    }, 'healtcheck: unknown type encountered');
+-                    ee.emit('error',
+-                            new Error('unknown check type: ' + obj.type));
+-                    break;
+-                }
+-            });
++        check.on('end', function () {
++            log.debug('healthcheck: done');
++        });
+ 
+-            check.on('error', function (err) {
+-                log.debug(err, 'healtcheck: unexpected error');
+-                ee.emit('error', err);
+-            });
++        if (!stop)
++            check.start();
++    }
+ 
+-            check.on('end', function () {
+-                log.debug('healthcheck: done');
+-            });
++    if (opts.healthCheck)
++        healthcheck();
+ 
+-            if (!stop)
+-                check.start();
+-        }
++    ee.stop = function () {
++        stop = true;
+ 
+-        (function zkHeartbeat() {
+-            var heartbeatInterval = opts.heartbeatInterval || 3000;
+-            var hCfg = opts.heartbeat || {};
+-
+-            (function checkZK() {
+-                log.debug('zk.heartbeat(%j): starting', znodes);
+-                zk.heartbeat({nodes: znodes}, function (check_err) {
+-                    var _data;
+-                    var _event;
+-                    var _to;
+-
+-                    if (check_err) {
+-                        log.debug(check_err, 'zk.heartbeat(%j) failed', znodes);
+-                        _data = check_err;
+-                        _event = 'heartbeatFailure';
+-                        _to = Math.max(heartbeatInterval, 60000);
+-                    } else {
+-                        log.debug('zk.heartbeat(%j): ok', znodes);
+-                        _data = znodes;
+-                        _event = 'heartbeat';
+-                        _to = heartbeatInterval;
+-                    }
+-
+-                    if (!stop)
+-                        zk_timer = setTimeout(checkZK, _to);
+-                    ee.emit(_event, _data);
+-                });
+-            })();
+-        })();
+-
+-        if (opts.healthCheck)
+-            healthcheck();
+-
+-        ee.stop = function () {
+-            stop = true;
+-
+-            if (check)
+-                check.stop();
+-
+-            clearTimeout(zk_timer);
+-        };
+-
+-        ee.emit('register', znodes);
+-    });
++        if (check)
++            check.stop();
++        self.check = null;
++    };
+ 
+     return (ee);
+ }
+ 
+-
+ ///--- Exports
+ 
+-module.exports = register_plus;
++module.exports = {
++    createRegistrar: function (opts) {
++        return (new Registrar(opts));
++    },
++    createZKClient: createZKClient
++};
+ 
+ _export(health);
+ _export(register);
+-_export(zk);
+diff --git a/lib/register.js b/lib/register.js
+index b956d78..a651126 100644
+--- a/lib/register.js
++++ b/lib/register.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var os = require('os');
+@@ -13,8 +13,11 @@ var path = require('path');
+ 
+ var assert = require('assert-plus');
+ var once = require('once');
++var util = require('util');
+ var vasync = require('vasync');
++var verror = require('verror');
+ 
++var VError = verror.VError;
+ 
+ 
+ ///--- Helpers
+@@ -51,26 +54,77 @@ function registerService(opts, cb) {
+     cb = once(cb);
+ 
+     var log = opts.log;
++    var registrar = opts.registrar;
+     var zk = opts.zk;
+ 
+     log.debug('registerService(%s): entered', opts.path);
+ 
+-    var obj = {
++    var data = new Buffer(JSON.stringify({
+         type: 'service',
+         service: opts.registration.service
+-    };
+-    opts.zk.put(opts.path, obj, function (err) {
++    }), 'utf8');
++
++    vasync.waterfall([
++        function (callback) {
++            zk.get(opts.path, function (err, recvData) {
++                if (err) {
++                    /*
++                     * We do not expect the service node to disappear in the
++                     * event that we have to re-establish a session. This
++                     * indicates unexpected interference.
++                     */
++                    if (err.code === 'NO_NODE') {
++                        if (registrar.getSessionGeneration() > 0) {
++                            log.warn(err, 'missing service node ' + opts.path +
++                                ' on subsequent session');
++                            callback(null, false);
++                            return;
++                        }
++                    }
++                    log.warn(err, 'unable to retrieve data for ' +
++                        'service node ' + opts.path);
++                    callback(null, false);
++                    return;
++
++                }
++                callback(null, true, recvData);
++            });
++        },
++        function (found, recvData, callback) {
++            if (recvData instanceof Function) {
++                callback = recvData;
++                recvData = null;
++
++            }
++
++            /*
++             * Create the service node if it was not found. Set its data
++             * appropriately if it was found, but the data buffer did not match
++             * what was expected. Otherwise, just continue.
++             */
++            if (!found) {
++                zk.createWithEmptyParents(opts.path, data, {}, function (err) {
++                    if (err.code == 'NODE_EXISTS') {
++                        callback();
++                        return;
++                    }
++                    callback(err);
++                });
++
++            } else if (recvData !== null && data.compare(recvData) !== 0) {
++                zk.set(opts.path, data, -1, callback);
++
++            } else {
++                callback();
++            }
++        }
++    ], function(err) {
+         if (err) {
+-            log.error(err, 'registerService: put failed');
+-            cb(err);
++            log.error(err, 'registerService: failed');
+         } else {
+             log.debug('registerService: done');
+-
+-            if (opts.nodes.indexOf(opts.path) === -1)
+-                opts.nodes.push(opts.path);
+-
+-            cb();
+         }
++        cb(err);
+     });
+ }
+ 
+@@ -83,9 +137,13 @@ function cleanupPreviousEntries(opts, cb) {
+ 
+     log.debug('cleanupPreviousEntries(%j): entered', opts.nodes);
+     vasync.forEachParallel({
+-        func: function _unlink(n, _cb) {
+-            zk.unlink(n, function (err) {
+-                if (err && err.name !== 'NO_NODE') {
++        func: function _delete(n, _cb) {
++            if (opts.registrar.ephemerals[n])
++                delete opts.registrar.ephemerals[n];
++
++            var ver = opts.version !== undefined ? opts.version : -1;
++            zk.delete(n, ver, function (err) {
++                if (err && err.code !== 'NO_NODE') {
+                     _cb(err);
+                 } else {
+                     _cb();
+@@ -105,35 +163,12 @@ function cleanupPreviousEntries(opts, cb) {
+ }
+ 
+ 
+-function setupDirectories(opts, cb) {
+-    cb = once(cb);
+-
+-    var log = opts.log;
+-    var zk = opts.zk;
+-
+-    log.debug('setupDirectories(%j): entered', opts.nodes);
+-    vasync.forEachParallel({
+-        func: zk.mkdirp.bind(zk),
+-        inputs: opts.nodes.map(function (p) {
+-            return (path.dirname(p));
+-        })
+-    }, function (err) {
+-        if (err) {
+-            log.debug(err, 'setupDirectories: failed');
+-            cb(err);
+-        } else {
+-            log.debug(err, 'setupDirectories: done');
+-            cb();
+-        }
+-    });
+-}
+-
+-
+ function registerEntries(opts, cb) {
+     cb = once(cb);
+ 
+     var log = opts.log;
+     var zk = opts.zk;
++    var registrar = opts.registrar;
+ 
+     log.debug('registerEntries(%j): entered', opts.nodes);
+     vasync.forEachParallel({
+@@ -154,9 +189,169 @@ function registerEntries(opts, cb) {
+                 ports: ports
+             };
+             var _opts = {
+-                flags: ['ephemeral_plus']
++                flags: ['EPHEMERAL']
+             };
+-            zk.create(n, _obj, _opts, once(_cb));
++            var data = new Buffer(JSON.stringify(_obj), 'utf8');
++
++            /*
++             * Time to wait before again stating the ephemeral node we've
++             * tried to created but had found already exists. On each successive
++             * call, this value increases by a power of two up to 16 seconds.
++             */
++            var INTERVAL_FLOOR = 1000;
++            var INTERVAL_CEIL = 16000;
++            var GROWTH_FACTOR = 2;
++
++            var statInterval = INTERVAL_FLOOR, timeWaited = 0;
++            var timer, shortCircuit;
++
++            /*
++             * The following functions are tied together in a small state
++             * machine that ensure that upon session creation, registrar does
++             * not allow the ephemeral node it intends to create to fall out of
++             * zookeeper:
++             *
++             *   createEphemeral ----(A)-----> clearTimerAndCallback
++             *    ^     |                        ^       ^
++             *    |    (B)                       |       |
++             *  +-+     |                       (G)      |
++             *  |       v                        |       |
++             *  |   tryDelayedCheckNodeExists----+       |
++             *  |       |          ^                     |
++             * (F)     (C)         |                     |
++             *  |       |         (D)                    |
++             *  |       v          |                     |
++             *  +-- checkNodeExists ----------(E)--------+
++             *
++             *  (A) - Occurs when either there is a fatal creation error that
++             *  is not a'CONNECTION_LOSS' or a 'NO_NODE' error. This is the
++             *  expected usual case.
++             *
++             *  (B) - Occurs when either there is a 'CONNECTION_LOSS' while
++             *  trying to create the ephemeral node or the node is found to
++             *  already exist (error code NODE_EXISTS). The former case
++             *  indicates that cueball has moved the session to a new
++             *  connection, the latter indicates that there is a 'ghost' node
++             *  from a previous session stored in zookeeper.
++             *
++             *  (C) - Occurs at every GROWTH_FACTOR^N seconds starting with
++             *  N = 0 up to a configured ceiling (INTERVAL_CEILING) and then
++             *  stays at the ceiling. This is the exponential backoff mechanism
++             *  at play.
++             *
++             *  (D) - Occurs when checkNodeExists has found that a 'ghost'
++             *  ephemeral node from a previous session still exists in
++             *  zookeeper. This indicates that registrar must backoff and run
++             *  (C) again to check for the node.
++             *
++             *  (E) - Occurs when there is a fatal error stating the ephemeral
++             *  node that is neither a 'CONNECTION_LOSS' nor a 'NO_NODE'.
++             *
++             *  (F) - Occurs when checkNodeExists finds that the 'ghost'
++             *  ephemeral node from the previous zookeeper session has dropped
++             *  out due to session expiry.
++             *
++             *  (G) - Occurs if we've waited at least the session timeout trying
++             *  to create the new ephemeral node. If this happens, then either
++             *  another session has been created with the appropriate node, or
++             *  zookeeper has been down for a period of time that is at least
++             *  the session timeout. In both cases a new session will have been
++             *  created which will register the node.
++             */
++
++            /*
++             * Schedule a stat operation on the node in N seconds, where
++             * INTERVAL_FLOOR <= N < INTERVAL_CEIL.
++             */
++            function tryDelayedWork(work) {
++                if (statInterval >= INTERVAL_CEIL) {
++                    statInterval = INTERVAL_FLOOR;
++                }
++                log.info('checking for existence of ephemeral node ' + n +
++                        ' in ' + statInterval + ' seconds.');
++                if (timeWaited >= registrar.sessionTimeout) {
++                    setImmediate(clearTimerAndCallback, new VError(
++                        'register: timed out waiting to create node "%s". ' +
++                        'Waited %d seconds.', n, timeWaited));
++                    return;
++                }
++                timeWaited += statInterval;
++                timer = setTimeout(work, statInterval);
++                statInterval *= GROWTH_FACTOR;
++            }
++
++            /*
++             * Check for the existence of the ephemeral node with the
++             * appropriate owning session. If one doesn't exist, or we've
++             * suffered a transient connection loss due to the node-zkstream
++             * session migration, try to create the node.
++             */
++            function checkNodeExists() {
++                zk.stat(n, function (err, stat) {
++                    if (err) {
++                        if (err.code === 'NO_NODE') {
++                            setImmediate(createEphemeral);
++                        } else if (err.code === 'CONNECTION_LOSS') {
++                            setImmediate(tryDelayedWork, checkNodeExists);
++                        } else {
++                            setImmediate(clearTimerAndCallback, new VError(err,
++                                    'check node "%s" exists', n));
++                        }
++                        return;
++                    }
++                    setImmediate(tryDelayedWork, checkNodeExists);
++                });
++            }
++
++            function createEphemeral() {
++                /*
++                 * It's possible that zookeeper will report nodes that were
++                 * owned by previous sessions even after said session has
++                 * expired. This presents a window during which it's possible
++                 * for the node to silently drop out of zookeeper. To prevent
++                 * this, we use an exponential backoff mechanism that checks
++                 * if the node exists, recreating it if it drops out.
++                 */
++                zk.createWithEmptyParents(n, data, _opts, function (err) {
++                    if (err) {
++                        if (err.code === 'NODE_EXISTS') {
++                            log.warn(err, 'register: ephemeral node ' + n +
++                                ' already exists. Starting delayed ' +
++                                'existence checks.');
++                            setImmediate(tryDelayedWork, checkNodeExists);
++                            return;
++                        } else if (err.code === 'CONNECTION_LOSS') {
++                            log.warn(err, 'register: connection loss while ' +
++                                'creating ephemeral node ' + n + '. Retrying.');
++                            setImmediate(tryDelayedWork, createEphemeral);
++                            return;
++                        }
++                        setImmediate(clearTimerAndCallback, new VError(err,
++                                'create node "%s"', n));
++                    } else {
++                        opts.registrar.ephemerals[n] = {
++                            data: data,
++                            flags: _opts.flags,
++                            path: n
++                        };
++                        setImmediate(clearTimerAndCallback);
++                    }
++                });
++            }
++
++            /*
++             * Interpose the vasync callback with a callback that clears the
++             * stat-interval timer. This is only called when either there is a
++             * fatal error during creation, or the node was successfully
++             * created. In both cases, if we've set a timeout, we'll want it
++             * gone before proceeding.
++             */
++            function clearTimerAndCallback(err) {
++                clearTimeout(timer);
++                _cb(err);
++            }
++
++            createEphemeral();
+         },
+         inputs: opts.nodes
+     }, function (err) {
+@@ -171,7 +366,7 @@ function registerEntries(opts, cb) {
+ }
+ 
+ 
+-function register(opts, cb) {
++function register(opts, registrar, cb, newSession) {
+     assert.object(opts, 'options');
+     assert.object(opts.log, 'options.log');
+     assert.optionalString(opts.adminIp, 'options.adminIp');
+@@ -179,11 +374,13 @@ function register(opts, cb) {
+     assert.string(opts.domain, 'options.domain');
+     assert.object(opts.registration, 'options.registration');
+     assert.string(opts.registration.type, 'options.registration.type');
++    assert.object(registrar, 'registrar');
+     assert.optionalNumber(opts.registration.ttl, 'options.registration.ttl');
+     assert.optionalArrayOfNumber(opts.registration.ports,
+                                  'options.registration.ports');
+     assert.optionalObject(opts.registration.service,
+                           'options.registration.service');
++    assert.optionalBool(opts.firstRegistration, 'opts.firstRegistration');
+     if (opts.registration.service) {
+         var s = opts.registration.service;
+         assert.string(s.type, 'options.registration.service.type');
+@@ -223,20 +420,29 @@ function register(opts, cb) {
+         ].concat((opts.aliases || []).map(domainToPath)),
+         path: p,
+         registration: opts.registration,
+-        zk: opts.zk
++        registrar: registrar,
++        zk: opts.zk,
+     };
+-    vasync.pipeline({
+-        arg: cookie,
+-        funcs: [
++    var pipeline;
++    if (newSession) {
++        pipeline = [
++            registerService,
++            registerEntries
++        ];
++    } else {
++        pipeline = [
+             cleanupPreviousEntries,
+             function wait(_, _cb) {
+                 // Be nice to watchers and wait for them to catch up
+                 setTimeout(once(_cb), 1000);
+             },
+-            setupDirectories,
+-            registerEntries,
+-            registerService
+-        ]
++            registerService,
++            registerEntries
++        ];
++    }
++    vasync.pipeline({
++        arg: cookie,
++        funcs: pipeline
+     }, function (err) {
+         if (err) {
+             log.debug(err, 'register: unable to register with ZooKeeper');
+@@ -251,47 +457,30 @@ function register(opts, cb) {
+ }
+ 
+ 
+-function unregister(opts, cb) {
++function unregister(opts, registrar, cb) {
+     assert.object(opts, 'options');
+     assert.object(opts.log, 'options.log');
+     assert.object(opts.zk, 'options.zk');
+-    assert.arrayOfString(opts.znodes, 'options.znodes');
++    assert.object(registrar, 'registrar');
+     assert.func(cb, 'callback');
+ 
+     cb = once(cb);
+ 
+     var log = opts.log.child({
+         component: 'unregister',
+-        znodes: opts.znodes
+     }, true);
+     var zk = opts.zk;
+ 
+     log.debug('unregister: entered');
+-    vasync.forEachPipeline({
+-        func: function cleanup(n, _cb) {
+-            _cb = once(_cb);
+ 
+-            log.debug('unregister: deleting %s', n);
+-            zk.unlink(n, function (err) {
+-                if (err) {
+-                    log.debug(err, 'unregister: failed to delete %s', n);
+-                    _cb(err);
+-                } else {
+-                    log.debug('unregister: unlink(%s) done', n);
+-                    cb();
+-                }
+-            });
+-        },
+-        inputs: opts.znodes
+-    }, function (err) {
+-        if (err) {
+-            log.debug(err, 'unregister: failed');
+-            cb(err);
+-        } else {
+-            log.debug('unregister: done');
+-            cb();
+-        }
++    zk.on('close', function () {
++        registrar.ephemerals = {};
++        registrar.zk = null;
++        log.debug('unregister: done');
++        cb();
+     });
++
++    zk.close();
+ }
+ 
+ 
+diff --git a/lib/zk.js b/lib/zk.js
+deleted file mode 100644
+index 7ea4336..0000000
+--- a/lib/zk.js
++++ /dev/null
+@@ -1,135 +0,0 @@
+-/*
+- * This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+- */
+-
+-/*
+- * Copyright (c) 2014, Joyent, Inc.
+- */
+-
+-var assert = require('assert-plus');
+-var backoff = require('backoff');
+-var once = require('once');
+-var vasync = require('vasync');
+-var zkplus = require('zkplus');
+-
+-
+-
+-///-- API
+-
+-function heartbeat(opts, cb) {
+-    assert.object(opts, 'options');
+-    assert.arrayOfString(opts.nodes, 'options.nodes');
+-    assert.optionalObject(opts.retry, 'options.retry');
+-    assert.object(opts.zk, 'options.zk');
+-    assert.func(cb, 'callback');
+-
+-    cb = once(cb);
+-
+-    function check(_, _cb) {
+-        vasync.forEachParallel({
+-            func: opts.zk.stat.bind(opts.zk),
+-            inputs: opts.nodes
+-        }, _cb);
+-    }
+-
+-    var retry = backoff.call(check, null, cb);
+-    retry.failAfter((opts.retry || {}).maxAttempts || 5);
+-    retry.setStrategy(new backoff.ExponentialStrategy({
+-        initialDelay: (opts.retry || {}).initialDelay || 1000,
+-        maxDelay: (opts.retry || {}).maxDelay || 30000
+-    }));
+-    retry.start();
+-}
+-
+-
+-function patchClient(zk) {
+-    zk.heartbeat = function _heartbeat(opts, cb) {
+-        assert.object(opts, 'options');
+-
+-        heartbeat({
+-            nodes: opts.nodes,
+-            retry: opts.retry,
+-            zk: zk
+-        }, cb);
+-    };
+-
+-    return (zk);
+-}
+-
+-
+-function createZKClient(opts, cb) {
+-    assert.object(opts, 'options');
+-    assert.object(opts.log, 'options.log');
+-    assert.arrayOfObject(opts.servers, 'options.servers');
+-    assert.func(cb, 'callback');
+-
+-    assert.ok((opts.servers.length > 0), 'options.servers empty');
+-    opts.servers.forEach(function (s) {
+-        assert.string(s.host, 'servers.host');
+-        assert.number(s.port, 'servers.port');
+-    });
+-
+-    cb = once(cb);
+-
+-    function create(_, _cb) {
+-        var client = zkplus.createClient(opts);
+-        client.connect(function (err) {
+-            if (err) {
+-                _cb(err);
+-            } else {
+-                _cb(null, patchClient(client));
+-            }
+-        });
+-    }
+-
+-    var log = opts.log.child({component: 'zookeeper'}, true);
+-    var retry = backoff.call(create, null, function (err, client) {
+-        if (err) {
+-            log.fatal(err, 'createClient: unable to create ZK client');
+-            cb(err);
+-        } else {
+-            log.info('ZK: connected: %s', client.toString());
+-            cb(null, client);
+-        }
+-    });
+-    retry.failAfter(Infinity);
+-    retry.setStrategy(new backoff.ExponentialStrategy({
+-        initialDelay: 1000,
+-        maxDelay: 90000
+-    }));
+-    setImmediate(retry.start.bind(retry));
+-
+-    retry.on('backoff', function (number, delay) {
+-        var level;
+-        if (number === 0) {
+-            level = 'info';
+-        } else if (number < 5) {
+-            level = 'warn';
+-        } else {
+-            level = 'error';
+-        }
+-        log[level]({
+-            attempt: number,
+-            delay: delay
+-        }, 'zookeeper: connection attempted (failed)');
+-
+-        retry.emit('attempt', number, delay);
+-    });
+-
+-    retry.stop = function () {
+-        retry.abort();
+-        cb(new Error('createZKClient: aborted'));
+-    };
+-
+-    return (retry);
+-}
+-
+-
+-
+-///--- Exports
+-
+-module.exports = {
+-    createZKClient: createZKClient
+-};
+diff --git a/main.js b/main.js
+index 3f9b4b3..073939a 100644
+--- a/main.js
++++ b/main.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ var fs = require('fs');
+@@ -78,6 +78,44 @@ function configure(argv) {
+     assert.object(cfg.zookeeper, 'config.zookeeper');
+     assert.optionalObject(cfg.healthCheck, 'config.healthCheck');
+ 
++    /*
++     * MANTA-3536 - if registrar is passed a config that specifies the ip
++     * address of zookeeper server(s) with the 'host' field, copy the value into
++     * a new 'address' field, which is what node-zkstream expects.
++     */
++    var servers = cfg.zookeeper.servers;
++    var usesOldConfig = false;
++
++    if (servers) {
++        servers.forEach(function (server) {
++            if (!server.address) {
++                usesOldConfig = true;
++                server.address = server.host;
++            }
++        });
++    } else {
++        if (!cfg.zookeeper.address) {
++            usesOldConfig = true;
++            cfg.zookeeper.address = cfg.zookeeper.host;
++        }
++    }
++
++    /*
++     * MANTA-3536 - node-zkstream uses the option 'sessionTimeout' instead of
++     * 'timeout'. Older configs aimed at node-zkplus will specify the timeout
++     * using 'timeout' field, so we translate it here for backwards
++     * compatibility.
++     */
++    if (!cfg.zookeeper.sessionTimeout) {
++        usesOldConfig = true;
++        cfg.zookeeper.sessionTimeout = cfg.zookeeper.timeout;
++    }
++
++    if (usesOldConfig) {
++        LOG.warn('registrar configuration uses old zookeeper options, ' +
++                'converting to new format and continuing');
++    }
++
+     cfg.zookeeper.log = LOG;
+ 
+     return (cfg);
+@@ -121,32 +159,12 @@ function usage(help, msg) {
+ 
+     var cfg = configure(argv);
+ 
+-    app.createZKClient(cfg.zookeeper, function (init_err, zk) {
+-        if (init_err) {
+-            LOG.fatal(init_err, 'unable to create ZooKeeper client');
+-            process.exit(1);
+-        }
+-
+-        zk.on('close', function () {
+-            LOG.warn('zookeeper: disconnected');
+-        });
+-
+-        // annoyingly this fires twice, so ignore the first one
+-        zk.once('connect', function () {
+-            zk.on('connect', function () {
+-                LOG.info('zookeeper: reconnected');
+-            });
+-        });
+-
+-        zk.on('session_expired', function force_restart() {
+-            LOG.fatal('Zookeeper session_expired event; exiting');
+-            process.exit(1);
+-        });
++    app.createZKClient(cfg.zookeeper, function (zk) {
++        assert.object(zk, 'zk');
+ 
+         // backward compatible with top-level 'adminIp' in configs.
+         cfg.registration.adminIp = cfg.registration.adminIp || cfg.adminIp;
+ 
+-        var is_down = false;
+         var opts = clone(cfg.registration);
+         if (cfg.healthCheck) {
+             opts.healthCheck = clone(cfg.healthCheck);
+@@ -157,44 +175,108 @@ function usage(help, msg) {
+         opts.registration = cfg.registration;
+         opts.zk = zk;
+ 
+-        var eventStream = app(opts);
++        var registrar = app.createRegistrar(opts);
++
++        /*
++         * If registrar.zk is null, this meant that there has already been an
++         * event that triggered the termination of the session, and we can
++         * safely exit. Otherwise, the work has to be done here.
++         */
++        function unregisterAndExit(signal) {
++            if (registrar.zk === null) {
++                LOG.debug('registrar: received ' + signal + ', but the zk ' +
++                        'session is already terminated.');
++                process.exit(0);
++            }
++            LOG.info('registrar: received ' + signal + ', unregistering ' +
++                    'ephemeral nodes.');
++            var unregisterOpts = {
++                log: LOG,
++                zk: zk
++            };
++            app.unregister(unregisterOpts, registrar, function (err) {
++                if (err) {
++                    LOG.debug(err, 'registrar: unexpected error ' +
++                        'unregistering nodes');
++                }
++                process.exit(0);
++            });
++        }
+ 
+-        eventStream.on('fail', function (err) {
+-            LOG.error(err, 'registrar: healthcheck failed');
+-        });
++        var exitSignals = [
++            'SIGTERM',
++            'SIGINT'
++        ];
+ 
+-        eventStream.on('ok', function () {
+-            LOG.info('registrar: healthcheck ok (was down)');
++        exitSignals.forEach(function (signal) {
++            process.on(signal, function () {
++                unregisterAndExit(signal);
++            });
+         });
+ 
+-        eventStream.on('error', function (err) {
+-            LOG.error(err, 'registrar: unexpected error');
++        // node-zkstream events
++        zk.on('connect', function () {
++            LOG.info('zookeeper: connected');
+         });
+ 
+-        eventStream.on('register', function (nodes) {
+-            LOG.info({
+-                znodes: nodes
+-            }, 'registrar: registered');
++        zk.on('close', function () {
++            LOG.warn('zookeeper: disconnected');
+         });
+ 
+-        eventStream.on('unregister', function (err, nodes) {
+-            LOG.warn({
+-                err: err,
+-                znodes: nodes
+-            }, 'registrar: unregistered');
+-        });
+ 
+-        eventStream.on('heartbeatFailure', function (err) {
+-            if (!is_down)
+-                LOG.error(err, 'zookeeper: heartbeat failed');
+-            is_down = true;
++        zk.on('session', function () {
++            LOG.info('zookeeper: session established');
++
++            registrar.registerOnNewSession(function (rerr) {
++                if (rerr) {
++                    LOG.error(rerr, 'registration(%j) failed',
++                        opts.registration);
++                    return;
++                }
++                LOG.debug('registration successful for session generation ' +
++                    registrar.getSessionGeneration());
++
++                if (registrar.hasHealthCheck()) {
++                    return;
++                }
++
++                var healthCheckEvents = registrar.createHealthCheck();
++
++                // health-check events
++                healthCheckEvents.on('fail', function (err) {
++                    LOG.error(err, 'registrar: healthcheck failed');
++                });
++
++                healthCheckEvents.on('ok', function () {
++                    LOG.info('registrar: healthcheck ok (was down)');
++                });
++
++                healthCheckEvents.on('error', function (err) {
++                    LOG.error(err, 'registrar: unexpected error');
++                });
++
++                healthCheckEvents.on('register', function (nodes) {
++                    LOG.info({
++                        znodes: nodes
++                    }, 'registrar: registered');
++                });
++
++                healthCheckEvents.on('unregister', function (err, nodes) {
++                    LOG.warn({
++                        err: err,
++                        znodes: nodes
++                    }, 'registrar: unregistered');
++                });
++
++            });
+         });
+ 
+-        eventStream.on('heartbeat', function () {
+-            if (is_down)
+-                LOG.info('zookeeper heartbeat ok');
++        zk.on('expire', function force_restart() {
++            LOG.warn('zookeeper: session expired');
++        });
+ 
+-            is_down = false;
++        zk.on('failed', function () {
++            LOG.warn('zookeeper: failed');
+         });
+     });
+ })();
+diff --git a/package.json b/package.json
+index afd4340..64e8511 100644
+--- a/package.json
++++ b/package.json
+@@ -18,7 +18,7 @@
+         "once": "1.3.0",
+         "vasync": "1.5.0",
+         "verror": "1.4.0",
+-        "zkplus": "git://github.com/mcavage/node-zkplus.git#master"
++        "zkstream": "0.10.1"
+     },
+     "devDependencies": {
+         "faucet": "0.0.1",

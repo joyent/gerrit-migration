@@ -1,0 +1,197 @@
+commit 4216fb985e14ebfa32e160c3cfe2b0c8686f5e49 (refs/changes/90/2290/1)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2017-07-26T21:47:16+00:00 (2 years, 2 months ago)
+    
+    MORAY-403 UpdateObjects generates bad SQL for non-boolean/number/string values
+    MORAY-406 PutObject with a null field rarely does what you expect
+
+diff --git a/docs/index.md b/docs/index.md
+index e6eac0f..ad330a5 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -761,6 +761,8 @@ A few caveats:
+ - The `JSON value` will *not* be updated in situ, though Moray hides this fact
+   from you.  Subsequent "get" operations will merge the results into the
+   returned value.
++- If you store an object with an array in a field that does not have an array
++  type index, you will never see the update.
+ 
+ ### API
+ 
+diff --git a/lib/errors.js b/lib/errors.js
+index a2c94b1..1302d5c 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -273,6 +273,23 @@ function NotIndexedError(cause, bucket, filter, options) {
+ util.inherits(NotIndexedError, WError);
+ 
+ 
++function NotNullableError(cause, name, type) {
++    if (arguments.length === 2) {
++        type = name;
++        name = cause;
++        cause = {};
++    }
++    assert.string(name, 'name');
++    assert.string(type, 'type');
++
++    WError.call(this, cause,
++                'index "%s" (of type "%s") is not nullable',
++                name, type);
++    this.name = this.constructor.name;
++}
++util.inherits(NotNullableError, WError);
++
++
+ function ObjectNotFoundError(cause, bucket, key) {
+     if (arguments.length === 2) {
+         key = bucket;
+@@ -350,6 +367,7 @@ module.exports = {
+     NoDatabasePeersError: NoDatabasePeersError,
+     NotFunctionError: NotFunctionError,
+     NotIndexedError: NotIndexedError,
++    NotNullableError: NotNullableError,
+     ObjectNotFoundError: ObjectNotFoundError,
+     QueryTimeoutError: QueryTimeoutError,
+     SchemaChangeError: SchemaChangeError,
+diff --git a/lib/objects/common.js b/lib/objects/common.js
+index 23266bd..3b53eb4 100644
+--- a/lib/objects/common.js
++++ b/lib/objects/common.js
+@@ -884,17 +884,23 @@ function rowToObject(bucket, row, ignore) {
+         _count: parseInt(row._count, 10)
+     };
+ 
+-    // Moray supports 'update', which updates the PG columns, but
+-    // not the serialized JSON.  Here, we do the following:
+-    // - if the PG column is listed in 'ignore', do nothing
+-    // - if the PG column is null, delete the returned value
+-    // - if the PG column has a value:
+-    //   - if the serialized data is either not there or the serialized
+-    //     form is there and is not an array, blindly overwrite
+-    // - If the serialied data is present and an Array, we just skip - note
+-    //   the only system using this is UFDS, and indexes with arrays (really
+-    //   multi-valued attributes) is already goofy and not-supported, so we
+-    //   can safely ignore it, generally speaking.
++    /*
++     * Moray supports 'update', which updates the Postgres columns, but not
++     * the serialized JSON. Here, we do the following:
++     *
++     * - If the PG column is listed in 'ignore', do nothing. This indicates
++     *   that the column is being reindexed, and we can't trust the data in
++     *   the PG column.
++     * - If the PG column is null, delete the returned value.
++     * - If the serialized data is present and an Array, then:
++     *   - Copy the PG column when the index type is an array
++     *   - Ignore the PG column when the index type is a scalar. This is to
++     *     avoid corrupting the original array that has been converted into
++     *     the scalar type. The only system that relies on this behaviour is
++     *     UFDS, which uses arrays with "string" indexes. This results in
++     *     things like [ "a", "b" ] turning into "a,b".
++     * - Otherwise, blindly overwrite.
++     */
+     bucket._indexKeys.forEach(function (key) {
+         var k = key.key;
+         var v = row[key.lcKey];
+@@ -902,12 +908,15 @@ function rowToObject(bucket, row, ignore) {
+             return;
+         }
+         if (v === undefined || v === null) {
+-            if (obj.value[k])
++            if (obj.value[k] !== null) {
+                 delete obj.value[k];
+-        } else {
+-            if (!obj.value[k] || !Array.isArray(obj.value[k])) {
++            }
++        } else if (Array.isArray(obj.value[k])) {
++            if (TYPES[bucket.index[k].type].array) {
+                 obj.value[k] = v;
+             }
++        } else {
++            obj.value[k] = v;
+         }
+     });
+ 
+@@ -1015,7 +1024,9 @@ function indexObject(schema, object) {
+             throw new InvalidIndexTypeError(k, t);
+         }
+ 
+-        if (TYPES[t].array) {
++        if (value === null) {
++            ndx[k] = null;
++        } else if (TYPES[t].array) {
+             var scalarType = t.slice(1, -1);
+             if (Array.isArray(value)) {
+                 var vals = [];
+diff --git a/lib/objects/update.js b/lib/objects/update.js
+index 8f60178..47ab8c7 100644
+--- a/lib/objects/update.js
++++ b/lib/objects/update.js
+@@ -19,6 +19,7 @@ var dtrace = require('../dtrace');
+ 
+ var mod_errors = require('../errors');
+ var NotIndexedError = mod_errors.NotIndexedError;
++var NotNullableError = mod_errors.NotNullableError;
+ var FieldUpdateError = mod_errors.FieldUpdateError;
+ 
+ 
+@@ -46,10 +47,11 @@ var SUBPIPELINE = PIPELINE.slice(1);
+ ///--- Handlers
+ 
+ function updateRows(req, cb) {
++    var args;
+     var b = req.bucket;
+     var column  = '';
+     var etag = 'u' + libuuid.create().substr(0, 7);
+-    var ok = true;
++    var i, k;
+     var log = req.log;
+     var pg = req.pg;
+     var q;
+@@ -63,31 +65,27 @@ function updateRows(req, cb) {
+ 
+     cb = once(cb);
+ 
+-    req.fieldKeys.forEach(function (k) {
++    try {
++        args = common.indexObject(req.bucket.index, req.fields);
++    } catch (e) {
++        cb(e);
++        return;
++    }
++
++    for (i = 0; i < req.fieldKeys.length; i++) {
++        k = req.fieldKeys[i];
+         if (!req.bucket.index[k]) {
+-            ok = false;
++            cb(new NotIndexedError(b.name, JSON.stringify(req.fields)));
+             return;
+         }
+ 
+-        switch (req.bucket.index[k].type) {
+-        case 'boolean':
+-            vals.push(req.fields[k].toUpperCase());
+-            break;
+-        case 'number':
+-            vals.push(parseInt(req.fields[k], 10));
+-            break;
+-        case 'string':
+-            vals.push(req.fields[k] + '');
+-            break;
+-        default:
+-            break;
++        if (args[k] === null) {
++            cb(new NotNullableError(k, req.bucket.index[k].type));
++            return;
+         }
+-        column += ',' + k + '=$' + vals.length;
+-    });
+ 
+-    if (!ok) {
+-        cb(new NotIndexedError(b.name, JSON.stringify(req.fields)));
+-        return;
++        vals.push(args[k]);
++        column += ',' + k + '=$' + vals.length;
+     }
+ 
+     sql = util.format(('UPDATE %s ' +

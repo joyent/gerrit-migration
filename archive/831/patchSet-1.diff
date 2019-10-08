@@ -1,0 +1,237 @@
+commit b2a6db358a8e21406dfdaded268ce04ce2a141b5 (refs/changes/31/831/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-11-01T11:02:27-07:00 (2 years, 11 months ago)
+    
+    joyent/node-cueball#46 Add support for connection linger
+
+diff --git a/README.md b/README.md
+index 059e582..125e4cf 100644
+--- a/README.md
++++ b/README.md
+@@ -75,6 +75,9 @@ Parameters
+   - `log` -- optional Object, a `bunyan`-style logger to use
+   - `spares` -- optional Number, number of spares wanted in the pool per host
+   - `maximum` -- optional Number, maximum number of connections per host
++  - `linger` -- optional Number, milliseconds for idle connections to "linger"
++    in the pool before being closed (useful especially with rapidly changing
++    loads)
+   - `initialDomains` -- optional Array of String, initial domains to create
+     connections to at startup (to pre-seed the Agent for quick user later)
+   - `tcpKeepAliveInitialDelay` -- optional Number, if supplied, enable TCP
+@@ -107,6 +110,8 @@ Parameters
+   - `log` -- optional Object, a `bunyan`-style logger to use
+   - `spares` -- optional Number, number of spares wanted in the pool per host
+   - `maximum` -- optional Number, maximum number of connections per host
++  - `linger` -- optional Number, milliseconds for idle connections in excess of
++    `spares` to linger in the pool before being closed
+   - `maxDNSConcurrency` -- optional Number, max number of DNS queries to issue
+     at once (default 5)
+   - `checkTimeout` -- optional Number, milliseconds of idle time before
+diff --git a/lib/connection-fsm.js b/lib/connection-fsm.js
+index 5f778e9..8d16569 100644
+--- a/lib/connection-fsm.js
++++ b/lib/connection-fsm.js
+@@ -64,6 +64,7 @@ function ConnectionFSM(options) {
+ 	this.cf_log = options.log.child({
+ 		backend: this.cf_backend.key
+ 	});
++	this.cf_idleEntry = undefined;
+ 
+ 	mod_assert.object(options.recovery, 'options.recovery');
+ 
+@@ -207,6 +208,15 @@ ConnectionFSM.prototype.closeAfterRelease = function () {
+ 	this.cf_closeAfter = true;
+ };
+ 
++ConnectionFSM.prototype.timeInIdle = function () {
++	var now = new Date();
++	if (this.isInState('idle')) {
++		return (now - this.cf_idleEntry);
++	} else {
++		return (undefined);
++	}
++};
++
+ ConnectionFSM.prototype.state_init = function (S) {
+ 	S.validTransitions(['connect', 'closed']);
+ 	S.on(this, 'startAsserted', function () {
+@@ -355,6 +365,7 @@ ConnectionFSM.prototype.state_idle = function (S) {
+ 	this.cf_claimed = false;
+ 	this.cf_claimStack = [];
+ 	this.cf_log.trace('connected, idling');
++	this.cf_idleEntry = new Date();
+ 
+ 	if (this.cf_shadow) {
+ 		this.cf_shadow.sh_claimed = false;
+diff --git a/lib/pool.js b/lib/pool.js
+index 9103136..a02c099 100644
+--- a/lib/pool.js
++++ b/lib/pool.js
+@@ -75,6 +75,9 @@ function CueBallConnectionPool(options) {
+ 	mod_utils.assertRecoverySet(options.recovery);
+ 	this.p_recovery = options.recovery;
+ 
++	mod_assert.optionalNumber(options.linger, 'options.linger');
++	this.p_linger = options.linger;
++
+ 	mod_assert.optionalObject(options.log, 'options.log');
+ 	this.p_log = options.log || mod_bunyan.createLogger({
+ 		name: 'CueBallConnectionPool'
+@@ -145,6 +148,8 @@ function CueBallConnectionPool(options) {
+ 	}, 60000);
+ 	this.p_shuffleTimerInst.unref();
+ 
++	this.p_lingerTimer = undefined;
++
+ 	FSM.call(this, 'starting');
+ }
+ mod_util.inherits(CueBallConnectionPool, FSM);
+@@ -426,13 +431,21 @@ CueBallConnectionPool.prototype._rebalance = function () {
+ 	var plan = mod_utils.planRebalance(conns, self.p_dead, target,
+ 	    self.p_max);
+ 
+-	if (plan.remove.length > 0 || plan.add.length > 0) {
+-		this.p_log.trace('rebalancing pool, remove %d, ' +
+-		    'add %d (busy = %d, spares = %d, target = %d)',
+-		    plan.remove.length, plan.add.length,
+-		    busy, spares, target);
+-	}
++	var minNextRebal = undefined;
++	var removed = 0, added = 0;
++
+ 	plan.remove.forEach(function (fsm) {
++		var gone = (self.p_keys.indexOf(fsm.cf_backend.key) === -1);
++
++		/* Apply linger time (if any). */
++		var t = fsm.timeInIdle();
++		if (t !== undefined && !gone && self.p_linger !== undefined &&
++		    t < self.p_linger) {
++			var rem = self.p_linger - t;
++			if (minNextRebal === undefined || rem < minNextRebal)
++				minNextRebal = rem;
++			return;
++		}
+ 		/*
+ 		 * Only tell the FSM to quit *right now* if either:
+ 		 *   1. it's idle
+@@ -447,12 +460,13 @@ CueBallConnectionPool.prototype._rebalance = function () {
+ 		 */
+ 		var fsmIdx = self.p_connections[fsm.cf_backend.key].
+ 		    indexOf(fsm);
+-		if (fsm.isInState('idle') || fsmIdx > 0 ||
+-		    self.p_keys.indexOf(fsm.cf_backend.key) === -1) {
++		if (fsm.isInState('idle') || fsmIdx > 0 || gone) {
+ 			fsm.close();
+ 			--total;
++			++removed;
+ 		} else {
+ 			fsm.closeAfterRelease();
++			++removed;
+ 		}
+ 	});
+ 	plan.add.forEach(function (k) {
+@@ -460,8 +474,25 @@ CueBallConnectionPool.prototype._rebalance = function () {
+ 		if (++total > self.p_max)
+ 			return;
+ 		self.addConnection(k);
++		++added;
+ 	});
+ 
++	if (removed > 0 || added > 0) {
++		this.p_log.trace('rebalancing pool, removed %d, ' +
++		    'added %d (busy = %d, spares = %d, target = %d)',
++		    plan.remove.length, plan.add.length,
++		    busy, spares, target);
++	}
++
++	if (minNextRebal !== undefined && this.p_lingerTimer === undefined) {
++		this.p_lingerTimer = setTimeout(function () {
++			self.p_lingerTimer = undefined;
++			self.rebalance();
++		}, minNextRebal + 50);
++		this.p_log.trace('scheduling another rebalance due to linger ' +
++		    'in %d ms', minNextRebal);
++	}
++
+ 	this.p_inRebalance = false;
+ 	this.p_lastRebalance = new Date();
+ };
+@@ -540,6 +571,9 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 			var node = self.p_idleq.push(fsm);
+ 			fsm.p_idleq_node = node;
+ 
++			if (self.p_linger !== undefined)
++				self.rebalance();
++
+ 			return;
+ 		}
+ 
+diff --git a/test/pool.test.js b/test/pool.test.js
+index ce8f2c1..061f4fc 100644
+--- a/test/pool.test.js
++++ b/test/pool.test.js
+@@ -381,6 +381,64 @@ mod_tape.test('removing a backend', function (t) {
+ 	});
+ });
+ 
++mod_tape.test('linger time', function (t) {
++	connections = [];
++	resolver = undefined;
++
++	var pool = new mod_pool.ConnectionPool({
++		log: log,
++		domain: 'foobar',
++		spares: 0,
++		maximum: 2,
++		linger: 100,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery
++	});
++	t.ok(resolver);
++
++	resolver.emit('added', 'b1', {});
++	resolver.emit('added', 'b2', {});
++	setImmediate(function () {
++		t.equal(connections.length, 0);
++
++		pool.claim(function (err, handle, conn) {
++			t.error(err);
++			var b1 = conn.backend;
++			t.ok(['b1', 'b2'].indexOf(b1) !== -1);
++
++			pool.claim(function (err2, handle2, conn2) {
++				t.error(err2);
++				var b2 = conn2.backend;
++				t.ok(['b1', 'b2'].indexOf(b2) !== -1);
++				t.notStrictEqual(b1, b2);
++
++				handle.release();
++				handle2.release();
++
++				setTimeout(function () {
++					t.equal(connections.length, 2);
++					setTimeout(function () {
++						t.equal(connections.length, 0);
++						t.end();
++					}, 200)
++				}, 50);
++			});
++
++			setImmediate(function () {
++				t.equal(connections.length, 2);
++				connections[1].connect();
++			});
++		});
++
++		setImmediate(function () {
++			t.equal(connections.length, 1);
++			connections[0].connect();
++		});
++	});
++});
++
+ mod_tape.test('cleanup sandbox', function (t) {
+ 	sandbox.restore();
+ 	t.end();

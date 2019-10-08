@@ -1,0 +1,2671 @@
+commit 4ee8ed3e6064ce42c8041fa5d3bdd093a3e726a1 (refs/changes/41/4141/3)
+Author: Joshua M. Clulow <jmc@joyent.com>
+Date:   2018-06-07T16:59:00+00:00 (1 year, 4 months ago)
+    
+    MANATEE-400 Manatee deleterious when dataset will not unmount
+    MANATEE-405 snapshotter should not enter maintenance when dataset does not exist
+
+diff --git a/lib/adm.js b/lib/adm.js
+index 92b2636..511a994 100644
+--- a/lib/adm.js
++++ b/lib/adm.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /**
+@@ -31,10 +31,9 @@ var progbar = require('progbar');
+ var prompt = require('prompt');
+ var restify = require('restify');
+ var sprintf = require('extsprintf').sprintf;
+-var util = require('util');
+ var vasync = require('vasync');
+ var VError = require('verror');
+-var zfs = require('./zfsClient');
++var ZfsClient = require('./zfsClient');
+ var zk = require('joyent-zookeeper-client');
+ 
+ var LOG = bunyan.createLogger({
+@@ -1313,6 +1312,16 @@ function stateBackfill(opts, cb) {
+  * @param {Boolean} opts.ignorePrompts Ignores prompts if set.
+  */
+ function rebuild(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.config, 'opts.config');
++    assert.func(cb, 'cb');
++
++    var zfsCfg = opts.config.postgresMgrCfg.zfsClientCfg;
++    zfsCfg.dbUser = opts.config.postgresMgrCfg.dbUser;
++    zfsCfg.log = LOG.child({ component: 'ZfsClient' });
++
++    var zfs = new ZfsClient(zfsCfg);
++
+     vasync.pipeline({ funcs: [
+         _createZkClient,
+         _getShards,
+@@ -1463,15 +1472,58 @@ function rebuild(opts, cb) {
+             checkZkActive();
+         },
+         function _deleteDataDir(_, _cb) {
+-            console.error('Attempting to remove ZFS dataset\'s contents');
++            assert.bool(_.removeFromDeposed, '_.removeFromDeposed');
++            if (_.removeFromDeposed) {
++                /*
++                 * The operator has elected to rebuild a deposed peer.  Peers
++                 * can become deposed as part of particular maintenance
++                 * operations (e.g., promoting a sync so that the primary can
++                 * be rebooted or updated).
++                 *
++                 * Remove the old dataset automatically as it does not contain
++                 * current data.
++                 */
++                console.error('Removing deposed ZFS dataset');
++                zfs.destroyDataset(function (err, removed) {
++                    if (err) {
++                        _cb(err);
++                        return;
++                    }
++
++                    assert.bool(removed, 'removed');
++                    if (removed) {
++                        console.error('ZFS dataset removed');
++                    } else {
++                        console.error('No ZFS dataset detected');
++                    }
++                    _cb();
++                });
++                return;
++            }
++
+             /*
+-             * If sitter hasn't started since our zone booted then this
+-             * directory will not be the dataset we expect. However, this
+-             * is handled by sitter, where a restore is not always required
+-             * (see postgresMgr._standby for details).
++             * If this peer is not deposed, the operator has likely requested
++             * an explicit, manual rebuild.
++             *
++             * It is difficult or impossible to know for all cases whether an
++             * existing dataset would be valuable for recovery purposes if this
++             * operation fails, or was started in error.  Rather than destroy
++             * the dataset, we will preserve it and inform the operator.
+              */
+-            var cmd = 'rm -rf ' + _.config.postgresMgrCfg.dataDir + '/*';
+-            exec(cmd, _cb);
++            console.error('Attempting to isolate any existing ZFS dataset');
++            zfs.isolateDataset({ prefix: 'rebuild' }, function (err, name) {
++                if (err) {
++                    _cb(err);
++                    return;
++                }
++
++                if (name === null) {
++                    console.error('No existing ZFS dataset detected.');
++                } else {
++                    console.error('Isolated existing ZFS dataset as: %s', name);
++                }
++                _cb();
++            });
+         },
+         function _removeFromDeposed(_, _cb) {
+             if (!_.removeFromDeposed) {
+@@ -1997,16 +2049,3 @@ function transformBackupUrl(zkNode) {
+     var data = zkNode.split('-')[0].split(':');
+     return 'http://' + data[0] + ':' + data[2];
+ }
+-
+-/**
+- * transform an zk election node name into a postgres url.
+- * @param {string} zkNode The zknode, e.g.
+- * 10.77.77.9:pgPort:backupPort-0000000057
+- *
+- * @return {string} The transformed pg url, e.g.
+- * tcp://postgres@10.0.0.0:5432/postgres
+- */
+-function transformPgUrl(zkNode) {
+-    var data = zkNode.split('-')[0].split(':');
+-    return 'tcp://postgres@' + data[0] + ':' + data[1] + '/postgres';
+-}
+diff --git a/lib/backupSender.js b/lib/backupSender.js
+index a29473c..23dd233 100644
+--- a/lib/backupSender.js
++++ b/lib/backupSender.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /**
+@@ -27,7 +27,6 @@ var util = require('util');
+ 
+ var assert = require('assert-plus');
+ var once = require('once');
+-var shelljs = require('shelljs');
+ var vasync = require('vasync');
+ var verror = require('verror');
+ 
+@@ -287,5 +286,3 @@ BackupSender.prototype._getLatestSnapshot = function (callback) {
+         return callback(null, snapshots[snapshotIndex]);
+     });
+ };
+-
+-/** #@- */
+diff --git a/lib/backupServer.js b/lib/backupServer.js
+index 7f390f5..c6c92a6 100644
+--- a/lib/backupServer.js
++++ b/lib/backupServer.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /**
+@@ -22,9 +22,7 @@
+  */
+ var assert = require('assert-plus');
+ var BackupQueue = require('./backupQueue');
+-var BackupSender = require('./backupSender');
+ var restify = require('restify');
+-var util = require('util');
+ var uuid = require('node-uuid');
+ 
+ /**
+@@ -156,5 +154,3 @@ BackupServer.prototype._init = function () {
+         return next();
+     }
+ };
+-
+-/** #@- */
+diff --git a/lib/common.js b/lib/common.js
+new file mode 100644
+index 0000000..ce7b726
+--- /dev/null
++++ b/lib/common.js
+@@ -0,0 +1,468 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var mod_fs = require('fs');
++
++var mod_assert = require('assert-plus');
++var mod_forkexec = require('forkexec');
++var mod_jsprim = require('jsprim');
++var mod_verror = require('verror');
++var mod_vasync = require('vasync');
++
++var VE = mod_verror.VError;
++
++
++function replacefile(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.string(opts.src, 'opts.src');
++    mod_assert.string(opts.dst, 'opts.dst');
++    mod_assert.func(callback, 'callback');
++
++    mod_vasync.waterfall([ function (next) {
++        /*
++         * Unlink the destination file.
++         */
++        mod_fs.unlink(opts.dst, function (err) {
++            if (err) {
++                if (err.code === 'ENOENT') {
++                    /*
++                     * The file did not exist already.
++                     */
++                    next();
++                    return;
++                }
++
++                next(new VE(err, 'unlink destination file'));
++                return;
++            }
++
++            next();
++        });
++
++    }, function (next) {
++        /*
++         * Read source file.
++         */
++        mod_fs.readFile(opts.src, { encoding: null }, function (err, data) {
++            if (err) {
++                next(new VE(err, 'read source file'));
++                return;
++            }
++
++            next(null, data);
++        });
++
++    }, function (data, next) {
++        mod_assert.ok(Buffer.isBuffer(data), 'data (Buffer)');
++        mod_assert.func(next, 'next');
++
++        /*
++         * Write destination file.
++         */
++        var mode = parseInt('0644', 8);
++        mod_fs.writeFile(opts.dst, data, { mode: mode, flag: 'wx' },
++          function (err) {
++            if (err) {
++                next(new VE(err, 'write destination file'));
++                return;
++            }
++
++            next();
++        });
++
++    } ], function (err) {
++        if (err) {
++            callback(new VE(err, 'replace file "%s" with contents of "%s"',
++              opts.dst, opts.src));
++            return;
++        }
++
++        callback();
++    });
++}
++
++function chown(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.string(opts.path, 'opts.path');
++    mod_assert.string(opts.username, 'opts.username');
++    mod_assert.bool(opts.recursive, 'opts.recursive');
++    mod_assert.func(callback, 'callback');
++
++    var argv = [ '/usr/bin/chown' ];
++    if (opts.recursive) {
++        argv.push('-R');
++    }
++    argv.push(opts.username, opts.path);
++
++    mod_forkexec.forkExecWait({ argv: argv, includeStderr: true },
++      function (err) {
++        if (err) {
++            callback(new VE(err, '%schown "%s" to "%s"',
++              opts.recursive ? 'recursive ' : '',
++              opts.path, opts.username));
++            return;
++        }
++
++        callback();
++    });
++}
++
++function chmod(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.string(opts.path, 'opts.path');
++    mod_assert.string(opts.mode, 'opts.mode');
++    mod_assert.bool(opts.recursive, 'opts.recursive');
++    mod_assert.func(callback, 'callback');
++
++    var argv = [ '/usr/bin/chmod' ];
++    if (opts.recursive) {
++        argv.push('-R');
++    }
++    argv.push(opts.mode, opts.path);
++
++    mod_forkexec.forkExecWait({ argv: argv, includeStderr: true },
++      function (err) {
++        if (err) {
++            callback(new VE(err, '%schmod "%s" to %s',
++              opts.recursive ? 'recursive ' : '',
++              opts.path, opts.mode));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Invoke zfs(1M) with the specified arguments, generating an appropriate debug
++ * log message before and after command execution.  This routine is a helper
++ * for all of the other ZFS functions in this file.
++ */
++function zfsExecCommon(log, argv, callback) {
++    mod_assert.object(log, 'log');
++    mod_assert.arrayOfString(argv, 'args');
++    mod_assert.func(callback, 'callback');
++
++    /*
++     * Note that we do not pass our environment on to the "zfs" command, in
++     * order to avoid environment-dependent behaviour; e.g., locale-specific
++     * error messages or output formatting.  Buffer up to 2MB of output from
++     * the ZFS command.
++     */
++    var opts = {
++        argv: [ '/sbin/zfs' ].concat(argv),
++        env: {},
++        maxBuffer: 2 * 1024 * 1024,
++        includeStderr: true
++    };
++
++    log.debug({ argv: argv }, 'exec zfs start');
++    mod_forkexec.forkExecWait(opts, function (err, info) {
++        log.debug({ argv: argv, err: err, info: info }, 'exec zfs end');
++
++        callback(err, info);
++    });
++}
++
++/*
++ * Set a ZFS dataset property.
++ */
++function zfsSet(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.string(opts.property, 'opts.property');
++    mod_assert.string(opts.value, 'opts.value');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('set ZFS property "%s" to "%s" on dataset "%s"',
++      opts.property, opts.value, opts.dataset);
++
++    zfsExecCommon(opts.log, [ 'set', opts.property + '=' + opts.value,
++      opts.dataset ], function (err, info) {
++        if (err) {
++            callback(new VE(err, 'set property "%s" to "%s" on dataset "%s"',
++              opts.property, opts.value, opts.dataset));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Resets a ZFS dataset property so that a value is inherited from the parent
++ * dataset.
++ */
++function zfsInherit(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.string(opts.property, 'opts.property');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('clear ZFS property "%s" on dataset "%s"', opts.property,
++      opts.dataset);
++
++    zfsExecCommon(opts.log, [ 'inherit', opts.property, opts.dataset ],
++      function (err, info) {
++        if (err) {
++            callback(new VE(err, 'clear property "%s" on dataset "%s"',
++              opts.property, opts.value, opts.dataset));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Gets the value of a ZFS dataset property.
++ */
++function zfsGet(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.string(opts.property, 'opts.property');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('get ZFS property "%s" on dataset "%s"', opts.property,
++      opts.dataset);
++
++    zfsExecCommon(opts.log, [ 'get', '-Hp', opts.property, opts.dataset ],
++      function (err, info) {
++        if (err) {
++            callback(new VE(err, 'get property "%s" from dataset "%s"',
++              opts.property, opts.dataset));
++            return;
++        }
++
++        var t = info.stdout.split('\t');
++        if (t.length !== 4 || t[0] !== opts.dataset || t[1] !== opts.property) {
++            callback(new VE('zfs get "%s" "%s": invalid line: %s',
++              opts.property, opts.dataset, info.stdout.trim()));
++            return;
++        }
++
++        opts.log.info('ZFS property "%s" on dataset "%s" has value "%s"',
++          opts.property, opts.dataset, t[2]);
++
++        callback(null, t[2]);
++    });
++}
++
++/*
++ * Create a snapshot of a ZFS dataset.
++ */
++function zfsSnapshot(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.string(opts.snapshot, 'opts.snapshot');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('create ZFS snapshot "%s" on dataset "%s"', opts.snapshot,
++      opts.dataset);
++
++    zfsExecCommon(opts.log, [ 'snapshot', opts.dataset + '@' + opts.snapshot ],
++      function (err, info) {
++        if (err) {
++            callback(new VE(err, 'create snapshot "%s" of dataset "%s"',
++              opts.snapshot, opts.dataset));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Create a ZFS dataset.
++ */
++function zfsCreate(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.optionalObject(opts.props, 'opts.props');
++    mod_assert.func(callback, 'callback');
++
++    var args = [ 'create' ];
++    if (opts.props) {
++        mod_jsprim.forEachKey(opts.props, function (prop, val) {
++            args.push('-o', prop + '=' + val);
++        });
++    }
++    args.push(opts.dataset);
++
++    opts.log.info('create ZFS dataset "%s"', opts.dataset);
++
++    zfsExecCommon(opts.log, args, function (err, info) {
++        if (err) {
++            callback(new VE(err, 'create dataset "%s"', opts.dataset));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Rename a ZFS dataset.
++ */
++function zfsRename(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.string(opts.target, 'opts.target');
++    mod_assert.bool(opts.parents, 'opts.parents');
++    mod_assert.func(callback, 'callback');
++
++    var args = [ 'rename' ];
++    if (opts.parents) {
++        args.push('-p');
++    }
++    args.push(opts.dataset, opts.target);
++
++    opts.log.info('rename ZFS dataset from "%s" to "%s"', opts.dataset,
++      opts.target);
++
++    zfsExecCommon(opts.log, args, function (err, info) {
++        if (err) {
++            callback(new VE(err, 'rename dataset "%s" to "%s"', opts.dataset,
++              opts.target));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Mount a ZFS dataset.
++ */
++function zfsMount(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('mount ZFS dataset "%s"', opts.dataset);
++
++    zfsExecCommon(opts.log, [ 'mount', opts.dataset ], function (err, info) {
++        if (err) {
++            callback(new VE(err, 'mount dataset "%s"', opts.dataset));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Destroy a ZFS dataset.
++ */
++function zfsDestroy(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.bool(opts.recursive, 'opts.recursive');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('destroy ZFS dataset "%s"%s', opts.dataset,
++      (opts.recursive ? ' (recursive)' : ''));
++
++    var args = [ 'destroy' ];
++    if (opts.recursive) {
++        args.push('-r');
++    }
++    args.push(opts.dataset);
++
++    zfsExecCommon(opts.log, args, function (err, info) {
++        if (err) {
++            callback(new VE(err, '%sdestroy dataset "%s"',
++              opts.recursive ? 'recursively ' : '', opts.dataset));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Unmount a ZFS dataset.
++ */
++function zfsUnmount(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.bool(opts.force, 'opts.force');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('unmount ZFS dataset "%s"' + (opts.force ? ' (force)' : ''),
++      opts.dataset);
++
++    var args = [ 'unmount' ];
++    if (opts.force) {
++        args.push('-f');
++    }
++    args.push(opts.dataset);
++
++    zfsExecCommon(opts.log, args, function (err, info) {
++        if (err) {
++            callback(new VE(err, '%sunmount dataset "%s"',
++              opts.force ? 'force ' : '', opts.dataset));
++            return;
++        }
++
++        callback();
++    });
++}
++
++/*
++ * Check if a ZFS dataset exists.
++ */
++function zfsExists(opts, callback) {
++    mod_assert.object(opts, 'opts');
++    mod_assert.object(opts.log, 'opts.log');
++    mod_assert.string(opts.dataset, 'opts.dataset');
++    mod_assert.func(callback, 'callback');
++
++    opts.log.info('check if ZFS dataset "%s" exists', opts.dataset);
++
++    zfsExecCommon(opts.log, [ 'list', '-Hp', '-o', 'name' ],
++      function (err, info) {
++        if (err) {
++            callback(new VE(err, 'check for dataset "%s"', opts.dataset));
++            return;
++        }
++
++        var lines = info.stdout.split('\n');
++        var exists = lines.indexOf(opts.dataset) !== -1;
++
++        callback(null, exists);
++    });
++}
++
++
++module.exports = {
++    replacefile: replacefile,
++    chown: chown,
++    chmod: chmod,
++    zfsSet: zfsSet,
++    zfsInherit: zfsInherit,
++    zfsGet: zfsGet,
++    zfsMount: zfsMount,
++    zfsUnmount: zfsUnmount,
++    zfsSnapshot: zfsSnapshot,
++    zfsCreate: zfsCreate,
++    zfsDestroy: zfsDestroy,
++    zfsRename: zfsRename,
++    zfsExists: zfsExists
++};
+diff --git a/lib/postgresMgr.js b/lib/postgresMgr.js
+index f9c8fec..e728ad9 100644
+--- a/lib/postgresMgr.js
++++ b/lib/postgresMgr.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /**
+@@ -21,7 +21,6 @@
+  *                           (_/
+  */
+ var assert = require('assert-plus');
+-var backoff = require('backoff');
+ var ZfsClient = require('./zfsClient');
+ var ConfParser = require('./confParser');
+ var EventEmitter = require('events').EventEmitter;
+@@ -32,18 +31,19 @@ var mod_lsn = require('pg-lsn');
+ var path = require('path');
+ var pg = require('pg');
+ var Client = pg.Client;
+-var shelljs = require('shelljs');
+ var spawn = require('child_process').spawn;
+-var exec = require('child_process').exec;
+ var once = require('once');
+ var posix = require('posix');
+ var sprintf = require('util').format;
+-var SnapShotter = require('./snapShotter');
+ var url = require('url');
+ var util = require('util');
+ var vasync = require('vasync');
+ var verror = require('verror');
+ 
++var lib_common = require('../lib/common');
++
++var VE = verror.VError;
++
+ 
+ // --- Globals
+ 
+@@ -224,7 +224,6 @@ function updateSymlink(srcpath, dstpath) {
+  * tcp://postgres@10.0.0.0:5432/postgres
+  * @param {string} options.dbUser PG user, e.g. postgres.
+  * @param {string} options.zfsClientCfg ZFS client config.
+- * @param {string} options.snapShotterCfg Snapshotter config.
+  * @param {string} options.healthChkInterval Interval of the PG health check in
+  * ms.
+  * @param {string} options.healthChkTimeout Timeout of the PG health check. If
+@@ -293,9 +292,6 @@ function PostgresMgr(options) {
+     /** @type {object} The handle to the zfs client */
+     self._zfsClient = new ZfsClient(self._zfsClientCfg);
+ 
+-    /** @type {SnapShotter} The pg zfs snapshotter.  */
+-    self._snapShotter = new SnapShotter(options.snapShotterCfg);
+-
+     /*
+      * The health check configs and state.
+      */
+@@ -1025,32 +1021,32 @@ PostgresMgr.prototype._waitForStandby = function (stdby) {
+  */
+ PostgresMgr.prototype._primary = function _primary(stdby, callback) {
+     var self = this;
+-    var log = self._log;
++    var log = self._log.child({ op: 'primary transition', url: self._url,
++      standby: stdby });
+ 
+-    log.info({
+-        url: self._url,
+-        standby: stdby
+-    }, 'PostgresMgr._primary: entering.');
++    log.info('transitioning to primary mode');
+ 
+     vasync.pipeline({funcs: [
+         function _cancelTransitioning(_, cb) {
+             if (self._transitionFunc) {
+                 self._transitionFunc.on('done', cb);
+                 self._transitionFunc.cancel();
+-            } else {
+-                return (cb());
++                return;
+             }
++
++            cb();
+         },
+-        function _initDb(_, cb) {
+-            self._initDb(cb);
++        function (_, cb) {
++            self._prepareDatabase(cb);
+         },
+         function _deleteRecoveryConf(_, cb) {
+             fs.unlink(self._recoveryConfPath, function (e) {
+                 if (e && e.code !== 'ENOENT') {
+-                    return cb(e);
+-                } else {
+-                    return cb();
++                    cb(e);
++                    return;
+                 }
++
++                cb();
+             });
+         },
+         function _updateConfigs(_, cb) {
+@@ -1067,32 +1063,30 @@ PostgresMgr.prototype._primary = function _primary(stdby, callback) {
+             self._restart(cb);
+         },
+         function _snapshot(_, cb) {
+-            self._snapShotter.createSnapshot(String(Date.now()), cb);
++            self._zfsClient.snapshotDataset(cb);
+         },
+         function _startReplCheck(_, cb) {
+             if (!stdby) {
+-                return (cb());
++                cb();
++                return;
+             }
++
+             self._transitionFunc = self._waitForStandby(stdby);
+             self._transitionFunc.on('done', function () {
+                 self._transitionFunc = null;
+             });
+-            return (cb());
++
++            cb();
+         }
+     ], arg: {}}, function (err) {
+         if (err) {
+-            log.error({
+-                err: err,
+-                standby: stdby,
+-                url: self._url
+-            }, 'PostgresMgr._primary: error');
+-        } else {
+-            log.info({
+-                standby: stdby,
+-                url: self._url
+-            }, 'PostgresMgr._primary: complete');
++            log.error(err, 'primary transition failed');
++            callback(err);
++            return;
+         }
+-        return (callback(err));
++
++        log.info('primary transition complete');
++        callback();
+     });
+ };
+ 
+@@ -1176,7 +1170,7 @@ PostgresMgr.prototype._updateStandby = function _updateStandby(stdby,
+ /**
+  * Transitions a postgres instance to standby state.
+  *
+- * The only long-running task in this is the restore, which can take minutes to
++ * The only long-running task in this is the restore, which could take hours to
+  * complete.  In other places we set up a transitioning function that can be
+  * canceled so that the manatee state machine doesn't get stuck when something
+  * downstream fails.  In the case of a restore, if the downstream fails then the
+@@ -1196,30 +1190,11 @@ PostgresMgr.prototype._standby = function _standby(primUrl,
+                                                    backupUrl,
+                                                    callback) {
+     var self = this;
+-    var log = self._log;
+     var primaryUrl = url.parse(primUrl);
+-    var backupSnapshot;
++    var log = self._log.child({ op: 'standby transition',
++      primaryUrl: primaryUrl.href, backupUrl: backupUrl });
+ 
+-    log.info({
+-        primaryUrl: primaryUrl.href,
+-        backupUrl: backupUrl
+-    }, 'PostgresMgr._standby: entering');
+-
+-    /**
+-     * Update the primary connection info in recovery.conf
+-     */
+-    function updatePrimaryConnInfo(cb) {
+-        var opts = {};
+-        var value = sprintf(
+-            PRIMARY_CONNINFO_STR,
+-            primaryUrl.hostname,
+-            primaryUrl.port,
+-            primaryUrl.auth,
+-            self._url.href,
+-            self._pgConnectTimeout);
+-        opts[PRIMARY_CONNINFO] = value;
+-        self._updateRecoveryConf(opts, cb);
+-    }
++    log.info('transitioning to standby mode');
+ 
+     function updateConfigurations(cb) {
+         try {
+@@ -1232,172 +1207,199 @@ PostgresMgr.prototype._standby = function _standby(primUrl,
+         }
+ 
+         /*
+-         * Update primary_conninfo to point to the new (host, port) pair.
++         * Update "primary_conninfo" (in "recovery.conf") to point to the new
++         * (host, port) pair.
+          */
+-        updatePrimaryConnInfo(function (err) {
++        var opts = {};
++        opts[PRIMARY_CONNINFO] = sprintf(PRIMARY_CONNINFO_STR,
++            primaryUrl.hostname,
++            primaryUrl.port,
++            primaryUrl.auth,
++            self._url.href,
++            self._pgConnectTimeout);
++
++        self._updateRecoveryConf(opts, function (err) {
+             if (err) {
+                 cb(err);
+                 return;
+             }
+ 
+             /*
+-             * Set synchronous_commit to off in order
+-             * to enable async replication.
++             * Set "synchronous_commit" to "off" in order to enable async
++             * replication.
+              */
+-            var opts = {};
+-            opts[SYNCHRONOUS_COMMIT] = 'off';
++            var pgopts = {};
++            pgopts[SYNCHRONOUS_COMMIT] = 'off';
+ 
+-            self._updatePgConf(opts, cb);
++            self._updatePgConf(pgopts, cb);
+         });
+     }
+ 
+-    /**
+-     * Restores the current postgres instance from the primary via zfs_recv.
+-     */
+-    function restore(cb) {
+-        log.info({
+-            zfsClientCfg: self._zfsClientCfg
+-        }, 'PostgresMgr._standby: restoring db from primary');
++    var isRestore = false;
++    var oldDataset = null;
+ 
+-        self._zfsClient.restore(backupUrl, function (err2, snapshot) {
+-            backupSnapshot = snapshot;
+-            if (err2) {
+-                log.info({
+-                    err: err2,
+-                    backupUrl: backupUrl
+-                }, 'PostgresMgr._standby: could not restore from primary');
+-                return cb(err2);
+-            }
+-            var cmd = 'chown -R ' + self._dbUser + ' ' + self._dataDir;
+-            log.info({
+-                cmd: cmd
+-            }, 'PostgresMgr._standby: finished backup, chowning datadir');
+-            exec(cmd, cb);
+-        });
+-    }
++    vasync.waterfall([ function _cancelTransitioning(cb) {
++        assert.func(cb, 'cb');
+ 
+-    vasync.pipeline({funcs: [
+-        function _cancelTransitioning(_, cb) {
+-            if (self._transitionFunc) {
+-                self._transitionFunc.on('done', cb);
+-                self._transitionFunc.cancel();
+-            } else {
+-                return (cb());
+-            }
+-        },
++        if (self._transitionFunc) {
++            self._transitionFunc.on('done', cb);
++            self._transitionFunc.cancel();
++            return;
++        }
++
++        setImmediate(cb);
++
++    }, function _stopPostgres(cb) {
+         // have to stop postgres here first such that we can assert the dataset,
+         // other wise some actions will fail with EBUSY
+-        function _stopPostgres(_, cb) {
+-            log.info('PostgresMgr.initDb: stop postgres');
+-            self._stop(cb);
+-        },
+-        // fix for MANATEE-90, always check that the dataset exists before
+-        // starting postgres
+-        function _assertDataset(_, cb) {
+-            self._zfsClient.assertDataset(cb);
+-        },
++        log.info('stop postgres');
++        self._stop(cb);
++
++    }, function _assertDataset(cb) {
++        /*
++         * Make sure the database is mounted correctly.  As this is not the
++         * primary peer, we will not create the dataset if it does not exist
++         * already.
++         */
++        self._zfsClient.mountDataset({ createIfMissing: false }, cb);
++
++    }, function _updateConfigs(res, cb) {
++        assert.object(res, 'res');
++        assert.bool(res.exists, 'res.exists');
++        assert.func(cb, 'cb');
++
++        /*
++         * If the dataset does not yet exist, we can skip straight to restoring
++         * from the upstream peer.
++         */
++        if (!res.exists) {
++            log.info('dataset does not exist; need to restore');
++            isRestore = true;
++            setImmediate(cb);
++            return;
++        }
++
+         /*
+          * Attempt to update the configuration for standby mode. If this step
+-         * errors out, then we assume that we need to perform a restore of the
+-         * database from the primary. This is controlled by the _.isRestore flag
+-         * attached to the vasync args, and checked in the following steps.
++         * fails, assume that we need to perform a restore of the database from
++         * the primary.
+          */
+-        function _updateConfigs(_, cb) {
+-            updateConfigurations(function (err) {
+-                _.isRestore = err;
+-                cb();
+-            });
+-        },
+-        // restart pg to enable the config changes.
+-        function _restart(_, cb) {
+-            if (_.isRestore) {
+-                return cb();
+-            } else {
+-                self._restart(function (err) {
+-                    _.isRestore = err;
+-                    return cb();
+-                });
+-            }
+-        },
+-        // following run only if _.isRestore is needed
+-        function _restore(_, cb) {
+-            if (!_.isRestore) {
+-                cb();
+-                return;
++        updateConfigurations(function (err) {
++            if (err) {
++                log.warn(err, 'update config failed; need to restore');
++                isRestore = true;
+             }
+ 
+-            log.warn({ err: _.isRestore }, 'PostgresMgr._standby: ' +
+-                'failed to move into standby state, performing restore');
++            cb();
++        });
++
++    }, function _restart(cb) {
++        if (isRestore) {
++            setImmediate(cb);
++            return;
++        }
+ 
+-            restore(function (err) {
+-                // restore the original backup if zfs recv fails.
+-                if (err) {
+-                    self._zfsClient.restoreDataset(backupSnapshot,
+-                        function () {
+-                        return cb(err);
+-                    });
+-                } else {
+-                    return cb();
+-                }
+-            });
+-        },
+         /*
+-         * If we've just performed a restore, then we need to update the
+-         * configuration files again, since the ZFS dataset will contain
+-         * a configuration made for the upstream database.
++         * Restart PostgreSQL to enable the configuration changes.
+          */
+-        function _updateConfigsAgain(_, cb) {
+-            if (!_.isRestore) {
+-                cb();
+-                return;
++        self._restart(function (err) {
++            if (err) {
++                /*
++                 * The database did not start correctly.  We assume that the
++                 * failure is not transient, and attempt to restore a copy of
++                 * the database from the upstream peer.
++                 */
++                log.warn(err, 'PostgreSQL restart failed; need to restore');
++                isRestore = true;
+             }
+ 
+-            updateConfigurations(cb);
+-        },
+-        function _restartAgain(_, cb) {
+-            if (!_.isRestore) {
+-                return cb();
+-            } else {
+-                self._restart(function (err) {
+-                    // restore the original snapshot if we can't restart, which
+-                    // usuallly indicates corruption in the received dataset
+-                    if (err) {
+-                        self._zfsClient.restoreDataset(backupSnapshot,
+-                                                       function () {
+-                            return cb(err);
+-                        });
+-                    } else {
+-                        return cb();
+-                    }
+-                });
++            cb();
++        });
++
++    }, function _restore(cb) {
++        if (!isRestore) {
++            setImmediate(cb);
++            return;
++        }
++
++        log.info({
++            zfsClientCfg: self._zfsClientCfg
++        }, 'restoring database from upstream peer');
++
++        self._zfsClient.restore(backupUrl, function (err, dsname) {
++            if (err) {
++                log.warn({
++                    err: err,
++                    backupUrl: backupUrl
++                }, 'could not restore from upstream peer');
++                cb(err);
++                return;
+             }
+-        },
+-        // if the restore is successful, then destroy the backupdataset
+-        function _destroyBackupDatset(_, cb) {
+-            if (!_.isRestore) {
+-                return cb();
+-            } else {
+-                var cmd = 'zfs destroy -r ' +
+-                    backupSnapshot.split('@')[0];
+-                log.info({cmd: cmd}, 'PostgresMgr._standby: exec');
+-                exec(cmd, cb);
++
++            /*
++             * The restoration process may have left a backup dataset behind.
++             * Store this value so that we can delete it iff PostgreSQL starts
++             * successfully with the new dataset.
++             */
++            if (dsname !== null) {
++                assert.string(dsname, 'dsname');
++
++                oldDataset = dsname;
+             }
++
++            /*
++             * In case the PostgreSQL user has a different ID on the remote
++             * peer, change the ownership of all files in the dataset now.
++             */
++            log.info('setting ownership on restored dataset');
++            lib_common.chown({ path: self._dataDir, username: self._dbUser,
++              recursive: true }, cb);
++        });
++
++    }, function _updateConfigsAgain(cb) {
++        /*
++         * If we've just performed a restore, we need to update the
++         * configuration files again as the ZFS dataset will contain a
++         * configuration made for the upstream database.
++         */
++        if (!isRestore) {
++            setImmediate(cb);
++            return;
+         }
+-    ], arg: {}}, function (err) {
++
++        updateConfigurations(cb);
++
++    }, function _restartAgain(cb) {
++        if (!isRestore) {
++            setImmediate(cb);
++            return;
++        }
++
++        self._restart(function (err) {
++            cb(err);
++        });
++
++    }, function _destroyBackupDatset(cb) {
++        if (oldDataset === null) {
++            setImmediate(cb);
++            return;
++        }
++
++        assert.string(oldDataset, 'oldDataset');
++
++        log.info('destroying old dataset "%s"', oldDataset);
++        lib_common.zfsDestroy({ log: log, dataset: oldDataset,
++          recursive: true }, cb);
++
++    } ], function (err) {
+         if (err) {
+-            log.info({
+-                err:err,
+-                primaryUrl: primaryUrl.href,
+-                backupUrl: backupUrl
+-            }, 'PostgresMgr._standby: error');
+-            return callback(err);
+-        } else {
+-            log.info({
+-                primaryUrl: primaryUrl.href,
+-                backupUrl: backupUrl
+-            }, 'PostgresMgr._standby: complete');
+-            return callback();
++            log.error(err, 'standby transition failed');
++            callback(err);
++            return;
+         }
++
++        log.info('standby transition complete');
++        callback();
+     });
+ };
+ 
+@@ -1555,7 +1557,7 @@ PostgresMgr.prototype._startHealthCheck = function (callback) {
+                  * @type {verror.VError} error
+                  */
+                 self._healthy = false;
+-                self._lastHealthChkErr =  new verror.VError(err, msg);
++                self._lastHealthChkErr = new verror.VError(err, msg);
+                 self.emit('unhealthy', self._lastHealthChkErr);
+             }
+         } else {
+@@ -1737,104 +1739,194 @@ PostgresMgr.prototype._start = function _start(cb) {
+ };
+ 
+ 
+-/**
+- * Initializes the postgres data directory for a new DB. This can fail if the
+- * db has already been initialized - this is okay, as startdb will fail if init
+- * didn't finish succesfully.
+- *
+- * This function should only be called by the primary of the shard. Standbys
+- * will not need to initialize but rather restore from a already running
+- * primary.
++/*
++ * Prepare the PostgreSQL data directory by mounting the dataset or creating
++ * one if it does not yet exist.  If the database does not yet exist, the
++ * "initdb" program will be invoked to create it.
+  *
+- * @param {function} callback The callback of the form f(err).
++ * This function should only be called on the primary peer.  Standby peers will
++ * instead restore the previously prepared database from the primary peer.
+  */
+-PostgresMgr.prototype._initDb = function (callback) {
++PostgresMgr.prototype._prepareDatabase = function (callback) {
+     var self = this;
+-    var log = self._log;
+-    log.info({
+-        dataDir: self._dataDir
+-    }, 'PostgresMgr.initDb: entering');
++    var log = self._log.child({ op: 'prepare database',
++        datadir: self._dataDir });
+ 
+-    vasync.pipeline({funcs: [
+-        // have to stop postgres here first such that we can assert the dataset,
+-        // other wise some actions will fail with EBUSY
+-        function stopPostgres(_, cb) {
+-            log.info('PostgresMgr.initDb: stop postgres');
+-            self._stop(cb);
+-        },
+-        // fix for MANATEE-90, always check that the dataset exists before
+-        // initializing postgres
+-        function assertDataset(_, cb) {
+-            log.info({dataset: self._zfsClientCfg.dataset},
+-                'PostgresMgr.initDb: assert dataset');
+-            self._zfsClient.assertDataset(cb);
+-        },
+-        function checkDataDirExists(_, cb) {
+-            log.info({datadir: self._dataDir},
+-                'PostgresMgr.initDb: check datadir exists');
+-            fs.stat(self._dataDir, function (err, stats) {
+-                if (err || !stats.isDirectory()) {
+-                    return cb(new verror.VError(err,
+-                        'postgres datadir ' + self._dataDir + ' DNE'));
+-                }
++    log.info('preparing database');
+ 
+-                return cb();
+-            });
++    vasync.waterfall([ function stopPostgres(cb) {
++        assert.func(cb, 'cb');
+ 
+-        },
+-        function setDataDirOwnership(_, cb) {
+-            var cmd = 'chown -R ' + self._dbUser + ' '  + self._dataDir;
+-            log.info({cmd: cmd},
+-                'PostgresMgr.initDb: changing datadir ownership to postgres');
+-            exec(cmd, cb);
+-        },
+-        function setDataDirPerms(_, cb) {
+-            var cmd = 'chmod 700 ' + self._dataDir;
+-            log.info({cmd: cmd},
+-                'PostgresMgr.initDb: changing datadir perms to 700');
+-            exec(cmd, cb);
++        /*
++         * PostgreSQL should definitely not be running before we manipulate the
++         * dataset.
++         */
++        log.info('stopping postgres');
++        self._stop(cb);
+ 
+-        },
+-        function _initDb(_, cb) {
+-            try {
+-                self.resolveVersionedPaths();
+-            } catch (e) {
+-                cb(new verror.VError(e,
+-                    'failed to resolve versioned paths before running initdb'));
++    }, function (cb) {
++        assert.func(cb, 'cb');
++
++        /*
++         * Ensure that the dataset is mounted.  If it does not exist, we want
++         * to create it now.
++         */
++        log.info('mounting dataset');
++        self._zfsClient.mountDataset({ createIfMissing: true }, cb);
++
++    }, function (res, cb) {
++        assert.object(res, 'res');
++        assert.func(cb, 'cb');
++
++        /*
++         * Check the data directory within the newly mounted dataset to ensure
++         * that it either does not yet exist, or is a directory.
++         */
++        log.info('checking that data directory exists');
++        fs.lstat(self._dataDir, function (err, stats) {
++            if (err && err.code === 'ENOENT') {
++                /*
++                 * The directory does not yet exist.  Create it now.
++                 */
++                log.info('data directory does not exist; creating directory');
++                fs.mkdir(self._dataDir, function (err_) {
++                    if (err_) {
++                        cb(new VE(err_, 'creating PostgreSQL data directory ' +
++                          '"%s"', self._dataDir));
++                        return;
++                    }
++
++                    cb();
++                });
++                return;
++            }
++
++            if (err) {
++                cb(new VE(err, 'stat PostgreSQL data directory "%s"',
++                  self._dataDir));
+                 return;
+             }
+ 
+-            assert.string(self._pgInitDbPath, 'self._pgInitDbPath');
++            if (!stats.isDirectory()) {
++                cb(new VE(err, 'PostgreSQL data directory "%s" is not a ' +
++                  'directory', self._dataDir));
++                return;
++            }
+ 
+-            var args = [ 'sudo', '-u', self._dbUser,
+-                         self._pgInitDbPath, '--encoding=UTF-8', '--locale=C',
+-                         '-D', self._dataDir ];
++            cb();
++        });
+ 
+-            log.info({cmd: 'initdb', argv: args},
+-                'PostgresMgr.initDb: initializing db');
++    }, function setDataDirOwnership(cb) {
++        assert.func(cb, 'cb');
+ 
+-            mod_forkexec.forkExecWait({ argv: args }, function (err, info) {
+-                // ignore errors since the db could already be initialized
+-                log.info(info, 'PostgresMgr.initDb: initdb returned');
++        log.info('setting data directory ownership');
++        lib_common.chown({ path: self._dataDir, username: self._dbUser,
++          recursive: true }, cb);
+ 
+-                shelljs.cp('-f', self._hbaConf, self._dataDir + '/pg_hba.conf');
+-                log.info({
+-                    dataDir: self._dataDir,
+-                    postgresqlConf: self._postgresConf
+-                }, 'PostgresMgr.initDb: copying postgresql.conf to data dir');
++    }, function setDataDirPerms(cb) {
++        assert.func(cb, 'cb');
+ 
+-                //TODO: Is this necessary?  Shouldn't we copy this over
+-                // in other places and not here?  I'd rather this file doesn't
+-                // exist than it exist and is wrong.
+-                shelljs.cp('-f', self._postgresConf, self._dataDir +
+-                    '/postgresql.conf');
++        log.info('setting data directory permissions');
++        lib_common.chmod({ path: self._dataDir, mode: '700',
++          recursive: false }, cb);
+ 
+-                cb();
+-            });
++    }, function (cb) {
++        assert.func(cb, 'cb');
++
++        /*
++         * Check to see if the data directory is empty before trying to run
++         * "initdb".  The logic "initdb" uses to determine if the database
++         * exists already is very simple: it effectively checks for files in
++         * the data directory, and if it finds any it assumes the database
++         * exists.
++         */
++        log.info('checking if PostgreSQL database exists');
++        fs.readdir(self._dataDir, function (err, files) {
++            if (err) {
++                cb(new VE(err, 'checking for PostgreSQL database in "%s"',
++                  self._dataDir));
++                return;
++            }
++
++            cb(null, (files.length === 0));
++        });
++
++    }, function _initDb(needinit, cb) {
++        assert.bool(needinit, 'needinit');
++        assert.func(cb, 'cb');
++
++        try {
++            self.resolveVersionedPaths();
++        } catch (e) {
++            cb(new VE(e, 'failed to resolve versioned paths before running ' +
++              'initdb'));
++            return;
+         }
+-    ], arg: {}}, function (err) {
+-        log.info({err: err}, 'PostgresMgr.initDb: finished');
+-        return callback(err);
++
++        assert.string(self._pgInitDbPath, 'self._pgInitDbPath');
++
++        if (!needinit) {
++            log.info('database files exist; skip initdb');
++            setImmediate(cb);
++            return;
++        }
++
++        var args = [ 'sudo', '-u', self._dbUser,
++                     self._pgInitDbPath, '--encoding=UTF-8', '--locale=C',
++                     '-D', self._dataDir ];
++
++        log.info({ cmd: 'initdb', argv: args }, 'creating database cluster');
++
++        mod_forkexec.forkExecWait({ argv: args, includeStderr: true },
++          function (err, info) {
++            log.info(info, '"initdb" finished');
++
++            if (err) {
++                cb(new VE(err, '"initdb" failed'));
++                return;
++            }
++
++            cb();
++        });
++
++    }, function (cb) {
++        assert.func(cb, 'cb');
++
++        /*
++         * Install the access control configuration.
++         */
++        log.info('installing access control file (pg_hba.conf)');
++        lib_common.replacefile({ src: self._hbaConf,
++          dst: path.join(self._dataDir, 'pg_hba.conf') }, cb);
++
++    }, function (cb) {
++        assert.func(cb, 'cb');
++
++        /*
++         * Remove any existing PostgreSQL configuration file.  This file will
++         * be correctly generated later, before the database is started.
++         */
++        log.info('unlinking existing PostgreSQL configuration');
++        fs.unlink(path.join(self._dataDir, 'postgresql.conf'), function (err) {
++            if (err && err.code === 'ENOENT') {
++                /*
++                 * The file was already not present.
++                 */
++                err = null;
++            }
++
++            cb(err);
++        });
++
++    } ], function (err) {
++        if (err) {
++            log.error(err, 'database preparation failure');
++            callback(new VE(err, 'preparing database'));
++            return;
++        }
++
++        log.info('database preparation complete');
++        callback();
+     });
+ };
+ 
+@@ -2313,5 +2405,3 @@ PostgresMgr.prototype._checkReplStatus = function (stdby, callback) {
+ 
+     });
+ };
+-
+-/** #@- */
+diff --git a/lib/snapShotter.js b/lib/snapShotter.js
+index 88d3bae..68e4e3b 100644
+--- a/lib/snapShotter.js
++++ b/lib/snapShotter.js
+@@ -28,6 +28,8 @@ var restify = require('restify');
+ var util = require('util');
+ var vasync = require('vasync');
+ 
++var lib_common = require('../lib/common');
++
+ /*
+  * For determining if a ZFS snapshot name is at least somewhat well-formed.
+  * Can also be used to break a snapshot, e.g. "data/set@snapname" into
+@@ -164,6 +166,31 @@ SnapShotter.prototype.start = function start(callback) {
+     (function cleanup() {
+         log.info('cleaning up snapshots');
+         vasync.pipeline({funcs: [
++            function _checkForDataset(_, cb) {
++                assert.string(self._dataset, 'self._dataset');
++
++                lib_common.zfsExists({ log: log, dataset: self._dataset },
++                  function (err, exists) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++
++                    assert.bool(exists, 'exists');
++                    if (exists) {
++                        cb();
++                        return;
++                    }
++
++                    /*
++                     * If the dataset does not yet exist, sleep for an interval
++                     * before checking again.
++                     */
++                    log.info('dataset "%s" does not yet exist; no cleanup',
++                      self._dataset);
++                    setTimeout(cleanup, self._pollInterval);
++                });
++            },
+             function _getSnapshots(_, cb) {
+                 assert.string(self._dataset, 'self._dataset');
+                 assert.ok(!RE_SNAPSHOT.test(self._dataset), self._dataset +
+diff --git a/lib/statusServer.js b/lib/statusServer.js
+index 1fa81d5..80d6695 100644
+--- a/lib/statusServer.js
++++ b/lib/statusServer.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /**
+@@ -20,11 +20,9 @@
+  *                           (_/
+  *
+  */
+-var util = require('util');
+ 
+ var assert = require('assert-plus');
+ var restify = require('restify');
+-var uuid = require('node-uuid');
+ 
+ /**
+  *
+diff --git a/lib/zfsClient.js b/lib/zfsClient.js
+index 2340177..a571443 100644
+--- a/lib/zfsClient.js
++++ b/lib/zfsClient.js
+@@ -5,32 +5,25 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+-/**
+- * @overview The ZFS client.
+- *
+- *                   _.---.._
+- *      _        _.-' \  \    ''-.
+- *    .'  '-,_.-'   /  /  /       '''.
+- *   (       _                     o  :
+- *    '._ .-'  '-._         \  \-  ---]
+- *                  '-.___.-')  )..-'
+- *                           (_/
+- */
++
+ var assert = require('assert-plus');
+-var exec = require('child_process').exec;
+ var path = require('path');
++var fs = require('fs');
+ var once = require('once');
+ var net = require('net');
+ var restify = require('restify');
+ var spawn = require('child_process').spawn;
+-var util = require('util');
+-var uuid = require('node-uuid');
+ var vasync = require('vasync');
+ var verror = require('verror');
+ 
++var lib_common = require('../lib/common');
++
++var VE = verror.VError;
++
++
+ /**
+  * ZFS client. Interactions with the underlying ZFS dataset -- which is used by
+  * PostgreSQL -- are managed through this client.
+@@ -67,7 +60,6 @@ function ZfsClient(options) {
+ 
+     var self = this;
+ 
+-    /** @type {Bunyan} The bunyan log object */
+     this._log = options.log.child({component: 'ZfsClient'}, true);
+     self._log.info('initializing ZfsClient with options', options);
+ 
+@@ -105,24 +97,26 @@ function ZfsClient(options) {
+     }, 'initalized ZfsClient');
+ }
+ 
+-module.exports = ZfsClient;
+-
+-/**
+- * @callback ZfsClient-restoreCb
+- * @param {Error} error
+- * @param {string} backupSnapshot The previous dataset's snapshot.
+- */
+-
+-/**
+- * Restores the current dataset from the remote host.
+- * @param {string} serverUrl server's url. e.g. http://10.0.0.0:1234
+- * @param {ZfsClient-restoreCb} callback
++/*
++ * Receive a snapshot of a dataset from a remote Manatee peer.  The snapshot
++ * will be received as a child of the ZFS dataset delegated into the zone,
++ * where it will then be used to start PostgreSQL.
++ *
++ * The "serverUrl" argument must be the URL of the backup server on the remote
++ * Manatee peer.  The "callback" function has the signature:
++ *
++ *     callback(err, oldDataset)
++ *
++ * If there is already a dataset in the target location it will be preserved by
++ * renaming it to a unique name based on the time of this restore operation.
++ * The new name will be passed to the callback as "oldDataset".  If no dataset
++ * existed already, "oldDataset" will be null.
+  */
+ ZfsClient.prototype.restore = function restore(serverUrl, callback) {
+     var self = this;
+     var log = self._log;
+ 
+-    var backupSnapshot;
++    var oldDataset = null;
+ 
+     log.info({
+         dataset: self._dataset,
+@@ -130,378 +124,515 @@ ZfsClient.prototype.restore = function restore(serverUrl, callback) {
+         pollInterval: self._pollInterval
+     }, 'ZFSClient.restore: entering');
+ 
+-    vasync.pipeline({funcs: [
+-        function _createRestClient(_, cb) {
+-            self._client = restify.createJsonClient({
+-                url: serverUrl,
+-                version: '*'
+-            });
+-            return cb();
+-        },
+-        function _backupCurrentDataset(_, cb) {
+-            self._backupDataset(self._dataset,
+-                                self._parentDataset + '/' + uuid.v4(),
+-                                self._mountpoint,
+-                                function (err, snap)
+-            {
+-                backupSnapshot = snap;
+-                return cb(err);
+-            });
+-        },
+-        function _receive(_, cb) {
+-            self._receive(self._dataset,
+-                          serverUrl,
+-                          self._pollInterval,
+-                          cb);
+-        },
+-        function _setMountPoint(_, cb) {
+-            var cmd = 'zfs set mountpoint=' + self._mountpoint + ' ' +
+-                      self._dataset;
+-            log.info({ cmd: cmd }, 'ZfsClient.restore: exec');
+-            exec(cmd, cb);
+-        },
+-        function _setNoAutoMount(_, cb) {
+-            var cmd = 'zfs set canmount=noauto ' + self._dataset;
+-            log.info({ cmd: cmd }, 'ZfsClient.restore: exec');
+-            exec(cmd, cb);
+-        },
+-        function _mount(_, cb) {
+-            var cmd = 'zfs mount ' + self._dataset;
+-            log.info({ cmd: cmd }, 'ZfsClient.restore: exec');
+-            exec(cmd, cb);
+-        },
+-        // MANATEE-119 - snapshot after restoring the dataset from a primary
+-        function _snapshot(_, cb) {
+-            var cmd = 'zfs snapshot ' + self._dataset + '@' +
+-                new Date().getTime();
+-            log.info({ cmd: cmd }, 'ZfsClient.restore: exec');
+-            exec(cmd, cb);
+-        }
+-    ], arg: {}}, function (err) {
++    self._client = restify.createJsonClient({
++        url: serverUrl,
++        version: '*'
++    });
++
++    vasync.waterfall([ function (next) {
++        /*
++         * Before we try to receive a copy of the database from the upstream
++         * peer, move the existing dataset (if any) out of the way.
++         */
++        self.isolateDataset({ prefix: 'autorebuild' }, next);
++
++    }, function (isolatedName, next) {
++        assert.optionalString(isolatedName, 'isolatedName');
++        assert.func(next, 'next');
++
++        /*
++         * Keep the name of the newly isolated dataset so that we can delete
++         * it if this restore succeeds.  If there was no extant dataset to
++         * isolate, this value will be null.
++         */
++        oldDataset = isolatedName;
++
++        self._receive(self._dataset, serverUrl, self._pollInterval, next);
++
++    }, function (next) {
++        /*
++         * Set the "canmount" property to "noauto" so that the system does not
++         * try to automatically mount this dataset.  Manatee itself will mount
++         * and unmount the dataset as required.
++         */
++        lib_common.zfsSet({ log: log, dataset: self._dataset,
++          property: 'canmount', value: 'noauto' }, next);
++
++    }, function (next) {
++        lib_common.zfsSet({ log: log, dataset: self._dataset,
++          property: 'mountpoint', value: self._mountpoint }, next);
++
++    }, function (next) {
++        /*
++         * Historically, Manatee had set a value for the "snapdir" property on
++         * the database dataset.  To be safe, we reset that property on the
++         * received dataset.
++         */
++        lib_common.zfsInherit({ log: log, dataset: self._dataset,
++          property: 'snapdir' }, next);
++
++    }, function (next) {
++        lib_common.zfsMount({ log: log, dataset: self._dataset }, next);
++
++    }, function (next) {
++        /*
++         * Before we begin to use the dataset received from the upstream peer,
++         * take an initial snapshot.
++         */
++        self.snapshotDataset(next);
++
++    } ], function (err) {
+         if (err) {
+-            log.info({
++            err = new VE(err, 'receiving snapshot from "%s"', serverUrl);
++
++            log.error({
+                 err: err,
+                 dataset: self._dataset,
+-                backupSnapshot: backupSnapshot,
++                oldDataset: oldDataset,
+                 serverUrl: serverUrl,
+                 pollInterval: self._pollInterval
+             }, 'unable to restore snapshot');
+-            return callback(err, backupSnapshot);
+-        } else {
+-            log.info({
+-                dataset: self._dataset,
+-                backupSnapshot: backupSnapshot,
+-                serverUrl: serverUrl,
+-                pollInterval: self._pollInterval
+-            }, 'ZFSClient.restore: success');
+-            return callback(null, backupSnapshot);
++            callback(err, oldDataset);
++            return;
+         }
++
++        log.info({
++            dataset: self._dataset,
++            oldDataset: oldDataset,
++            serverUrl: serverUrl,
++            pollInterval: self._pollInterval
++        }, 'ZFSClient.restore: success');
++        callback(null, oldDataset);
+     });
+ };
+ 
+-/**
+- * @callback ZfsClient-cb
+- * @param {Error} err
++/*
++ * Create a snapshot of the dataset.  The name of the snapshot will be the
++ * current UNIX time in milliseconds, as expected by the cleanup process in the
++ * snapshotter service.
+  */
++ZfsClient.prototype.snapshotDataset = function snapshotDataset(callback) {
++    var self = this;
+ 
+-/**
+- * Restores a dataset from a snapshot.
+- * @param {string} snapshot The snapshot to restore from.
+- * @param {ZfsClient-cb} callback
++    assert.func(callback, 'callback');
++
++    lib_common.zfsSnapshot({ log: self._log, dataset: self._dataset,
++      snapshot: String(Date.now()) }, callback);
++};
++
++/*
++ * Ensure that the PostgreSQL dataset is correctly mounted, owned by the
++ * correct UNIX user, and has appropriate values for a handful of ZFS
++ * properties.
++ *
++ * This process attempts to avoid making potentially disruptive or expensive
++ * changes to the system if they can be avoided.  In particular, we avoid
++ * unmounting the dataset if it is already correctly mounted: this operation
++ * can fail if another process (e.g., an operator shell) is holding the
++ * directory open and is not required if the system is already correctly
++ * configured.
++ *
++ * The "opts" object has the following required properties:
++ *
++ *      createIfMissing     specifies whether to create the dataset if
++ *                          it does not already exist (boolean)
++ *
++ * If the dataset does not exist and "createIfMissing" is true, we will create
++ * an empty dataset with the appropriate name and mount that.  If false, and
++ * the dataset does not exist, no further actions will be taken.
++ *
++ * The "callback" function accepts two arguments:
++ *
++ *      err                 an error object if the operation failed
++ *
++ *      res                 a result object with an "exists" boolean property
++ *                          reflecting whether or not the dataset exists
+  */
+-ZfsClient.prototype.restoreDataset = function restoreDataset(snapshot, callback)
+-{
++ZfsClient.prototype.mountDataset = function mountDataset(opts, callback) {
+     var self = this;
+-    var log = self._log;
+-    var dataset = self._dataset;
+ 
+-    log.info({
+-        dataset: dataset,
+-        snapshot: snapshot
+-    }, 'ZfsClient.restoreDataset: entering');
++    assert.object(opts, 'opts');
++    assert.bool(opts.createIfMissing, 'opts.createIfMissing');
+ 
+-    vasync.pipeline({funcs: [
+-        function _destroyDataset(_, cb) {
+-            var cmd = 'zfs destroy -r ' + dataset;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, function (err) {
+-                log.info({err: new verror.VError(
+-                    'zfs destroy failed', err)});
+-                    // don't care if the destroy fails
+-                    return cb();
+-            });
+-        },
+-        function _cloneDataset(_, cb) {
+-            // TODO: we want to set canmount=noauto such that we don't auto
+-            // mount the snapshot. This doesn't currently work, blocked on
+-            // OS-1870
+-            var cmd = 'zfs clone -o canmount=off ' + snapshot + ' ' + dataset;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _promoteDataset(_, cb) {
+-            var cmd = 'zfs promote ' + dataset;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _destroyBackupDataset(_, cb) {
+-            var cmd = 'zfs destroy -r ' +
+-                snapshot.split('@')[0];
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _setCanmountNoauto(_, cb) {
+-            var cmd = 'zfs set canmount=noauto ' + dataset;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _setMountpoint(_, cb) {
+-            var cmd = 'zfs set mountpoint=' +
+-                self._mountpoint + ' ' + dataset;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _mkdirpMountpoint(_, cb) {
+-            var cmd = 'mkdir -p ' + self._mountpoint;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _chownMountPoint(_, cb) {
+-            var cmd = 'chown -R ' + self._dbUser + ' ' + self._mountpoint;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _chmodMountpoint(_, cb) {
+-            var cmd = 'chmod 755 ' + self._mountpoint;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.restoreDataset: chmod mountpoint to 755');
+-            exec(cmd, cb);
+-        },
+-        function _zfsMount(_, cb) {
+-            var cmd = 'zfs mount ' + dataset;
+-            log.info({cmd: cmd}, 'ZfsClient.restoreDataset: exec');
+-            exec(cmd, cb);
++    var log = self._log.child({ dataset: self._dataset,
++        zfs_op: 'mount dataset' });
++
++    log.debug('mounting dataset');
++
++    vasync.waterfall([ function (next) {
++        /*
++         * Check to see if the dataset exists already.
++         */
++        lib_common.zfsExists({ log: log, dataset: self._dataset }, next);
++
++    }, function (exists, next) {
++        assert.bool(exists, 'exists');
++        assert.func(next, 'next');
++
++        if (exists) {
++            setImmediate(next);
++            return;
+         }
+-    ], arg: {}}, function (err) {
+-        if (err) {
+-            log.info({
+-                err: err,
+-                dataset: dataset,
+-                snapshot: snapshot
+-            }, 'unable to restore dataset');
+-            return callback(err);
+-        } else {
+-            log.info({
+-                dataset: dataset,
+-                snapshot: snapshot
+-            }, 'restored dataset');
+-            return callback();
++
++        /*
++         * The dataset does not already exist.
++         */
++        if (!opts.createIfMissing) {
++            /*
++             * The caller does not want the dataset to be created if it
++             * does not exist.  Return without doing any more work.
++             */
++            log.debug('dataset does not exist, not creating');
++            callback(null, { exists: false });
++            return;
+         }
+-    });
+-};
+ 
+-/**
+- * Asserts whether the zfs dataset is ready to used.
+- * This checks:
+- * -  whether the dataset exists.
+- * -  whether the mountpoint is correct.
+- * -  whether the dataset is mounted.
+- * -  if the dataset is not mounted, mount the dataset.
+- * @param {ZfsClient-cb} callback
+- */
+-ZfsClient.prototype.assertDataset = function assertDataset(callback) {
+-    var self = this;
+-    var log = self._log;
+-    log.debug({
+-        dataset: self._dataset
+-    }, 'entering ZfsClient.assertDataset');
++        /*
++         * Create the dataset.
++         */
++        lib_common.zfsCreate({ log: log, dataset: self._dataset,
++          props: { canmount: 'noauto' }}, next);
+ 
+-    vasync.pipeline({funcs: [
+-        function _checkDatasetExists(_, cb) {
+-            _.exists = true;
+-            var cmd = 'zfs list ' + self._dataset;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: checking whether dataset exists');
++    }, function (next) {
++        /*
++         * Ensure that the "canmount" property is set to "noauto".
++         */
++        lib_common.zfsGet({ log: log, dataset: self._dataset,
++          property: 'canmount' }, function (err, value) {
++            if (err) {
++                next(err);
++                return;
++            }
+ 
+-            exec(cmd, function (err) {
+-                if (err) {
+-                    _.exists = false;
+-                    log.info({err: err, dataset: self._dataset},
+-                        'dataset does not exist');
++            if (value === 'noauto') {
++                next();
++                return;
++            }
++
++            lib_common.zfsSet({ log: log, dataset: self._dataset,
++              property: 'canmount', value: 'noauto' }, next);
++        });
++
++    }, function (next) {
++        /*
++         * Ensure that the "mountpoint" property is set correctly.
++         */
++        lib_common.zfsGet({ log: log, dataset: self._dataset,
++          property: 'mountpoint' }, function (err, value) {
++            if (err) {
++                next(err);
++                return;
++            }
++
++            if (value === self._mountpoint) {
++                next();
++                return;
++            }
++
++            lib_common.zfsSet({ log: log, dataset: self._dataset,
++              property: 'mountpoint', value: self._mountpoint }, next);
++        });
++
++    }, function (next) {
++        /*
++         * Ensure that the dataset is mounted.
++         */
++        lib_common.zfsGet({ log: log, dataset: self._dataset,
++          property: 'mounted' }, function (err, value) {
++            if (err) {
++                next(err);
++                return;
++            }
++
++            if (value === 'yes') {
++                setImmediate(next);
++                return;
++            }
++
++            lib_common.zfsMount({ log: log, dataset: self._dataset }, next);
++        });
++
++    }, function (next) {
++        /*
++         * Older versions of Manatee explicitly overrode the "snapdir" property
++         * to make the snapshot directory visible.  This was never strictly
++         * necessary, and indeed caused problems with recursive chown of the
++         * dataset directory, so we ensure it is reset to the default (hidden)
++         * behaviour here.
++         */
++        lib_common.zfsInherit({ log: log, dataset: self._dataset,
++          property: 'snapdir' }, next);
++
++    }, function (next) {
++        /*
++         * Confirm in mnttab(4) that the dataset is mounted at the correct
++         * location.
++         */
++        fs.readFile('/etc/mnttab', { encoding: 'utf8' }, function (err, data) {
++            if (err) {
++                next(new VE(err, 'reading mount table'));
++                return;
++            }
++
++            var found = 0;
++            var lines = data.split('\n');
++            for (var i = 0; i < lines.length; i++) {
++                var t = lines[i].split('\t');
++                if (t.length < 5) {
++                    continue;
++                }
++
++                var special = t[0];
++                var mountpoint = t[1];
++                var fstype = t[2];
++
++                if (mountpoint === self._mountpoint) {
++                    if (fstype === 'zfs' && special === self._dataset) {
++                        found++;
++                        continue;
++                    }
++
++                    next(new VE('incorrect file system mounted at "%s": %j',
++                        self._mountpoint, t));
++                    return;
++                }
++
++                if (fstype === 'zfs' && special === self._dataset) {
++                    assert.notEqual(mountpoint, self._mountpoint);
++
++                    next(new VE('dataset "%s" mounted at "%s" instead of "%s"',
++                      self._dataset, mountpoint, self._mountpoint));
++                    return;
+                 }
+-                // doesn't matter if the dataset doesn't exist, we will create
+-                // it
+-                return cb();
+-            });
+-        },
+-        // fix for MANATEE-95, if the box restarts during a restore operation,
+-        // then the backup dataset never gets renamed back to the manatee
+-        // dataset.
+-        function _createDataset(_, cb) {
+-            if (_.exists) {
+-                return cb();
+             }
+-            var cmd = 'zfs create -o canmount=noauto ' + self._dataset;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: dataset DNE, creating dataset');
+-            exec(cmd, cb);
+ 
+-            return (undefined);
+-        },
+-        // dataset should exist here, unmount it so we can perform setup, such
+-        // as setting the mountpoint.
+-        function _unmountDataset(_, cb) {
+-            var cmd = 'zfs unmount ' + self._dataset;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: unmounting dataset for setup');
+-            exec(cmd, function (err, stdout, stderr) {
+-                log.info({
+-                    err: err,
+-                    stdout: stdout,
+-                    stderr: stderr
+-                }, 'ZfsClient.assertDataset: unmount finished');
++            if (found !== 1) {
++                next(new VE('found %d instead of 1 mount in mnttab(4)',
++                  found));
++                return;
++            }
+ 
+-                // the unmount will fail if the dataset is already unmounted so
+-                // ignore it.
+-                return cb();
+-            });
+-        },
+-        function _setMountpoint(_, cb) {
+-            var cmd = 'zfs set mountpoint=' + self._mountpoint + ' ' +
+-                self._dataset;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: setting mountpoint');
+-            exec(cmd, cb);
+-        },
+-        function _chownMountpoint(_, cb) {
+-            var cmd = 'chown -R ' + self._dbUser + ' ' + self._mountpoint;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: chown mountpoint to dbuser');
+-            exec(cmd, cb);
+-        },
+-        function _chmodMountpoint(_, cb) {
+-            var cmd = 'chmod 755 ' + self._mountpoint;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: chmod mountpoint to 755');
+-            exec(cmd, cb);
+-        },
+-        // MANATEE-94 -- if the dataset isn't mounted, and for some reason
+-        // there are already files under the mountpath, we need to remove them
+-        // otherwise the mount dataset operation will fail.
+-        function rmrMountpoint(_, cb) {
+-            var cmd = 'rm -rf ' + self._mountpoint + '/*';
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: removing files under mountpoint');
+-            exec(cmd, cb);
+-        },
+-        function _mountDataset(_, cb) {
+-            var cmd = 'zfs mount ' + self._dataset;
+-            log.debug({
+-                cmd: cmd
+-            }, 'ZfsClient.assertDataset: mounting dataset');
+-            exec(cmd, cb);
++            next();
++        });
++    }, function (next) {
++        /*
++         * In case the PostgreSQL user ID has changed from previous image
++         * versions, or is different in a dataset received from a remote peer,
++         * reset ownership now.
++         */
++        lib_common.chown({ path: self._mountpoint, username: self._dbUser,
++          recursive: true }, next);
++
++    } ], function (err) {
++        if (err) {
++            callback(new VE(err, '%smounting dataset "%s" at "%s"',
++              opts.createIfMissing ? 'creating/' : '',
++              self._dataset, self._mountpoint));
++            return;
+         }
+-    ], arg: {}}, function (err) {
+-        log.info({
+-            err: err
+-        }, 'ZfsClient.assertDataset: exiting');
+ 
+-        return callback(err);
++        log.debug('dataset is mounted');
++        callback(null, { exists: true });
+     });
+ };
+ 
+-/**
+- * #@+
+- * @private
+- * @memberOf ZfsClient
++/*
++ * Permanently destroy the dataset under our management.
+  */
++ZfsClient.prototype.destroyDataset = function (callback) {
++    assert.func(callback, 'callback');
+ 
+-/**
+- * @callback ZfsClient-backupDatasetCb
+- * @param {Error} err
+- * @param {string} backupSnapshot The snapshot of the backedup dataset.
+- */
++    var self = this;
+ 
+-/**
+- * Backup the current dataset such that another dataset can be replaced in its
+- * place.
++    assert.string(self._dataset, 'self._dataset');
++    var dataset = self._dataset;
++
++    var log = self._log.child({ dataset: self._dataset,
++        zfs_op: 'destroy dataset' });
++
++    log.debug('destroying dataset');
++
++    var destroy;
++
++    vasync.waterfall([ function (next) {
++        assert.func(next, 'next');
++
++        /*
++         * Check to see if the dataset we have been asked to destroy exists.
++         */
++        lib_common.zfsExists({ log: log, dataset: dataset }, next);
++
++    }, function (exists, next) {
++        assert.bool(exists, 'exists');
++        assert.func(next, 'next');
++
++        if (!exists) {
++            log.info('dataset "%s" does not exist; not destroying', dataset);
++            destroy = false;
++            setImmediate(next);
++            return;
++        }
++
++        /*
++         * Destroy the dataset.  We destroy recursively in case there are any
++         * snapshots.
++         */
++        log.info('dataset "%s" exists; destroying', dataset);
++        destroy = true;
++        lib_common.zfsDestroy({ log: log, dataset: dataset, recursive: true },
++          next);
++
++    } ], function (err) {
++        if (err) {
++            callback(new VE(err, 'destroying dataset "%s"', dataset));
++            return;
++        }
++
++        assert.bool(destroy, 'destroy');
++        log.debug('dataset ' + (destroy ? 'destroyed' : 'did not exist'));
++        callback(null, destroy);
++    });
++};
++
++/*
++ * Isolate the managed dataset: that is, ensure it is unmounted, will not be
++ * remounted automatically, and is renamed under a special parent for isolated
++ * datasets.
+  *
+- * @param {object} self
+- * @param {string} dataset The dataset to backup.
+- * @param {string} backup The dataset to back up to.
+- * @param {string} mountpoint The mountpoint of the dataset.
+- * @param {ZfsClient-backupdatasetCb} callback
++ * The "opts" object has the following required properties:
++ *
++ *      prefix          a string prefix that will be included in the renamed
++ *                      dataset name (e.g., "rebuild")
++ *
++ * The "callback" function has two arguments:
++ *
++ *      err             an error object if the operation failed
++ *
++ *      isolatedName    the string name of the renamed dataset, or null if
++ *                      there was no dataset to isolate
+  */
+-ZfsClient.prototype._backupDataset = function (dataset,
+-                                              backup,
+-                                              mountpoint,
+-                                              callback)
+-{
++ZfsClient.prototype.isolateDataset = function (opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.prefix, 'opts.prefix');
++    assert.func(callback, 'callback');
++
+     var self = this;
+-    var log = self._log;
+-    log.debug({
+-        dataset: dataset,
+-        backupDataset: backup,
+-        mountpoint: mountpoint
+-    }, 'entering ZfsClient.backupDataset');
+ 
+-    var snapshotId = Date.now();
++    assert.string(self._dataset, 'self._dataset');
++    var dataset = self._dataset;
+ 
+-    vasync.pipeline({funcs: [
+-        // first take a snapshot of the current dataset
+-        function _takeSnapshot(_, cb) {
+-            _.srcSnapshot = dataset + '@' + snapshotId;
+-            var cmd = 'zfs snapshot ' + _.srcSnapshot;
+-            log.info({cmd: cmd}, 'ZfsClient.backupDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _cloneDataset(_, cb) {
+-            // TODO: we want to set canmount=noauto such that we don't auto
+-            // mount the snapshot. This doesn't currently work , blocked on
+-            // OS-1870
+-            var cmd = 'zfs clone -o canmount=off ' +
+-                _.srcSnapshot + ' ' + backup;
+-            log.info({cmd: cmd}, 'ZfsClient.backupDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _setCanmountOn(_, cb) {
+-            var cmd = 'zfs set canmount=noauto ' + backup;
+-            log.info({cmd: cmd}, 'ZfsClient.backupDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _setMountpoint(_, cb) {
+-            var cmd = 'zfs set mountpoint=' + mountpoint +
+-                ' ' + backup;
+-            log.info({cmd: cmd}, 'ZfsClient.backupDataset: exec');
+-            exec(cmd, cb);
+-        },
+-        function _promoteDataset(_, cb) {
+-            var cmd = 'zfs promote ' + backup;
+-            log.info({cmd: cmd}, 'ZfsClient.backupDataset: exec');
+-            exec(cmd, cb);
++    var log = self._log.child({ dataset: dataset, prefix: opts.prefix,
++        zfs_op: 'isolate dataset' });
++
++    log.debug('isolating dataset');
++
++    var isolate = false;
++
++    /*
++     * Keep isolated datasets together under a common parent dataset.
++     */
++    assert.string(self._parentDataset, 'self._parentDataset');
++    var isolatedName = [ self._parentDataset, 'isolated',
++      opts.prefix + '-' + (new Date()).toISOString() ].join('/');
++
++    vasync.waterfall([ function (next) {
++        assert.func(next, 'next');
++
++        /*
++         * Check to see if the dataset we have been asked to isolate exists.
++         */
++        lib_common.zfsExists({ log: log, dataset: dataset }, next);
++
++    }, function (exists, next) {
++        assert.bool(exists, 'exists');
++        assert.func(next, 'next');
++
++        if (!exists) {
++            log.info('dataset "%s" does not exist; not preserving', dataset);
++            isolate = false;
++            isolatedName = null;
++            setImmediate(next);
++            return;
+         }
+-    ], arg: {}}, function (err) {
++
++        isolate = true;
++        log.info('dataset "%s" exists; renaming to "%s"', dataset,
++          isolatedName);
++
++        /*
++         * Set "canmount" to "off", which implicitly unmounts the dataset.
++         * This will fail if the dataset is busy and cannot be unmounted.  When
++         * set to "off", the dataset cannot be mounted in future unless the
++         * property is reset to "noauto" or "on".
++         */
++        lib_common.zfsSet({ log: log, dataset: dataset, property: 'canmount',
++          value: 'off' }, next);
++
++    }, function (next) {
++        assert.func(next, 'next');
++
++        if (!isolate) {
++            setImmediate(next, null, null);
++            return;
++        }
++
++        /*
++         * Check to make sure the dataset was unmounted as a result of setting
++         * the "canmount" property.
++         */
++        lib_common.zfsGet({ log: log, dataset: dataset, property: 'mounted' },
++          next);
++
++    }, function (value, next) {
++        assert.optionalString(value, 'value');
++        assert.func(next, 'next');
++
++        if (!isolate) {
++            setImmediate(next);
++            return;
++        }
++
++        assert.string(value, 'value');
++
++        if (value !== 'no') {
++            next(new VE('wanted "no" but found "%s" for property "mounted"',
++                value));
++            return;
++        }
++
++        /*
++         * Clear any explicit mount point for this dataset, so that it will
++         * inherit the mountpoint of the parent dataset after we rename it.
++         */
++        lib_common.zfsInherit({ log: log, dataset: dataset,
++          property: 'mountpoint' }, next);
++
++    }, function (next) {
++        assert.func(next, 'next');
++
++        if (!isolate) {
++            setImmediate(next);
++            return;
++        }
++
++        /*
++         * Rename the dataset to place it in the isolated dataset holding
++         * area.  The isolate holding dataset might not exist, so request that
++         * any intermediate datasets be created automatically.
++         */
++        lib_common.zfsRename({ log: log, dataset: dataset, target: isolatedName,
++          parents: true }, next);
++
++    } ], function (err) {
+         if (err) {
+-            err = new verror.VError(err);
+-        } else {
+-            var backupSnapshot = backup+ '@' + snapshotId;
+-            log.info({
+-                err: err,
+-                dataset: dataset,
+-                backupDataset: backup,
+-                backupSnapshot: backupSnapshot,
+-                mountpoint: mountpoint
+-            }, 'ZfsClient.backupDataset: exiting');
+-            return callback(err, backupSnapshot);
++            callback(new VE(err, 'preserving dataset "%s"', dataset));
++            return;
+         }
++
++        log.debug({ isolated_name: isolatedName },
++          'dataset isolation complete');
++
++        callback(null, isolatedName);
+     });
+ };
+ 
+@@ -545,7 +676,7 @@ ZfsClient.prototype._postRestoreRequest = function (serverUrl, callback) {
+             pollInterval: self._pollInterval,
+             response: obj
+         }, 'ZfsClient.postRestoreRequest: exiting');
+-        return callback(err, obj ? obj.jobPath : null);
++        callback(err, obj ? obj.jobPath : null);
+     });
+ };
+ 
+@@ -663,21 +794,6 @@ ZfsClient.prototype._receive = function (dataset,
+     }, 'ZfsClient.restore: entering');
+ 
+     vasync.pipeline({funcs: [
+-        function destroyCurrentDataset(_, cb) {
+-            var cmd = 'zfs destroy -r ' + dataset;
+-            log.info({cmd: cmd}, 'ZfsClient.receive: exec');
+-            exec(cmd, cb);
+-        },
+-        /*
+-         * MANATEE-94 destroyCurrentDataset() should already have removed
+-         * everything under the mountpoint, however, to be safe, we rmr
+-         * everything under $mountpoint/
+-         */
+-        function rmrMountpoint(_, cb) {
+-            var cmd = 'rm -rf ' + self._mountpoint + '/*';
+-            log.info({cmd: cmd}, 'ZfsClient.receive: exec');
+-            exec(cmd, cb);
+-        },
+         function _startZfsRecv(_, cb) {
+             cb = once(cb);
+             log.info('zfsClient._receive: starting zfs recv ' + self._dataset);
+@@ -712,7 +828,7 @@ ZfsClient.prototype._receive = function (dataset,
+ 
+                 log.info('zfsClient._receive: completed zfs recv');
+             });
+-            return cb();
++            cb();
+         },
+         function createServer(_, cb) {
+             cb = once(cb);
+@@ -720,7 +836,7 @@ ZfsClient.prototype._receive = function (dataset,
+             server.on('connection', function (socket) {
+                 log.info('ZFSClient._receive: got socket, piping to zfs recv');
+                 socket.pipe(_.zfsRecv.stdin);
+-                return cb();
++                cb();
+             });
+ 
+             log.info({port: self._zfsPort, host: self._zfsHost},
+@@ -731,18 +847,18 @@ ZfsClient.prototype._receive = function (dataset,
+                              'ZfsClient._receive: could not start server');
+                     err = new verror.VError(err);
+                 }
+-                return cb(err);
++                cb(err);
+             });
+ 
+             server.on('error', function (err) {
+                 log.warn({err: err}, 'ZfsClient._receive: got socket error');
+-                return cb(new verror.VError(err));
++                cb(new verror.VError(err));
+             });
+         },
+         function _postRestoreRequest(_, cb) {
+             self._postRestoreRequest(serverUrl, function (err, jobPath) {
+                 _.jobPath = jobPath;
+-                return cb(err);
++                cb(err);
+             });
+         },
+         /*
+@@ -755,10 +871,10 @@ ZfsClient.prototype._receive = function (dataset,
+                                         restoreIntervalId, _.jobPath, cb);
+         }
+     ], arg: {}}, function (err) {
+-        // always close the server when done.
+         try {
+             server.close();
+         } catch (e) {}
++        clearInterval(restoreIntervalId);
+ 
+         if (err) {
+             log.info({
+@@ -767,18 +883,17 @@ ZfsClient.prototype._receive = function (dataset,
+                 serverUrl: serverUrl,
+                 pollInterval: pollInterval
+             }, 'unable to receive snapshot');
+-            // clear the interval incase one of the other funcs failed
+-            clearInterval(restoreIntervalId);
+-            return callback(err);
+-        } else {
+-            log.info({
+-                dataset: dataset,
+-                serverUrl: serverUrl,
+-                pollInterval: pollInterval
+-            }, 'successfully received zfs dataset');
+-            return callback();
++            callback(err);
++            return;
+         }
++
++        log.info({
++            dataset: dataset,
++            serverUrl: serverUrl,
++            pollInterval: pollInterval
++        }, 'successfully received zfs dataset');
++        callback();
+     });
+ };
+ 
+-/** #@- */
++module.exports = ZfsClient;
+diff --git a/package.json b/package.json
+index c4f3cba..bf28bf4 100644
+--- a/package.json
++++ b/package.json
+@@ -19,7 +19,7 @@
+         "node": ">=0.10"
+     },
+     "dependencies": {
+-        "assert-plus": "0.1.5",
++        "assert-plus": "1.0.0",
+         "backoff": "1.2.0",
+         "bignum": "0.6.2",
+         "bunyan": "0.22.1",
+@@ -27,7 +27,7 @@
+         "extsprintf": "1.3.0",
+         "iniparser": "1.0.5",
+         "forkexec": "1.1.0",
+-        "jsprim": "1.4.0",
++        "jsprim": "2.0.0",
+         "manatee-state-machine": "git+https://github.com/joyent/manatee-state-machine.git#master",
+         "manta": "1.2.6",
+         "node-uuid": "1.4.1",
+@@ -40,16 +40,16 @@
+         "progbar": "0.1.0",
+         "prompt": "0.2.13",
+         "restify": "2.6.1",
+-        "shelljs": "0.0.5pre4",
+         "tab": "0.1.0",
+-        "vasync": "1.6.2",
+-        "verror": "1.6.0",
++        "vasync": "2.2.0",
++        "verror": "1.10.0",
+         "xtend": "1.0.3"
+     },
+     "devDependencies": {
+         "byline": "4.1.1",
+         "nodeunit": "git+https://github.com/yunong/nodeunit.git#4b1bf5e52941b72cf619a246f87b261da95a1231",
+         "node-manatee": "git+https://github.com/joyent/node-manatee#master",
++        "shelljs": "0.0.5pre4",
+         "tap": "0.4.8"
+     },
+     "scripts": {
+diff --git a/sitter.js b/sitter.js
+index 5825dd0..3889735 100644
+--- a/sitter.js
++++ b/sitter.js
+@@ -38,9 +38,7 @@ var LOG = bunyan.createLogger({
+     name: NAME,
+     serializers: {
+         err: bunyan.stdSerializers.err
+-    },
+-    // always turn source to true, manatee isn't in the data path
+-    src: true
++    }
+ });
+ 
+ var LOG_LEVEL_OVERRIDE = false;
+@@ -65,8 +63,6 @@ function parseOptions() {
+                 // just ensures that we're never < TRACE
+                 LOG_LEVEL_OVERRIDE = true;
+                 LOG.level(Math.max(bunyan.TRACE, (LOG.level() - 10)));
+-                if (LOG.level() <= bunyan.DEBUG)
+-                    LOG = LOG.child({src: true});
+                 break;
+ 
+             default:

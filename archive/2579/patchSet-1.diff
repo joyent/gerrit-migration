@@ -1,0 +1,356 @@
+commit 25019515c9438a04b1d6a4a3dfa755f11b8c3b89 (refs/changes/79/2579/1)
+Author: Marsell Kukuljevic <marsell@joyent.com>
+Date:   2017-09-15T22:37:50+12:00 (2 years, 1 month ago)
+    
+    PUBAPI-1434: Add plugin that allows an account to only use networks it owns
+
+diff --git a/lib/app.js b/lib/app.js
+index 3d260af..b6da126 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -266,13 +266,13 @@ function createClients(options, callback) {
+ 
+ 
+ /**
+- * Load enabled pre|post provision plugins
++ * Load enabled preprovision|postprovision|preaddnic plugins
+  *
+  * @param {Array} where each member is an {Object} representing a plugin config
+  * @param {Array} ufdsPlugins is the same but coming from UFDS instead of
+  *      the config file.
+- * @returns {Object} with first member being preProvision methods to call, and
+- *          second member postProvision
++ * @returns {Object} with first member being preProvision methods to call,
++ *          second member postProvision, and third preAddNic
+  */
+ 
+ function loadPlugins(plugins, ufdsPlugins, log) {
+@@ -280,6 +280,7 @@ function loadPlugins(plugins, ufdsPlugins, log) {
+     // Load enabled pre|post provision plugins:
+     var preProvision = [];
+     var postProvision = [];
++    var preAddNic = [];
+ 
+     // Plugins can be defined into Config file (plugins), UFDS (ufdsPlugins)
+     // or both. UFDS will take precedence over the config file. Therefore, we
+@@ -317,10 +318,18 @@ function loadPlugins(plugins, ufdsPlugins, log) {
+             if (plugin.postProvision) {
+                 postProvision.push(plugin.postProvision(cfg));
+             }
++
++            if (plugin.preAddNic) {
++                preAddNic.push(plugin.preAddNic(cfg));
++            }
+         }
+     });
+ 
+-    return [preProvision, postProvision];
++    return {
++        preProvision: preProvision,
++        postProvision: postProvision,
++        preAddNic: preAddNic
++    };
+ }
+ 
+ 
+@@ -617,7 +626,8 @@ module.exports = {
+                 machineThrottle = userThrottle(config, 'machines');
+                 // Make sure we pass the pre|post provision hooks
+                 // from the plugins
+-                machines.mount(server, machineThrottle, plugins[0], plugins[1]);
++                machines.mount(server, machineThrottle, plugins.preProvision,
++                        plugins.postProvision);
+                 metadata.mount(server, machineThrottle);
+                 snapshots.mount(server, machineThrottle);
+                 tags.mount(server, machineThrottle);
+@@ -629,7 +639,8 @@ module.exports = {
+                 policies.mount(server, userThrottle(config, 'policies'),
+                         config);
+                 roles.mount(server, userThrottle(config, 'roles'), config);
+-                nics.mount(server, userThrottle(config, 'nics'));
++                nics.mount(server, userThrottle(config, 'nics'),
++                        plugins.preAddNic);
+                 mod_config.mount(server, userThrottle(config, 'config'));
+                 resources.mount(server, userThrottle(config, 'resources'),
+                         config);
+diff --git a/lib/networks.js b/lib/networks.js
+index 14a990e..4cf97ce 100644
+--- a/lib/networks.js
++++ b/lib/networks.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ var assert = require('assert-plus');
+@@ -175,12 +175,13 @@ function preLoadNetworks(req, res, next) {
+         };
+     }
+ 
+-    // Skip network loading and filtering if we're neither on networks
+-    // end-points, creating a machine or updating the user's config
+-    // (which requires checking network existence)
+-    if (!/\/networks/.test(pathname) && !((/\/machines$/.test(pathname) &&
+-        method === 'POST')) && !(/\/config/.test(pathname) &&
+-        method === 'PUT')) {
++    // Skip network loading and filtering except for a few cases:
++        // network endpoints
++    if (!/\/networks/.test(pathname) &&
++        // machine creation or nic addition (some AddNic plugins use this)
++        !(method === 'POST' && /\/(?:machines|nics)$/.test(pathname)) &&
++        // updating user config (requires checking network existence)
++        !(method === 'PUT' && /\/config/.test(pathname))) {
+         return next();
+     }
+ 
+diff --git a/plugins/filter_owner_networks.js b/plugins/filter_owner_networks.js
+new file mode 100644
+index 0000000..c2cb70e
+--- /dev/null
++++ b/plugins/filter_owner_networks.js
+@@ -0,0 +1,242 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2017, Joyent, Inc.
++ */
++
++/*
++ * Forces specific accounts to only use networks which belong to that account.
++ * Specifically, prevents creating VMs with anything other than networks
++ * belonging to that account, or adding NICs which can access same.
++ *
++ * Each network has an optional array of UUIDs associated with users. When
++ * adding a NIC to a VM, we check that the UUID of the current account matches
++ * any of the UUIDs in the requested network's owner_uuids array. If not, it is
++ * rejected.
++ *
++ * Provisioning of a VM is similar in principle, with the complication of
++ * package networks and default_networks. If a params.networks is provided, we
++ * check that every one of those networks contains the current account's UUID in
++ * their owner_uuids array. If params.networks isn't provided, we check whether
++ * all networks listed by the package are owned by the account. If the package
++ * doesn't have any networks listed, then we lastly move on to
++ * params.default_networks and fill in params.networks ourselves, to disable
++ * cloudapi doing its own default filtering (which has looser filtering, by
++ * allowing DC-shared non-owned networks to also be used). For default_networks,
++ * we again only allow the use of external and internal networks that belong to
++ * the owner.
++ *
++ * One significant pitfall to be aware of is that this plugin partially
++ * replicated some of cloudapi's behaviours, plus it depends on certain others.
++ * Any major changes to these behaviours by cloudapi might either break this
++ * plugin, or cause the plugin to hide newer changes to cloudapi.
++ */
++
++
++var assert = require('assert-plus');
++var restify = require('restify');
++
++var InvalidArgumentError = restify.InvalidArgumentError;
++
++// same as in lib/networks.js and lib/machines.js
++var EXTERNAL_NIC_TAG = 'external';
++var INTERNAL_NIC_TAG = 'internal';
++var DEFAULT_NETWORKS = [EXTERNAL_NIC_TAG, INTERNAL_NIC_TAG];
++
++
++/*
++ * Return all networks which include ownerUuid inside their owner_uuids
++ * attribute.
++ */
++function getOwnedNetworks(networks, ownerUuid) {
++    assert.arrayOfObject(networks, 'networks');
++    assert.uuid(ownerUuid, 'ownerUuid');
++
++    return networks.filter(function filterOwner(network) {
++        var owners = network.owner_uuids;
++        return owners && owners.indexOf(ownerUuid) !== -1;
++    });
++}
++
++
++/*
++ * Returns either external (has public IPs) or internal (has private or DC-only
++ * IPs) networks, depending on netType arg. NB: internal networks are defined
++ * here to include fabrics.
++ */
++function filterNetworkType(networks, netType) {
++    assert.arrayOfObject(networks, 'networks');
++    assert.string(netType, 'netType');
++
++    if (netType === EXTERNAL_NIC_TAG) {
++        return networks.filter(function externalFilter(network) {
++            return !network.fabric && network.nic_tag === EXTERNAL_NIC_TAG;
++        });
++    } else {
++        return networks.filter(function internalFilter(network) {
++            return network.fabric || network.nic_tag !== EXTERNAL_NIC_TAG;
++        });
++    }
++}
++
++
++function getNetworkUuids(networks) {
++    assert.arrayOfObject(networks, 'networks');
++
++    return networks.map(function mapUuids(network) {
++        return network.uuid;
++    });
++}
++
++
++/*
++ * Return boolean of whether arr1 is a subset of arr2. Only works
++ * with arrays of primitive types.
++ */
++function isSubset(arr1, arr2) {
++    for (var i = 0; i < arr1.length; i++) {
++        var ele = arr1[i];
++
++        if (arr2.indexOf(ele) === -1) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++
++/*
++ * Hook for preprovisioning. Ensure that all networks given in params or
++ * packages the request's account in their owner_uuids attribute. If
++ * neither are provided, then filter the default external/internal networks
++ * for networks which fulfill the owner_uuids requirement.
++ */
++function preProvision(cfg) {
++    assert.object(cfg, 'cfg');
++    assert.arrayOfUuid(cfg.accounts, 'cfg.accounts');
++
++    return function filterOwnerProvision(req, res, next) {
++        assert.object(req, 'req');
++        assert.object(res, 'res');
++        assert.func(next, 'next');
++
++        var log = req.log;
++        log.debug('Running filterOwnerProvision');
++
++        var path = req.path();
++        if (req.method !== 'POST' || !/\/machines$/.test(path)) {
++            return next();
++        }
++
++        var accountUuid = req.account.uuid;
++        if (cfg.accounts.indexOf(accountUuid) === -1) {
++            return next();
++        }
++
++        var params = req.params;
++        var ownedNetworks = getOwnedNetworks(req.networks, accountUuid);
++        var ownedNetworkUuids = getNetworkUuids(ownedNetworks);
++        var reqNetworkUuids = params.networks;
++        var pkgNetworkUuids = req.pkg && req.pkg.networks;
++
++        if (reqNetworkUuids) {
++            log.debug('Comparing requested networks with owned networks');
++
++            if (!isSubset(reqNetworkUuids, ownedNetworkUuids)) {
++                return next(new InvalidArgumentError('Account does not have ' +
++                    'access to some or all of the requested networks.'));
++            }
++        } else if (pkgNetworkUuids) {
++            log.debug('Comparing package networks with owned networks');
++
++            if (!isSubset(pkgNetworkUuids, ownedNetworkUuids)) {
++                return next(new InvalidArgumentError('Account does not have ' +
++                    'access to some or all of the package networks.'));
++            }
++        } else {
++            log.debug('Allowing only owned networks in internal/external.');
++
++            var defaultNetTypes = params.default_networks || DEFAULT_NETWORKS;
++            if (!Array.isArray(defaultNetTypes)) {
++                return next(new InvalidArgumentError('default_networks is ' +
++                    'not an array'));
++            }
++
++            var filteredNetworks = [];
++            defaultNetTypes.forEach(function (type) {
++                var nets = filterNetworkType(ownedNetworks, type);
++                if (nets.length > 0) {
++                    filteredNetworks.push(nets[0]);
++                }
++            });
++
++            if (filteredNetworks.length === 0) {
++                return next(new InvalidArgumentError('Account does not have ' +
++                    'ownership of any default networks'));
++            }
++
++            log.info('Plugin rewrite of req.params.networks using',
++                defaultNetTypes);
++            params.networks = getNetworkUuids(filteredNetworks);
++        }
++
++        return next();
++    };
++}
++
++
++/*
++ * Hook run before adding a nic to a VM. Ensure that network given in network
++ * param contains the request's account in its owner_uuids attribute.
++ */
++function preAddNic(cfg) {
++    assert.object(cfg, 'cfg');
++    assert.arrayOfUuid(cfg.accounts, 'cfg.accounts');
++
++    return function filterOwnerAddNic(req, res, next) {
++        assert.object(req, 'req');
++        assert.object(res, 'res');
++        assert.func(next, 'next');
++
++        var log = req.log;
++        log.debug('Running filterOwnerAddNic');
++
++        var path = req.path();
++        if (req.method !== 'POST' || !/\/nics$/.test(path)) {
++            return next();
++        }
++
++        var accountUuid = req.account.uuid;
++        if (cfg.accounts.indexOf(accountUuid) === -1) {
++            return next();
++        }
++
++        var networkUuid = req.params.network;
++        if (!networkUuid) {
++            return next();
++        }
++
++        log.debug('Comparing requested network with owned networks');
++
++        var ownedNetworks = getOwnedNetworks(req.networks, accountUuid);
++        var ownedNetworkUuids = getNetworkUuids(ownedNetworks);
++
++        if (ownedNetworkUuids.indexOf(networkUuid) === -1) {
++            return next(new InvalidArgumentError(
++                'Account does not have access to the specified network.'));
++        }
++
++        return next();
++    };
++}
++
++
++module.exports = {
++    preProvision: preProvision,
++    preAddNic: preAddNic
++};

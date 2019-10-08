@@ -1,0 +1,1000 @@
+commit eac977e87e89341341a1ea4bc08ffc6b193e6fa1 (refs/changes/31/3131/2)
+Author: Mike Zeller <mike.zeller@joyent.com>
+Date:   2017-12-28T11:36:25-08:00 (1 year, 9 months ago)
+    
+    PUBAPI-1081 Enable requesting IP addresses on networks when provisioning or adding nics
+
+diff --git a/lib/machines.js b/lib/machines.js
+index 9708248..53d2f1d 100644
+--- a/lib/machines.js
++++ b/lib/machines.js
+@@ -29,6 +29,7 @@ var membership = require('./membership'),
+     preloadGroups = membership.preloadGroups;
+ var triton_affinity = require('./triton-affinity');
+ var volumeValidation = require('./validation/volumes');
++var networkValidation = require('./validation/networks');
+ 
+ 
+ // --- Globals
+@@ -443,26 +444,31 @@ function getCreateOptions(req) {
+ 
+             if (objectsAllowed) {
+                 switch (netType) {
+-                    case 'string':
+-                        ifaceObjects++;
+-                        break;
+-                    case 'object':
+-                        ifaceObjects++;
+-                        netUuid = netObj.ipv4_uuid;
+-
+-                        if (typeof (netUuid) !== 'string') {
+-                            throw new InvalidArgumentError(sprintf(
+-                                'property "networks[%d].ipv4_uuid": ' +
+-                                'string expected', idx));
+-                        }
++                case 'string':
++                    ifaceObjects++;
++                    break;
++                case 'object':
++                    ifaceObjects++;
++
++                    try {
++                        networkValidation.validateNetworkObject(netObj,
++                            req.networks);
++                    } catch (networkObjErr) {
++                        // Do to shared common code we need to prepend some more
++                        // info to the error
++                        networkObjErr.message = sprintf('property' +
++                            ' networks[%s].%s', idx, networkObjErr.message);
++                        networkObjErr.body.message = networkObjErr.message;
++                        throw networkObjErr;
++                    }
+ 
+-                        break;
+-                    default:
+-                        // the 'property "foo" ...' format intended to match
+-                        // the json-schema error format:
+-                        throw new InvalidArgumentError(sprintf(
+-                            'property "networks[%d]": array of strings or ' +
+-                            'objects expected', idx));
++                    break;
++                default:
++                    // the 'property "foo" ...' format intended to match
++                    // the json-schema error format:
++                    throw new InvalidArgumentError(sprintf(
++                        'property "networks[%d]": array of strings or ' +
++                        'objects expected', idx));
+                 }
+ 
+             } else {
+@@ -526,13 +532,21 @@ function getCreateOptions(req) {
+ 
+     opts.networks = networkUuids;
+     if (typeof (networkUuids[0]) === 'object') {
+-        // We only support ipv4_uuid and ipv4_count for now, so only allow
+-        // them, just to be safe:
++        // We only support ipv4_uuid, and ipv4_ips for now, so only allow them,
++        // just to be safe:
+         opts.networks = opts.networks.map(function (n) {
+-            return {
+-                ipv4_count: n.ipv4_count || 1,
+-                ipv4_uuid: n.ipv4_uuid
+-            };
++            var netObj = {};
++
++            // If a user doesn't specify ipv4_ips we tell vmapi to only give us
++            // a single ip. Multiple IPs per network will also be supported one
++            // day
++            if (!n.ipv4_ips) {
++                netObj.ipv4_count = n.ipv4_count || 1;
++            }
++
++            netObj.ipv4_uuid = n.ipv4_uuid;
++            netObj.ipv4_ips = n.ipv4_ips;
++            return netObj;
+         });
+ 
+     } else {
+@@ -1463,6 +1477,52 @@ function create(req, res, next) {
+         });
+     }
+ 
++    /*
++     * We need to verify that if a user passed in networks with IPs that none
++     * of the IPs are considered "managed".  NAPI will handle other validations
++     * for us.
++     */
++    var networksWithIps = [];
++    opts.networks.forEach(function (net) {
++        // Today we only support passing in ipv4 addrs,
++        // but this should be extended to support ipv6 addrs
++        if (net.ipv4_ips && net.ipv4_ips.length > 0) {
++            networksWithIps.push(net);
++        }
++    });
++
++    if (networksWithIps.length > 0) {
++        pipeline.push(function (_, cb) {
++            function validateIp(network, done) {
++                req.sdc.napi.getIP(network.ipv4_uuid, network.ipv4_ips[0],
++                    function napiGetIp(err, ip) {
++                    if (err) {
++                        done(err);
++                        return;
++                    }
++                    if (ip.belongs_to_type === 'other' ||
++                        ip.owner_uuid === req.config.ufds_admin_uuid) {
++                        done(new InvalidArgumentError('cannot use %s because' +
++                            ' its a managed ip', ip.ip));
++                        return;
++                    }
++                    done(null, ip);
++                });
++            }
++
++            vasync.forEachPipeline({
++                func: validateIp,
++                inputs: networksWithIps
++            }, function validateNetworkIps(err, results) {
++                if (err) {
++                    cb(err);
++                    return;
++                }
++                cb();
++            });
++        });
++    }
++
+ 
+     pipeline.push(function (_, cb) {
+         return req.sdc.vmapi.createVm(opts, {
+@@ -1491,6 +1551,15 @@ function create(req, res, next) {
+                             msgs.push('Invalid ' + e.field);
+                         }
+                     });
++                } else if (body.code && body.code === 'InvalidParameters' &&
++                    body.errors.length) {
++                    body.errors.forEach(function forEachError(e) {
++                        if (e.field === 'ip') {
++                            // when NAPI-438 is finished we should report back
++                            // the IP
++                            err = new InvalidArgumentError(err, 'ip in use');
++                        }
++                    });
+                 }
+ 
+                 if (msgs.length) {
+diff --git a/lib/nics.js b/lib/nics.js
+index 2f8c8a2..4e4b625 100644
+--- a/lib/nics.js
++++ b/lib/nics.js
+@@ -45,6 +45,10 @@ var assert  = require('assert-plus');
+ var restify = require('restify');
+ var vasync  = require('vasync');
+ 
++var util = require('util');
++var sprintf = util.format;
++
++var networkValidation = require('./validation/networks');
+ 
+ 
+ // --- Globals
+@@ -68,12 +72,12 @@ var MAC_RE  = /^[0-9a-f]{12}/i;
+ /*
+  * Add a NIC to a VM.
+  *
+- * A network UUID is passed in as an argument, which we need to look up in NAPI
+- * in order to find out the nic tag associated with that network or network
+- * pool. We then check that there isn't already another NIC on that VM with that
+- * network -- if there is, we 302 redirect to that NIC. We also need to check
+- * that the server has an appropriate nic tag, otherwise adding that network to
+- * the VM will not work.
++ * AddNic accepts a single network UUID or a single network object as an
++ * argument, which we need to look up in NAPI in order to find out the nic tag
++ * associated with that network or network pool. We then check that there isn't
++ * already another NIC on that VM with that network -- if there is, we 302
++ * redirect to that NIC. We also need to check that the server has an
++ * appropriate nic tag, otherwise adding that network to the VM will not work.
+  *
+  * Fabric networks are treated differently; instead of looking up the network
+  * nic_tag in NAPI, we check the server's sysinfo for virtual network interfaces
+@@ -104,20 +108,71 @@ function addNic(req, res, next) {
+     var serverUuid  = req.vm.server_uuid;
+     var ownerUuid   = req.account.uuid;
+     var login       = req.account.login;
+-    var networkUuid = req.params.network;
++    var networkArg  = req.params.network;
+     var origin      = req.params.origin || 'cloudapi';
+     var context = {
+         caller: req._auditCtx,
+         params: req.params
+     };
+ 
+-    if (!networkUuid) {
++    if (!networkArg) {
+         return next(new MissingParameterError('network must be specified'));
+     }
+ 
+-    if (typeof (networkUuid) !== 'string' || !networkUuid.match(UUID_RE)) {
+-        var errMsg = 'network argument has invalid format';
+-        return next(new InvalidArgumentError(errMsg));
++    /*
++     * With the push to use interface-centric provisioning across the stack
++     * we want AddNic to be able to accept the new style payload which looks
++     * like:
++     *
++     * [
++     *   {
++     *     ipv4_uuid: uuid_0, ipv4_count: <number>,
++     *     ipv4_ips: [ ip0, ip1, ... ],
++     *     ipv6_uuid: uuid_1, ipv6_count: <number>,
++     *     ipv6_ips: [ ip0, ip1, ... ],
++     *     primary: true
++     *   }, ...
++     * ]
++     *
++     * At this point in time AddNic will only accept a single interface
++     * object that contains a single ipv4_uuid. In addition to the network
++     * uuid we also allow the user to pass in an optional ipv4_ips array
++     * consisting of a single IP. In the future when napi fully supports having
++     * NICs with multiple IPs this will likely be extended to allow the array to
++     * contain multiple IPs.
++     *
++     * Once ZAPI-816 is rolled out everywhere, we would also like to support
++     * specifying that the new NIC should be the primary via the primaryIp flag.
++     * In addtion we will also be able to make a vmapi call directly without
++     * having to first create the NIC up front.
++     */
++    var networkUuid, networkIp;
++
++    // Make sure we have a single network uuid, or a single network object
++    switch (typeof (networkArg)) {
++    case 'string':
++        if (!networkArg.match(UUID_RE)) {
++            return next(new InvalidArgumentError(
++                'network argument has invalid format'));
++        }
++        networkUuid = networkArg;
++        break;
++    case 'object':
++        try {
++            networkValidation.validateNetworkObject(networkArg, req.networks);
++        } catch (networkObjErr) {
++            // Do to shared common code we need to prepend some more info to the
++            // error
++            networkObjErr.message = 'property network.' + networkObjErr.message;
++            networkObjErr.body.message = networkObjErr.message;
++            return next(networkObjErr);
++        }
++        networkUuid = networkArg.ipv4_uuid;
++        networkIp = networkArg.ipv4_ips[0];
++        break;
++    default:
++        return next(new InvalidArgumentError(
++            'network argument must be a network object or string'));
+     }
+ 
+     var network, nic;  // filled in by the vasync-called functions
+@@ -298,7 +353,9 @@ function addNic(req, res, next) {
+     }
+ 
+     function addToNapi(_, cb) {
+-        req.sdc.napi.provisionNic(network.uuid, {
++        var pipeline = [];
++
++        var params = {
+             belongs_to_uuid: vmUuid,
+             belongs_to_type: 'zone',
+             cn_uuid: serverUuid,
+@@ -306,18 +363,71 @@ function addNic(req, res, next) {
+             state: 'provisioning',
+             origin: origin,
+             context: context
+-        }, {
+-            log: log,
+-            headers: headers
+-        }, function (err, _nic) {
+-            if (err) {
+-                return cb(err);
+-            }
++        };
++
++        // linter currently complains about "_" being used in the parent scope
++        function provisionNic(notUsed, done) {
++            req.sdc.napi.provisionNic(network.uuid, params, {
++                log: log,
++                headers: headers
++            }, function napiProvisionNic(err, _nic) {
++                if (err) {
++                    var body = err.body;
++                    if (body.code && body.code === 'InvalidParameters' &&
++                        body.errors.length) {
++                        if (err.field === 'ip') {
++                            // when NAPI-438 is finished we should report back
++                            // the IP
++                            err = new InvalidArgumentError(err, 'ip in use');
++                        }
++                    }
++
++                    done(err);
++                    return;
++                }
+ 
+-            nic = _nic;
+-            log.debug(nic, 'Added NIC to NAPI');
++                nic = _nic;
++                log.info(nic, 'Added NIC to NAPI');
+ 
+-            return cb();
++                done();
++            });
++        }
++
++        // linter currently complains about "_" being used in the parent scope
++        function validateIp(notUsed, done) {
++            assert.string(networkIp, 'networkIp');
++
++            req.sdc.napi.getIP(network.uuid, networkIp,
++                function napiGetIp(err, ip) {
++                if (err) {
++                    done(err);
++                    return;
++                }
++                if (ip.belongs_to_type === 'other' ||
++                    ip.owner_uuid === req.config.ufds_admin_uuid) {
++                    done(new InvalidArgumentError('cannot use %s because' +
++                        ' it is a managed ip', ip.ip));
++                    return;
++                }
++                done(null, ip);
++            });
++        }
++
++        if (networkIp) {
++            params.ip = networkIp;
++            pipeline.push(validateIp);
++        }
++
++        pipeline.push(provisionNic);
++
++        vasync.pipeline({
++            funcs: pipeline
++        }, function (err, results) {
++            if (err) {
++                cb(err);
++                return;
++            }
++            cb();
+         });
+     }
+ 
+diff --git a/test/machines.70.test.js b/test/machines.70.test.js
+index 5e9e8f6..985ed51 100644
+--- a/test/machines.70.test.js
++++ b/test/machines.70.test.js
+@@ -136,7 +136,6 @@ test('CreateMachine', function (t) {
+     });
+ });
+ 
+-
+ test('Wait For Running', function (t) {
+     machinesCommon.waitForRunningMachine(CLIENT, MACHINE_UUID, function (err) {
+         t.ifError(err);
+@@ -151,6 +150,7 @@ test('Wait For Running', function (t) {
+ });
+ 
+ 
++
+ test('Get Machine,  with Firewall Enabled', function (t) {
+     if (!MACHINE_UUID) {
+         return t.end();
+diff --git a/test/machines.test.js b/test/machines.test.js
+index 6c60b29..45fc185 100644
+--- a/test/machines.test.js
++++ b/test/machines.test.js
+@@ -11,6 +11,7 @@
+ var util = require('util');
+ var test = require('tape').test;
+ var restify = require('restify');
++var vasync = require('vasync');
+ var common = require('./common');
+ var uuid = common.uuid;
+ var addPackage = common.addPackage;
+@@ -89,6 +90,8 @@ var SDC_512 = {
+ var SERVER_UUID;
+ var IMAGE_UUID;
+ var MACHINE_UUID;
++var NETWORK_UUID;
++var NETWORK_IP = '10.99.66.50';
+ 
+ var CLIENTS;
+ var CLIENT;
+@@ -349,6 +352,340 @@ test('CreateMachine using network without permissions', function (t) {
+ });
+ 
+ 
++test('CreateMachine using public network and ip', function (t) {
++    var netDetails = {
++        name: 'network-test-fake-public',
++        vlan_id: 99,
++        subnet: '10.99.66.0/24',
++        provision_start_ip: '10.99.66.5',
++        provision_end_ip: '10.99.66.250',
++        nic_tag: 'external',
++        owner_uuids: []
++    };
++
++    var vmDetails = {
++        image: IMAGE_UUID,
++        package: SDC_256.name,
++        server_uuid: SERVER_UUID
++    };
++
++    CLIENT.napi.createNetwork(netDetails, function (err, net) {
++        t.ifError(err);
++
++        vmDetails.networks = [
++            {
++                ipv4_uuid: net.uuid,
++                ipv4_ips: ['10.99.66.10']
++            }
++        ];
++
++        CLIENT.post('/my/machines', vmDetails, function (err2, req, res, body) {
++            t.ok(err2);
++            t.equal(err2.statusCode, 409);
++            t.deepEqual(body, {
++                code: 'InvalidArgument',
++                message: 'property networks[0].ipv4_uuid: cannot specify an' +
++                    ' IP on a public network'
++            });
++
++            CLIENT.napi.deleteNetwork(net.uuid, {}, function (err3) {
++                t.ifError(err3);
++                t.end();
++            });
++        });
++    });
++});
++
++
++test('Create Machine using network and IP', function (t) {
++    var netDetails = {
++        name: 'machines-test-network-and-ip',
++        vlan_id: 99,
++        subnet: '10.99.66.0/24',
++        provision_start_ip: '10.99.66.5',
++        provision_end_ip: '10.99.66.250',
++        nic_tag: 'external',
++        owner_uuids: [CLIENT.account.uuid]
++    };
++
++    var obj = {
++        image: IMAGE_UUID,
++        package: SDC_128.name,
++        server_uuid: SERVER_UUID
++    };
++
++    CLIENT.napi.createNetwork(netDetails, function (err, net) {
++        t.ifError(err);
++
++        NETWORK_UUID = net.uuid;
++
++        obj.networks = [
++            {
++                ipv4_uuid: net.uuid,
++                ipv4_ips: [ NETWORK_IP ]
++            }
++        ];
++
++
++        machinesCommon.createMachine(t, CLIENT, obj, function (_, machineUuid) {
++            MACHINE_UUID = machineUuid;
++            t.end();
++        });
++
++    });
++});
++
++
++test('Wait For Running Machine provisioned with IP', waitForRunning);
++
++
++test('Verify the machines IP', function (t) {
++    var params = {
++        belongs_to_uuid: MACHINE_UUID,
++        belongs_to_type: 'zone'
++    };
++
++    CLIENT.napi.listNics(params, function napiListNics(err, nics) {
++        t.ifError(err);
++
++        var found = nics.some(function nicHasIp(n) {
++            return n.ip === NETWORK_IP;
++        });
++
++        t.ok(found, 'nic with correct ip found');
++        t.end();
++    });
++});
++
++
++test('Create Machine using network and in use IP', function (t) {
++    var obj = {
++        image: IMAGE_UUID,
++        package: SDC_128.name,
++        server_uuid: SERVER_UUID,
++        networks: [
++            {
++                ipv4_uuid: NETWORK_UUID,
++                ipv4_ips: [ NETWORK_IP ]
++            }
++        ]
++    };
++
++    CLIENT.post('/my/machines', obj, function createMachine(err, req, res,
++        body) {
++        t.ok(err);
++        t.equal(err.statusCode, 409);
++        t.deepEqual(body, {
++            code: 'InvalidArgument',
++            message: 'ip in use'
++        });
++        t.end();
++    });
++});
++
++
++test('Destroy machine created with IP', function (t) {
++    CLIENT.vmapi.deleteVm({
++        uuid: MACHINE_UUID,
++        owner_uuid: CLIENT.account.uuid
++    }, function (err, job) {
++        t.ifError(err, 'Deleting machine ' + MACHINE_UUID);
++
++        waitForJob(CLIENT, job.job_uuid, function (deleteJobErr) {
++            t.ifError(deleteJobErr, 'waiting for job ' + job.job_uuid);
++
++            // Set MACHINE_UUID back to false so that we have a clean slate for
++            // the tests bellow
++            MACHINE_UUID = false;
++            t.end();
++        });
++    });
++});
++
++
++test('Destroy machines-test-network-and-ip network', function (t) {
++    CLIENT.napi.deleteNetwork(NETWORK_UUID,
++        function napiDeleteNetwork(err, res) {
++        t.ifError(err);
++        t.end();
++    });
++});
++
++
++test('CreateMachine using unknown network and an ip', function (t) {
++    var networkUuid = 'd674f27a-e695-11e7-8490-001fc69cf4fd';
++    var vmDetails = {
++        image: IMAGE_UUID,
++        package: SDC_256.name,
++        server_uuid: SERVER_UUID,
++        networks: [
++            {
++                ipv4_uuid: networkUuid,
++                // IP set to any value just for this test
++                ipv4_ips: ['10.99.66.10']
++            }
++        ]
++    };
++
++    CLIENT.post('/my/machines', vmDetails, function (err2, req, res, body) {
++        t.ok(err2);
++        t.equal(err2.statusCode, 404);
++        t.deepEqual(body, {
++            code: 'ResourceNotFound',
++            message: 'property networks[0].ipv4_uuid: ' +
++                'network ' + networkUuid + ' not found'
++        });
++
++        t.end();
++    });
++});
++
++
++test('CreateMachine using network and invalid number of ips', function (t) {
++    var networkUuid = 'd674f27a-e695-11e7-8490-001fc69cf4fd';
++    var vmDetails = {
++        image: IMAGE_UUID,
++        package: SDC_256.name,
++        server_uuid: SERVER_UUID,
++        networks: [
++            {
++                ipv4_uuid: networkUuid,
++                // IP set to any value just for this test
++                ipv4_ips: ['10.99.66.10', '10.99.66.10']
++            }
++        ]
++    };
++
++    CLIENT.post('/my/machines', vmDetails, function (err2, req, res, body) {
++        t.ok(err2);
++        t.equal(err2.statusCode, 409);
++        t.deepEqual(body, {
++            code: 'InvalidArgument',
++            message: 'property networks[0].ipv4_ips: ' +
++                'array should contain single ip'
++        });
++
++        t.end();
++    });
++});
++
++
++test('CreateMachine using network pool and an ip', function (t) {
++    var networkPoolUuid;
++    var networkUuids = [];
++    var networks = [
++        {
++            name: 'network-pool-fake-1',
++            vlan_id: 97,
++            subnet: '10.99.55.0/24',
++            provision_start_ip: '10.99.55.5',
++            provision_end_ip: '10.99.55.250',
++            nic_tag: 'external',
++            owner_uuids: []
++        },
++        {
++            name: 'network-pool-fake-2',
++            vlan_id: 98,
++            subnet: '10.99.67.0/24',
++            provision_start_ip: '10.99.67.5',
++            provision_end_ip: '10.99.67.250',
++            nic_tag: 'external',
++            owner_uuids: []
++        }
++    ];
++
++
++    function createNetwork(params, done) {
++        CLIENT.napi.createNetwork(params, function (err, net) {
++            if (err) {
++                done(err);
++                return;
++            }
++            networkUuids.push(net.uuid);
++            done();
++        });
++    }
++
++    function createNetworksForPool(_, done) {
++        vasync.forEachPipeline({
++            func: createNetwork,
++            inputs: networks
++        }, function (err, results) {
++            if (err) {
++                done(err);
++                return;
++            }
++            done();
++        });
++    }
++
++    function createPool(_, done) {
++        CLIENT.napi.createNetworkPool('network-pool-fake',
++            {networks: networkUuids}, function (err, net) {
++            if (err) {
++                done(err);
++                return;
++            }
++            networkPoolUuid = net.uuid;
++            done();
++        });
++    }
++
++    function runTest(_, done) {
++        var vmDetails = {
++            image: IMAGE_UUID,
++            package: SDC_256.name,
++            server_uuid: SERVER_UUID,
++            networks: [
++                {
++                    ipv4_uuid: networkPoolUuid,
++                    // IP set to any value just for this test
++                    ipv4_ips: ['10.99.66.10']
++                }
++            ]
++        };
++        CLIENT.post('/my/machines', vmDetails, function (err2, req, res, body) {
++            t.ok(err2);
++            t.equal(err2.statusCode, 409);
++            t.deepEqual(body, {
++                code: 'InvalidArgument',
++                message: 'property networks[0].ipv4_uuid: ' +
++                    'cannot specify an IP on a network pool'
++            });
++
++            // Call done without error since we expect to get one
++            done();
++        });
++    }
++
++    vasync.pipeline({
++        funcs: [createNetworksForPool, createPool, runTest]
++    }, function (err, results) {
++        // Regardless of errors we should cleanup and end the test
++        CLIENT.napi.deleteNetworkPool(networkPoolUuid,
++            function (delNetworkPoolErr, net) {
++            t.ifError(delNetworkPoolErr);
++
++            function deleteNetwork(netUuid, done) {
++                CLIENT.napi.deleteNetwork(netUuid,
++                    function (delNetworkErr, _) {
++                    t.ifError(delNetworkErr);
++                    done();
++                });
++            }
++
++            vasync.forEachParallel({
++                func: deleteNetwork,
++                inputs: networkUuids
++            }, function (delPipelineErr, _) {
++                t.ifError(delPipelineErr);
++                t.end();
++            });
++        });
++    });
++});
++
++
+ test('Create machine with invalid parameters', function (t) {
+     var obj = {
+         image: IMAGE_UUID,
+@@ -892,8 +1229,8 @@ test('ListMachines tombstone', function (t) {
+         common.checkHeaders(t, res.headers);
+         t.ok(body, 'GET /my/machines body');
+         t.ok(Array.isArray(body), 'GET /my/machines body is array');
+-        t.equal(body.length, 1, 'GET /my/machines list is not empty');
+-        t.equal(body[0].id, MACHINE_UUID);
++        t.equal(body.length, 2, 'GET /my/machines list is not empty');
++        t.equal(body[1].id, MACHINE_UUID);
+         t.end();
+     });
+ });
+diff --git a/test/nics.test.js b/test/nics.test.js
+index 1d67992..cbf8331 100644
+--- a/test/nics.test.js
++++ b/test/nics.test.js
+@@ -784,6 +784,9 @@ test('nics', function (tt) {
+     var fixtures;
+     var instNic;
+ 
++    // filled in later when adding a fabric nic
++    var fabricNetworkIp;
++
+     tt.test('  setup', function (t) {
+         vasync.pipeline({funcs: [
+             function commonSetup(_, next) {
+@@ -1151,6 +1154,86 @@ test('nics', function (tt) {
+         getErr(t, path, expectedErr);
+     });
+ 
++    tt.test('  Create NIC using public network and ip', function (t) {
++        var path = '/my/machines/' + fixtures.instId + '/nics';
++        var networkParams = {
++            ipv4_uuid: fixtures.externalNetwork.uuid,
++            // Doesn't matter what IP we pass here, just that we pass one
++            ipv4_ips: [ '192.168.1.1' ]
++        };
++        var args = { network: networkParams };
++
++        var expectedErr = {
++            jse_info: {},
++            jse_shortmsg: '',
++            message: 'property network.ipv4_uuid:' +
++                    ' cannot specify an IP on a public network',
++            statusCode: 409,
++            restCode: 'InvalidArgument',
++            name: 'InvalidArgumentError',
++            body: {
++                code: 'InvalidArgument',
++                message: 'property network.ipv4_uuid:' +
++                        ' cannot specify an IP on a public network'
++            }
++        };
++
++        postErr(t, path, args, expectedErr);
++    });
++
++    tt.test('  Create NIC using network and multiple ips', function (t) {
++        var path = '/my/machines/' + fixtures.instId + '/nics';
++        var networkParams = {
++            ipv4_uuid: fixtures.networks[0].network.uuid,
++            // Doesn't matter what IPs we use here, we should short curcuit
++            // early when multiple are detected
++            ipv4_ips: [ '192.168.1.1', '192.168.1.1' ]
++        };
++        var args = { network: networkParams };
++
++        var expectedErr = {
++            jse_info: {},
++            jse_shortmsg: '',
++            message: 'property network.ipv4_ips:' +
++                    ' array should contain single ip',
++            statusCode: 409,
++            restCode: 'InvalidArgument',
++            name: 'InvalidArgumentError',
++            body: {
++                code: 'InvalidArgument',
++                message: 'property network.ipv4_ips:' +
++                        ' array should contain single ip'
++            }
++        };
++
++        postErr(t, path, args, expectedErr);
++    });
++
++    tt.test('  Create NIC using unknown network and ip', function (t) {
++        var path = '/my/machines/' + fixtures.instId + '/nics';
++        var networkParams = {
++            ipv4_uuid: 'dd39e200-e68b-11e7-8490-001fc69cf4fd',
++            ipv4_ips: [ '192.168.1.1' ]
++        };
++        var args = { network: networkParams };
++
++        var expectedErr = {
++            jse_info: {},
++            jse_shortmsg: '',
++            message: 'property network.ipv4_uuid:' +
++                    ' network ' + networkParams.ipv4_uuid + ' not found',
++            statusCode: 404,
++            restCode: 'ResourceNotFound',
++            name: 'ResourceNotFoundError',
++            body: {
++                code: 'ResourceNotFound',
++                message: 'property network.ipv4_uuid:' +
++                        ' network ' + networkParams.ipv4_uuid + ' not found'
++            }
++        };
++
++        postErr(t, path, args, expectedErr);
++    });
+ 
+     tt.test('  Create NIC using network', function (t) {
+         var path = '/my/machines/' + fixtures.instId + '/nics';
+@@ -1567,6 +1650,9 @@ test('nics', function (tt) {
+             t.ifError(nic.belongs_to_type);
+             t.ifError(nic.belongs_to_uuid);
+ 
++            // Save the IP to use in the add nic provision from pool with IP
++            fixtures.networks[0].ip = nic.ip;
++
+             var location = res.headers.location;
+             t.ok(location);
+ 
+@@ -1587,6 +1673,70 @@ test('nics', function (tt) {
+         removeNic(t, fixtures.instId, instNic);
+     });
+ 
++    tt.test('  Create NIC using network pool and ip', function (t) {
++        var path = '/my/machines/' + fixtures.instId + '/nics';
++        var networkParams = {
++            ipv4_uuid: fixtures.networks[0].pool.uuid,
++            ipv4_ips: [ fixtures.networks[0].ip ]
++        };
++        var args = { network: networkParams };
++
++        var expectedErr = {
++            jse_info: {},
++            jse_shortmsg: '',
++            message: 'property network.ipv4_uuid:' +
++                    ' cannot specify an IP on a network pool',
++            statusCode: 409,
++            restCode: 'InvalidArgument',
++            name: 'InvalidArgumentError',
++            body: {
++                code: 'InvalidArgument',
++                message: 'property network.ipv4_uuid:' +
++                        ' cannot specify an IP on a network pool'
++            }
++        };
++
++        postErr(t, path, args, expectedErr);
++    });
++
++
++    tt.test('  Add fabric network NIC with managed ip', FABRIC_TEST_OPTS,
++        function (t) {
++        CLIENT.get('/my/networks', function (err, req, res, networks) {
++            t.ifError(err);
++
++            var fabricNetwork = networks.filter(function (net) {
++                return net.fabric;
++            })[0];
++            t.ok(fabricNetwork, format('fabricNetwork %s (%s)',
++                fabricNetwork.id, fabricNetwork.name));
++
++            var path = '/my/machines/' + fixtures.instId + '/nics';
++            var networkParams = {
++                ipv4_uuid: fabricNetwork.id,
++                ipv4_ips: [ fabricNetwork.gateway ]
++            };
++            var args = { network: networkParams };
++
++            var expectedErr = {
++                jse_info: {},
++                jse_shortmsg: '',
++                message: 'cannot use ' + fabricNetwork.gateway +
++                        ' because it is a managed ip',
++                statusCode: 409,
++                restCode: 'InvalidArgument',
++                name: 'InvalidArgumentError',
++                body: {
++                    code: 'InvalidArgument',
++                    message: 'cannot use ' + fabricNetwork.gateway +
++                            ' because it is a managed ip'
++                }
++            };
++
++            postErr(t, path, args, expectedErr);
++        });
++    });
++
+ 
+     tt.test('  Add fabric network NIC', FABRIC_TEST_OPTS, function (t) {
+         CLIENT.get('/my/networks', function (err, req, res, networks) {
+@@ -1609,6 +1759,10 @@ test('nics', function (tt) {
+                 instNic = nic;
+                 t.ok(instNic, 'AddNic nic: ' + JSON.stringify(nic));
+ 
++                // Save the ip so we can pass it back in manually in another
++                // create test
++                fabricNetworkIp = nic.ip;
++
+                 waitTilNicAdded(t, location);
+             });
+         });
+@@ -1621,6 +1775,43 @@ test('nics', function (tt) {
+     });
+ 
+ 
++    tt.test('  Add fabric network NIC with ip', FABRIC_TEST_OPTS, function (t) {
++        CLIENT.get('/my/networks', function (err, req, res, networks) {
++            t.ifError(err);
++
++            var fabricNetwork = networks.filter(function (net) {
++                return net.fabric;
++            })[0];
++            t.ok(fabricNetwork, format('fabricNetwork %s (%s)',
++                fabricNetwork.id, fabricNetwork.name));
++
++            var path = '/my/machines/' + fixtures.instId + '/nics';
++            var networkParams = {
++                ipv4_uuid: fabricNetwork.id,
++                ipv4_ips: [ fabricNetworkIp ]
++            };
++            var args = { network: networkParams };
++            CLIENT.post(path, args, function (nicCreateErr, nicCreateReq,
++                nicCreateRes, nic) {
++                t.ifError(nicCreateErr, 'AddNic to vm '+ fixtures.instId);
++                t.equal(nicCreateRes.statusCode, 201, 'AddNic 201 statusCode');
++
++                var location = nicCreateRes.headers.location;
++                t.ok(location, 'AddNic Location header: ' + location);
++                instNic = nic;
++                t.ok(instNic, 'AddNic nic: ' + JSON.stringify(nic));
++
++                waitTilNicAdded(t, location);
++            });
++        });
++    });
++
++    tt.test('  Remove NIC using fabric network and ip', FABRIC_TEST_OPTS,
++            function (t) {
++        removeNic(t, fixtures.instId, instNic);
++    });
++
++
+     tt.test('  teardown', function (t) {
+         deleteFixtures(t, fixtures, function (err) {
+             t.ifError(err, 'deleteFixtures');

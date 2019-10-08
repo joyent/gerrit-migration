@@ -1,0 +1,276 @@
+commit ee67e827b61facfa6a2b251625678a631a776b9b (refs/changes/72/4872/15)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2018-10-16T14:22:02-07:00 (12 months ago)
+    
+    TRITON-243 Change to using refquota instead of quota for zoneroots of bhyve VMs
+
+diff --git a/src/vm/man/vmadm.1m.md b/src/vm/man/vmadm.1m.md
+index 0417697d..78a3be8a 100644
+--- a/src/vm/man/vmadm.1m.md
++++ b/src/vm/man/vmadm.1m.md
+@@ -1751,11 +1751,9 @@ tab-complete UUIDs rather than having to type them out for every command.
+     quota:
+ 
+         This sets a quota on the zone filesystem. For OS VMs, this value is the
+-        space actually visible/usable in the guest. For kvm VMs, this value is
+-        the quota for the Zone containing the VM, which is not directly
+-        available to users. For bhyve VMs, disks are part of the zones/<uuid>
+-        dataset, as well as the zone itself, so the quota needs to be sized
+-        appropriately.
++        space actually visible/usable in the guest. For kvm and bhyve VMs, this
++        value is the quota (kvm) or refquota (bhyve) for the Zone containing
++        the VM, which is not directly available to users.
+ 
+         Set quota to 0 to disable (ie. for no quota).
+ 
+diff --git a/src/vm/node_modules/VM.js b/src/vm/node_modules/VM.js
+index ac72b7b2..8e2d17b3 100644
+--- a/src/vm/node_modules/VM.js
++++ b/src/vm/node_modules/VM.js
+@@ -140,6 +140,7 @@ var DEFAULT_MAX_MSG_IDS = 4096;
+ var DEFAULT_MAX_SEM_IDS = 4096;
+ var DEFAULT_MAX_SHM_IDS = 4096;
+ var DEFAULT_MDATA_TIMEOUT = 300;
++var DEFAULT_BHYVE_QUOTA = (1024 * 1024 * 1024);
+ var DISABLED = 0;
+ var MAX_HOSTVOL_FILE_BYTES = (10 * 1024 * 1024);
+ var MAX_SNAPNAME_LENGTH = 64;
+@@ -1377,6 +1378,8 @@ function setQuota(opts, callback)
+     assert.string(opts.dataset, 'opts.dataset');
+     assert.object(opts.log, 'opts.log');
+     assert(opts.hasOwnProperty('quota'), 'opts.quota');
++    assert.func(opts.cancelFn, 'opts.cancelFn');
++    assert.func(callback, 'callback');
+ 
+     var brand = opts.brand;
+     var dataset = opts.dataset;
+@@ -1399,10 +1402,8 @@ function setQuota(opts, callback)
+     }
+ 
+     if (brand === 'bhyve') {
+-        // For bhyve we want to use refquota so that the quota only applies to
+-        // the zonepath dataset, and not the zvol 'disks' that are underneath as
+-        // zones/<uuid>/diskX
+-        quotaKey = 'refquota';
++        setQuotaBhyve(opts, callback);
++        return;
+     }
+ 
+     zfs(['set', quotaKey + '=' + newval, dataset], log, function (err, fds) {
+@@ -1416,6 +1417,169 @@ function setQuota(opts, callback)
+     });
+ }
+ 
++/*
++ * See: https://github.com/joyent/rfd/blob/master/rfd/0148/snapspace.md
++ *
++ * | Dataset              | refquota | quota | refreservation | reservation |
++ * | -------------------- | -------- | ----- | -------------- | ----------- |
++ * | zones/<uuid>         | [1]      | [2]   | [1]            | [2]         |
++ * | zones/<uuid>/disk<N> | none     | none  | [3]            | none        |
++ *
++ * 1. This matches the `quota` value described in `vmadm(1M)`. A default value
++ *    of 1 GiB is used when not specified in the `vmadm` payload.  Note that 1
++ *    GiB is overkill, as this space contains small amounts of configuration
++ *    data and logs.
++ *
++ * 2. This is the sum of [1] and all [3]s for this instance.  The vmadm payload
++ *    value of *quota* may override this value, but only if it is larger than
++ *    the calculated value.
++ *
++ * 3. The value calculated by the system when *refreservation* is set to
++ *    *auto*.
++ *
++ * Steps:
++ *   - Set refquota, refreservation to `DEFAULT_BHYVE_QUOTA`
++ *   - Set refreservation on instance volumes to 'auto'
++ *   - Read value which was calculated for refreservation (auto_refres)
++ *   - Set quota zone root dataset to (DEFAULT_BHYVE_QUOTA + auto_refres)
++ */
++
++function setQuotaBhyve(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.string(opts.dataset, 'opts.dataset');
++    assert.object(opts.log, 'opts.log');
++    assert.func(opts.cancelFn, 'callback');
++    assert(opts.hasOwnProperty('quota'), 'opts.quota');
++
++    var cancelFn = opts.cancelFn;
++
++    var log = opts.log;
++    var dataset = opts.dataset;
++    var volumes;
++    var sum;
++
++    var maxQuota = Math.max(DEFAULT_BHYVE_QUOTA,
++        opts.quota * 1024 * 1024 * 1024);
++
++    vasync.waterfall([
++        function setRefQuotaRefRes(next) {
++            var zfsArgs = [
++                'set',
++                'refreservation=none',
++                'refquota=' + maxQuota,
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onSetQuotaRefRes(err, fds) {
++                if (err) {
++                    cancelFn();
++                    log.error(
++                        'setQuotaBhyve: "zfs set refquota" '
++                        + 'cmd failed: ' + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                next();
++            });
++        },
++
++        function getVolumes(next) {
++            // Look up the refreservation value of all zone volumes
++            var zfsArgs = [
++                'list', '-Hrt', 'volume',
++                '-o', 'name',
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onGetVolumes(err, fds) {
++                if (err) {
++                    cancelFn();
++                    log.error('setQuotaBhyve: "zfs list" cmd failed: '
++                        + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                volumes = fds.stdout.trim().split('\n');
++                next();
++            });
++        },
++
++        function setVolumesRefResAuto(next) {
++            // Set the 'refreservation' values on all the volumes to 'auto'
++            vasync.forEachPipeline({
++                inputs: volumes,
++                func: function (volume, cb) {
++                    var zfsArgs = ['set', 'refreservation=auto', volume];
++                    zfs(zfsArgs, log, function _onSetRefResAuto(err, fds) {
++                        if (err) {
++                            log.error(
++                                'setQuotaBhyve: "zfs set refres auto" '
++                                + 'cmd failed: ' + fds.stderr);
++                            cb(new Error(rtrim(fds.stderr)));
++                            return;
++                        }
++                        cb();
++                    });
++                }
++            }, next);
++        },
++
++        function getVolumeCalculatedRefRes(_, next) {
++            // Get the values which were calculated by the system when we set
++            // the refreservation to 'auto'
++            var zfsArgs = [
++                'list', '-Hpr', '-t', 'volume',
++                '-o', 'refreservation',
++                dataset
++            ];
++            zfs(zfsArgs, log, function _onGetVolumesRefRes(err, fds) {
++                if (err) {
++                    cancelFn();
++                    log.error('setQuotaBhyve() "zfs list" cmd failed: '
++                        + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++
++                sum = fds.stdout.trim().split('\n').reduce(
++                    function (acc, cur) {
++                        return acc + parseInt(cur, 10);
++                    }, 0);
++
++                next();
++            });
++        },
++
++        function setDatasetQuota(next) {
++            // Compare the quota value passed in to the one which we've
++            // computed based on volume refreservation values.
++
++            var quota =
++                (opts.quota * 1024 * 1024 * 1024) > (sum + maxQuota)
++                ?  opts.quota + 'g' : (sum + maxQuota);
++
++            var zfsArgs = [
++                'set',
++                'quota=' + quota,
++                'reservation=' + quota,
++                'reservation=' + maxQuota,
++                dataset
++            ];
++
++            zfs(zfsArgs, log, function _onSetDatasetQuota(err, fds) {
++                if (err) {
++                    cancelFn();
++                    log.error('setQuotaBhyve (setDatasetQuota): '
++                        + '"zfs set quota, reservation" '
++                        + 'cmd failed: ' + fds.stderr);
++                    next(new Error(rtrim(fds.stderr)));
++                    return;
++                }
++                next();
++            });
++        }
++    ], callback);
++}
++
++
+ exports.flatten = function (vmobj, key)
+ {
+     var index;
+@@ -14515,7 +14679,7 @@ function restartMetadataService(vmobj, payload, log, callback) {
+     });
+ }
+ 
+-function applyUpdates(oldobj, newobj, payload, log, callback)
++function applyUpdates(oldobj, newobj, payload, log, cancelFn, callback)
+ {
+     var changed = false;
+     var tracers_obj;
+@@ -14576,7 +14740,8 @@ function applyUpdates(oldobj, newobj, payload, log, callback)
+                     brand: oldobj.brand,
+                     dataset: newobj.zfs_filesystem,
+                     log: log,
+-                    quota: payload.quota
++                    quota: payload.quota,
++                    cancelFn: cancelFn
+                 }, function _onSetQuota(err) {
+                     if (!err) {
+                         changed = true;
+@@ -14995,6 +15160,7 @@ exports.update = function (uuid, payload, options, callback)
+     var lockpath;
+     var tracers_obj;
+     var vs;
++    var cancelFn;
+ 
+     // options parameter is optional
+     if (arguments.length === 3) {
+@@ -15489,7 +15655,6 @@ exports.update = function (uuid, payload, options, callback)
+              * simultaneously blocking on vminfod to give us the necessary
+              * "modify" event letting us know it has been successfully updated.
+              */
+-            var cancelFn;
+             vasync.parallel({funcs: [
+                 function (cb2) {
+                     var obj = {
+@@ -15664,8 +15829,9 @@ exports.update = function (uuid, payload, options, callback)
+                     cb();
+                 });
+             }, function (cb) {
+-                applyUpdates(vmobj, new_vmobj, payload, log, function () {
+-                    cb();
++                applyUpdates(vmobj, new_vmobj, payload, log, cancelFn,
++                function (err) {
++                    cb(err);
+                 });
+             }, function (cb) {
+                 // Update the firewall data

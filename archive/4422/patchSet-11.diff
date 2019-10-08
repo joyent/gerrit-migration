@@ -1,0 +1,523 @@
+commit d3998d67b6b0a26db7f8e550ac13521088ab8c2c (refs/changes/22/4422/11)
+Author: Josh Wilsdon <josh@wilsdon.ca>
+Date:   2018-08-01T17:37:27-07:00 (1 year, 2 months ago)
+    
+    TRITON-542 cn-agent should close connection after posting sysinfo
+    Reviewed by: Orlando Vazquez <orlando@joyent.com>
+    Approved by: Orlando Vazquez <orlando@joyent.com>
+
+diff --git a/lib/app.js b/lib/app.js
+index 059c019..960c8bf 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -28,6 +28,7 @@ var createHttpTaskDispatchFn
+ var TaskAgent = require('./task_agent/task_agent');
+ 
+ var DEFAULT_TASK_TIMEOUT_SECONDS = 60 * 60;
++var HEARTBEAT_INTERVAL = 5000; // milliseconds frequency of sending msgs
+ 
+ //
+ // 1.6 chosen here mostly randomly, just so we try a bit more often initially
+@@ -64,6 +65,7 @@ function App(options) {
+ 
+     this.agentserver = options.agentserver;
+     this.backend = options.backend;
++    this.cnapiQueue = vasync.queue(cnapiSend.bind(this), 1);
+     this.config = options.config;
+     this.log = options.log.child();
+     this.registerBackoff = new backo2({
+@@ -73,6 +75,7 @@ function App(options) {
+         min: REGISTER_RETRY_MIN_DELAY_MS
+     });
+     this.sdc_config = options.sdc_config;
++    this.statusQueued = false;
+     this.sysinfo = options.sysinfo;
+     // use the same user-agent format as vm-agent
+     this.userAgent = 'cn-agent/' + packageJson.version +
+@@ -80,6 +83,14 @@ function App(options) {
+         ' server/' + options.uuid;
+     this.uuid = options.uuid;
+ 
++    // ensure we have all the config required to connect to and use CNAPI
++    assert.object(this.config, 'this.config');
++    assert.optionalObject(this.config.cnapi, 'this.config.cnapi');
++    assert.string(this.sdc_config.dns_domain, 'this.sdc_config.dns_domain');
++    assert.string(this.sdc_config.datacenter_name,
++        'this.sdc_config.datacenter_name');
++    assert.object(this.sysinfo, 'this.sysinfo');
++
+     this.log.info('started cn-agent for %s', this.uuid);
+ }
+ 
+@@ -95,86 +106,28 @@ function shuffleArray(array) {
+ }
+ 
+ 
+-/**
+- * Return a list of addresses of CNAPI instances for this particular
+- * datacentre.
+- */
+-
+-App.prototype.retrieveCnapiAddresses = function (callback) {
++App.prototype.createCnapiConnection = function createCnapiConnection(callback) {
+     var self = this;
+ 
+-    // Allow overriding the IPs to use for CNAPI via the config
+-    if (self.config.cnapi_ips) {
+-        callback(null, self.config.cnapi_ips);
+-        return;
+-    }
+-
+-    assert.string(self.sdc_config.dns_domain, 'options.sdc_config.dns_domain');
+-    assert.string(self.sdc_config.datacenter_name,
+-        'options.sdc_config.datacenter_name');
+-
+-    var domainName
+-        = 'cnapi.' + self.sdc_config.datacenter_name + '.' +
+-            self.sdc_config.dns_domain;
+-
+-    self.log.info({ domainName: domainName }, 'cnapi domain name');
+-
+-    dns.resolve(domainName, function (dnserror, addrs) {
+-        if (dnserror) {
+-            callback(new verror.VError(
+-                dnserror, 'resolving cnapi address'));
+-            return;
+-        }
+-
+-        callback(null, addrs);
+-    });
+-};
++    var cnapiAddr = 'cnapi.' + self.sdc_config.datacenter_name + '.' +
++        self.sdc_config.dns_domain;
++    var resolversAddrs = ['binder.' + self.sdc_config.datacenter_name + '.' +
++        self.sdc_config.dns_domain];
++    var url = (self.config.cnapi && self.config.cnapi.url) ||
++        'http://' + cnapiAddr;
+ 
++    var restifyOptions = {
++        agent: false,
++        connectTimeout: 5000,
++        requestTimeout: 5000,
++        userAgent: self.userAgent,
++        url: url
++    };
+ 
+-// Need to find a valid CNAPI instance. We will retrieve the list of all
+-// CNAPI's via DNS, then iterate over them until we find a valid one. If no
+-// valid instances are found, sleep for a bit, then try again.
+-
+-App.prototype.ensureCnapiLookedUp = function (callback) {
+-    var self = this;
+-
+-    retrieveOrWait();
+-
+-    function retrieveOrWait() {
+-        retrieve(function (error, addr) {
+-            if (error) {
+-                var retryIntervalSeconds = 10;
+-                self.log.error({ error: error },
+-                    'finding cnapi address; retrying in %ds',
+-                    retryIntervalSeconds);
+-                setTimeout(function () {
+-                    retrieveOrWait();
+-                }, retryIntervalSeconds * 1000);
+-                return;
+-            }
+-
+-            self.cnapiAddr = addr;
+-            self.agentserver.setCnapiAddress(addr);
+-            callback();
+-        });
+-    }
+-
+-    function retrieve(cb) {
+-        self.retrieveCnapiAddresses(function (error, addrs) {
+-            if (error) {
+-                cb(
+-                    new verror.VError(error, 'retrieving cnapi addreseses'));
+-                return;
+-            }
+-
+-            if (!addrs.length) {
+-                cb(new verror.VError('no cnapi addresses found'));
+-                return;
+-            }
++    self.log.info('Creating CNAPI connection to %s', url);
++    self.cnapiClient = restify.createJsonClient(restifyOptions);
+ 
+-            cb(null, addrs[0]);
+-        });
+-    }
++    callback();
+ };
+ 
+ 
+@@ -187,19 +140,11 @@ App.prototype.updateAgents = function (callback) {
+         return;
+     }
+ 
+-    // We assume nobody will use this before initializing heartbeater,
+-    // otherwise we should complain:
+-    if (!self.client) {
+-        callback(new verror.VError('CNAPI client not initialized'));
+-        return;
+-    }
+-    // And the same for sysinfo:
+-    if (!self.sysinfo) {
+-        callback(new verror.VError('sysinfo not initialized'));
+-        return;
+-    }
++    assert.object(self.cnapiClient, 'self.cnapiClient');
++
+     var agents = self.sysinfo['SDC Agents'];
+     var agents_dir = '/opt/smartdc/agents/lib/node_modules';
++
+     fs.readdir(agents_dir, function (err, files) {
+         if (err) {
+             callback(err);
+@@ -269,7 +214,7 @@ App.prototype.updateAgents = function (callback) {
+                 return;
+             }
+             self.log.info({agents: agents}, 'Posting agents');
+-            self.client.post('/servers/' + self.uuid, {
++            self.cnapiClient.post('/servers/' + self.uuid, {
+                 agents: agents
+             }, function (er4) {
+                 if (er4) {
+@@ -284,19 +229,111 @@ App.prototype.updateAgents = function (callback) {
+     });
+ };
+ 
++App.prototype.queueHeartbeat = function queueHeartbeat() {
++    var self = this;
++
++    self.cnapiQueue.push('heartbeat', function _onHeartbeated() {
++        // Queue the next one 5s after this one completes.
++        setTimeout(self.queueHeartbeat.bind(self), HEARTBEAT_INTERVAL);
++    });
++};
++
++App.prototype.queueStatusUpdateIfNotAlreadyQueued =
++function queueStatusUpdateIfNotAlreadyQueued() {
++    var self = this;
++
++    if (self.statusQueued === true) {
++        self.log.debug('already have a status update pending');
++        return;
++    }
++
++    // Queue a status update
++    self.statusQueued = true;
++    self.cnapiQueue.push('status', function _onStatusUpdated() {
++        self.statusQueued = false;
++    });
++};
++
++/*
++ * This is used to serialize updates to CNAPI to ensure that we don't overload a
++ * busy CNAPI by sending more than 1 request at a time. This is handled via a
++ * vasync queue which calls this function to dispatch updates we need to make to
++ * CNAPI. As cn-agent decides it needs to make updates, it pushes to the queue
++ * to be executed asap, but not before other outstanding updates are completed.
++ */
++function cnapiSend(msgType, callback) {
++    var self = this; // we .bind() this to the App
++
++    switch (msgType) {
++        case 'agents':
++            self.updateAgents(function _onAgentUpdate(err) {
++                if (err) {
++                    self.log.error({
++                        err: err
++                    }, 'Error updating agents info into CNAPI');
++                }
++                callback();
++            });
++            break;
++        case 'heartbeat':
++            self.postHeartbeat(callback);
++            break;
++        case 'status':
++            self.postStatus(callback);
++            break;
++        case 'sysinfo':
++            self.registerServer(callback);
++            break;
++        default:
++            assert.fail('', '',
++                'Malfunction: unknown cnapi message type: "%s"', msgType);
++            break;
++    }
++}
++
++App.prototype.postHeartbeat = function postHeartbeat(callback) {
++    var self = this;
++
++    var hburlpath = '/servers/' + self.uuid + '/events/heartbeat';
++
++    self.cnapiClient.post({ path: hburlpath }, {},
++        function _onHeartbeatPosted(err) {
++
++        if (err) {
++            self.log.warn({ error: err }, 'failed to post heartbeat to CNAPI');
++        } else {
++            self.log.debug('posted heartbeat to CNAPI');
++        }
++
++        callback();
++    });
++};
++
++App.prototype.postStatus = function postStatus(callback) {
++    var self = this;
++
++    assert.object(self.latestStatus, 'self.latestStatus');
++
++    var statusurlpath = '/servers/' + self.uuid + '/events/status';
++
++    self.cnapiClient.post({ path: statusurlpath }, self.latestStatus,
++        function _onStatusPosted(err) {
++
++        if (err) {
++            self.log.warn({ error: err }, 'failed to post status to CNAPI');
++        } else {
++            self.log.debug('posted status to CNAPI');
++        }
++
++        callback();
++    });
++};
+ 
+ App.prototype.startHeartbeater = function () {
+     var self = this;
+     var statusReporter;
+-    var cnapiAddr = self.cnapiAddr;
+ 
+-    var url = 'http://' + cnapiAddr;
+-
+-    var restifyOptions = {
+-        url: url,
+-        connectTimeout: 5000,
+-        requestTimeout: 5000
+-    };
++    assert.object(self.cnapiClient, 'self.cnapiClient');
+ 
+     statusReporter = new StatusReporter({
+         backend: self.backend,
+@@ -304,39 +341,24 @@ App.prototype.startHeartbeater = function () {
+         serverUuid: self.uuid
+     });
+ 
+-    self.log.info('cnapi ip was %s', cnapiAddr);
+-    self.client = restify.createJsonClient(restifyOptions);
+-    var statusurlpath = '/servers/' + self.uuid + '/events/status';
+-    var hburlpath = '/servers/' + self.uuid + '/events/heartbeat';
+-
+-    statusReporter.on('heartbeat', function () {
+-        self.client.post({ path: hburlpath }, {}, function (err) {
+-            if (err) {
+-                self.log.warn({ error: err }, 'posting status to cnapi');
+-                return;
+-            }
+-            self.log.debug('posted heartbeat to cnapi');
+-        });
++    // When the statusReporter tells us we need to update the status, we record
++    // the latest status and queue an update. If a newer status comes in in the
++    // meantime, we'll update self.latestStatus, so when we finally run the
++    // status update, it will always post the latest one we have at that time.
++    statusReporter.on('status', function _queueStatusUpdate(_status) {
++        self.log.trace({ status: _status }, 'status report');
++        self.latestStatus = _status;
++        self.queueStatusUpdateIfNotAlreadyQueued();
+     });
+ 
+-    statusReporter.on('status', function (status) {
+-        self.log.trace({ status: status }, 'status report');
++    // Before we actually start the statusReporter, we want to make sure CNAPI
++    // has the latest agents. So queue an agent update first and only start()
++    // the reporter when the agents update has completed.
++    self.cnapiQueue.push('agents', function _agentUpdateComplete() {
++        // Queue first heartbeat. After this, heartbeats will requeue
++        // HEARTBEAT_INTERVAL after each heartbeat is posted.
++        self.queueHeartbeat();
+ 
+-        self.client.post({ path: statusurlpath }, status, function (err) {
+-            if (err) {
+-                self.log.warn({ error: err }, 'posting status to cnapi');
+-                return;
+-            }
+-            self.log.debug('posted status to cnapi');
+-        });
+-    });
+-
+-    self.updateAgents(function (err) {
+-        if (err) {
+-            self.log.error({
+-                err: err
+-            }, 'Error updating agents info into CNAPI');
+-        }
+         statusReporter.start();
+     });
+ };
+@@ -351,28 +373,19 @@ App.prototype.startHeartbeater = function () {
+ App.prototype.registerServer = function registerServer(callback) {
+     var self = this;
+ 
+-    var cnapiAddr = self.cnapiAddr;
+-    var restifyOptions;
++    assert.object(self.cnapiClient, 'self.cnapiClient');
++    assert.object(self.sysinfo, 'self.sysinfo');
++
+     var sysinfo = self.sysinfo;
+-    var url = 'http://' + cnapiAddr;
+     var urlPath = path.join('/servers', self.uuid, 'sysinfo');
+ 
+-    restifyOptions = {
+-        connectTimeout: 5000,
+-        requestTimeout: 5000,
+-        url: url,
+-        userAgent: self.userAgent
+-    };
+-
+-    self.client = restify.createJsonClient(restifyOptions);
+-
+     // We'll add our IP and port to the sysinfo here so that if we're not
+     // using the default port, CNAPI knows where to send requests to us.
+     sysinfo['CN Agent Port'] = self.agentserver.server.address().port;
+     sysinfo['CN Agent IP'] = self.agentserver.server.address().address;
+ 
+     // Make an attempt, if that fails, schedule a new attempt with a delay
+-    self.client.post({
++    self.cnapiClient.post({
+         path: urlPath
+     }, {
+         sysinfo: self.sysinfo
+@@ -398,7 +411,7 @@ App.prototype.registerServer = function registerServer(callback) {
+             self.log.warn({
+                 err: err,
+                 retryInMs: delay
+-            }, 'Error posting sysinfo to cnapi, will retry.');
++            }, 'Error posting sysinfo to CNAPI, will retry.');
+ 
+             setTimeout(function _registerAgain() {
+                 // The .call() is necessary here because we want the
+@@ -417,7 +430,7 @@ App.prototype.registerServer = function registerServer(callback) {
+         self.log.info({
+             headers: res.headers,
+             statusCode: res.statusCode
+-        }, 'posted sysinfo to cnapi');
++        }, 'posted sysinfo to CNAPI');
+ 
+         callback();
+     });
+@@ -457,10 +470,12 @@ App.prototype.start = function () {
+ 
+     vasync.pipeline({
+         funcs: [
+-            function _ensureCnapiLookedUp(_, cb) {
+-                self.ensureCnapiLookedUp(cb);
++            function _createCnapiConnection(_, cb) {
++                self.createCnapiConnection(cb);
+             }, function _registerServer(_, cb) {
+-                self.registerServer(cb);
++                // We only call cb() once the 'sysinfo' has been handled by
++                // the cnapiQueue.
++                self.cnapiQueue.push('sysinfo', cb);
+             }, function _startHeartbeater(_, cb) {
+                 self.startHeartbeater();
+                 cb();
+diff --git a/lib/heartbeater.js b/lib/heartbeater.js
+index 0011d27..ba2f6f9 100644
+--- a/lib/heartbeater.js
++++ b/lib/heartbeater.js
+@@ -40,7 +40,6 @@ function StatusReporter(opts) {
+     this.debug = !!process.env.DEBUG;
+     this.max_interval = 60000;  // milliseconds frequency for doing full reload
+     this.status_interval = 500;  // milliseconds frequency of sending msgs
+-    this.heartbeat_interval = 5000;  // milliseconds frequency of sending msgs
+ 
+     assert.object(opts, 'opts');
+     assert.object(opts.backend, 'opts.backend');
+@@ -48,7 +47,7 @@ function StatusReporter(opts) {
+     this.throttle = false;
+ 
+     // The backend provides the functions to get system-specific data for
+-    // heartbeats.
++    // status updates.
+     this.backend = opts.backend;
+ 
+     // This specifies whether the cache is dirty.  This could be because a zone
+@@ -247,13 +246,6 @@ StatusReporter.prototype.checkEmitStatus = function () {
+ };
+ 
+ 
+-StatusReporter.prototype.emitHeartbeat = function () {
+-    var self = this;
+-
+-    self.emit('heartbeat');
+-};
+-
+-
+ StatusReporter.prototype.startWatchers = function startWatchers() {
+     var self = this;
+ 
+@@ -287,8 +279,6 @@ StatusReporter.prototype.start = function () {
+         self.markDirty.bind(self), self.max_interval);
+     self.pingInterval = setInterval(
+         self.checkEmitStatus.bind(self), self.status_interval);
+-    self.hbInterval = setInterval(
+-        self.emitHeartbeat.bind(self), self.heartbeat_interval);
+ };
+ 
+ 
+diff --git a/lib/server.js b/lib/server.js
+index 6758ca3..e3825d6 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -116,18 +116,6 @@ AgentHttpServer.prototype.init = function () {
+         next();
+     });
+ 
+-    self.server.use(function validateIpAddresses(req, res, next) {
+-        // Should we periodically refresh the CNAPI IP address we have?
+-        if (req.method === 'POST' && [self.cnapiAddr, self.bindip].indexOf(
+-                req.connection.remoteAddress) === -1) {
+-            next(new restify.NotAuthorizedError(
+-                'requests must originate from CNAPI address'));
+-            return;
+-        }
+-        next();
+-        return;
+-    });
+-
+     self.server.on('uncaughtException', function (req, res, route, err) {
+         req.log.error(err);
+         res.send(err);
+@@ -201,13 +189,6 @@ AgentHttpServer.prototype.registerTaskHandler = function (uuid, handler) {
+ };
+ 
+ 
+-AgentHttpServer.prototype.setCnapiAddress = function (ip) {
+-    var self = this;
+-    assert.string(ip, 'ip');
+-    self.cnapiAddr = ip;
+-};
+-
+-
+ AgentHttpServer.prototype.setTaskHistory = function (history) {
+     var self = this;
+     self.taskHistory = history;
+diff --git a/package.json b/package.json
+index 4508124..541c39f 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "cn-agent",
+   "description": "Triton Compute Node Agent",
+-  "version": "2.2.1",
++  "version": "2.3.0",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {

@@ -1,0 +1,811 @@
+commit 002a3d50133e582dbd69d204dd7a30323da75471 (refs/changes/49/3249/3)
+Author: Julien Gilli <julien.gilli@joyent.com>
+Date:   2018-01-24T16:58:51-08:00 (1 year, 8 months ago)
+    
+    TRITON-59 check that instances mounting NFS volumes are provisioned on networks on which volumes are reachable
+    PUBAPI-1453 check that a container mounting a NFS volume is provisioned on a network on which that volume is reachable
+
+diff --git a/lib/errors.js b/lib/errors.js
+index 7e0f1e1..9a7c949 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -326,12 +326,38 @@ function vmapiErrorWrap(cause, message) {
+         case 'ValidationFailed':
+             return new ExposedSDCError(cause, message);
+ 
++        case 'VolumesNotReachable':
++            return new VolumesNotReachableError(cause);
++
+         /* By default don't expose internal error message details. */
+         default:
+             return new CloudApiError(cause, message);
+     }
+ }
+ 
++function VolumesNotReachableError(cause) {
++    assert.object(cause, 'cause');
++
++    var message = 'Volumes not reachable from machine';
++
++    message += ': ' + cause.body.errors.map(function renderErr(err) {
++        return err.message;
++    }).join(', ');
++
++    restify.RestError.call(this, {
++        cause: cause,
++        message: message,
++        statusCode: this.constructor.prototype.statusCode,
++        restCode: this.constructor.prototype.restCode
++    });
++}
++
++util.inherits(VolumesNotReachableError, restify.RestError);
++VolumesNotReachableError.prototype.name = 'VolumesNotReachableError';
++VolumesNotReachableError.restCode = 'VolumesNotReachableError';
++VolumesNotReachableError.statusCode = 409;
++VolumesNotReachableError.description = 'Volumes not reachable from machine';
++
+ /**
+  * Selectively expose some VOLAPI error details via a whitelist on restCode.
+  * Other VOLAPI error codes are wrapped such that the error is *logged*, but
+@@ -435,6 +461,7 @@ module.exports = {
+ 
+     DefaultFabricNetworkNotConfiguredError:
+         DefaultFabricNetworkNotConfiguredError,
++    VolumesNotReachableError: VolumesNotReachableError,
+ 
+     // Internal SDC API wrappers
+     vmapiErrorWrap: vmapiErrorWrap,
+diff --git a/lib/machines.js b/lib/machines.js
+index 00099de..da6017f 100644
+--- a/lib/machines.js
++++ b/lib/machines.js
+@@ -1541,26 +1541,30 @@ function create(req, res, next) {
+                             'firewall_enabled'].indexOf(e.field) !== -1) {
+                             msgs.push('Invalid ' + e.field);
+                         }
++
++                        if (msgs.length > 0) {
++                            err.message = err.message + ': ' + msgs.join('. ');
++                            err.body.message = err.message;
++                        }
+                     });
+ 
+                 } else if (body.code && body.code === 'InvalidParameters' &&
+                     body.errors.length > 0) {
+                     errors.translateDuplicateIpErrors(err);
++                } else if (body && body.code === 'VolumesNotReachable') {
++                    cb(new errors.VolumesNotReachableError(err));
++                    return;
+                 }
+ 
+-                if (msgs.length > 0) {
+-                    err.message = err.message + ': ' + msgs.join('. ');
+-                    err.body.message = err.message;
+-                }
+-
+-                return cb(err);
++                cb(err);
++                return;
+             }
+ 
+             // FIXME: for SDC7.next do this with backoff module.
+             // cloudapi's vmapi client is way faster than moray
+-            return setTimeout(function () {
++            setTimeout(function getVm() {
+                 // vm coming from createVM is merely vm_uuid, job_uuid:
+-                return req.sdc.vmapi.getVm({
++                req.sdc.vmapi.getVm({
+                     uuid: vm.vm_uuid,
+                     owner_uuid: customer
+                 }, {
+@@ -1570,7 +1574,8 @@ function create(req, res, next) {
+                     }
+                 }, function (err1, machine) {
+                     if (err1) {
+-                        return cb(err1);
++                        cb(err1);
++                        return;
+                     }
+                     // PUBAPI-625
+                     if (!req.datasets && req.dataset) {
+@@ -1585,7 +1590,7 @@ function create(req, res, next) {
+                     log.debug('GetMachine(/%s/%s) => %j',
+                             customer, name, machine);
+                     res.send(201, machine);
+-                    return cb(null);
++                    cb(null);
+                 });
+             }, 200);
+         });
+diff --git a/test/common.js b/test/common.js
+index 51192f7..4a5659b 100644
+--- a/test/common.js
++++ b/test/common.js
+@@ -1048,6 +1048,94 @@ function napiDeleteNicTagByName(opts, cb) {
+     });
+ }
+ 
++/*
++ * Make the already imported image with name "imageName" provisionable by making
++ * it public.
++ *
++ * @param {Object} client (required): a CloudAPI client instance as passed to
++ *   common.setup's callback's second parameter.
++ *
++ * @param {String} imageName (required): the name of the image to make
++ *   provisionable
++ *
++ * @param {Function} callback (required): called at the end of the process as
++ *   callback(err, provisionableImgObject)
++ *
++ * where "provisionableImgObject" represents an image with an "id" property that
++ * stores its UUID.
++ */
++function makeImageProvisionable(client, imageName, callback) {
++    assert.object(client, 'client');
++    assert.string(imageName, 'imageName');
++    assert.func(callback, 'callback');
++
++    var context = {};
++
++    vasync.pipeline({arg: context, funcs: [
++        function listImportedImages(ctx, next) {
++            client.get('/my/images?name=' + imageName,
++                function onListImportedImages(listImagesErr, req, res, images) {
++                    if (listImagesErr) {
++                        next(listImagesErr);
++                        return;
++                    }
++
++                    if (!images || images.length === 0) {
++                        next(new Error('Could not find image with name: ' +
++                            imageName));
++                        return;
++                    }
++
++                    ctx.images = images;
++                    next();
++                });
++
++        },
++        /*
++         * When images are imported into a DC's IMGAPI because they're an origin
++         * image for another image imported from updates.joyent.com, their
++         * "public" attribute is set to false, which makes them
++         * non-provisionable. In this case, we just update that public property
++         * to "true".
++         */
++        function ensureOneImportedImgIsPublic(ctx, next) {
++            var firstImage;
++            var publicImages;
++
++            assert.optionalArrayOfObject(ctx.images, 'ctx.images');
++
++            if (ctx.images && ctx.images.length > 0) {
++                publicImages = ctx.images.filter(function isPublic(image) {
++                    return image.public;
++                });
++
++                if (publicImages.length > 0) {
++                    ctx.provisionableImage = publicImages[0];
++                    next();
++                } else {
++                    firstImage = ctx.images[0];
++                    firstImage.public = true;
++                    client.imgapi.updateImage(firstImage.uuid, firstImage,
++                        client.account.uuid,
++                        function onImageUpdated(updateImgErr) {
++                            if (updateImgErr) {
++                                next(updateImgErr);
++                                return;
++                            }
++
++                            ctx.provisionableImage = firstImage;
++                            next();
++                        });
++                }
++            } else {
++                next();
++            }
++        }
++    ]}, function onAllDone(err) {
++        callback(err, context.provisionableImage);
++    });
++}
++
+ // --- Library
+ 
+ 
+@@ -1084,5 +1172,7 @@ module.exports = {
+ 
+     getCfg: function () {
+         return CONFIG;
+-    }
++    },
++
++    makeImageProvisionable: makeImageProvisionable
+ };
+diff --git a/test/machines/common.js b/test/machines/common.js
+index d3fd836..201f0bd 100644
+--- a/test/machines/common.js
++++ b/test/machines/common.js
+@@ -5,10 +5,10 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+-var assert = require('assert');
++var assert = require('assert-plus');
+ var sprintf = require('util').format;
+ var common = require('../common');
+ 
+@@ -54,7 +54,7 @@ function checkJob(client, id, callback) {
+ 
+ 
+ function waitForJob(client, id, callback) {
+-    assert.ok(client);
++    assert.object(client, 'client');
+     // console.log('waiting for job with uuid: %s', uuid);
+     checkJob(client, id, function (err, ready) {
+         if (err) {
+@@ -156,6 +156,48 @@ function waitForRunningMachine(client, machineUuid, cb) {
+     });
+ }
+ 
++function waitForDeletedMachine(client, machineUuid, cb) {
++    assert.object(client, 'client');
++    assert.uuid(machineUuid, 'machineUuid');
++    assert.func(cb, 'cb');
++
++    var MAX_NUM_ATTEMPTS = 20;
++    var numAttempts = 0;
++    var POLL_DELAY_MS = 5000;
++
++    function getMachineState() {
++        if (numAttempts > MAX_NUM_ATTEMPTS) {
++            cb(new Error('maximum number of attempts reached: ' + numAttempts +
++                '/' + MAX_NUM_ATTEMPTS));
++            return;
++        }
++
++        numAttempts++;
++        client.get('/my/machines/' + machineUuid,
++            function onGetMachine(getMachineErr, req, res, machine) {
++                /*
++                 * 410 means the VM was deleted.
++                 */
++                if (getMachineErr) {
++                    if (getMachineErr.statusCode === 410 &&
++                        machine && machine.state === 'deleted') {
++                        cb(null, machine);
++                    } else {
++                        cb(getMachineErr);
++                    }
++                } else {
++                    if (machine && (machine.state === 'deleted' ||
++                        machine.state === 'failed')) {
++                            cb(null, machine);
++                    } else {
++                        setTimeout(getMachineState, POLL_DELAY_MS);
++                    }
++                }
++            });
++    }
++
++    getMachineState();
++}
+ 
+ // TODO: This sucks. The first network here might NOT be provisionable: It
+ // might be junk from an earlier failed test.
+@@ -228,6 +270,7 @@ module.exports = {
+     waitForJob: waitForJob,
+     waitForWfJob: waitForWfJob,
+     waitForRunningMachine: waitForRunningMachine,
++    waitForDeletedMachine: waitForDeletedMachine,
+ 
+     TAG_KEY: TAG_KEY,
+     TAG_VAL: TAG_VAL,
+diff --git a/test/volumes-automount.test.js b/test/volumes-automount.test.js
+index 6def9f6..a299a5b 100644
+--- a/test/volumes-automount.test.js
++++ b/test/volumes-automount.test.js
+@@ -47,85 +47,6 @@ function deleteKeypair(cb) {
+     });
+ }
+ 
+-/*
+- * Make the image with name "imageName" provisionable. If it's imported and not
+- * public, it makes the image public.
+- *
+- * @params {String} imageName (required): the name of the image to make
+- *   provisionable
+- * @params {Function} callback (required): called at the end of the process as
+- *   callback(err, provisionableImgObject)
+- *
+- * where "provisionableImgObject" represents an image with an "id" property that
+- * stores its UUID.
+- */
+-function makeImageProvisionable(imageName, callback) {
+-    assert.string(imageName, 'imageName');
+-    assert.func(callback, 'callback');
+-
+-    var context = {};
+-
+-    vasync.pipeline({arg: context, funcs: [
+-        function listImportedImages(ctx, next) {
+-            CLIENT.get('/my/images?name=' + imageName,
+-                function onListImportedImages(listImagesErr, req, res, images) {
+-                    var err = listImagesErr;
+-
+-                    if (!images || images.length === 0) {
+-                        err = new Error('Could not find image with name: ' +
+-                            imageName);
+-                    }
+-
+-                    ctx.images = images;
+-                    next(err);
+-                });
+-
+-        },
+-        /*
+-         * When images are imported into a DC's IMGAPI because they're an origin
+-         * image for another image imported from updates.joyent.com, their
+-         * "public" attribute is set to false, which makes them
+-         * non-provisionable. In this case, we just update that public property
+-         * to "true".
+-         */
+-        function ensureOneImportedImgIsPublic(ctx, next) {
+-            var firstImage;
+-            var publicImages;
+-
+-            assert.optionalArrayOfObject(ctx.images, 'ctx.images');
+-
+-            if (ctx.images && ctx.images.length > 0) {
+-                publicImages = ctx.images.filter(function isPublic(image) {
+-                    return image.public;
+-                });
+-
+-                if (publicImages.length > 0) {
+-                    ctx.provisionableImage = publicImages[0];
+-                    next();
+-                } else {
+-                    firstImage = ctx.images[0];
+-                    firstImage.public = true;
+-                    CLIENT.imgapi.updateImage(firstImage.uuid, firstImage,
+-                        CLIENT.account.uuid,
+-                        function onImageUpdated(updateImgErr) {
+-                            if (updateImgErr) {
+-                                next(updateImgErr);
+-                                return;
+-                            }
+-
+-                            ctx.provisionableImage = firstImage;
+-                            next();
+-                        });
+-                }
+-            } else {
+-                next();
+-            }
+-        }
+-    ]}, function onAllDone(err) {
+-        callback(err, context.provisionableImage);
+-    });
+-}
+-
+ if (CONFIG.experimental_cloudapi_nfs_shared_volumes !== true) {
+     console.log('experimental_cloudapi_nfs_shared_volumes setting not ' +
+         'enabled, skipping tests');
+@@ -256,7 +177,7 @@ if (CONFIG.experimental_cloudapi_nfs_shared_volumes !== true) {
+         var IMG_NAMES = [TEST_IMAGE_LX, TEST_IMAGE_KVM, TEST_IMAGE_SMARTOS];
+ 
+         vasync.forEachParallel({
+-            func: makeImageProvisionable,
++            func: common.makeImageProvisionable.bind(null, CLIENT),
+             inputs: IMG_NAMES
+         }, function onAllImgsSetupDone(imgsSetupErr, results) {
+             var idx;
+diff --git a/test/volumes-mount-network-unreachable.test.js b/test/volumes-mount-network-unreachable.test.js
+new file mode 100644
+index 0000000..e1e5381
+--- /dev/null
++++ b/test/volumes-mount-network-unreachable.test.js
+@@ -0,0 +1,395 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var test = require('tape').test;
++var util = require('util');
++var vasync = require('vasync');
++
++var common = require('./common');
++var libuuid = require('libuuid');
++var mod_config = require('../lib/config.js');
++var mod_testConfig = require('./lib/config');
++var mod_testNetworks = require('./lib/networks');
++var mod_testVolumes = require('./lib/volumes');
++
++var machinesCommon = require('./machines/common');
++
++var CONFIG = mod_config.configure();
++var DEFAULT_FABRIC_NETWORK_UUID;
++var JOYENT_IMGAPI_SOURCE = 'https://images.joyent.com';
++var NON_DEFAULT_FABRIC_VLAN_ID = 4;
++var NON_DEFAULT_FABRIC_NETWORKS = [];
++var TEST_IMAGE_SMARTOS = 'minimal-64-lts';
++var TEST_SMARTOS_IMAGE_UUID;
++var UFDS_ADMIN_UUID = CONFIG.ufds_admin_uuid;
++
++function mountVolumeFromMachine(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.client, 'opts.client');
++    assert.arrayOfUuid(opts.machineNetworkUuids, 'opts.machineNetworkuuids');
++    assert.uuid(opts.machinePackageUuid, 'opts.machinePackageUuid');
++    assert.arrayOfUuid(opts.volumeNetworkUuids, 'opts.volumeNetworkUuids');
++
++    var client = opts.client;
++    var machinePackageUuid = opts.machinePackageUuid;
++    var shouldWaitForMachineDeletion = true;
++    var shouldWaitForVolumeDeletion = true;
++    var testMachineId;
++    var testMachineName = 'sdc-cloudapi-tests-mount-network-unreachable-' +
++        libuuid.create();
++    var testVolumeId;
++    var testVolumeName = 'sdc-cloudapi-tests-mount-network-unreachable-' +
++        libuuid.create();
++
++    vasync.pipeline({funcs: [
++        function createVol(_, next) {
++            client.post('/my/volumes', {
++                name: testVolumeName,
++                type: 'tritonnfs',
++                networks: opts.volumeNetworkUuids
++            }, function onVolumeCreated(volumeCreationErr, req, res, volume) {
++                if (!volumeCreationErr && volume) {
++                    testVolumeId = volume.id;
++                }
++
++                next(volumeCreationErr);
++            });
++        },
++        function waitForVolumeReady(_, next) {
++            var expectedState = 'ready';
++
++            mod_testVolumes.waitForTransitionToState(client, testVolumeId,
++                expectedState, function onTransition() {
++                    CLIENT.get('/my/volumes/' + testVolumeId,
++                        function onGetVolume(getVolumeErr, req, res, volume) {
++                            if (!volume || volume.state !== expectedState) {
++                                next(new Error('test volume not in expected ' +
++                                    'state (' + expectedState + ')'));
++                            } else {
++                                next();
++                            }
++                        });
++            });
++        },
++        function createMachine(_, next) {
++            var payload;
++
++            payload = {
++                metadata: {},
++                image: TEST_SMARTOS_IMAGE_UUID,
++                package: machinePackageUuid,
++                name: testMachineName,
++                firewall_enabled: false,
++                networks: opts.machineNetworkUuids,
++                volumes: [
++                    {
++                        name: testVolumeName,
++                        type: 'tritonnfs',
++                        mode: 'rw',
++                        mountpoint: '/foo'
++                    }
++                ]
++            };
++
++            CLIENT.post('/my/machines', payload,
++                function machineCreated(machineCreateErr, req, res, body) {
++                    if (machineCreateErr) {
++                        next(machineCreateErr);
++                        return;
++                    }
++
++                    if (!body) {
++                        next(new Error('Empty body in response to ' +
++                            'CreateMachine request'));
++                        return;
++                    }
++
++                    testMachineId = body.id;
++
++                    next();
++                });
++        },
++        /*
++         * We purposedly ignore errors when waiting for test machines to run, as
++         * this is not what this specific tests suite is testing. Once a machine
++         * is scheduled for provisioning, we already know whether or not the
++         * validation of volume/machine networks allowed or prevented a machine
++         * from being created. We just want to wait for the machine to be
++         * created to be able to clean it up (delete it) afterwards.
++         */
++        function waitForMachineToRun(_, next) {
++            machinesCommon.waitForRunningMachine(client, testMachineId,
++                function waitDone(waitErr) {
++                    next();
++                });
++        },
++        function deleteMachine(_, next) {
++            client.del('/my/machines/' + testMachineId, function onDel(delErr) {
++                if (delErr) {
++                    shouldWaitForMachineDeletion = false;
++                }
++                next();
++            });
++        },
++        function waitMachineDeleted(_, next) {
++            if (!shouldWaitForMachineDeletion) {
++                next();
++                return;
++            }
++
++            machinesCommon.waitForDeletedMachine(client, testMachineId,
++                function onWaitDone(waitMachineErr) {
++                    next();
++                });
++        },
++        function deleteVolume(_, next) {
++            client.del('/my/volumes/' + testVolumeId, function onDel(delErr) {
++                if (delErr) {
++                    shouldWaitForVolumeDeletion = false;
++                }
++
++                next();
++            });
++        },
++        function waitVolumeDeleted(_, next) {
++            if (!shouldWaitForVolumeDeletion) {
++                next();
++                return;
++            }
++
++            mod_testVolumes.waitForDeletion(client, testVolumeId,
++                function onWaitDone(waitErr) {
++                    next();
++                });
++        }
++    ]}, cb);
++}
++
++if (CONFIG.experimental_cloudapi_nfs_shared_volumes !== true) {
++    console.log('experimental_cloudapi_nfs_shared_volumes setting not ' +
++        'enabled, skipping tests');
++    process.exitCode = 0;
++} else {
++    var CLIENTS;
++    var CLIENT;
++    var SERVER;
++    var SSH_PUBLIC_KEY;
++
++    var testPackage;
++
++    test('setup', function (t) {
++        common.setup({clientApiVersion: '~8.0'}, function (_, clients, server) {
++            CLIENTS = clients;
++            CLIENT = clients.user;
++            SERVER = server;
++
++            t.end();
++        });
++    });
++
++    // need a package we can use to provision our containers
++    test('find usable package', function (t) {
++        CLIENT.get('/my/packages',
++            function onGetPackages(getPackageErr, req, res, packages) {
++                t.ifErr(getPackageErr, 'getting packages should succeed');
++                if (!getPackageErr) {
++                    t.ok(Array.isArray(packages),
++                        'packages should be an array');
++                    t.ok(packages.length > 0,
++                        'should have at least one package');
++
++                    // choose the smallest package over 1024
++                    packages.forEach(function choosePackage(pkg) {
++                        if (pkg.memory >= 1024) {
++                            if (testPackage === undefined) {
++                                testPackage = pkg;
++                                return;
++                            }
++
++                            if (pkg.memory < testPackage.memory) {
++                                testPackage = pkg;
++                            }
++                        }
++                    });
++
++                    t.ok(testPackage && testPackage.id,
++                        'should have found package, got: '
++                        + JSON.stringify(testPackage));
++
++                    t.end();
++                }
++            });
++    });
++
++    test('ensure SmartOS image', function (t) {
++        common.makeImageProvisionable(CLIENT, TEST_IMAGE_SMARTOS,
++            function onImgProvisionable(imgSetupErr, img) {
++                t.ifErr(imgSetupErr, 'setting up images should not error');
++
++                if (!imgSetupErr) {
++                    TEST_SMARTOS_IMAGE_UUID = img.id;
++                }
++
++                t.end();
++            });
++
++    });
++
++    /*
++     * This is necessary so that we proceed with the rest of the tests suite
++     * only after the entry for the newly added user (including its default
++     * fabric network used to provision volumes) is present in UFDS.
++     */
++    test('getting config from ufds', function (t) {
++        mod_testConfig.waitForAccountConfigReady(CLIENT,
++            function onConfigReady(configReadyErr, ufdsConfig) {
++                t.ifErr(configReadyErr, 'newly created user\'s config should ' +
++                    'eventually be created');
++                if (ufdsConfig) {
++                    DEFAULT_FABRIC_NETWORK_UUID = ufdsConfig.default_network;
++                }
++                t.end();
++            });
++    });
++
++    test('create fabric VLAN', function (t) {
++        CLIENT.post('/my/fabrics/default/vlans', {
++            name: 'sdccloudapi_tests_volumes_network_unreachable',
++            description: 'test VLAN for sdc-cloudapi tests',
++            vlan_id: NON_DEFAULT_FABRIC_VLAN_ID
++        }, function vlanCreated(vlanCreateErr, req, res, body) {
++            t.ifErr(vlanCreateErr, 'VLAN creation should be successful');
++            t.end();
++        });
++    });
++
++    test('create first non-default fabric network', function (t) {
++        CLIENT.post(util.format('/my/fabrics/default/vlans/%d/networks',
++            NON_DEFAULT_FABRIC_VLAN_ID), {
++                name: 'sdccloudapitests_volumes_network_unreachable',
++                provision_start_ip: '10.42.1.0',
++                provision_end_ip: '10.42.255.254',
++                resolvers: ['8.8.8.8'],
++                subnet: '10.42.0.0/16'
++            }, function onFabricNetCreated(fabricNetCreateErr, req, res, body) {
++                t.ifError(fabricNetCreateErr,
++                    'fabric network creation should be successful');
++                if (body) {
++                    NON_DEFAULT_FABRIC_NETWORKS.push(body.id);
++                }
++                t.end();
++            });
++    });
++
++    test('create second non-default fabric network', function (t) {
++        CLIENT.post(util.format('/my/fabrics/default/vlans/%d/networks',
++            NON_DEFAULT_FABRIC_VLAN_ID), {
++                name: 'sdccloudapitests_volumes_network_unreachable_2',
++                provision_start_ip: '10.43.1.0',
++                provision_end_ip: '10.43.255.254',
++                resolvers: ['8.8.8.8'],
++                subnet: '10.43.0.0/16'
++            }, function onFabricNetCreated(fabricNetCreateErr, req, res, body) {
++                t.ifError(fabricNetCreateErr,
++                    'fabric network creation should be successful');
++                if (body) {
++                    NON_DEFAULT_FABRIC_NETWORKS.push(body.id);
++                }
++                t.end();
++            });
++    });
++
++    test('volume on non-default-fabric, machine on default fabric',
++        function (t) {
++            mountVolumeFromMachine({
++                client: CLIENT,
++                machineNetworkUuids: [DEFAULT_FABRIC_NETWORK_UUID],
++                machinePackageUuid: testPackage.id,
++                volumeNetworkUuids: [NON_DEFAULT_FABRIC_NETWORKS[0]]
++            }, function onMountDone(mountErr) {
++                t.ok(mountErr, 'mounting volume on non-default fabric from ' +
++                    'machine on default fabric should fail, got: ' + mountErr);
++                t.end();
++            });
++        });
++
++    test('volume on default-fabric, machine on non-default fabric',
++    function (t) {
++        mountVolumeFromMachine({
++            client: CLIENT,
++            machineNetworkUuids: [NON_DEFAULT_FABRIC_NETWORKS[0]],
++            machinePackageUuid: testPackage.id,
++            volumeNetworkUuids: [DEFAULT_FABRIC_NETWORK_UUID]
++        }, function onMountDone(mountErr) {
++            t.ok(mountErr, 'mounting volume on default fabric from machine ' +
++                'on non-default fabric should fail, got: ' + mountErr);
++            t.end();
++        });
++    });
++
++    test('volume on non-default-fabric, machine on same non-default fabric',
++        function (t) {
++            mountVolumeFromMachine({
++                client: CLIENT,
++                machineNetworkUuids: [NON_DEFAULT_FABRIC_NETWORKS[0]],
++                machinePackageUuid: testPackage.id,
++                volumeNetworkUuids: [NON_DEFAULT_FABRIC_NETWORKS[0]]
++            }, function onMountDone(mountErr) {
++                t.ifError(mountErr, 'mounting volume on non-default fabric ' +
++                    'from machine on same non-default fabric should succeed');
++                t.end();
++            });
++        });
++
++    test('volume on 2 non-default fabrics, machine on one of them',
++        function (t) {
++            mountVolumeFromMachine({
++                client: CLIENT,
++                machineNetworkUuids: [NON_DEFAULT_FABRIC_NETWORKS[0]],
++                machinePackageUuid: testPackage.id,
++                volumeNetworkUuids: [
++                    NON_DEFAULT_FABRIC_NETWORKS[0],
++                    NON_DEFAULT_FABRIC_NETWORKS[1]
++                ]
++            }, function onMountDone(mountErr) {
++                t.ifError(mountErr, 'mounting volume on two non-default ' +
++                    'fabric networks from machine on one of them should ' +
++                    'succeed');
++                t.end();
++            });
++        });
++
++    test('machine on 2 non-default fabrics, volume on one of them',
++        function (t) {
++            mountVolumeFromMachine({
++                client: CLIENT,
++                machineNetworkUuids: [
++                    NON_DEFAULT_FABRIC_NETWORKS[0],
++                    NON_DEFAULT_FABRIC_NETWORKS[1]
++                ],
++                machinePackageUuid: testPackage.id,
++                volumeNetworkUuids: [NON_DEFAULT_FABRIC_NETWORKS[0]]
++            }, function onMountDone(mountErr) {
++                t.ifError(mountErr, 'mounting volume on non-default fabric ' +
++                    'network from machine on several networks including that ' +
++                    'one should succeed');
++                t.end();
++            });
++        });
++
++    test('teardown', function (t) {
++        common.teardown(CLIENTS, SERVER, function onTeardown(err) {
++            t.ifErr(err, 'teardown should be successful, got: '
++                + (err ? err.message : 'SUCCESS'));
++            t.end();
++        });
++    });
++}

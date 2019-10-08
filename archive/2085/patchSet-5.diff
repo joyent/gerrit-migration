@@ -1,0 +1,1376 @@
+commit bc3e8d395d084cc54b20e89fc6f7a298b5931b89 (refs/changes/85/2085/5)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2017-06-14T10:38:25-07:00 (2 years, 4 months ago)
+    
+    joyent/node-zkstream#6 session resumption support
+    joyent/node-zkstream#7 document watcher support
+    joyent/node-zkstream#8 tests using multiple ZK servers
+
+diff --git a/README.md b/README.md
+index d02f5ad..894c3e8 100644
+--- a/README.md
++++ b/README.md
+@@ -43,17 +43,6 @@ Parameters
+ 
+ Returns a request emitter (see below).
+ 
+-### `Client#get(path[, cb])`
+-
+-Gets the data stored in a given node.
+-
+-Parameters
+- - `path`: a String, path to the node
+- - `cb`: an optional Function `(err, data)` with parameters:
+-   - `data`: a Buffer
+-
+-Returns a request emitter (see below).
+-
+ ### `Client#stat(path[, cb])`
+ 
+ Gathers basic information about the node at a given path, including its version
+@@ -73,6 +62,18 @@ Parameters
+ 
+ Returns a request emitter (see below).
+ 
++### `Client#get(path[, cb])`
++
++Gets the data stored in a given node.
++
++Parameters
++ - `path`: a String, path to the node
++ - `cb`: an optional Function `(err, data, stat)` with parameters:
++   - `data`: a Buffer
++   - `stat`: an Object, same format as `stat` in `Client#stat`
++
++Returns a request emitter (see below).
++
+ ### `Client#delete(path, version[, cb])`
+ 
+ Deletes a given node as long as its latest version matches the given version.
+@@ -99,6 +100,76 @@ Parameters
+ 
+ Returns a request emitter (see below).
+ 
++### `Client#set(path, data, version[, cb])`
++
++Sets the contents of a given node as long as its latest version matches the
++given version.
++
++Parameters
++ - `path`: a String, path to the node
++ - `data`: a Buffer, the new data to place in the node
++ - `version`: a Number, version number as returned from `Client#stat`
++ - `cb`: an optional Function `(err)`
++
++Returns a request emitter (see below).
++
++### `Client#sync(path[, cb])`
++
++Forces the ZK leader to sync up with its followers on the state of the given
++node.
++
++Parameters
++ - `path`: a String, path to the node
++ - `cb`: an optional Function `(err)`
++
++Returns a request emitter (see below).
++
++### `Client#watcher(path)`
++
++Returns a watcher EventEmitter for a given path.
++
++Parameters
++ - `path`: a String, path to the node to watch
++
++## Watchers
++
++### `Watcher#on('created', cb)`
++
++Registers a callback to be called when a particular node is created. If the
++node already exists right now, the callback will be called straight away.
++
++Parameters
++ - `cb`: a Function `(stat)` with arguments:
++   - `stat`: an Object, same as the `stat` returned by `Client#stat` above
++
++### `Watcher#on('deleted', cb)`
++
++Registers a callback to be called when a particular node is deleted. If the
++node does not exist right now, the callback will be called straight away.
++
++NOTE: Deleted events may be missed during network outages.
++
++Parameters
++ - `cb`: a Function `()`
++
++### `Watcher#on('dataChanged', cb)`
++
++Registers a callback to be called when a particular node's data has changed. Always fires immediately with the current contents of the node if it exists.
++
++Parameters
++ - `cb`: a Function `(data)` with arguments:
++   - `data`: a Buffer, contents of the node
++
++### `Watcher#on('childrenChanged', cb)`
++
++Registers a callback to be called when a particular node's children have
++changed. Always fires immediately with the current children of the node if it
++exists.
++
++Parameters
++ - `cb`: a Function `(children)` with arguments:
++   - `children`: an Array of Strings
++
+ ## Request emitters
+ 
+ An interface returned by most functions on Client. A subclass of EventEmitter,
+diff --git a/lib/client-fsm.js b/lib/client-fsm.js
+index e3c3460..7911faa 100644
+--- a/lib/client-fsm.js
++++ b/lib/client-fsm.js
+@@ -22,17 +22,38 @@ const mod_net = require('net');
+ function ZKClientFSM(opts) {
+ 	mod_assert.object(opts, 'options');
+ 
+-	mod_assert.string(opts.host, 'options.host');
+-	mod_assert.number(opts.port, 'options.port');
+-	this.zs_host = opts.host;
+-	this.zs_port = opts.port;
++	mod_assert.optionalArrayOfObject(opts.servers, 'options.servers');
++	if (opts.servers === undefined) {
++		mod_assert.string(opts.host, 'options.host');
++		mod_assert.number(opts.port, 'options.port');
++		this.zs_servers = [
++			{ host: opts.host, port: opts.port }
++		];
++	} else {
++		this.zs_servers = opts.servers;
++		this.zs_servers.forEach(function (srv) {
++			mod_assert.string(srv.host, 'servers[].host');
++			mod_assert.number(srv.port, 'servers[].port');
++		});
++	}
++	shuffle(this.zs_servers);
++	mod_assert.optionalNumber(opts.timeout, 'options.timeout');
++	this.zs_timeout = opts.timeout;
++	if (this.zs_timeout === undefined)
++		this.zs_timeout = 30000;
+ 	this.zs_decoder = undefined;
+ 	this.zs_encoder = undefined;
+ 	this.zs_xidMap = {};
+-	this.zs_xid = 1;
++	this.zs_xid = 0;
+ 	this.zs_reqs = {};
+ 	this.zs_watchers = {};
+ 	this.zs_socket = undefined;
++	this.zs_server = undefined;
++
++	this.zs_cr = undefined;
++	this.zs_lastPkt = undefined;
++	this.zs_lastZxid = new mod_jsbn.BigInteger('0');
++
+ 	mod_fsm.FSM.call(this, 'init');
+ }
+ mod_util.inherits(ZKClientFSM, mod_fsm.FSM);
+@@ -72,8 +93,18 @@ ZKClientFSM.prototype.state_closed = function (S) {
+ 	this.zs_encoder = undefined;
+ 	this.zs_socket.destroy();
+ 	this.zs_socket = undefined;
+-	this.emit('close');
+ 	this.zs_decoder = undefined;
++
++	this.zs_cr = undefined;
++	this.zs_lastPkt = undefined;
++	this.zs_lastZxid = new mod_jsbn.BigInteger('0');
++
++	this.zs_xidMap = {};
++	this.zs_xid = 0;
++	this.zs_reqs = {};
++	this.zs_watchers = {};
++
++	this.emit('close');
+ };
+ 
+ ZKClientFSM.prototype.state_connecting = function (S) {
+@@ -84,9 +115,12 @@ ZKClientFSM.prototype.state_connecting = function (S) {
+ 	this.zs_encoder = new mod_zkstreams.ZKEncodeStream({
+ 		fsm: this
+ 	});
++	this.zs_server = this.zs_servers.shift();
++	this.zs_servers.push(this.zs_server);
+ 	this.zs_socket = mod_net.connect({
+-		host: this.zs_host,
+-		port: this.zs_port
++		host: this.zs_server.host,
++		port: this.zs_server.port,
++		allowHalfOpen: true
+ 	});
+ 	S.on(this.zs_socket, 'connect', function () {
+ 		S.gotoState('handshaking');
+@@ -105,8 +139,10 @@ ZKClientFSM.prototype.state_connecting = function (S) {
+ 
+ ZKClientFSM.prototype.state_handshaking = function (S) {
+ 	var self = this;
+-	S.on(this.zs_decoder, 'readable', function () {
++	S.on(this.zs_decoder, 'readable', function zkReadConnectResp() {
+ 		var pkt = self.zs_decoder.read();
++		if (pkt === null)
++			return;
+ 		if (self.zs_decoder.read() !== null) {
+ 			self.emit('error', new mod_errors.ZKProtocolError(
+ 			    'UNEXPECTED_PACKET', 'Received unexpected ' +
+@@ -121,7 +157,15 @@ ZKClientFSM.prototype.state_handshaking = function (S) {
+ 			S.gotoState('error');
+ 			return;
+ 		}
++		if (pkt.sessionId.toString('hex') === '0000000000000000') {
++			self.emit('error', new mod_errors.ZKProtocolError(
++			    'SESSION_EXPIRED', 'Attempted to resume a ' +
++			    'session that had already expired'));
++			S.gotoState('closed');
++			return;
++		}
+ 		self.zs_cr = pkt;
++		self.zs_lastPkt = new Date();
+ 		S.gotoState('connected');
+ 	});
+ 	S.on(this.zs_decoder, 'error', function (err) {
+@@ -146,17 +190,19 @@ ZKClientFSM.prototype.state_handshaking = function (S) {
+ 	this.zs_encoder.pipe(this.zs_socket);
+ 	this.zs_encoder.write({
+ 		protocolVersion: 0,
+-		lastZxidSeen: new mod_jsbn.BigInteger('0'),
+-		timeOut: 30000,
+-		sessionId: new mod_jsbn.BigInteger('0'),
+-		passwd: new Buffer(16).fill(0)
++		lastZxidSeen: this.zs_lastZxid,
++		timeOut: this.zs_timeout,
++		sessionId: this.zs_cr ?
++		    this.zs_cr.sessionId : new mod_jsbn.BigInteger('0'),
++		passwd: this.zs_cr ?
++		    this.zs_cr.passwd : new Buffer(16).fill(0)
+ 	});
+ };
+ 
+ ZKClientFSM.prototype.state_connected = function (S) {
+ 	var self = this;
+ 
+-	var pingInterval = this.zs_cr.timeOut / 2;
++	var pingInterval = this.zs_cr.timeOut / 4;
+ 	if (pingInterval < 2000)
+ 		pingInterval = 2000;
+ 	var pingTimer = S.interval(pingInterval, function () {
+@@ -164,10 +210,13 @@ ZKClientFSM.prototype.state_connected = function (S) {
+ 	});
+ 	pingTimer.unref();
+ 
+-	S.on(this.zs_decoder, 'readable', function () {
++	S.on(this.zs_decoder, 'readable', function onZkReadable() {
+ 		var pkt;
+ 		while (self.zs_decoder &&
+ 		    (pkt = self.zs_decoder.read()) !== null) {
++
++			self.zs_lastPkt = new Date();
++
+ 			if (pkt.opcode === 'NOTIFICATION') {
+ 				if (pkt.state !== 'SYNC_CONNECTED') {
+ 					continue;
+@@ -181,6 +230,13 @@ ZKClientFSM.prototype.state_connected = function (S) {
+ 					watcher.emit(evt);
+ 				continue;
+ 			}
++
++			var zxid = new mod_jsbn.BigInteger(pkt.zxid);
++			if (self.zs_lastZxid === undefined ||
++			    zxid.compareTo(self.zs_lastZxid) > 0) {
++				self.zs_lastZxid = zxid;
++			}
++
+ 			var req = self.zs_reqs[pkt.xid];
+ 			if (req === undefined) {
+ 				self.emit('packet', pkt);
+@@ -211,38 +267,101 @@ ZKClientFSM.prototype.state_connected = function (S) {
+ 		S.gotoState('error');
+ 	});
+ 	S.on(this, 'closeAsserted', function () {
+-		S.gotoState('closed');
++		S.gotoState('closing');
+ 	});
+ 	S.on(this, 'pingTimeout', function () {
+-		self.zs_lastError = new Error('Ping timeout');
++		self.zs_lastError = new mod_errors.ZKPingTimeoutError();
+ 		S.gotoState('error');
+ 	});
+ 
++	this.resumeWatchers();
+ 	this.emit('connect');
+ };
+ 
++ZKClientFSM.prototype.state_closing = function (S) {
++	var self = this;
++	var xid = this.nextXid();
++	S.on(this.zs_decoder, 'readable', function () {
++		var pkt;
++		while (self.zs_decoder &&
++		    (pkt = self.zs_decoder.read()) !== null) {
++			if (pkt.xid !== xid) {
++				var req = self.zs_reqs[pkt.xid];
++				if (req !== undefined) {
++					if (pkt.err === 'OK') {
++						req.emit('reply', pkt);
++						continue;
++					}
++					var err = new mod_errors.ZKError(
++					    pkt.err,
++					    mod_consts.ERR_TEXT[pkt.err]);
++					req.emit('error', err, pkt);
++				}
++			} else {
++				S.gotoState('closed');
++				return;
++			}
++		}
++	});
++	S.on(this.zs_decoder, 'error', function (err) {
++		self.zs_lastError = err;
++		S.gotoState('closed');
++	});
++	S.on(this.zs_encoder, 'error', function (err) {
++		self.zs_lastError = err;
++		S.gotoState('closed');
++	});
++	S.on(this.zs_decoder, 'end', function () {
++		S.gotoState('closed');
++	});
++	S.on(this.zs_socket, 'error', function (err) {
++		self.zs_lastError = err;
++		S.gotoState('closed');
++	});
++	this.zs_encoder.write({
++		opcode: 'CLOSE_SESSION',
++		xid: xid
++	});
++	this.zs_encoder.end();
++};
++
+ ZKClientFSM.prototype.state_error = function (S) {
+ 	var self = this;
+-	this.emit('error', this.zs_lastError);
+ 	Object.keys(this.zs_reqs).forEach(function (xid) {
+ 		self.zs_reqs[xid].emit('error', self.zs_lastError);
+ 	});
++	this.zs_reqs = {};
++	if (this.zs_cr !== undefined && this.zs_lastPkt !== undefined) {
++		var now = new Date();
++		var delta = now.getTime() - this.zs_lastPkt.getTime();
++		if (delta < this.zs_cr.timeOut) {
++			S.gotoState('connecting');
++			return;
++		}
++	}
++	this.emit('error', this.zs_lastError);
+ 	S.gotoState('closed');
+ };
+ 
+ ZKClientFSM.prototype.ping = function (cb) {
+ 	mod_assert.optionalFunc(cb, 'callback');
++	if (!this.isInState('connected'))
++		throw (new Error('Client must be connected to send packets'));
+ 	var self = this;
+-	var req = new mod_events.EventEmitter();
+ 	var pkt = {
+ 		xid: mod_consts.XID_PING,
+ 		opcode: 'PING'
+ 	};
++	var req = new ZKRequest(pkt);
+ 	if (this.zs_reqs[pkt.xid] !== undefined) {
+ 		this.zs_reqs[pkt.xid].once('reply', function () {
+-			cb();
++			if (cb !== undefined)
++				cb();
++		});
++		this.zs_reqs[pkt.xid].once('error', function (err) {
++			if (cb !== undefined)
++				cb(err);
+ 		});
+-		this.zs_reqs[pkt.xid].once('error', cb);
+ 		return;
+ 	}
+ 	this.zs_reqs[pkt.xid] = req;
+@@ -255,7 +374,7 @@ ZKClientFSM.prototype.ping = function (cb) {
+ 		delete (self.zs_reqs[pkt.xid]);
+ 		var t2 = new Date();
+ 		clearTimeout(timer);
+-		if (cb)
++		if (cb !== undefined)
+ 			cb(null, (t2 - t1));
+ 	}
+ 	function onTimeout() {
+@@ -265,22 +384,63 @@ ZKClientFSM.prototype.ping = function (cb) {
+ 	function onError(err) {
+ 		delete (self.zs_reqs[pkt.xid]);
+ 		clearTimeout(timer);
+-		if (cb)
++		if (cb !== undefined)
+ 			cb(err);
+ 	}
+ };
+ 
+-ZKClientFSM.prototype.setWatches = function (events, cb) {
++ZKClientFSM.prototype.resumeWatchers = function () {
++	var self = this;
++	var events = {
++		dataChanged: [],
++		createdOrDestroyed: [],
++		childrenChanged: []
++	};
++	var count = 0;
++	var paths = Object.keys(this.zs_watchers);
++	paths.forEach(function (path) {
++		var w = self.zs_watchers[path];
++		var evts = w.eventsActive();
++		var cod = false;
++		evts.forEach(function (evt) {
++			if (evt === 'created' || evt === 'deleted') {
++				if (cod)
++					return;
++				events.createdOrDestroyed.push(path);
++				++count;
++				cod = true;
++			} else if (evt === 'dataChanged') {
++				events.dataChanged.push(path);
++				++count;
++			} else if (evt === 'childrenChanged') {
++				events.childrenChanged.push(path);
++				++count;
++			}
++		});
++	});
++	if (count < 1)
++		return;
++	var zxid = this.zs_lastZxid;
++	this.setWatches(events, zxid, function (err) {
++		if (err) {
++			self.emit('pingTimeout');
++		}
++	});
++};
++
++ZKClientFSM.prototype.setWatches = function (events, zxid, cb) {
+ 	mod_assert.object(events, 'events');
+ 	mod_assert.func(cb, 'callback');
++	if (!this.isInState('connected'))
++		throw (new Error('Client must be connected to send packets'));
+ 	var self = this;
+-	var req = new mod_events.EventEmitter();
+ 	var pkt = {
+ 		xid: mod_consts.XID_SET_WATCHES,
+ 		opcode: 'SET_WATCHES',
+-		relZxid: new mod_jsbn.BigInteger('0'),
++		relZxid: zxid,
+ 		events: events
+ 	};
++	var req = new ZKRequest(pkt);
+ 	if (this.zs_reqs[pkt.xid] !== undefined) {
+ 		this.zs_reqs[pkt.xid].once('reply', function () {
+ 			self.setWatches(events, cb);
+@@ -306,15 +466,18 @@ ZKClientFSM.prototype.setWatches = function (events, cb) {
+ 	}
+ };
+ 
+-function ZKRequest() {
++function ZKRequest(packet) {
+ 	mod_events.EventEmitter.call(this);
++	this.packet = packet;
+ }
+ mod_util.inherits(ZKRequest, mod_events.EventEmitter);
+ 
+ ZKClientFSM.prototype.request = function (pkt) {
+ 	mod_assert.object(pkt, 'packet');
+ 	var self = this;
+-	var req = new ZKRequest();
++	if (!this.isInState('connected'))
++		throw (new Error('Client must be connected to send packets'));
++	var req = new ZKRequest(pkt);
+ 	pkt.xid = this.nextXid();
+ 	this.zs_reqs[pkt.xid] = req;
+ 	req.once('reply', endRequest);
+@@ -354,7 +517,7 @@ ZKClientFSM.prototype.get = function (path, cb) {
+ 	});
+ 	if (cb) {
+ 		req.once('reply', function (pkt) {
+-			cb(null, pkt.data);
++			cb(null, pkt.data, pkt.stat);
+ 		});
+ 		req.once('error', cb);
+ 	}
+@@ -398,6 +561,30 @@ ZKClientFSM.prototype.create = function (path, data, options, cb) {
+ 	return (req);
+ };
+ 
++ZKClientFSM.prototype.set = function (path, data, version, cb) {
++	mod_assert.string(path, 'path');
++	mod_assert.buffer(data, 'data');
++	mod_assert.optionalNumber(version, 'version');
++	mod_assert.optionalFunc(cb, 'callback');
++
++	if (version === undefined)
++		version = -1;
++
++	var req = this.request({
++		opcode: 'SET_DATA',
++		path: path,
++		data: data,
++		version: version
++	});
++	if (cb) {
++		req.once('reply', function (pkt) {
++			cb(null, pkt.path);
++		});
++		req.once('error', cb);
++	}
++	return (req);
++};
++
+ ZKClientFSM.prototype.delete = function (path, version, cb) {
+ 	mod_assert.string(path, 'path');
+ 	mod_assert.number(version, 'version');
+@@ -435,6 +622,23 @@ ZKClientFSM.prototype.stat = function (path, cb) {
+ 	return (req);
+ };
+ 
++ZKClientFSM.prototype.sync = function (path, cb) {
++	mod_assert.string(path, 'path');
++	mod_assert.optionalFunc(cb, 'callback');
++
++	var req = this.request({
++		opcode: 'SYNC',
++		path: path
++	});
++	if (cb) {
++		req.once('reply', function (pkt) {
++			cb(null);
++		});
++		req.once('error', cb);
++	}
++	return (req);
++};
++
+ function ZKWatcher(client, path) {
+ 	this.zkw_path = path;
+ 	this.zkw_client = client;
+@@ -442,6 +646,15 @@ function ZKWatcher(client, path) {
+ }
+ mod_util.inherits(ZKWatcher, mod_events.EventEmitter);
+ 
++ZKWatcher.prototype.eventsActive = function () {
++	var self = this;
++	var evts = ['created', 'deleted', 'dataChanged', 'childrenChanged'];
++	evts = evts.filter(function (evt) {
++		return (self.listeners(evt).length > 0);
++	});
++	return (evts);
++};
++
+ ZKWatcher.prototype.once = function () {
+ 	throw (new Error('ZKWatcher does not support once() (use on)'));
+ };
+@@ -458,8 +671,22 @@ ZKWatcher.prototype.on = function (evt, cb) {
+ 
+ ZKWatcher.prototype.emit = function (evt) {
+ 	var self = this;
+-	var req = this.zkw_client.request(this.reqPacket(evt));
+-	req.once('reply', function (pkt) {
++	if (this.listeners(evt).length < 1)
++		return;
++	if (!this.zkw_client.isInState('connected')) {
++		function onStateChanged(st) {
++			if (st === 'connected') {
++				self.emit(evt);
++				self.zkw_client.removeListener('stateChanged',
++				    onStateChanged);
++			}
++		}
++		this.zkw_client.on('stateChanged', onStateChanged);
++		return;
++	}
++	var qpkt = this.reqPacket(evt);
++	var req = this.zkw_client.request(qpkt);
++	req.on('reply', function (pkt) {
+ 		var args = [evt];
+ 		switch (evt) {
+ 		case 'created':
+@@ -468,17 +695,21 @@ ZKWatcher.prototype.emit = function (evt) {
+ 		case 'deleted':
+ 			return;
+ 		case 'dataChanged':
+-			args.push(pkt.data);
++			args.push(pkt.data, pkt.stat);
+ 			break;
+ 		case 'childrenChanged':
+-			args.push(pkt.children);
++			args.push(pkt.children, pkt.stat);
+ 			break;
+ 		default:
+ 			throw (new Error('Unknown watcher event ' + evt));
+ 		}
+ 		mod_events.EventEmitter.prototype.emit.apply(self, args);
+ 	});
+-	req.once('error', function (err) {
++	req.on('error', function (err) {
++		if (err.code === 'PING_TIMEOUT') {
++			self.emit(evt);
++			return;
++		}
+ 		if (evt === 'created' && err.code === 'NO_NODE') {
+ 			return;
+ 		}
+@@ -486,6 +717,9 @@ ZKWatcher.prototype.emit = function (evt) {
+ 			mod_events.EventEmitter.prototype.emit.call(self, evt);
+ 			return;
+ 		}
++		if (err.code === 'NO_NODE') {
++			return;
++		}
+ 		mod_events.EventEmitter.prototype.emit.call(self, 'error', err);
+ 	});
+ };
+@@ -504,7 +738,7 @@ ZKWatcher.prototype.reqPacket = function (evt) {
+ 		pkt.opcode = 'GET_DATA';
+ 		break;
+ 	case 'childrenChanged':
+-		pkt.opcode = 'GET_CHILDREN';
++		pkt.opcode = 'GET_CHILDREN2';
+ 		break;
+ 	default:
+ 		throw (new Error('Unknown watcher event ' + evt));
+@@ -520,3 +754,16 @@ ZKClientFSM.prototype.watcher = function (path) {
+ 	this.zs_watchers[path] = w;
+ 	return (w);
+ };
++
++/* A Fisher-Yates shuffle. */
++function shuffle(array) {
++	var i = array.length;
++	while (i > 0) {
++		var j = Math.floor(Math.random() * i);
++		--i;
++		var temp = array[i];
++		array[i] = array[j];
++		array[j] = temp;
++	}
++	return (array);
++}
+diff --git a/lib/errors.js b/lib/errors.js
+index 031d7f1..d34323b 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -8,7 +8,8 @@
+ 
+ module.exports = {
+ 	ZKProtocolError: ZKProtocolError,
+-	ZKError: ZKError
++	ZKError: ZKError,
++	ZKPingTimeoutError: ZKPingTimeoutError
+ };
+ 
+ const mod_assert = require('assert-plus');
+@@ -23,6 +24,14 @@ function ZKProtocolError(code, msg) {
+ }
+ mod_util.inherits(ZKProtocolError, Error);
+ 
++function ZKPingTimeoutError() {
++	if (Error.captureStackTrace)
++		Error.captureStackTrace(this, ZKPingTimeoutError);
++	ZKProtocolError.call(this, 'PING_TIMEOUT',
++	    'The server failed to answer a ping within the required interval');
++}
++mod_util.inherits(ZKPingTimeoutError, ZKProtocolError);
++
+ function ZKError(code, msg) {
+ 	if (Error.captureStackTrace)
+ 		Error.captureStackTrace(this, ZKError);
+diff --git a/lib/zk-buffer.js b/lib/zk-buffer.js
+index e12b007..1db0779 100644
+--- a/lib/zk-buffer.js
++++ b/lib/zk-buffer.js
+@@ -74,6 +74,12 @@ ZKBuffer.prototype.readRequest = function () {
+ 	case 'EXISTS':
+ 		this.readExistsRequest(pkt);
+ 		break;
++	case 'SET_DATA':
++		this.readSetDataRequest(pkt);
++		break;
++	case 'SYNC':
++		this.readSyncRequest(pkt);
++		break;
+ 	default:
+ 		throw (new Error('Unsupported opcode ' + pkt.opcode));
+ 	}
+@@ -106,6 +112,13 @@ ZKBuffer.prototype.writeRequest = function (pkt) {
+ 	case 'EXISTS':
+ 		this.writeExistsRequest(pkt);
+ 		break;
++	case 'SET_DATA':
++		this.writeSetDataRequest(pkt);
++		break;
++	case 'SYNC':
++		this.writeSyncRequest(pkt);
++		break;
++	case 'CLOSE_SESSION':
+ 	case 'PING':
+ 		/* No extra data is included: the header is sufficient. */
+ 		break;
+@@ -189,6 +202,26 @@ ZKBuffer.prototype.writeExistsRequest = function (pkt) {
+ 	this.writeBool(pkt.watch, 'watch');
+ };
+ 
++ZKBuffer.prototype.readSetDataRequest = function (pkt) {
++	pkt.path = this.readUString();
++	pkt.data = this.readBuffer();
++	pkt.version = this.readInt();
++};
++
++ZKBuffer.prototype.writeSetDataRequest = function (pkt) {
++	this.writeUString(pkt.path, 'path');
++	this.writeBuffer(pkt.data, 'data');
++	this.writeInt(pkt.version, 'version');
++};
++
++ZKBuffer.prototype.readSyncRequest = function (pkt) {
++	pkt.path = this.readUString();
++};
++
++ZKBuffer.prototype.writeSyncRequest = function (pkt) {
++	this.writeUString(pkt.path, 'path');
++};
++
+ ZKBuffer.prototype.readSetWatchesRequest = function (pkt) {
+ 	var i, count;
+ 
+@@ -269,8 +302,12 @@ ZKBuffer.prototype.readResponse = function (xidMap) {
+ 		case 'EXISTS':
+ 			this.readExistsResponse(pkt);
+ 			break;
++		case 'SET_DATA':
++			this.readSetDataResponse(pkt);
++			break;
+ 		case 'SET_WATCHES':
+ 		case 'PING':
++		case 'SYNC':
+ 		case 'DELETE':
+ 			/*
+ 			 * No special response packet format -- error code in
+@@ -301,6 +338,10 @@ ZKBuffer.prototype.readExistsResponse = function (pkt) {
+ 	pkt.stat = this.readStat();
+ };
+ 
++ZKBuffer.prototype.readSetDataResponse = function (pkt) {
++	pkt.stat = this.readStat();
++};
++
+ ZKBuffer.prototype.readGetACLResponse = function (pkt) {
+ 	pkt.acl = this.readACL();
+ 	pkt.stat = this.readStat();
+diff --git a/package.json b/package.json
+index f8ce339..ed1a985 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "zkstream",
+-  "version": "0.3.0",
++  "version": "0.4.0",
+   "description": "",
+   "main": "lib/index.js",
+   "dependencies": {
+diff --git a/test/basic.test.js b/test/basic.test.js
+index 486fe25..56e6e6b 100644
+--- a/test/basic.test.js
++++ b/test/basic.test.js
+@@ -73,12 +73,12 @@ mod_tape.test('find the test object', function (t) {
+ 			});
+ 			req2.once('error', function (err) {
+ 				t.error(err);
+-				t.end();
++				zkc.close();
+ 			});
+ 		});
+ 		req.once('error', function (err) {
+ 			t.error(err);
+-			t.end();
++			zkc.close();
+ 		});
+ 	});
+ });
+@@ -210,6 +210,85 @@ mod_tape.test('delete it while watching', function (t) {
+ 	});
+ });
+ 
++mod_tape.test('session resumption with watcher', function (t) {
++	var connected = 0;
++	var closed = 0;
++
++	var zkc1 = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: 2181
++	});
++	zkc1.connect();
++
++	var zkc2 = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: 2181
++	});
++	zkc2.connect();
++
++	zkc1.on('stateChanged', function (st) {
++		if (st === 'closed' && ++closed >= 2)
++			t.end();
++		if (st !== 'connected')
++			return;
++
++		if (++connected == 2) {
++			create();
++		}
++	});
++
++	zkc2.on('stateChanged', function (st) {
++		if (st === 'closed' && ++closed >= 2)
++			t.end();
++		if (st !== 'connected')
++			return;
++
++		if (++connected == 2) {
++			create();
++		}
++	});
++
++	function create() {
++		var ret = 0;
++		var d = new Buffer('hi there', 'ascii');
++		var w = zkc2.watcher('/foo');
++		function onCreated() {
++			if (++ret == 2) {
++				w.removeListener('created', onCreated);
++				ready();
++			}
++		}
++		w.on('created', onCreated);
++		zkc1.watcher('/foo').on('dataChanged', function (data) {
++			if (data.toString('utf-8') === 'hello again') {
++				zkc1.close();
++			}
++		});
++		zkc1.create('/foo', d, {}, function (err, path) {
++			t.error(err);
++			t.strictEqual(path, '/foo');
++			if (++ret == 2) {
++				w.removeListener('created', onCreated);
++				ready();
++			}
++		});
++	}
++
++	function ready() {
++		zkc2.stat('/foo', function (err, stat) {
++			t.error(err);
++
++			zkc1.zs_socket.destroy();
++
++			var data = new Buffer('hello again');
++			zkc2.set('/foo', data, stat.version, function (err2) {
++				t.error(err2);
++				zkc2.close();
++			});
++		});
++	}
++});
++
+ mod_tape.test('stop zk server', function (t) {
+ 	zk.on('stateChanged', function (st) {
+ 		if (st === 'stopped')
+diff --git a/test/multi-node.test.js b/test/multi-node.test.js
+new file mode 100644
+index 0000000..ed79702
+--- /dev/null
++++ b/test/multi-node.test.js
+@@ -0,0 +1,232 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++const mod_tape = require('tape');
++const mod_zk = require('./zkserver');
++const mod_client = require('../lib/client-fsm');
++const mod_net = require('net');
++
++var zk1, zk2, zk3;
++
++var zks = {
++	'1': {
++		'clientPort': 2182,
++		'quorumPort': 12182,
++		'electionPort': 12192
++	},
++	'2': {
++		'clientPort': 2183,
++		'quorumPort': 12183,
++		'electionPort': 12193
++	},
++	'3': {
++		'clientPort': 2184,
++		'quorumPort': 12184,
++		'electionPort': 12194
++	}
++};
++
++mod_tape.test('start zk servers', function (t) {
++	var running = 0;
++	zk1 = new mod_zk.ZKServer({
++		servers: zks,
++		serverId: '1'
++	});
++	zk2 = new mod_zk.ZKServer({
++		servers: zks,
++		serverId: '2'
++	});
++	zk3 = new mod_zk.ZKServer({
++		servers: zks,
++		serverId: '3'
++	});
++	zk1.on('stateChanged', function (st) {
++		if (st === 'running' && ++running == 3)
++			t.end();
++	});
++	zk2.on('stateChanged', function (st) {
++		if (st === 'running' && ++running == 3)
++			t.end();
++	});
++	zk3.on('stateChanged', function (st) {
++		if (st === 'running' && ++running == 3)
++			t.end();
++	});
++});
++
++mod_tape.test('simple connect and ping #1', function (t) {
++	var zkc = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: zks['1'].clientPort
++	});
++	zkc.connect();
++
++	zkc.on('stateChanged', function (st) {
++		if (st === 'connected') {
++			zkc.ping(function (err) {
++				t.error(err);
++				zkc.close();
++			});
++		} else if (st === 'closed') {
++			t.end();
++		}
++	});
++});
++
++mod_tape.test('simple connect and ping #3', function (t) {
++	var zkc = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: zks['3'].clientPort
++	});
++	zkc.connect();
++
++	zkc.on('stateChanged', function (st) {
++		if (st === 'connected') {
++			zkc.ping(function (err) {
++				t.error(err);
++				zkc.close();
++			});
++		} else if (st === 'closed') {
++			t.end();
++		}
++	});
++});
++
++mod_tape.test('write visibility', function (t) {
++	var connected = 0, closed = 0;
++
++	var zkc1 = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: zks['1'].clientPort
++	});
++	zkc1.connect();
++	var zkc2 = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: zks['2'].clientPort
++	});
++	zkc2.connect();
++
++	zkc1.on('stateChanged', function (st) {
++		if (st === 'closed' && ++closed >= 2)
++			t.end();
++		if (st !== 'connected')
++			return;
++
++		if (++connected == 2) {
++			create();
++		}
++	});
++
++	zkc2.on('stateChanged', function (st) {
++		if (st === 'closed' && ++closed >= 2)
++			t.end();
++		if (st !== 'connected')
++			return;
++
++		if (++connected == 2) {
++			create();
++		}
++	});
++
++	function create() {
++		var data = new Buffer('hello world');
++		zkc1.create('/foo', data, {}, function (err, path) {
++			t.error(err);
++			t.strictEqual(path, '/foo');
++			get();
++		});
++	}
++
++	function get() {
++		zkc2.get('/foo', function (err, data, stat) {
++			t.error(err);
++			t.strictEqual(data.toString(), 'hello world');
++			t.strictEqual(stat.version, 0);
++
++			zkc2.close();
++			zkc1.close();
++		});
++	}
++});
++
++mod_tape.test('cross-server data watch', function (t) {
++	var connected = 0, closed = 0;
++
++	var zkc1 = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: zks['1'].clientPort
++	});
++	zkc1.connect();
++	var zkc2 = new mod_client.ClientFSM({
++		host: 'localhost',
++		port: zks['2'].clientPort
++	});
++	zkc2.connect();
++
++	zkc1.on('stateChanged', function (st) {
++		if (st === 'closed' && ++closed >= 2)
++			t.end();
++		if (st !== 'connected')
++			return;
++
++		if (++connected == 2) {
++			setup();
++		}
++	});
++
++	zkc2.on('stateChanged', function (st) {
++		if (st === 'closed' && ++closed >= 2)
++			t.end();
++		if (st !== 'connected')
++			return;
++
++		if (++connected == 2) {
++			setup();
++		}
++	});
++
++	function setup() {
++		var watchFired = false;
++		zkc1.watcher('/foo').on('dataChanged',
++		    function (newData, stat) {
++			if (newData.toString() === 'testing') {
++				t.ok(stat.version > 0);
++				watchFired = true;
++			}
++		});
++		var data = new Buffer('testing');
++		zkc2.set('/foo', data, 0, function (err) {
++			t.error(err);
++			zkc2.sync('/foo', function (err2) {
++				t.error(err2);
++				t.ok(watchFired);
++				zkc1.close();
++				zkc2.close();
++			});
++		});
++	}
++});
++
++mod_tape.test('stop zk servers', function (t) {
++	var stopped = 0;
++	zk1.on('stateChanged', function (st) {
++		if (st === 'stopped' && ++stopped == 3)
++			t.end();
++	});
++	zk2.on('stateChanged', function (st) {
++		if (st === 'stopped' && ++stopped == 3)
++			t.end();
++	});
++	zk3.on('stateChanged', function (st) {
++		if (st === 'stopped' && ++stopped == 3)
++			t.end();
++	});
++	zk1.stop();
++	zk2.stop();
++	zk3.stop();
++});
+diff --git a/test/zkserver.js b/test/zkserver.js
+index 42c62ea..f8b4bd3 100644
+--- a/test/zkserver.js
++++ b/test/zkserver.js
+@@ -18,22 +18,51 @@ const mod_events = require('events');
+ const mod_uuid = require('node-uuid');
+ 
+ function ZKServer(opts) {
++	var self = this;
+ 	this.zk_cmds = ['zkServer.sh', 'zkServer',
+ 	    '/usr/share/zookeeper/bin/zkServer.sh',
+ 	    '/usr/local/bin/zkServer.sh',
+ 	    '/opt/local/sbin/zkServer.sh'];
+-	this.zk_opts = opts;
++	this.zk_opts = opts || {};
+ 	this.zk_tokill = [];
+ 	var uuid = (this.zk_uuid = mod_uuid.v4());
+ 	this.zk_tmpdir = '/tmp/' + uuid;
++	this.zk_servers = this.zk_opts.servers;
++	if (this.zk_servers === undefined) {
++		this.zk_servers = {
++			'1': {
++				'clientPort': 2181,
++				'quorumPort': 2888,
++				'electionPort': 3888
++			}
++		};
++	}
++	this.zk_serverId = this.zk_opts.serverId || '1';
++	this.zk_server = this.zk_servers[this.zk_serverId];
+ 	this.zk_config = this.zk_tmpdir + '/zoo.cfg';
+ 	mod_fs.mkdirSync(this.zk_tmpdir);
+-	mod_fs.writeFileSync(this.zk_config,
+-	    'tickTime=2000\n' +
+-	    'initLimit=10\n' +
+-	    'syncLimit=5\n' +
+-	    'dataDir=' + this.zk_tmpdir + '/data\n' +
+-	    'clientPort=2181\n');
++	mod_fs.mkdirSync(this.zk_tmpdir + '/data');
++	var config = [];
++	config.push('tickTime=2000');
++	config.push('initLimit=10');
++	config.push('syncLimit=5');
++	config.push('dataDir=' + this.zk_tmpdir + '/data');
++	config.push('clientPort=' + this.zk_server.clientPort);
++	Object.keys(this.zk_servers).forEach(function (sid) {
++		config.push('server.' + sid + '=localhost:' +
++		    self.zk_servers[sid].quorumPort + ':' +
++		    self.zk_servers[sid].electionPort);
++	});
++	mod_fs.writeFileSync(this.zk_config, config.join('\n') + '\n');
++	mod_fs.writeFileSync(this.zk_tmpdir + '/data/myid', this.zk_serverId);
++	mod_fs.writeFileSync(this.zk_tmpdir + '/log4j.properties',
++	    'log4j.rootCategory=INFO,console\n' +
++	    'log4j.rootLogger=INFO,console\n' +
++	    'log4j.appender.console = org.apache.log4j.ConsoleAppender\n' +
++	    'log4j.appender.console.Target = System.out\n' +
++	    'log4j.appender.console.layout = org.apache.log4j.PatternLayout\n' +
++	    'log4j.appender.console.layout.ConversionPattern = ' +
++	        '%d{yyyy-MM-dd HH:mm:ss}|%p|%c{1}|%L|%m%n\n');
+ 	if (opts && opts.command)
+ 		this.zk_cmds.unshift(opts.command);
+ 	mod_fsm.FSM.call(this, 'starting');
+@@ -43,12 +72,35 @@ mod_util.inherits(ZKServer, mod_fsm.FSM);
+ ZKServer.prototype.cli = function () {
+ 	mod_assert.strictEqual(this.getState(), 'running');
+ 
++	var opts = {};
++	opts.cwd = this.zk_tmpdir;
++	opts.env = {};
++	opts.env.HOME = process.env.HOME;
++	opts.env.USER = process.env.USER;
++	opts.env.LOGNAME = process.env.LOGNAME;
++	opts.env.PATH = process.env.PATH;
++	opts.env.ZOOCFGDIR = this.zk_tmpdir;
++	opts.env.ZOO_LOG_DIR = this.zk_tmpdir;
++	opts.env.ZOO_LOG4J_PROP = 'ERROR,console';
++	opts.env.JVMFLAGS = '-Dzookeeper.log.dir=' + this.zk_tmpdir;
++
+ 	var args = Array.prototype.slice.apply(arguments);
+ 	var cb = args.pop();
+ 	mod_assert.func(cb, 'callback');
++	for (var i = 0; i < args.length; ++i) {
++		if (/[ \t]/.test(args[i])) {
++			/* JSSTYLED */
++			args[i] = '"' + args[i].replace(/"/g, '\\"') + '"';
++		}
++	}
++	args = args.join(' ');
+ 	var cmd = this.zk_cmd.replace('zkServer', 'zkCli');
+ 
+-	var kid = mod_cproc.spawn(cmd, args);
++	var kid = mod_cproc.spawn(
++	     cmd, ['-server', 'localhost:' + this.zk_server.clientPort], opts);
++
++	kid.stdin.write(args + '\n');
++	kid.stdin.end();
+ 
+ 	var output = '';
+ 	kid.stdout.on('data', function (d) {
+@@ -61,19 +113,34 @@ ZKServer.prototype.cli = function () {
+ 	kid.on('close', function (code) {
+ 		if (code === 0) {
+ 			output = output.split('\n');
+-			if (/^Connecting to /.test(output[0]))
+-				output.shift();
+-			if (output[0] === '')
+-				output.shift();
+-			if (/^WATCHER::/.test(output[0]))
+-				output.shift();
+-			if (output[0] === '')
+-				output.shift();
+-			if (/^WatchedEvent.*type:None/.test(output[0]))
+-				output.shift();
+-			if (output[0] === '')
+-				output.shift();
+-			cb(null, output.join('\n'));
++			var shifted = true;
++			while (output.length > 0 && shifted) {
++				shifted = false;
++				var parts = output[0].split('|');
++				if (parts.length === 5 &&
++				    /^[A-Z]+$/.test(parts[1])) {
++					output.shift();
++					shifted = true;
++				}
++				if (/^\[zk: localhost.*\] /.test(output[0])) {
++					output.shift();
++					shifted = true;
++				}
++				if (/^Welcome to ZooKeeper!/.test(output[0]) ||
++				    /^JLine support/.test(output[0]) ||
++				    /^Connecting to /.test(output[0]) ||
++				    /^WATCHER::/.test(output[0]) ||
++				    /^WatchedEvent.*type:None/.test(
++				    output[0]) || output[0] === '') {
++					output.shift();
++					shifted = true;
++				}
++			}
++			if (/^\[zk: localhost.*\] /.test(
++			    output[output.length - 1])) {
++				output.pop();
++			}
++			cb(null, output.join('\n') + '\n');
+ 
+ 		} else {
+ 			errout = errout.split('\n');
+@@ -101,12 +168,15 @@ ZKServer.prototype.state_spawning = function (S) {
+ 	var self = this;
+ 
+ 	var opts = {};
++	opts.cwd = this.zk_tmpdir;
+ 	opts.env = {};
+ 	opts.env.HOME = process.env.HOME;
+ 	opts.env.USER = process.env.USER;
+ 	opts.env.LOGNAME = process.env.LOGNAME;
+ 	opts.env.PATH = process.env.PATH;
++	opts.env.ZOOCFGDIR = this.zk_tmpdir;
+ 	opts.env.ZOO_LOG_DIR = this.zk_tmpdir;
++	opts.env.ZOO_LOG4J_PROP = 'INFO,console';
+ 	opts.env.JVMFLAGS = '-Dzookeeper.log.dir=' + this.zk_tmpdir;
+ 
+ 	this.zk_kid = mod_cproc.spawn(this.zk_cmd, ['start-foreground',
+@@ -119,21 +189,39 @@ ZKServer.prototype.state_spawning = function (S) {
+ 			S.gotoState('error');
+ 		}
+ 	});
+-	var output = '';
++	var logs = '';
+ 	this.zk_kid.stderr.on('data', function (data) {
+ 		console.error('zk: %j', data.toString('ascii'));
+ 	});
+ 	this.zk_kid.stdout.on('data', function (data) {
+-		console.error('zk: %j', data.toString('ascii'));
+-	});
+-	S.on(this.zk_kid.stderr, 'data', function (data) {
+-		output += data.toString('ascii');
+-		var lines = output.split('\n');
+-		lines = lines.map(function (l) {
+-			return (/^Using config: [^ \t]+$/.test(l));
++		var str = data.toString('ascii');
++		logs += str;
++		var lines = logs.split('\n');
++		if (str.charAt(str.length - 1) === '\n') {
++			logs = '';
++		} else {
++			logs = lines[lines.length - 1];
++		}
++		lines.forEach(function (l) {
++			var parts = l.split('|');
++			if (parts.length === 5 && /^[A-Z]+$/.test(parts[1])) {
++				self.emit('zkLogLine', parts[0], parts[1],
++				    parts[2], parts[3], parts[4]);
++			}
+ 		});
+-		if (lines.length > 0)
++	});
++	S.on(this, 'zkLogLine', function (date, level, klass, line, msg) {
++		var sc = Object.keys(self.zk_servers).length;
++		if (sc > 1 &&
++		    level === 'INFO' && klass === 'QuorumPeer' &&
++		    /^(LEADING|FOLLOWING)/.test(msg)) {
+ 			S.gotoState('findkids');
++		}
++		if (sc === 1 &&
++		    level === 'INFO' && klass === 'NIOServerCnxnFactory' &&
++		    /^binding to port/.test(msg)) {
++			S.gotoState('findkids');
++		}
+ 	});
+ 	S.on(this.zk_kid, 'close', function (code) {
+ 		self.zk_lastError = new Error('Exited with status ' + code);
+@@ -159,6 +247,10 @@ ZKServer.prototype.state_findkids = function (S) {
+ 	});
+ 
+ 	S.on(req, 'result', function (res) {
++		if (res.length < 1) {
++			S.gotoState('findkids');
++			return;
++		}
+ 		self.zk_tokill = res.map(function (ps) {
+ 			return (parseInt(ps.pid, 10));
+ 		});
+@@ -177,7 +269,9 @@ ZKServer.prototype.state_testing = function (S) {
+ 	});
+ 
+ 	S.timeout(1000, function () {
+-		var kid = mod_cproc.spawn(cmd, ['ls', '/']);
++		var kid = mod_cproc.spawn(cmd, [
++		    '-server', 'localhost:' + self.zk_server.clientPort,
++		    'ls', '/']);
+ 		S.on(kid, 'close', function (code) {
+ 			if (code === 0) {
+ 				S.gotoState('running');
+@@ -224,10 +318,10 @@ ZKServer.prototype.state_stopping = function (S) {
+ 		console.error('zk: killing %d', pid);
+ 		mod_cproc.spawnSync('kill', [pid]);
+ 	});
+-	mod_cproc.spawnSync('rm', ['-fr', this.zk_tmpdir]);
+ };
+ 
+ ZKServer.prototype.state_stopped = function () {
++	mod_cproc.spawnSync('rm', ['-fr', this.zk_tmpdir]);
+ 	delete (this.zk_kid);
+ };
+ 

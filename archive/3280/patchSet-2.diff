@@ -1,0 +1,657 @@
+commit d8a385589d7a1d18334518517201e42fbf5daccb (refs/changes/80/3280/2)
+Author: Dylan Yep <dyep49@gmail.com>
+Date:   2018-02-02T11:12:46-08:00 (1 year, 8 months ago)
+    
+    TRITON-63 Add metrics collection to VMAPI
+
+diff --git a/docs/index.md b/docs/index.md
+index db32891..3bd0ef3 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -10,7 +10,7 @@ markdown2extras: tables, code-friendly
+ -->
+ 
+ <!--
+-    Copyright (c) 2017, Joyent, Inc.
++    Copyright (c) 2018, Joyent, Inc.
+ -->
+ 
+ # Introduction to VMs API
+@@ -433,6 +433,42 @@ The `dataMigrations` property is composed of two sub-properties:
+    migration that completed successfully, they represent the latest error that
+    occured when migration the data for the corresponding data model.
+ 
++# Metrics
++
++VMAPI exposes metrics via [node-artedi](https://github.com/joyent/node-artedi).
++For development, it is probably easiest to use `curl` to scrape metrics:
++
++```
++$ curl http://localhost:8881/metrics
++```
++The metrics are returned in Prometheus v0.0.4 text format.
++
++The following metrics are collected:
++
++- HTTP requests completed
++- Total time to process request in seconds
++
++Each of the metrics returned include the following metadata labels:
++
++- datacenter (Datacenter name e.g. us-east-1)
++- service (Service name e.g. vampi)
++- method (e.g. 'PUT')
++- statusCode (e.g. 200)
++- operation (e.g. 'listvms')
++- instance (Instance UUID)
++- server (Server UUID)
++- pid
++
++The metric collection facility provided is intended to be consumed by a monitoring service like a Prometheus or InfluxDB server.
++
++Notably, some metadata labels are not being collected due to their potential
++for high cardinality. Metadata labels that have a large number of unique
++values cause memory strain on metric client processes (vmapi) as well as
++metric servers (Prometheus). It's important to understand what kind of an
++effect on the entire system the addition of metrics and metadata labels can have
++before adding them. This is an issue that would likely not appear in a
++development or staging environment.
++
+ # VMs
+ 
+ The Vms endpoint let us get information about VMs living on a SDC install; there is only one VMAPI instance per datacenter. VMAPI acts as an HTTP interface to VM data stored in Moray. VMAPI is used to obtain information about particular VMs, or when we need perform actions on them -- such as start, reboot, resize, etc.
+diff --git a/lib/monitor.js b/lib/monitor.js
+new file mode 100644
+index 0000000..659de89
+--- /dev/null
++++ b/lib/monitor.js
+@@ -0,0 +1,63 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2018 Joyent, Inc.
++ */
++
++/*
++ * Artedi monitoring server.
++ */
++
++var artedi = require('artedi');
++var assert = require('assert-plus');
++var restify = require('restify');
++var VError = require('verror');
++
++function getMetricsHandler(collector) {
++    function getMetrics(req, res, next) {
++        /*
++         * Restify GET requests will keep socket open until entire request
++         * body is read. req.resume() is used to prevent connection leaks.
++         *
++         * More information at:
++         * https://jira.joyent.us/browse/MANTA-3338
++         */
++        req.on('end', function collectMetrics() {
++            collector.collect(artedi.FMT_PROM,
++                function sendMetrics(err, metrics) {
++                if (err) {
++                    next(new VError(err, 'error retrieving metrics'));
++                }
++                // Prometheus exposition format version
++                res.setHeader('Content-Type', 'text/plain; version=0.0.4');
++                res.send(metrics);
++                next();
++            });
++        });
++        req.resume();
++    }
++    var chain = [ getMetrics ];
++    return chain;
++}
++
++function MonitorServer(config) {
++    assert.object(config, 'config');
++    assert.object(config.log, 'config.log');
++    assert.object(config.collector, 'config.collector');
++
++    this.port = 8881;
++    this.log = config.log.child({ component: 'monitoring' });
++    this.address = '0.0.0.0';
++    this.server = restify.createServer({ serverName: 'Monitor' });
++    this.server.get('/metrics', getMetricsHandler(config.collector));
++}
++
++MonitorServer.prototype.listen = function (callback) {
++    this.server.listen(this.port, this.address, callback);
++};
++
++module.exports = MonitorServer;
+diff --git a/lib/vmapi.js b/lib/vmapi.js
+index f2a6aa7..2597920 100644
+--- a/lib/vmapi.js
++++ b/lib/vmapi.js
+@@ -44,6 +44,7 @@ var API_SERVER_DEFAULT_PORT = 80;
+  */
+ function VmapiApp(options) {
+     assert.object(options, 'options');
++    assert.object(options.collector, 'options.collector');
+     assert.optionalObject(options.log, 'options.log');
+ 
+     // Fabric options
+@@ -177,6 +178,17 @@ VmapiApp.prototype._initApis = function _initApis(options) {
+         addFluentdHost(log, options.fluentd_host);
+     }
+ 
++    // Create metric collectors for request count and time.
++    var requestCounter = options.collector.counter({
++        name: 'http_requests_completed',
++        help: 'count of VMAPI requests completed'
++    });
++
++    var timeHistogram = options.collector.histogram({
++        name: 'http_request_duration_seconds',
++        help: 'total time to process VMAPI requests'
++    });
++
+     // Init VmapiApp server
+     this.server = restify.createServer({
+         name: 'VMAPI',
+@@ -203,6 +215,24 @@ VmapiApp.prototype._initApis = function _initApis(options) {
+ 
+         var method = req.method;
+ 
++        var latency = res.getHeader('X-Response-Time');
++        if (typeof (latency) !== 'number') {
++          latency = Date.now() - req._time;
++        }
++
++        var latencySeconds = latency / 1000;
++
++        var name = route ? (route.name || route) : 'unknown';
++
++        var labels = {
++            operation: name,
++            method: method || 'unknown',
++            statusCode: res.statusCode
++        };
++
++        requestCounter.increment(labels);
++        timeHistogram.observe(latencySeconds, labels);
++
+         var requestSuccessful = responseIndicatesSuccess(res);
+         // For debugging purposes, include the response's body in the audit log
+         // by default.
+diff --git a/package.json b/package.json
+index c644304..cdbd686 100644
+--- a/package.json
++++ b/package.json
+@@ -5,6 +5,7 @@
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {
++    "artedi": "^1.2.1",
+     "assert-plus": "1.0.0",
+     "async": "0.7.0",
+     "backoff": "2.5.0",
+diff --git a/sapi_manifests/vmapi/template b/sapi_manifests/vmapi/template
+index e75210b..3f2f4c2 100644
+--- a/sapi_manifests/vmapi/template
++++ b/sapi_manifests/vmapi/template
+@@ -4,6 +4,10 @@
+     "useVmAgent": true,
+     "ufdsAdminUuid": "{{{ufds_admin_uuid}}}",
+     "reserveKvmStorage": "{{reserveKvmStorage}}",
++    "datacenterName": "{{datacenter_name}}",
++    "serviceName": "{{SERVICE_NAME}}",
++    "instanceUuid": "{{INSTANCE_UUID}}",
++    "serverUuid": "{{SERVER_UUID}}",
+ {{#experimental_fluentd_host}}
+     "fluentd_host": "{{{experimental_fluentd_host}}}",
+ {{/experimental_fluentd_host}}
+diff --git a/server.js b/server.js
+index ca60ba5..13f0ade 100644
+--- a/server.js
++++ b/server.js
+@@ -12,6 +12,7 @@
+  * Main entry-point for the VMs API.
+  */
+ 
++var artedi = require('artedi');
+ var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var changefeed = require('changefeed');
+@@ -25,10 +26,12 @@ var restify = require('restify');
+ var sigyan = require('sigyan');
+ var util = require('util');
+ var vasync = require('vasync');
++var VError = require('verror').VError;
+ 
+ var sdc = require('sdc-clients');
+ var CNAPI = require('./lib/apis/cnapi');
+ var IMGAPI = require('./lib/apis/imgapi');
++var Monitor = require('./lib/monitor');
+ var PAPI = require('./lib/apis/papi');
+ var VmapiApp = require('./lib/vmapi');
+ var VOLAPI = require('sdc-clients').VOLAPI;
+@@ -149,6 +152,16 @@ function startVmapiService() {
+ 
+     config.version = version() || '7.0.0';
+ 
++    config.collector = artedi.createCollector({
++        labels: {
++            datacenter: config.datacenterName,
++            service: config.serviceName,
++            instance: config.instanceUuid,
++            server: config.serverUuid,
++            pid: process.pid
++        }
++    });
++
+     // Increase/decrease loggers levels using SIGUSR2/SIGUSR1:
+     sigyan.add([vmapiLog]);
+ 
+@@ -256,7 +269,23 @@ function startVmapiService() {
+              * API client's connection status appropriately and differently.
+              */
+             next();
+-        }
++        },
++
++      function initMonitorServer(_, next) {
++        var monitorConfig = {
++            log: vmapiLog,
++            collector: config.collector
++        };
++
++        var monitorServer = new Monitor(monitorConfig);
++        var port = monitorServer.port;
++
++        monitorServer.listen(function startMonitorServer() {
++            monitorServer.log.info('monitoring server started on port %d',
++                port);
++            next();
++        });
++      }
+     ]}, function dependenciesInitDone(err) {
+         if (err) {
+             vmapiLog.error({
+@@ -276,6 +305,7 @@ function startVmapiService() {
+             var vmapiApp = new VmapiApp({
+                 apiClients: apiClients,
+                 changefeedPublisher: changefeedPublisher,
++                collector: config.collector,
+                 dataMigrationsCtrl: dataMigrationsCtrl,
+                 log: vmapiLog.child({ component: 'http-api' }, true),
+                 moray: moray,
+diff --git a/test/fixtures/vmapi-server-throwing-expected-stderr.txt b/test/fixtures/vmapi-server-throwing-expected-stderr.txt
+index 15bcc9a..4dd7d99 100644
+--- a/test/fixtures/vmapi-server-throwing-expected-stderr.txt
++++ b/test/fixtures/vmapi-server-throwing-expected-stderr.txt
+@@ -1,6 +1,6 @@
+-/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:24
++/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:25
+     throw new Error('boom');
+     ^
+ 
+ Error: boom
+-    at Server.throwingRestifyHandler (/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:24:11)
+\ No newline at end of file
++    at Server.throwingRestifyHandler (/opt/smartdc/vmapi/test/fixtures/vmapi-server-with-throwing-handler.js:25:11)
+diff --git a/test/fixtures/vmapi-server-with-throwing-handler.js b/test/fixtures/vmapi-server-with-throwing-handler.js
+index 8041192..d27ad34 100644
+--- a/test/fixtures/vmapi-server-with-throwing-handler.js
++++ b/test/fixtures/vmapi-server-with-throwing-handler.js
+@@ -5,9 +5,10 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++var artedi = require('artedi');
+ var libuuid = require('libuuid');
+ var mod_vmapiClient = require('sdc-clients').VMAPI;
+ var path = require('path');
+@@ -45,6 +46,7 @@ vasync.pipeline({funcs: [
+                 bucketsSetup: function bucketsSetup() { return true; }
+             },
+             changefeedPublisher: changefeedUtils.createNoopCfPublisher(),
++            collector: artedi.createCollector(),
+             dataMigrationsCtrl: new NoopDataMigrationsController(),
+             morayBucketsInitializer: {
+                 status: function status() { return 'BUCKETS_REINDEX_DONE'; },
+@@ -89,4 +91,4 @@ vasync.pipeline({funcs: [
+         vmapiClient.close();
+         vmapiApp.close();
+     });
+-});
+\ No newline at end of file
++});
+diff --git a/test/monitoring.test.js b/test/monitoring.test.js
+new file mode 100644
+index 0000000..1d1ce65
+--- /dev/null
++++ b/test/monitoring.test.js
+@@ -0,0 +1,154 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var restify = require('restify');
++var url = require('url');
++var vasync = require('vasync');
++
++var common = require('./common');
++
++var monitorClient;
++var vmapiClient;
++
++function createMonitorClient() {
++    var vmapiUrl = process.env.VMAPI_URL || 'http://localhost';
++    var parsedUrl = url.parse(vmapiUrl);
++    parsedUrl.port = 8881;
++    parsedUrl.host = null;
++
++    var monitorUrl = url.format(parsedUrl);
++    var client = restify.createStringClient({
++        connectTimeout: 250,
++        rejectUnauthorized: false,
++        retry: false,
++        url: monitorUrl
++    });
++
++    return client;
++}
++
++/*
++ * The metrics endpoint returns metrics in the Prometheus v0.0.4 format.
++ * This function takes the metrics response and a string matching the
++ * metric line you want to match as input and returns the count of that
++ * metric.
++ */
++function getMetricCount(metricsRes, metric) {
++    var metricsLines = metricsRes.split('\n');
++    var metricLine = metricsLines.filter(function (line) {
++        return line.includes(metric);
++    });
++    var count = parseInt(metricLine[0].split(' ')[1]);
++    return count;
++}
++
++function incrementListVmCount(_, callback) {
++    var endpoint = '/vms?limit=1';
++    vmapiClient.get(endpoint, callback);
++}
++
++function fetchMetricCount(metricString, callback) {
++    monitorClient.get('/metrics', function getMetrics(err, req, res, data) {
++        var count = getMetricCount(data, metricString);
++        callback(err, count);
++    });
++}
++
++exports.setUp = function (callback) {
++    common.setUp(function (err, _client) {
++        assert.ifError(err);
++        assert.ok(_client, 'restify client');
++        vmapiClient = _client;
++        monitorClient = createMonitorClient();
++        callback();
++    });
++};
++
++exports.metrics_handler = function (t) {
++    monitorClient.get('/metrics', function getMetrics(err, req, res, data) {
++        common.ifError(t, err);
++        t.ok(res, 'The response should exist');
++        t.equal(res.statusCode, 200, 'The status code should be 200');
++        t.ok(data, 'The data should exist');
++        t.done();
++    });
++};
++
++exports.metrics_counter = function (t) {
++    var listVmCount;
++    var updatedListVmCount;
++    var listVmMetricString = 'http_requests_completed{operation="listvms",' +
++                             'method="GET",statusCode="200"';
++
++    vasync.pipeline({
++        'funcs': [
++            incrementListVmCount,
++            function getVmCount(ctx, next) {
++                fetchMetricCount(listVmMetricString, function (err, count) {
++                    common.ifError(t, err);
++                    listVmCount = count;
++                    next();
++                });
++            },
++            incrementListVmCount,
++            function getUpdatedVmCount(ctx, next) {
++                fetchMetricCount(listVmMetricString, function (err, count) {
++                    common.ifError(t, err);
++                    updatedListVmCount = count;
++                    next();
++                });
++            }
++        ]
++    }, function (err, results) {
++        common.ifError(t, err);
++        t.ok(listVmCount, 'listvm count');
++        t.ok(updatedListVmCount, 'updated listvm count');
++        t.equal(listVmCount + 1, updatedListVmCount,
++                'listvm count should increase by one');
++        t.done();
++    });
++};
++
++exports.metrics_histogram_counter = function (t) {
++    var listVmDurationCount;
++    var updatedListVmDurationCount;
++    var listVmDurationString = 'http_request_duration_seconds{le="+Inf",' +
++                               'operation="listvms",method="GET",' +
++                               'statusCode="200"';
++
++    vasync.pipeline({
++        'funcs': [
++            incrementListVmCount,
++            function getListDurationCount(ctx, next) {
++                fetchMetricCount(listVmDurationString, function (err, count) {
++                    common.ifError(t, err);
++                    listVmDurationCount = count;
++                    next();
++                });
++            },
++            incrementListVmCount,
++            function getUpdatedListDurationCount(ctx, next) {
++                fetchMetricCount(listVmDurationString, function (err, count) {
++                    common.ifError(t, err);
++                    updatedListVmDurationCount = count;
++                    next();
++                });
++            }
++        ]
++    }, function (err, results) {
++        common.ifError(t, err);
++        t.ok(listVmDurationCount, 'listvm duration count');
++        t.ok(updatedListVmDurationCount, 'updated listvm duration count');
++        t.equal(listVmDurationCount + 1, updatedListVmDurationCount,
++                'listvm duration count should increase by one');
++        t.done();
++    });
++};
+diff --git a/test/vms.data-migrations.test.js b/test/vms.data-migrations.test.js
+index 7737ffc..e8d93e6 100644
+--- a/test/vms.data-migrations.test.js
++++ b/test/vms.data-migrations.test.js
+@@ -5,9 +5,10 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++var artedi = require('artedi');
+ var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var jsprim = require('jsprim');
+@@ -263,6 +264,7 @@ exports.data_migrations = function (t) {
+                     wfapi: MOCKED_WFAPI_CLIENT
+                 },
+                 changefeedPublisher: changefeedUtils.createNoopCfPublisher(),
++                collector: artedi.createCollector(),
+                 dataMigrationsCtrl: ctx.dataMigrationsCtrl,
+                 morayBucketsInitializer: ctx.morayBucketsInitializer,
+                 moray: ctx.moray
+diff --git a/test/vms.reindex-moray-bucket-transient-error.test.js b/test/vms.reindex-moray-bucket-transient-error.test.js
+index f52316a..15cbe50 100644
+--- a/test/vms.reindex-moray-bucket-transient-error.test.js
++++ b/test/vms.reindex-moray-bucket-transient-error.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -18,6 +18,7 @@
+  * errors.
+  */
+ 
++var artedi = require('artedi');
+ var assert = require('assert-plus');
+ var jsprim = require('jsprim');
+ var Logger = require('bunyan');
+@@ -102,6 +103,7 @@ exports.moray_init_transient_error = function (t) {
+                     wfapi: mockedWfapiClient
+                 },
+                 changefeedPublisher: changefeedUtils.createNoopCfPublisher(),
++                collector: artedi.createCollector(),
+                 dataMigrationsCtrl: new NoopDataMigrationsController(),
+                 morayBucketsInitializer: morayBucketsInitializer,
+                 moray: moray
+diff --git a/test/vms.update-moray-bucket-non-transient-error.test.js b/test/vms.update-moray-bucket-non-transient-error.test.js
+index 83b53d2..5b96492 100644
+--- a/test/vms.update-moray-bucket-non-transient-error.test.js
++++ b/test/vms.update-moray-bucket-non-transient-error.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -16,6 +16,7 @@
+  * service.
+  */
+ 
++var artedi = require('artedi');
+ var jsprim = require('jsprim');
+ var Logger = require('bunyan');
+ var VMAPI = require('sdc-clients').VMAPI;
+@@ -133,6 +134,7 @@ exports.moray_init_non_transient_error = function (t) {
+                     wfapi: mockedWfapiClient
+                 },
+                 changefeedPublisher: changefeedUtils.createNoopCfPublisher(),
++                collector: artedi.createCollector(),
+                 dataMigrationsCtrl: new NoopDataMigrationsController(),
+                 morayBucketsInitializer: morayBucketsInitializer,
+                 moray: moray
+diff --git a/test/vms.update-moray-bucket-removes-index-fails.test.js b/test/vms.update-moray-bucket-removes-index-fails.test.js
+index a7da666..6358313 100644
+--- a/test/vms.update-moray-bucket-removes-index-fails.test.js
++++ b/test/vms.update-moray-bucket-removes-index-fails.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -14,6 +14,7 @@
+  * MorayBucketsInitializer instance emits an error event.
+  */
+ 
++var artedi = require('artedi');
+ var jsprim = require('jsprim');
+ var Logger = require('bunyan');
+ var VMAPI = require('sdc-clients').VMAPI;
+@@ -155,6 +156,7 @@ exports.moray_init_invalid_index_removal = function (t) {
+                     wfapi: mockedWfapiClient
+                 },
+                 changefeedPublisher: changefeedUtils.createNoopCfPublisher(),
++                collector: artedi.createCollector(),
+                 dataMigrationsCtrl: new NoopDataMigrationsController(),
+                 morayBucketsInitializer: morayBucketsInitializer,
+                 moray: moray
+diff --git a/test/vms.update-moray-bucket-transient-error.test.js b/test/vms.update-moray-bucket-transient-error.test.js
+index e91ebb5..1fb7c6b 100644
+--- a/test/vms.update-moray-bucket-transient-error.test.js
++++ b/test/vms.update-moray-bucket-transient-error.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -15,6 +15,7 @@
+  * proper status error.
+  */
+ 
++var artedi = require('artedi');
+ var assert = require('assert-plus');
+ var jsprim = require('jsprim');
+ var Logger = require('bunyan');
+@@ -68,6 +69,7 @@ exports.moray_init_transient_error = function (t) {
+                 apiClients: {
+                     wfapi: mockedWfapiClient
+                 },
++                collector: artedi.createCollector(),
+                 changefeedPublisher: changefeedUtils.createNoopCfPublisher(),
+                 dataMigrationsCtrl: new NoopDataMigrationsController(),
+                 morayBucketsInitializer: morayBucketsInitializer,
+diff --git a/test/vms.update-moray-bucket-versioning.test.js b/test/vms.update-moray-bucket-versioning.test.js
+index 469ddda..d1b8860 100644
+--- a/test/vms.update-moray-bucket-versioning.test.js
++++ b/test/vms.update-moray-bucket-versioning.test.js
+@@ -5,9 +5,10 @@
+  */
+ 
+ /*
+- * Copyright (c) 2017, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++var artedi = require('artedi');
+ var assert = require('assert-plus');
+ var jsprim = require('jsprim');
+ var libuuid = require('libuuid');
+@@ -323,6 +324,7 @@ function testMigrationToBucketsConfig(bucketsConfig, options, t, callback) {
+                     wfapi: MOCKED_WFAPI_CLIENT
+                 },
+                 changefeedPublisher: changefeedUtils.createNoopCfPublisher(),
++                collector: artedi.createCollector(),
+                 dataMigrationsCtrl: new NoopDataMigrationsController(),
+                 morayBucketsInitializer: morayBucketsInitializer,
+                 moray: storage

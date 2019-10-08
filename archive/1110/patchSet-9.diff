@@ -1,0 +1,626 @@
+commit ca1d7b1422e807db1735b56b350abbd056948a46 (refs/changes/10/1110/9)
+Author: Wyatt Preul <wpreul@gmail.com>
+Date:   2017-01-10T11:43:37-06:00 (2 years, 9 months ago)
+    
+    joyent/node-manta#296 add client encryption support
+
+diff --git a/lib/client.js b/lib/client.js
+index 8de4b24..497a017 100644
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -23,6 +23,7 @@ var Watershed = require('watershed').Watershed;
+ var LOMStream = require('lomstream').LOMStream;
+ 
+ var auth = require('smartdc-auth');
++var cse = require('./cse');
+ var jobshare = require('./jobshare');
+ var Queue = require('./queue');
+ var trackmarker = require('./trackmarker');
+@@ -171,7 +172,11 @@ function createOptions(opts, userOpts) {
+         headers: normalizeHeaders(userOpts.headers),
+         id: id,
+         path: opts.path.replace(/\/$/, ''),
+-        query: clone(userOpts.query || {})
++        query: clone(userOpts.query || {}),
++        cse_keyId: opts.cse_keyId || userOpts.cse_keyId,
++        cse_key: opts.cse_key || userOpts.cse_key,
++        cse_cipher: opts.cse_cipher || userOpts.cse_cipher,
++        cse_getKey: opts.cse_getKey || userOpts.cse_getKey
+     };
+ 
+     if (userOpts.role)
+@@ -827,7 +832,17 @@ MantaClient.prototype.get = function get(p, opts, cb) {
+ 
+             res.pause();
+ 
+-            cb(null, stream, res);
++            var encTypes = res.headers['m-encrypt-type'] ?
++              res.headers['m-encrypt-type'].split('/') : [];
++
++            // Not encrypted, return original file stream
++            if (encTypes[0] !== 'client' ||
++              !cse.isSupportedVersion(encTypes[1])) {
++                cb(null, stream, res);
++            } else {
++                cse.decrypt(opts, stream, res, cb);
++            }
++
+ 
+             if (length === false &&
+                 res.headers['content-length'] &&
+@@ -1808,6 +1823,8 @@ MantaClient.prototype.mkdirp = function mkdirp(dir, opts, cb) {
+  *  - cb: callback of the form f(err)
+  */
+ MantaClient.prototype.put = function put(p, input, opts, cb) {
++    var self = this;
++
+     assert.string(p, 'path');
+     assert.stream(input, 'input');
+     if (typeof (opts) === 'function') {
+@@ -1843,17 +1860,30 @@ MantaClient.prototype.put = function put(p, input, opts, cb) {
+             parseInt(opts.copies, 10);
+     }
+ 
+-    if (options.headers['content-length'] === undefined)
++    if (options.headers['content-length'] === undefined) {
+         options.headers['transfer-encoding'] = 'chunked';
++    }
+ 
+     options._original_path = p; // needed for mkdirp case
+ 
+-    log.debug(options, 'put: entered');
++    if (options.cse_keyId !== null && options.cse_keyId !== undefined) {
++        cse.encrypt(options, input, function (err, encrypted) {
++            if (err) {
++                cb(err);
++                return;
++            }
++
++            doPut(self, log, options, encrypted, cb, opts.mkdirs);
++        });
++        return;
++    }
++
+     doPut(this, log, options, input, cb, opts.mkdirs);
+ };
+ 
+ 
+ function doPut(self, log, options, input, cb, allowretry) {
++    log.debug(options, 'put: entered');
+     self.signRequest({
+         headers: options.headers
+     }, function onSignRequest(err) {
+diff --git a/lib/cse.js b/lib/cse.js
+new file mode 100644
+index 0000000..cb8e66e
+--- /dev/null
++++ b/lib/cse.js
+@@ -0,0 +1,286 @@
++/*
++ * Copyright 2017 Joyent, Inc.
++ */
++
++var crypto = require('crypto');
++
++var assert = require('assert-plus');
++var PassThrough = require('stream').PassThrough;
++if (!PassThrough)
++    PassThrough = require('readable-stream/passthrough.js');
++
++var b64 = require('b64');
++
++
++var VERSION = '1.0';
++var CIPHERS = {
++    'AES/CBC/PKCS5Padding': {
++        string: 'aes-256-cbc',
++        ivBytes: 16,
++        keyBytes: 32
++    },
++    'AES/CTR/NoPadding': {
++        string: 'aes-256-ctr',
++        ivBytes: 16,
++        keyBytes: 32
++    },
++    'AES/GCM/NoPadding': {
++        string: 'aes-256-gcm',
++        ivBytes: 12,
++        keyBytes: 32
++    }
++};
++
++
++exports.isSupportedVersion = function isSupportedVersion(version) {
++    if (!version || version.indexOf('.') === -1) {
++        return (false);
++    }
++
++    var versionParts = version.split('.');
++    var major = parseInt(versionParts[0], 10);
++
++    return (major === 1);
++};
++
++
++exports.decrypt = function decrypt(options, encrypted, res, cb) {
++    assert.object(options, 'options');
++    assert.stream(encrypted, 'encrypted');
++    assert.func(options.cse_getKey, 'options.cse_getKey');
++
++    var invalidHeaders = validateHeaders(res.headers);
++    if (invalidHeaders) {
++        cb(new Error('Headers are missing or invalid: ' +
++            invalidHeaders), null, res);
++        return;
++    }
++
++    options.cse_getKey(res.headers['m-encrypt-key-id'], function (err, key) {
++        if (err) {
++            cb(err, null, res);
++            return;
++        }
++
++        var algorithm = getAlgorithm(res.headers['m-encrypt-cipher']);
++        if (!algorithm) {
++            cb(new Error('Unsupported cipher algorithm: ' +
++                res.headers['m-encrypt-cipher']));
++            return;
++        }
++        var decipher = crypto.createDecipheriv(algorithm.string, key,
++            b64.decode(new Buffer(res.headers['m-encrypt-iv'])));
++        var hmac = crypto.createHmac('sha256', key);
++        var output = new PassThrough();
++        var byteLength = 0;
++
++        encrypted.on('data', function (data) {
++            hmac.update(data);
++        });
++
++        encrypted.on('error', function (streamErr) {
++            decipher.removeAllListeners();
++            encrypted.removeAllListeners();
++            cb(streamErr);
++        });
++
++        decipher.on('data', function (data) {
++            byteLength += Buffer.byteLength(data);
++        });
++
++        decipher.once('error', function (decErr) {
++            decipher.removeAllListeners();
++            cb(decErr);
++        });
++
++        decipher.once('end', function (data) {
++            var digest = hmac.digest('base64');
++
++            if (digest !== res.headers['m-encrypt-mac']) {
++                cb(new Error('cipher hmac doesn\'t match stored' +
++                  ' m-encrypt-mac value'), null, res);
++                return;
++            }
++
++            if (byteLength !== parseInt(
++              res.headers['m-encrypt-original-content-length'], 10)) {
++                cb(new Error(
++                    'decrypted file size doesn\'t match original copy'),
++                    null, res);
++                return;
++            }
++
++            decryptMetadata(res.headers, key, function () {
++                cb(null, output, res);
++            });
++        });
++
++
++        encrypted.pipe(decipher).pipe(output);
++    });
++};
++
++
++var REQUIRED_HEADERS = [
++    'm-encrypt-key-id',
++    'm-encrypt-iv',
++    'm-encrypt-cipher',
++    'm-encrypt-mac',
++    'm-encrypt-original-content-length'
++];
++
++function validateHeaders(headers) {
++    var missingHeaders = [];
++    REQUIRED_HEADERS.forEach(function (header) {
++        if (headers[header] === undefined || headers[header] === null) {
++            missingHeaders.push(header);
++        }
++    });
++
++    if ((headers['m-encrypt-metadata'] !== undefined &&
++      headers['m-encrypt-metadata'] !== null) &&
++      !headers['m-encrypt-metadata-cipher']) {
++
++      missingHeaders.push('m-encrypt-metadata-cipher');
++    }
++
++    return (missingHeaders.length ? missingHeaders : null);
++}
++
++
++function decryptMetadata(headers, key, cb) {
++    if (!headers['m-encrypt-metadata']) {
++        cb();
++        return;
++    }
++
++    var algorithm = getAlgorithm(headers['m-encrypt-metadata-cipher']);
++    if (!algorithm) {
++        cb(new Error('Unsupported cipher algorithm: ' +
++            headers['m-encrypt-metadata-cipher']));
++        return;
++    }
++    var decipher = crypto.createDecipheriv(algorithm.string, key,
++        b64.decode(new Buffer(headers['m-encrypt-metadata-iv'])));
++    var hmac = crypto.createHmac('sha256', key);
++
++    var bufs = [];
++    decipher.on('data', function (data) {
++        bufs.push(data);
++    });
++
++    decipher.once('finish', function () {
++        hmac.update(b64.decode(new Buffer(headers['m-encrypt-metadata'])));
++        headers['m-encrypt-metadata'] = Buffer.concat(bufs).toString();
++
++        if (headers['m-encrypt-metadata-mac'] !== hmac.digest('base64')) {
++            cb(new Error('mac hash doesn\'t match'));
++            return;
++        }
++
++        cb();
++    });
++
++    decipher.write(b64.decode(new Buffer(headers['m-encrypt-metadata'])));
++    decipher.end();
++}
++
++exports.encrypt = function encrypt(options, input, cb) {
++    assert.object(options, 'options');
++    assert.stream(input, 'input');
++    assert.string(options.cse_key, 'options.cse_key');
++    assert.string(options.cse_cipher, 'options.cse_cipher');
++
++    var algorithm = getAlgorithm(options.cse_cipher);
++    if (!algorithm) {
++        assert.ok(algorithm, 'Unsupported cipher algorithm: ' +
++            options.cse_cipher);
++    }
++
++    var iv = crypto.randomBytes(algorithm.ivBytes);
++    var cipher = crypto.createCipheriv(algorithm.string, options.cse_key, iv);
++    var hmac = crypto.createHmac('sha256', options.cse_key);
++    var output = new PassThrough();
++    var byteLength = 0;
++
++    cipher.on('data', function (data) {
++        hmac.update(data);
++    });
++
++    cipher.once('error', function (err) {
++        cipher.removeAllListeners();
++        cb(err);
++    });
++
++    input.on('data', function (data) {
++        byteLength += Buffer.byteLength(data);
++    });
++
++    cipher.once('end', function (data) {
++        options.headers['m-encrypt-type'] = 'client/' + VERSION;
++        options.headers['m-encrypt-key-id'] = options.cse_keyId;
++        options.headers['m-encrypt-iv'] = b64.encode(iv).toString();
++        options.headers['m-encrypt-cipher'] = options.cse_cipher;
++        options.headers['m-encrypt-mac'] = hmac.digest('base64');
++        options.headers['m-encrypt-original-content-length'] = byteLength;
++
++        if (options.headers && options.headers['m-encrypt-metadata']) {
++            encryptMetadata(options.headers, options.cse_key,
++                function (err) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++
++                    cb(null, output);
++                });
++
++            return;
++        }
++
++        cb(null, output);
++    });
++
++    input.pipe(cipher).pipe(output);
++};
++
++
++function encryptMetadata(headers, key, cb) {
++    var algorithm = getAlgorithm(headers['m-encrypt-metadata-cipher']);
++    if (!algorithm) {
++        cb(new Error('Unsupported cipher algorithm: ' +
++            headers['m-encrypt-metadata-cipher']));
++        return;
++    }
++
++    var iv = crypto.randomBytes(algorithm.ivBytes);
++    headers['m-encrypt-metadata-iv'] = b64.encode(iv).toString();
++    var cipher = crypto.createCipheriv(algorithm.string, key, iv);
++    var hmac = crypto.createHmac('sha256', key);
++
++    var bufs = [];
++    cipher.on('data', function (data) {
++        bufs.push(data);
++    });
++
++    cipher.once('finish', function () {
++        var encrypted = Buffer.concat(bufs);
++        headers['m-encrypt-metadata'] = b64.encode(encrypted).toString();
++        hmac.update(encrypted);
++        headers['m-encrypt-metadata-mac'] = hmac.digest('base64');
++        cb();
++    });
++
++    cipher.once('error', function (err) {
++        cipher.removeAllListeners();
++        cb(err);
++    });
++
++    cipher.write(headers['m-encrypt-metadata']);
++    cipher.end();
++}
++
++
++function getAlgorithm(cipher) {
++    return (CIPHERS[cipher]);
++}
+diff --git a/package.json b/package.json
+index c36677e..298d389 100644
+--- a/package.json
++++ b/package.json
+@@ -11,6 +11,7 @@
+     "main": "./lib/index.js",
+     "dependencies": {
+         "assert-plus": "^1.0.0",
++        "b64": "^2.0.0",
+         "backoff": "~2.3.0",
+         "bunyan": "^1.8.1",
+         "clone": "~0.1.11",
+diff --git a/test/client.test.js b/test/client.test.js
+index 7b27aab..1134fa3 100644
+--- a/test/client.test.js
++++ b/test/client.test.js
+@@ -163,6 +163,27 @@ test('#231: put (special characters)', function (t) {
+     });
+ });
+ 
++test('put (encrypt stream)', function (t) {
++    var text = 'The lazy brown fox \nsomething \nsomething foo';
++    var stream = new MemoryStream();
++    var options = {
++      cse_key: 'FFFFFFFBD96783C6C91E222211112222',
++      cse_keyId: 'dev/test',
++      cse_cipher: 'AES/CTR/NoPadding'
++    };
++
++    this.client.put(ROOT + '/encrypted', stream, options, function (err, res) {
++        t.ifError(err);
++        t.ok(res.req._headers['m-encrypt-key-id']);
++        t.done();
++    });
++
++    process.nextTick(function () {
++        stream.write(text);
++        stream.end();
++    });
++});
++
+ test('#231: ls (special characters)', function (t) {
+     this.client.ls(SUBDIR1, function (err, res) {
+         t.ifError(err);
+@@ -196,6 +217,47 @@ test('#231: get (special characters)', function (t) {
+     });
+ });
+ 
++test('get (decrypt stream)', function (t) {
++    var self = this;
++    var text = 'The lazy brown fox \nsomething \nsomething foo';
++    var stream = new MemoryStream();
++    var fpath = ROOT + '/todecrypt';
++    var key = 'FFFFFFFBD96783C6C91E222211112222';
++    var options = {
++      cse_key: key,
++      cse_keyId: 'dev/test',
++      cse_cipher: 'AES/CTR/NoPadding',
++      cse_getKey: function (keyId, cb) {
++          cb(null, key);
++      }
++    };
++
++    self.client.put(fpath, stream, options, function (putErr, putRes) {
++        t.ifError(putErr);
++        t.ok(putRes.req._headers['m-encrypt-key-id']);
++        setTimeout(function () {
++          self.client.get(fpath, options, function (getErr, decrypted, getRes) {
++              t.ifError(getErr);
++
++              var result = '';
++              decrypted.on('data', function (data) {
++                result += data.toString();
++              });
++
++              decrypted.once('end', function () {
++                t.ok(result === text);
++                t.done();
++              });
++          });
++        }, 10);
++    });
++
++    process.nextTick(function () {
++        stream.write(text);
++        stream.end();
++    });
++});
++
+ 
+ test('#231: rm (special characters)', function (t) {
+     this.client.unlink(SPECIALOBJ1, function (err) {
+diff --git a/test/cse.test.js b/test/cse.test.js
+new file mode 100644
+index 0000000..a808c3a
+--- /dev/null
++++ b/test/cse.test.js
+@@ -0,0 +1,144 @@
++/*
++ * Copyright 2017 Joyent, Inc.
++ */
++
++var MemoryStream = require('readable-stream/passthrough.js');
++
++var cse = require('../lib/cse');
++
++
++function test(name, testfunc) {
++    module.exports[name] = testfunc;
++}
++
++
++test('isSupportedVersion() returns false for invalid versions', function (t) {
++    var versions = [
++        '',
++        null,
++        '0.0',
++        '0.',
++        'b.b'
++    ];
++
++    versions.forEach(function (version) {
++        t.ok(!cse.isSupportedVersion(version));
++    });
++    t.done();
++});
++
++
++test('isSupportedVersion() returns true for valid versions', function (t) {
++    var versions = [
++        '1.0',
++        '1.1'
++    ];
++
++    versions.forEach(function (version) {
++        t.ok(cse.isSupportedVersion(version));
++    });
++    t.done();
++});
++
++
++test('encrypt() throws with missing options', function (t) {
++    var input = new MemoryStream();
++
++    t.throws(function () {
++        cse.encrypt(null, input, function (err, res) {
++
++        });
++    }, /options \(object\) is required/);
++
++    t.done();
++});
++
++
++test('encrypt() throws with unsupported cipher alg', function (t) {
++    var options = {
++        cse_key: 'FFFFFFFBD96783C6C91E222211112222',
++        cse_cipher: 'AES/CFB/NoPadding'
++    };
++    var input = new MemoryStream();
++
++    t.throws(function () {
++        cse.encrypt(options, input, function (err, res) {
++
++        });
++    }, /Unsupported cipher algorithm/);
++
++    t.done();
++});
++
++test('encrypt() throws with invalid key length', function (t) {
++    var options = {
++        cse_key: 'FFFFFF',
++        cse_cipher: 'AES/CTR/NoPadding'
++    };
++    var input = new MemoryStream();
++
++    t.throws(function () {
++        cse.encrypt(options, input, function (err, res) {
++
++        });
++    }, /Invalid key length/);
++
++    t.done();
++});
++
++test('encrypt() throws with invalid input', function (t) {
++    var options = {
++      cse_key: 'FFFFFFFBD96783C6C91E222211112222',
++      cse_keyId: 'dev/test',
++      cse_cipher: 'AES/CTR/NoPadding'
++    };
++
++    t.throws(function () {
++        cse.encrypt(options, null, function (err, res) {
++
++        });
++    }, /input \(stream\) is required/);
++
++    t.done();
++});
++
++
++test('decrypt() throws with missing options', function (t) {
++    var input = new MemoryStream();
++
++    t.throws(function () {
++        cse.decrypt(null, input, function (err, res) {
++
++        });
++    }, /options \(object\) is required/);
++
++    t.done();
++});
++
++test('decrypt() throws with missing options.cse_getKey', function (t) {
++    var input = new MemoryStream();
++
++    t.throws(function () {
++        cse.decrypt({}, input, function (err, res) {
++
++        });
++    }, /options\.cse_getKey \(func\) is required/);
++
++    t.done();
++});
++
++test('decrypt() throws with invalid input', function (t) {
++    var options = {
++        cse_getKey: function (keyId, cb) {
++            cb();
++        }
++    };
++
++    t.throws(function () {
++        cse.decrypt(options, null, function (err, res) {
++
++        });
++    }, /encrypted \(stream\) is required/);
++
++    t.done();
++});

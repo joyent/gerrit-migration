@@ -1,0 +1,274 @@
+commit 78a3d699bc48a4a26da454c157e428f146fd492f (refs/changes/35/1535/2)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2017-02-23T22:49:57+00:00 (2 years, 7 months ago)
+    
+    MANTA-3110 Loadbalancers need support for multiple untrusted networks
+
+diff --git a/deps/jsstyle b/deps/jsstyle
+index da42b50..9600c7e 160000
+--- a/deps/jsstyle
++++ b/deps/jsstyle
+@@ -1 +1 @@
+-Subproject commit da42b50ceb12d431437b32efd4c411a8e2fac0c8
++Subproject commit 9600c7e56c84f3a74d6e3d70c336e86f7a3e3769
+diff --git a/etc/config.coal.json b/etc/config.coal.json
+index 4d14601..c54759e 100644
+--- a/etc/config.coal.json
++++ b/etc/config.coal.json
+@@ -1,7 +1,7 @@
+ {
+         "name": "manta.coal.joyent.us",
+-        "adminIp": "127.0.0.1",
+-        "externalIp": "::1",
++        "trustedIP": "127.0.0.1",
++        "untrustedIPs": [ "::1" ],
+         "zookeeper": {
+                 "servers": [ {
+                         "host": "10.99.99.11",
+diff --git a/etc/haproxy.cfg.in b/etc/haproxy.cfg.in
+index 3ab0780..0dd5a07 100644
+--- a/etc/haproxy.cfg.in
++++ b/etc/haproxy.cfg.in
+@@ -46,10 +46,7 @@ frontend https
+         bind 127.0.0.1:8443 accept-proxy
+         default_backend secure_api
+ 
+-frontend http_external
+-        bind %s:80
+-        default_backend insecure_api
+-
++%s
+ 
+ frontend http_internal
+         bind %s:80
+diff --git a/lib/lb_manager.js b/lib/lb_manager.js
+index 92041b4..4742a8f 100644
+--- a/lib/lb_manager.js
++++ b/lib/lb_manager.js
+@@ -30,14 +30,17 @@ var RESTART = '/usr/sbin/svcadm restart haproxy';
+ var CLEAR_SERVER_LINE = '        server be%d %s:81 check inter 30s slowstart 10s\n';
+ /* JSSTYLED */
+ var SSL_SERVER_LINE =   '        server be%d %s:80 check inter 30s slowstart 10s\n';
++var INSECURE_FRONTEND =
++    'frontend http_external\n        default_backend insecure_api\n';
++var INSUECRE_BIND_LINE = '        bind %s:80\n';
+ 
+ 
+ 
+ ///--- API
+ 
+ function updateConfig(opts, cb) {
+-    assert.string(opts.adminIp, 'options.adminIp');
+-    assert.string(opts.externalIp, 'options.exernalIp');
++    assert.string(opts.trustedIP, 'options.trustedIP');
++    assert.arrayOfString(opts.untrustedIPs, 'options.untrustedIPs');
+     assert.arrayOfString(opts.hosts, 'hosts');
+     assert.func(cb, 'callback');
+ 
+@@ -50,22 +53,41 @@ function updateConfig(opts, cb) {
+         ssl += sprintf(SSL_SERVER_LINE, i, h);
+     });
+ 
++    var untrusted = '';
++    if (opts.untrustedIPs.length > 0) {
++        untrusted += INSECURE_FRONTEND;
++        opts.untrustedIPs.forEach(function (ip) {
++            untrusted += sprintf(INSUECRE_BIND_LINE, ip);
++        });
++    }
++
+     var str = sprintf(CFG_IN,
+-                      os.hostname(),
+-                      ssl,
+-                      clear,
+-                      opts.externalIp,
+-                      opts.adminIp,
+-                      opts.adminIp);
++        os.hostname(),
++        ssl,
++        clear,
++        untrusted,
++        opts.trustedIP,
++        opts.trustedIP);
+ 
+     fs.writeFile(CFG_FILE, str, 'utf8', cb);
+ }
+ 
+ 
++/*
++ * Regenerate the configuration file using the provided parameters, and then
++ * restart HAProxy so that it picks it up.
++ *
++ * Options:
++ * - trustedIP, an address on the Manta network that is considered preauthorized
++ * - untrustedIPs, an array of addresses that untrusted traffic comes in over
++ * - hosts, an array of Muskie backends to forward requests to
++ * - restart (optional), the command to run to restart HAProxy
++ * - log, a Bunyan logger
++ */
+ function restart(opts, cb) {
+     assert.object(opts, 'options');
+-    assert.string(opts.adminIp, 'options.adminIp');
+-    assert.string(opts.externalIp, 'options.externalIp');
++    assert.string(opts.trustedIP, 'options.trustedIP');
++    assert.arrayOfString(opts.untrustedIPs, 'options.untrustedIPs');
+     assert.arrayOfString(opts.hosts, 'options.hosts');
+     assert.object(opts.log, 'options.log');
+     assert.optionalString(opts.restart, 'options.restart');
+diff --git a/main.js b/main.js
+index aff9ccc..3c6a71f 100644
+--- a/main.js
++++ b/main.js
+@@ -14,6 +14,8 @@ var assert = require('assert-plus');
+ var backoff = require('backoff');
+ var bunyan = require('bunyan');
+ var dashdash = require('dashdash');
++var forkexec = require('forkexec');
++var net = require('net');
+ var once = require('once');
+ var zkplus = require('zkplus');
+ 
+@@ -50,6 +52,58 @@ var OPTIONS = [
+     }
+ ];
+ 
++///--- Helper functions
++
++function getUntrustedIPs(cfg, callback) {
++    // Allow hardcoding addresses in the configuration.
++    if (cfg.hasOwnProperty('untrustedIPs')) {
++        callback();
++        return;
++    }
++
++    cfg.untrustedIPs = [];
++
++    var args = [ '/usr/sbin/mdata-get', 'sdc:nics' ];
++    LOG.info({ cmd: args }, 'Loading NIC information');
++    forkexec.forkExecWait({
++        argv: args
++    }, function (err, info) {
++        if (err) {
++            LOG.error(info, 'Failed to load NIC information');
++            setImmediate(callback, err);
++            return;
++        }
++
++        var nics = JSON.parse(info.stdout);
++        assert.array(nics, 'nics');
++
++        LOG.info({ nics: nics }, 'Looked up NICs');
++
++        nics.forEach(function (nic) {
++            // Skip NICs on trusted networks.
++            if (nic.nic_tag === 'admin' || nic.nic_tag === 'manta') {
++                return;
++            }
++
++            if (nic.hasOwnProperty('ips')) {
++                nic.ips.forEach(function (addr) {
++                    var ip = addr.split('/')[0];
++                    if (net.isIPv4(ip) || net.isIPv6(ip)) {
++                        cfg.untrustedIPs.push(ip);
++                    }
++                });
++            } else if (nic.hasOwnProperty('ip')) {
++                if (net.isIPv4(nic.ip)) {
++                    cfg.untrustedIPs.push(nic.ip);
++                }
++            } else {
++                LOG.warn({ nic: nic }, 'NIC has no IP addresses');
++            }
++        });
++
++        callback();
++    });
++}
+ 
+ 
+ ///--- CLI Functions
+@@ -78,7 +132,11 @@ function configure() {
+         process.exit(1);
+     }
+ 
++    assert.string(cfg.name, 'config.name');
++    assert.string(cfg.trustedIP, 'config.trustedIP');
+     assert.object(cfg.zookeeper, 'config.zookeeper');
++    assert.optionalArrayOfString(cfg.untrustedIPs,
++        'config.untrustedIPs');
+ 
+     if (cfg.logLevel)
+         LOG.level(cfg.logLevel);
+@@ -145,8 +203,8 @@ function startWatch(opts, cb) {
+ 
+             watch.on('hosts', function onHosts(hosts) {
+                 var _opts = {
+-                    adminIp: cfg.adminIp,
+-                    externalIp: cfg.externalIp,
++                    trustedIP: cfg.trustedIP,
++                    untrustedIPs: cfg.untrustedIPs,
+                     hosts: hosts || [],
+                     log: opts.log,
+                     restart: cfg.restart
+@@ -253,5 +311,18 @@ function startWatch(opts, cb) {
+         retry.start();
+     }
+ 
+-    zookeeper();
++    getUntrustedIPs(cfg, function (err) {
++        if (err) {
++            // We failed to load our IPs: abort.
++            LOG.fatal(err, 'Failed to look up any IPs');
++            process.exit(1);
++        }
++
++        LOG.info({
++            trustedIP: cfg.trustedIP,
++            untrustedIPs: cfg.untrustedIPs
++        }, 'Selected IPs for untrusted networks');
++
++        zookeeper();
++    });
+ })();
+diff --git a/package.json b/package.json
+index fa27e22..0f35238 100644
+--- a/package.json
++++ b/package.json
+@@ -5,10 +5,11 @@
+     "author": "Joyent (joyent.com)",
+     "private": true,
+     "dependencies": {
+-        "assert-plus": "0.1.5",
++        "assert-plus": "1.0.0",
+         "backoff": "2.3.0",
+         "bunyan": "0.22.1",
+         "dashdash": "1.4.0",
++        "forkexec": "1.1.0",
+         "node-uuid": "1.4.1",
+         "once": "1.3.0",
+         "vasync": "1.4.3",
+diff --git a/sapi_manifests/muppet/template b/sapi_manifests/muppet/template
+index d5fadee..80ccab9 100644
+--- a/sapi_manifests/muppet/template
++++ b/sapi_manifests/muppet/template
+@@ -1,7 +1,6 @@
+ {
+   "name": "manta.{{REGION}}.{{DNS_DOMAIN}}",
+-  "adminIp": "{{auto.MANTA_IP}}",
+-  "externalIp": "{{auto.EXTERNAL_IP}}",
++  "trustedIP": "{{auto.MANTA_IP}}",
+   "zookeeper": {
+     "connectTimeout": 1000,
+     "servers": [
+diff --git a/tools/jsl.node.conf b/tools/jsl.node.conf
+index 0b8ae95..e8711c7 100644
+--- a/tools/jsl.node.conf
++++ b/tools/jsl.node.conf
+@@ -118,6 +118,7 @@
+ +define module
+ +define process
+ +define require
+++define setImmediate
+ +define setInterval
+ +define setTimeout
+ +define Buffer

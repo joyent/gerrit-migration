@@ -1,0 +1,1845 @@
+commit 4b32d218b2c7f072d55276074e31d355e7a1c5e7 (refs/changes/15/2915/24)
+Author: Nick Zivkovic <nick.zivkovic@joyent.com>
+Date:   2018-04-22T00:54:00+00:00 (1 year, 6 months ago)
+    
+    NAPI-434 Want way to automatically generate available subnets
+
+diff --git a/docs/index.md b/docs/index.md
+index fec29f4..c40262e 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -847,7 +847,12 @@ Create a new fabric network on a VLAN.
+ ### Inputs
+ 
+ The parameters to this endpoint are the same as to [CreateNetwork](#CreateNetwork),
+-but with some fields removed:
++but with some fields removed, and others added. Note that for fabrics, a user
++can manually specify a subnet or ask NAPI to automatically choose one for them.
++This means that there are two separate sets of parameters that are mutually
++exclusive. The following are the allocation params: `[subnet,
++provision_start_ip, provision_end_ip]`. And these are the manual params:
++`[subnet_alloc, family, subnet_prefix]`.
+ 
+ | Field              | Type             | Description                                                                               |
+ | ------------------ | ---------------- | ----------------------------------------------------------------------------------------- |
+@@ -856,6 +861,9 @@ but with some fields removed:
+ | subnet             | CIDR             | Subnet                                                                                    |
+ | provision_start_ip | IP               | First IP address to allow provisioning on                                                 |
+ | provision_end_ip   | IP               | Last IP address to allow provisioning on                                                  |
++| subnet_alloc       | Boolean          | Automatically choose subnet                                                               |
++| family             | String           | Address family: only 'ipv4' supported                             |
++| subnet_prefix      | Number           | Number of prefix bits (only 24-bit prefixes supported)                        |
+ | gateway            | IP               | Gateway IP address (Optional)                                                             |
+ | internet_nat       | Boolean          | Provision a NAT zone on the gateway address (Optional) (default: true)                    |
+ | resolvers          | Array of IPs     | Resolver IP addresses (Optional)                                                          |
+diff --git a/lib/endpoints/ping.js b/lib/endpoints/ping.js
+index 5d7f231..5b91069 100644
+--- a/lib/endpoints/ping.js
++++ b/lib/endpoints/ping.js
+@@ -28,7 +28,8 @@ var constants = require('../util/constants');
+ function ping(req, res, next) {
+     var stats = {
+         config: {
+-            fabrics_enabled: constants.FABRICS_ENABLED
++            fabrics_enabled: constants.FABRICS_ENABLED,
++            subnet_alloc_enabled: req.app.config.autoAllocSubnets
+         },
+         healthy: true,
+         services: {
+diff --git a/lib/models/network.js b/lib/models/network.js
+index 9c267a1..ba255fd 100644
+--- a/lib/models/network.js
++++ b/lib/models/network.js
+@@ -32,6 +32,9 @@ var UUID = require('node-uuid');
+ var validate = require('../util/validate');
+ var vasync = require('vasync');
+ var VError = require('verror');
++var autoalloc = require('../util/autoalloc');
++var mod_subnet_streams = require('../util/subnet-streams');
++
+ /*
+  * Circular dependencies required at end of file.
+  */
+@@ -151,15 +154,18 @@ var CREATE_SCHEMA = {
+         nic_tag: function _nicTagExists(opts, name, tags, callback) {
+             mod_nicTag.validateExists(true, opts, name, tags, callback);
+         },
+-        provision_end_ip: validate.IP,
+-        provision_start_ip: validate.IP,
+-        subnet: validate.subnet,
+         vlan_id: validate.VLAN
+     },
+     optional: {
+         description: validate.string,
+         // XXX: allow this?
+         fabric: validate.bool,
++        subnet_alloc: validate.bool,
++        family: validate.enum(['ipv4']),
++        subnet_prefix: validate.subnetPrefix,
++        subnet: validate.subnet,
++        provision_end_ip: validate.IP,
++        provision_start_ip: validate.IP,
+         fields: validate.fieldsArray(VALID_FIELDS),
+         gateway: validateGateway,
+         internet_nat: validate.bool,
+@@ -172,6 +178,7 @@ var CREATE_SCHEMA = {
+     },
+     after: [
+         validateFabricOwner,
++        validateSubnetAlloc,
+         validateProvisionRange,
+         validateNicTagMTU
+     ]
+@@ -246,7 +253,9 @@ var GET_SCHEMA = {
+ 
+ // --- Internal
+ 
+-
++function getMarkerSubnet(net_obj) {
++    return (net_obj.subnet);
++}
+ 
+ /**
+  * Given a NIC, return a UsedBy error description for a 'nic',
+@@ -683,6 +692,84 @@ function validateProvisionRangeUpdate(opts, params, parsed, cb) {
+     }, null, toValidate, cb);
+ }
+ 
++function validateSubnetAutoAlloc(opts, _, parsedParams, callback) {
++    var errs = [];
++    if (!opts.app.config.autoAllocSubnets) {
++        errs.push(new errors.invalidParam('subnet_auto_alloc',
++            'Subnet allocation is not enabled on this instance'));
++        callback(errs);
++        return;
++    }
++    if (parsedParams.subnet) {
++        errs.push(new errors.invalidParam('subnet',
++            'Manual allocation parameter not allowed'));
++    }
++    if (parsedParams.provision_start_ip) {
++        errs.push(new errors.invalidParam('provision_start_ip',
++            'Manual allocation parameter not allowed'));
++    }
++    if (parsedParams.provision_end_ip) {
++        errs.push(new errors.invalidParam('provision_end_ip',
++            'Manual allocation parameter not allowed'));
++    }
++
++    if (!parsedParams.family) {
++        errs.push(new errors.missingParam('family'));
++    }
++    if (!parsedParams.subnet_prefix) {
++        errs.push(new errors.missingParam('subnet_prefix'));
++    }
++    if (!parsedParams.vnet_id) {
++        errs.push(new errors.missingParam('vnet_id'));
++    }
++    errors.sortErrsByField(errs);
++    if (errs.length > 0) {
++        callback(errs);
++        return;
++    }
++    callback();
++}
++
++function validateSubnetParamsAlloc(_opts, _, parsedParams, callback) {
++    var errs = [];
++    if (parsedParams.subnet_alloc) {
++        errs.push(new errors.invalidParam('subnet_alloc',
++            'Auto allocation parameter not allowed'));
++    }
++    if (parsedParams.subnet_prefix) {
++        errs.push(new errors.invalidParam('subnet_prefix',
++            'Auto allocation parameter not allowed'));
++    }
++    if (!parsedParams.provision_start_ip) {
++        errs.push(new errors.missingParam('provision_start_ip'));
++    }
++    if (!parsedParams.provision_end_ip) {
++        errs.push(new errors.missingParam('provision_end_ip'));
++    }
++    errors.sortErrsByField(errs);
++    if (errs.length > 0) {
++        callback(errs);
++        return;
++    }
++    callback();
++}
++
++/*
++ * Validates that these two sets of params do not overlap:
++ *
++ *    [subnet, provision_start_ip, provision_end_ip]
++ *    [subnet_alloc, family, subnet_prefix]
++ *
++ * Also validates that params.fabric = true and vnet_id = defined for
++ * subnet_alloc path.
++ */
++function validateSubnetAlloc(opts, original, parsedParams, callback) {
++    if (parsedParams.subnet_alloc) {
++        validateSubnetAutoAlloc(opts, original, parsedParams, callback);
++    } else {
++        validateSubnetParamsAlloc(opts, original, parsedParams, callback);
++    }
++}
+ 
+ /**
+  * Validates that:
+@@ -691,8 +778,11 @@ function validateProvisionRangeUpdate(opts, params, parsed, cb) {
+  * * that end doesn't come before start.
+  */
+ function validateProvisionRange(opts, _, parsedParams, callback) {
+-    if (!parsedParams.subnet_start || !parsedParams.subnet_bits) {
+-        return callback();
++    if (parsedParams.subnet_alloc || !parsedParams.subnet_start ||
++        !parsedParams.subnet_bits || !parsedParams.provision_start_ip ||
++        !parsedParams.provision_end_ip) {
++        callback();
++        return;
+     }
+ 
+     var errs = [];
+@@ -709,6 +799,7 @@ function validateProvisionRange(opts, _, parsedParams, callback) {
+     assert.ok(subnet, 'subnet');
+     parsedParams.subnet = subnet.toString();
+ 
++
+     // check that provisioning ranges match subnet type
+     // if they don't match, set variable to null and skip later checks
+     if (provisionStart.kind() !== subnetType) {
+@@ -982,38 +1073,20 @@ function validateRoutes(_, name, val, callback) {
+  * Validates parameters and returns a network object if all parameters are
+  * valid, or an error otherwise
+  */
+-function createValidNetwork(opts, callback) {
+-    var app = opts.app;
+-    var log = opts.log;
++function createNetworkObject(opts) {
+     var params = opts.params;
+ 
+-    var copts = {
+-        app: app,
+-        fabric: opts.fabric,
+-        log: log,
+-        owner_uuid: opts.owner_uuid
+-    };
+-
+-    validate.params(CREATE_SCHEMA, copts, params,
+-        function (err, validatedParams) {
+-        if (err) {
+-            return callback(err);
+-        }
+-
+-        // If we're creating a new network, use strings to populate the
+-        // network's IP table.
+-        validatedParams.ip_use_strings = true;
+-
+-        // Auto-assign gateway IP if internet_nat is requested but gateway
+-        // is unset.
+-        if (validatedParams.fabric && validatedParams.internet_nat &&
+-                !validatedParams.gateway) {
++    // If we're creating a new network, use strings to populate the
++    // network's IP table.
++    params.ip_use_strings = true;
+ 
+-            validatedParams.gateway = validatedParams.provision_start_ip;
+-        }
++    // Auto-assign gateway IP if internet_nat is requested but gateway
++    // is unset.
++    if (params.fabric && params.internet_nat && !params.gateway) {
++        params.gateway = params.provision_start_ip;
++    }
+ 
+-        return callback(null, new Network(validatedParams));
+-    });
++    return new Network(params);
+ }
+ 
+ 
+@@ -1463,6 +1536,85 @@ Network.prototype.matches = function matchesIntersection(intersection) {
+     return true;
+ };
+ 
++/*
++ * Hits the napi_networks bucket, and filters the results according to 'filter'
++ * which is a string.
++ */
++function listFilteredNetworks(opts, filter, attr, callback) {
++    var app = opts.app;
++    var log = opts.log;
++
++    mod_moray.listObjs({
++        defaultFilter: '(uuid=*)',
++        filter: filter,
++        log: log,
++        bucket: BUCKET,
++        model: Network,
++        limit: opts.limit,
++        moray: app.moray,
++        sort: {
++            attribute: attr,
++            order: 'ASC'
++        }
++    }, callback);
++}
++
++/*
++ * Add an additional boolean expression to the filter, that includes only all
++ * subnets that appear after 'marker'.
++ */
++function addSubnetMarkerToFilter(filter, marker) {
++    if (marker) {
++        return '(&' + filter + '!(subnet<=' + marker + '))';
++    }
++    return filter;
++}
++
++/*
++ * Wraps listFilteredNetworks in a LOMStream. Looks at 10 networks at a time.
++ */
++function listFilteredNetworksStream(opts, baseFilter, marker, attr) {
++    var dupOpts = jsprim.deepCopy(opts);
++    var filter;
++
++    var s = new lomstream.LOMStream({
++        fetch: function (opts2, lobj, _datacb, cb) {
++            var copyOpts = jsprim.deepCopy(opts2);
++            copyOpts.limit = lobj.limit;
++            filter = addSubnetMarkerToFilter(baseFilter, lobj.marker);
++
++            listFilteredNetworks(copyOpts, filter, attr, function (err, nets) {
++                if (err) {
++                    cb(err);
++                    return;
++                }
++
++                cb(null, { done: nets.length === 0, results: nets });
++                return;
++            });
++        },
++        marker: marker,
++        limit: 10,
++        fetcharg: dupOpts
++    });
++    return s;
++}
++
++
++function allocateSubnets(opts, callback) {
++    var filter = '(vnet_id=' + opts.params.vnet_id + ')';
++
++
++    var subnetStream = listFilteredNetworksStream(opts, filter, getMarkerSubnet,
++        'subnet');
++    subnetStream.on('error', callback);
++
++    var pairStream = new mod_subnet_streams.SubnetPairStream();
++    var availableSubnetStream =
++        new mod_subnet_streams.AvailableSubnetStream(opts);
++
++    callback(null, subnetStream.pipe(pairStream).pipe(availableSubnetStream));
++}
+ 
+ 
+ // --- Exported functions
+@@ -1491,22 +1643,97 @@ function createNetwork(opts, callback) {
+     var log = opts.log;
+     var network;
+     var params = opts.params;
++    var validatedParams;
++    var copts = {
++        app: app,
++        fabric: opts.fabric,
++        log: log,
++        owner_uuid: opts.owner_uuid
++    };
+ 
+     log.debug(params, 'createNetwork: entry');
+ 
+     vasync.pipeline({
+         funcs: [
+-        function _createNetObj(_, cb) {
+-            createValidNetwork(opts, function (err, res) {
++        function _validateHttpParams(_, cb) {
++            validate.params(CREATE_SCHEMA, copts, opts.params,
++                function (err, validParams) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++                    validatedParams = validParams;
++                    cb();
++            });
++        },
++        function _allocateSubnet(_, cb) {
++            if (!validatedParams.subnet_alloc) {
++                cb();
++                return;
++            }
++            allocateSubnets(opts, function (err, subnet_stream) {
++                /*
++                 * Note that the subnet_stream is lazy by default, it does not
++                 * need an explicit pause-call. We only get data if we call
++                 * read(). If we bail out of this pipeline-phase via a call to
++                 * cb(), we will end up orphaning the subnet_stream, which will
++                 * get GC'd in the future.
++                 */
+                 if (err) {
+-                    return cb(err);
++                    cb(err);
++                    return;
+                 }
+ 
+-                network = res;
+-                return cb();
++                function done(err2) {
++                    subnet_stream.removeListener('readable', onReadable);
++                    subnet_stream.removeListener('error', onError);
++                    subnet_stream.removeListener('end', onEnd);
++                    cb(err2);
++                }
++
++                function onReadable() {
++                    var subnet = subnet_stream.read(1);
++                    /*
++                     * Wait until next readable.
++                     */
++                    if (subnet === null) {
++                        return;
++                    }
++                    validatedParams.subnet_start = subnet.address();
++                    validatedParams.subnet_bits = subnet.prefixLength();
++                    var provrange = autoalloc.allocProvisionRange(subnet);
++                    validatedParams.provision_start_ip = provrange[0];
++                    validatedParams.provision_end_ip = provrange[1];
++                    done();
++                }
++
++                function onError(err2) {
++                    done(err2);
++                }
++
++                function onEnd() {
++                    done(new errors.SubnetsExhaustedError());
++                }
++
++                subnet_stream.on('error', onError);
++                subnet_stream.on('readable', onReadable);
++                subnet_stream.on('end', onEnd);
+             });
+         },
+ 
++        function _createNetObj(_, cb) {
++            var vopts = {
++                app: app,
++                fabric: opts.fabric,
++                log: log,
++                owner_uuid: opts.owner_uuid,
++                params: validatedParams
++            };
++            network = createNetworkObject(vopts);
++            return cb();
++        },
++
++
+         function _createNet(_, cb) {
+             var raw = network.raw();
+             log.debug({ uuid: network.uuid, raw: raw },
+@@ -1764,6 +1991,7 @@ function validateListNetworks(params, callback) {
+ }
+ 
+ 
++
+ /**
+  * Lists networks, filtering by parameters
+  */
+diff --git a/lib/util/autoalloc.js b/lib/util/autoalloc.js
+new file mode 100644
+index 0000000..1f9b2d3
+--- /dev/null
++++ b/lib/util/autoalloc.js
+@@ -0,0 +1,140 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017, Joyent, Inc.
++ */
++
++'use strict';
++
++var assert = require('assert-plus');
++var ipaddr = require('ip6addr');
++
++function allocProvisionRange(subnet) {
++    if (typeof (subnet) === 'string') {
++        subnet = ipaddr.createCIDR(subnet);
++    } else {
++        assert.object(subnet);
++    }
++    var first = subnet.first();
++    var last = subnet.last();
++    return [first.toString(), last.toString()];
++}
++
++function ip(s) {
++    return (ipaddr.parse(s));
++}
++
++/* Subnets overlap if s1.maximum >= s2.minimum */
++var IP_10_0_0_0 = ip('10.0.0.0');
++var IP_172_16_0_0 = ip('172.16.0.0');
++var IP_192_168_0_0 = ip('192.168.0.0');
++
++var IP_10_255_255_255 = ip('10.255.255.255');
++var IP_172_31_255_255 = ip('172.31.255.255');
++
++var IP_9_255_255_255 = ip('9.255.255.255');
++var IP_172_15_255_255 = ip('172.15.255.255');
++var IP_192_167_255_255 = ip('192.167.255.255');
++var IP_172_31_255_0 = ip('172.31.255.0');
++var IP_172_32_0_0 = ip('172.32.0.0');
++
++var IP_11_0_0_0 = ip('11.0.0.0');
++var IP_192_169_0_0 = ip('192.169.0.0');
++var IP_10_255_255_0 = ip('10.255.255.0');
++
++function previousAddr(addr) {
++    if (addr.compare(IP_10_0_0_0) === 0) {
++        throw new Error('address should always be decrementable');
++    } else if (addr.compare(IP_172_16_0_0) === 0) {
++        return IP_10_255_255_255;
++    } else if (addr.compare(IP_192_168_0_0) === 0) {
++        return IP_172_31_255_255;
++    } else {
++        return addr.offset(-1);
++    }
++}
++
++function subnetsAdjacent(sn1, sn2) {
++    assert.ok(sn1.compare(sn2) < 0);
++    var prev = previousAddr(sn2.address());
++    return sn1.contains(prev);
++}
++
++/*
++ * We percieve a gap between two subnets when they don't overlap and are not
++ * adjacent.
++ */
++function haveGapBetweenSubnets(s1, s2) {
++    return (!subnetsAdjacent(s1, s2));
++}
++
++
++/*
++ * We decrement a subnet's prefix by one, return NULL if we can't.
++ */
++function decSubImpl(sub, plen) {
++    var new_addr = sub.address().offset(-1);
++    if (new_addr.compare(IP_9_255_255_255) === 0) {
++        return null;
++    } else if (new_addr.compare(IP_172_15_255_255) === 0) {
++        new_addr = IP_10_255_255_0;
++    } else if (new_addr.compare(IP_192_167_255_255) === 0) {
++        new_addr = IP_172_31_255_0;
++    }
++
++    return ipaddr.createCIDR(new_addr, plen);
++}
++
++/*
++ * We increment a subnet's prefix by one, return NULL if we can't.
++ */
++function incSubImpl(sub, plen) {
++    var new_addr = sub.last().offset(2);
++    if (new_addr.compare(IP_11_0_0_0) === 0) {
++        new_addr = IP_172_16_0_0;
++    } else if (new_addr.compare(IP_172_32_0_0) === 0) {
++        new_addr = IP_192_168_0_0;
++    } else if (new_addr.compare(IP_192_169_0_0) === 0) {
++        return null;
++    }
++
++    return ipaddr.createCIDR(new_addr, plen);
++}
++
++/*
++ * Increment a subnet's prefix, but restrict the prefix length of the resulting
++ * subnet to 'nlen'-bits.
++ *
++ *  10.88.0.0/16 ===> 10.89.0.0/'nlen'
++ */
++function incrementSubnet(cidr, nlen) {
++    assert.number(nlen, 'nlen');
++    var plen = cidr.prefixLength();
++    var adjustedCIDR = ipaddr.createCIDR(cidr.address(), Math.min(plen, nlen));
++    return incSubImpl(adjustedCIDR, nlen);
++}
++
++/*
++ * Decrements a subnet's prefix, but restrict the prefix length of the resulting
++ * subnet to 'nlen'-bits.
++ *
++ *  10.89.0.0/16 ===> 10.88.0.0/'nlen'
++ */
++function decrementSubnet(cidr, nlen) {
++    assert.number(nlen, 'nlen');
++    var plen = cidr.prefixLength();
++    var adjustedCIDR = ipaddr.createCIDR(cidr.address(), Math.min(plen, nlen));
++    return decSubImpl(adjustedCIDR, nlen);
++}
++
++module.exports = {
++    allocProvisionRange: allocProvisionRange,
++    decrementSubnet: decrementSubnet,
++    incrementSubnet: incrementSubnet,
++    haveGapBetweenSubnets: haveGapBetweenSubnets,
++    subnetsAdjacent: subnetsAdjacent
++};
+diff --git a/lib/util/constants.js b/lib/util/constants.js
+index 74aef90..bb47eaa 100644
+--- a/lib/util/constants.js
++++ b/lib/util/constants.js
+@@ -178,6 +178,7 @@ module.exports = {
+         'provision_start_ip must be before provision_end_ip',
+     SERVER_UNDERLAY_MSG: 'Only server NICs can be underlay NICs',
+     SUBNET_FULL_MSG: 'no more free IPs',
++    SUBNETS_EXHAUSTED_MSG: 'out of subnets',
+     SUBNET_GATEWAY_MISMATCH: 'gateway should match subnet type (%s)',
+     SUBNET_RESOLVER_MISMATCH: 'resolvers should match subnet type (%s)',
+     SUBNET_ROUTE_DST_MISMATCH:
+diff --git a/lib/util/errors.js b/lib/util/errors.js
+index 0fa6fd0..56ba267 100644
+--- a/lib/util/errors.js
++++ b/lib/util/errors.js
+@@ -135,6 +135,23 @@ function SubnetFullError(network_uuid) {
+ 
+ util.inherits(SubnetFullError, restify.RestError);
+ 
++function SubnetsExhaustedError() {
++
++    restify.RestError.call(this, {
++        restCode: 'SubnetsExhausted',
++        statusCode: 507,
++        message: constants.SUBNETS_EXHAUSTED_MSG,
++        body: {
++            code: 'SubnetsExhausted',
++            message: constants.SUBNETS_EXHAUSTED_MSG
++        }
++    });
++
++    this.name = 'SubnetsExhaustedError';
++    this.stop = true;
++}
++
++util.inherits(SubnetsExhaustedError, restify.RestError);
+ 
+ /**
+  * Base error class for when all networks in a pool are full.
+@@ -306,6 +323,18 @@ function usedByParam(field, type, id, message) {
+     return paramErr;
+ }
+ 
++function sortErrsByField(errs) {
++    assert.arrayOfObject(errs, 'errs');
++    errs.sort(function (a, b) {
++        if (a.field < b.field) {
++            return -1;
++        }
++        if (a.field > b.field) {
++            return 1;
++        }
++        return 0;
++    });
++}
+ 
+ 
+ module.exports = {
+@@ -321,7 +350,9 @@ module.exports = {
+     nictagMtuInvalidForNetworks: nictagMtuInvalidForNetworks,
+     PoolFullError: PoolFullError,
+     SubnetFullError: SubnetFullError,
++    SubnetsExhaustedError: SubnetsExhaustedError,
+     unknownParams: unknownParams,
+     usedBy: usedBy,
+-    usedByParam: usedByParam
++    usedByParam: usedByParam,
++    sortErrsByField: sortErrsByField
+ };
+diff --git a/lib/util/subnet-streams.js b/lib/util/subnet-streams.js
+new file mode 100644
+index 0000000..2c44e9a
+--- /dev/null
++++ b/lib/util/subnet-streams.js
+@@ -0,0 +1,173 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017, Joyent, Inc.
++ */
++
++'use strict';
++
++var assert = require('assert-plus');
++var ipaddr = require('ip6addr');
++var autoalloc = require('./autoalloc');
++var mod_stream = require('stream');
++var util = require('util');
++
++function SubnetPairStream() {
++    this.sp_npushed = 0;
++    this.sp_prev = null;
++
++    mod_stream.Transform.call(this, { objectMode: true });
++}
++
++util.inherits(SubnetPairStream, mod_stream.Transform);
++
++SubnetPairStream.prototype.pushToStream = function (elem) {
++    var self = this;
++    self.push(elem);
++    self.sp_npushed++;
++};
++
++/*
++ * We receive a stream of subnets as input and produce a stream of subnet-pairs
++ * as output. The pairs constitute a sliding window of two subnets.
++ */
++SubnetPairStream.prototype._transform = function (net, _enc, done) {
++    var self = this;
++    var sub = net.subnet;
++    if (self.sp_prev !== null) {
++        self.pushToStream([self.sp_prev, sub]);
++    }
++    self.sp_prev = sub;
++    done();
++};
++
++
++SubnetPairStream.prototype._flush = function (done) {
++    var self = this;
++    if (self.sp_npushed === 0 && self.sp_prev !== null) {
++        self.pushToStream([self.sp_prev]);
++    }
++    done();
++};
++
++/*
++ * A stream of available subnets. It finds gaps in between existing subnets,
++ * and for each gap, fetches only up to the first 16 available subnets (i.e.
++ * less than 16, if the gap is really small). If we find no gaps (or eventually
++ * run out), it will get available subnets that are 1) less than the first seen
++ * subnet, and 2) greater than the last seen subnet, in that order.
++ */
++function AvailableSubnetStream(opts) {
++    this.us_opts = opts;
++    this.us_npushed = 0;
++    this.us_firstSeen = null;
++    this.us_lastSeen = null;
++    this.us_prevPair = null;
++
++    mod_stream.Transform.call(this, { objectMode: true });
++}
++
++util.inherits(AvailableSubnetStream, mod_stream.Transform);
++
++AvailableSubnetStream.prototype.pushToStream = function (elem) {
++    var self = this;
++    self.push(elem);
++    self.us_npushed++;
++};
++
++/*
++ * We receive a stream of subnet-pairs as input, and produce a stream of
++ * available subnets as output. The available subnets all fit the user's
++ * specifications (prefix length).
++ */
++AvailableSubnetStream.prototype._transform = function (pair, _enc, done) {
++    assert.ok(pair.length <= 2);
++    assert.ok(pair.length > 0);
++    var self = this;
++    var startSub = pair[0];
++    var endSub = pair.length > 1 ? pair[1] : pair[0];
++    var newSubLimit = 16;
++    var plen = self.us_opts.params.subnet_prefix;
++    var i = 0;
++    var currentSub = startSub;
++    self.us_prevPair = pair;
++
++    if (self.us_firstSeen === null) {
++        self.us_firstSeen = pair[0];
++    }
++    self.us_lastSeen = pair[(pair.length - 1)];
++
++    if (pair.length === 1 ||
++        autoalloc.haveGapBetweenSubnets(pair[0], pair[1])) {
++        while (i < newSubLimit) {
++            currentSub = autoalloc.incrementSubnet(currentSub, plen);
++            if (currentSub === null ||
++                currentSub.compare(endSub) === 0) {
++                break;
++            }
++            self.pushToStream(currentSub);
++            i++;
++        }
++    }
++    done();
++};
++
++
++AvailableSubnetStream.prototype._flush = function (done) {
++    var self = this;
++    var plen = self.us_opts.params.subnet_prefix;
++    var startSub = self.us_firstSeen;
++    var currentSub = null;
++    var endSub = self.us_lastSeen;
++    var newSubLimit = 16;
++    var i = 0;
++    /* There were no used subnets */
++    if (self.us_prevPair === null) {
++        while (i < newSubLimit) {
++            if (currentSub === null) {
++                currentSub = ipaddr.createCIDR('10.0.0.0', plen);
++            } else {
++                currentSub = autoalloc.incrementSubnet(currentSub, plen);
++            }
++            if (currentSub === null) {
++                break;
++            }
++            self.pushToStream(currentSub);
++            i++;
++        }
++        done();
++        return;
++    }
++
++    /*
++     * There were used subnets, but we have pushed less than 16 subnets to the
++     * stream.
++     */
++    currentSub = autoalloc.decrementSubnet(startSub, plen);
++    while (currentSub && self.us_npushed < newSubLimit) {
++        self.pushToStream(currentSub);
++        currentSub = autoalloc.decrementSubnet(currentSub, plen);
++    }
++
++    if (self.us_npushed >= newSubLimit) {
++        done();
++        return;
++    }
++
++    currentSub = autoalloc.incrementSubnet(endSub, plen);
++    while (currentSub && self.us_npushed < newSubLimit) {
++        self.pushToStream(currentSub);
++        currentSub = autoalloc.incrementSubnet(currentSub, plen);
++    }
++
++    done();
++};
++
++module.exports = {
++    SubnetPairStream: SubnetPairStream,
++    AvailableSubnetStream: AvailableSubnetStream
++};
+diff --git a/lib/util/validate.js b/lib/util/validate.js
+index 24f8731..56de3e7 100644
+--- a/lib/util/validate.js
++++ b/lib/util/validate.js
+@@ -55,6 +55,23 @@ function validateBoolean(_, name, val, callback) {
+     callback(errors.invalidParam(name, 'must be a boolean value'));
+ }
+ 
++/**
++ * Currently validates that prefix is 24.
++ */
++function validateSubnetPrefix(_, name, val, callback) {
++    if (typeof (val) !== 'number') {
++        callback(errors.invalidParam(name,
++            'Subnet prefix should be number'));
++        return;
++    }
++
++    if (val !== 24) {
++        callback(errors.invalidParam(name, 'Only /24 is supported'));
++        return;
++    }
++
++    callback(null, val);
++}
+ 
+ /**
+  * Validates that a value is one of the values present in an array that
+@@ -345,6 +362,7 @@ function validateVxlanID(_, name, vlan_id, callback) {
+ 
+ module.exports = {
+     bool: validateBoolean,
++    subnetPrefix: validateSubnetPrefix,
+     enum: validateEnum,
+     fieldsArray: warden.fieldsArray,
+     IP: validateIP,
+diff --git a/sapi_manifests/napi/template b/sapi_manifests/napi/template
+index e7e48bf..fbdc7fc 100644
+--- a/sapi_manifests/napi/template
++++ b/sapi_manifests/napi/template
+@@ -2,6 +2,7 @@
+   "port": 80,
+   "datacenter": "{{{datacenter_name}}}",
+   "logLevel": "{{{NAPI_LOG_LEVEL}}}",
++  "autoAllocSubnets": false,
+   "useNetAgent": true,
+   "macOUI": "{{{napi_mac_prefix}}}",
+ {{#experimental_fluentd_host}}
+diff --git a/test/config.json b/test/config.json
+index 5c3bc7f..ab5a495 100644
+--- a/test/config.json
++++ b/test/config.json
+@@ -2,6 +2,7 @@
+   "//": "minimal NAPI config needed for unit tests",
+ 
+   "datacenter": "unit-test",
++  "autoAllocSubnets": false,
+   "macOUI": "010203",
+   "overlay": {
+       "enabled": true,
+diff --git a/test/integration/fabrics.test.js b/test/integration/fabrics.test.js
+index cc2f31f..014c924 100644
+--- a/test/integration/fabrics.test.js
++++ b/test/integration/fabrics.test.js
+@@ -37,10 +37,14 @@ var extend = mod_jsprim.mergeObjects;
+ // --- Globals
+ 
+ 
++var client = h.createNAPIclient();
+ 
++var subnet_alloc_enabled;
+ var ADMIN_OWNER = config.server.ufdsAdminUuid;
+ var CREATED = {};
+ var OWNERS = [
++    mod_uuid.v4(),
++    mod_uuid.v4(),
+     mod_uuid.v4(),
+     mod_uuid.v4(),
+     mod_uuid.v4()
+@@ -74,8 +78,21 @@ var VLANS = [
+         name: mod_vlan.randomName(),
+         owner_uuid: OWNERS[2],
+         vlan_id: 44
++    },
++
++    {
++        name: mod_vlan.randomName(),
++        owner_uuid: OWNERS[3],
++        vlan_id: 45
++    },
++
++    {
++        name: mod_vlan.randomName(),
++        owner_uuid: OWNERS[4],
++        vlan_id: 46
+     }
+ ];
++
+ // Real (non-fabric networks):
+ var REAL_NETS = [
+     h.validNetworkParams({ nic_tag: UNDERLAY_NIC_TAG }),
+@@ -159,9 +176,33 @@ var NETS = [
+         owner_uuid: VLANS[3].owner_uuid,
+         provision_start_ip: '172.16.1.1',
+         provision_end_ip: '172.16.3.254'
++    },
++
++    // 5: Used for testing subnet alloc
++    {
++        vlan_id: VLANS[4].vlan_id,
++        subnet_alloc: true,
++        subnet_prefix: 24,
++        family: 'ipv4',
++        // Also double-check that the MTU is correct:
++        mtu: OVERLAY_MTU,
++        name: mod_fabric_net.generateName(),
++        owner_uuid: VLANS[4].owner_uuid
++    },
++    // 6: Used for testing subnet alloc
++    {
++        vlan_id: VLANS[5].vlan_id,
++        subnet_alloc: true,
++        subnet_prefix: 24,
++        family: 'ipv4',
++        // Also double-check that the MTU is correct:
++        mtu: OVERLAY_MTU,
++        name: mod_fabric_net.generateName(),
++        owner_uuid: VLANS[5].owner_uuid
+     }
+ 
+ ];
++
+ var VMS = [
+     mod_uuid.v4(),
+     mod_uuid.v4(),
+@@ -225,6 +266,13 @@ function checkEventLog(t, opts) {
+ 
+ test('setup', function (t) {
+     t.test('create default nic tag', mod_nic_tag.createDefault);
++    t.test('is-alloc-enabled', function (t2) {
++        client.ping(function (err, res) {
++            t2.ok(err === null);
++            subnet_alloc_enabled = res.config.subnet_alloc_enabled;
++            t2.end();
++        });
++    });
+ });
+ 
+ 
+@@ -321,6 +369,39 @@ test('create VLANs', function (t) {
+         });
+     });
+ 
++    if (subnet_alloc_enabled) {
++        t.test('create vlan: 4', function (t2) {
++            mod_vlan.createAndGet(t2, {
++                params: extend(VLANS[4], {
++                    // Specify at least owner_uuid and vlan_id - these are
++                    // required by mod_vlan.delAllCreated() in the test
++                    // teardown.
++                    fields: [ 'name', 'owner_uuid', 'vlan_id' ]
++                }),
++                exp: {
++                    name: VLANS[4].name,
++                    owner_uuid: VLANS[4].owner_uuid,
++                    vlan_id: VLANS[4].vlan_id
++                }
++            });
++        });
++
++        t.test('create vlan: 5', function (t2) {
++            mod_vlan.createAndGet(t2, {
++                params: extend(VLANS[5], {
++                    // Specify at least owner_uuid and vlan_id - these are
++                    // required by mod_vlan.delAllCreated() in the test
++                    // teardown.
++                    fields: [ 'name', 'owner_uuid', 'vlan_id' ]
++                }),
++                exp: {
++                    name: VLANS[5].name,
++                    owner_uuid: VLANS[5].owner_uuid,
++                    vlan_id: VLANS[5].vlan_id
++                }
++            });
++        });
++    }
+ });
+ 
+ 
+@@ -547,6 +628,49 @@ test('create network', function (t) {
+         });
+     });
+ 
++    if (subnet_alloc_enabled) {
++        t.test('create network: 5', function (t2) {
++            mod_fabric_net.createAndGet(t2, {
++                params: extend(NETS[5], {
++                    // mod_fabric_net.delAllCreated() needs uuid, owner_uuid and
++                    // vlan_id in order to delete the network:
++                    fields: [ 'name', 'owner_uuid', 'subnet', 'uuid',
++                        'vlan_id' ]
++                }),
++                partialExp: {
++                    name: NETS[5].name,
++                    owner_uuid: NETS[5].owner_uuid,
++                    // uuid gets filled in by createAndGet()
++                    vlan_id: NETS[5].vlan_id
++                }
++            }, function (_err, res) {
++                t.ok(typeof (res.subnet) !== 'undefined', 'Subnet present');
++                t2.end();
++            });
++        });
++
++        t.test('create network: 6', function (t2) {
++            mod_fabric_net.createAndGet(t2, {
++                params: extend(NETS[6], {
++                    // mod_fabric_net.delAllCreated() needs uuid, owner_uuid and
++                    // vlan_id in order to delete the network:
++                    fields: [ 'name', 'owner_uuid', 'subnet', 'uuid',
++                        'vlan_id' ]
++                }),
++                partialExp: {
++                    name: NETS[6].name,
++                    owner_uuid: NETS[6].owner_uuid,
++                    // uuid gets filled in by createAndGet()
++                    vlan_id: NETS[6].vlan_id
++                }
++            }, function (_err, res) {
++                t.ok(typeof (res.subnet) !== 'undefined', 'Subnet present');
++                t2.end();
++                t.end();
++            });
++        });
++    }
++
+ });
+ 
+ 
+diff --git a/test/unit/available-subnet-stream.test.js b/test/unit/available-subnet-stream.test.js
+new file mode 100644
+index 0000000..42ce84d
+--- /dev/null
++++ b/test/unit/available-subnet-stream.test.js
+@@ -0,0 +1,197 @@
++
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2018, Joyent, Inc.
++ */
++
++/*
++ * Unit tests for unknown subnet stream.
++ */
++
++'use strict';
++
++var mod_subnet_streams = require('../../lib/util/subnet-streams');
++var test = require('tape');
++
++var SubnetPairStream = mod_subnet_streams.SubnetPairStream;
++var AvailableSubnetStream = mod_subnet_streams.AvailableSubnetStream;
++var ipaddr = require('ip6addr');
++
++function c(s) {
++    return (ipaddr.createCIDR(s));
++}
++
++function driver(t, input_pairs, outputs) {
++    t.test('Verify Inputs and Ouputs', function (t2) {
++        var pairStream = new SubnetPairStream();
++        var streamOpts = {params: {subnet_prefix: 24}};
++        var availableSubnetsStream = new AvailableSubnetStream(streamOpts);
++        var pipeline = pairStream.pipe(availableSubnetsStream);
++        var output_num = 0;
++        var areDone = false;
++        function done() {
++            if (areDone === true) {
++                return;
++            }
++            areDone = true;
++            pipeline.removeListener('readable', onReadable);
++            pipeline.removeListener('error', onError);
++            pipeline.removeListener('end', onEnd);
++            t2.end();
++        }
++        function onError(err2) {
++            t2.ok(false);
++            done(err2);
++        }
++        function onReadable() {
++            for (;;) {
++                var out = pipeline.read(1);
++                if (out === null || output_num === outputs.length) {
++                    t2.ok(output_num === outputs.length);
++                    return;
++                }
++                t2.deepEqual(outputs[output_num], out);
++                output_num++;
++            }
++        }
++        function onEnd() {
++            done();
++        }
++        input_pairs.forEach(function (pair) {
++            pipeline.write(pair);
++        });
++        pipeline.end();
++        pipeline.on('readable', onReadable);
++        pipeline.on('end', onEnd);
++        pipeline.on('error', onError);
++    });
++}
++
++
++// NOTE:
++// We want to create a stream, where we push manually constructed pairs on 1
++// side, and verify that the other side emits the subnets that in the gaps.
++// Pretty simple, requires:
++//    - test for stream input with gaps
++//    - test for gapless (non-empty) input stream
++//    - test for empty input stream
++
++test('Gapful Test', function (t) {
++    var input_pairs = [
++        [c('10.0.0.0/24'), c('10.0.1.0/24')],
++        [c('10.0.1.0/24'), c('10.2.0.0/24')],
++        [c('10.2.0.0/24'), c('10.2.99.0/24')],
++        [c('10.2.99.0/24'), c('10.2.100.0/24')],
++        [c('10.2.100.0/24'), c('10.2.200.0/24')]
++    ];
++    var outputs = [
++        c('10.0.2.0/24'),
++        c('10.0.3.0/24'),
++        c('10.0.4.0/24'),
++        c('10.0.5.0/24'),
++        c('10.0.6.0/24'),
++        c('10.0.7.0/24'),
++        c('10.0.8.0/24'),
++        c('10.0.9.0/24'),
++        c('10.0.10.0/24'),
++        c('10.0.11.0/24'),
++        c('10.0.12.0/24'),
++        c('10.0.13.0/24'),
++        c('10.0.14.0/24'),
++        c('10.0.15.0/24'),
++        c('10.0.16.0/24'),
++        c('10.0.17.0/24'),
++        c('10.2.1.0/24'),
++        c('10.2.2.0/24'),
++        c('10.2.3.0/24'),
++        c('10.2.4.0/24'),
++        c('10.2.5.0/24'),
++        c('10.2.6.0/24'),
++        c('10.2.7.0/24'),
++        c('10.2.8.0/24'),
++        c('10.2.9.0/24'),
++        c('10.2.10.0/24'),
++        c('10.2.11.0/24'),
++        c('10.2.12.0/24'),
++        c('10.2.13.0/24'),
++        c('10.2.14.0/24'),
++        c('10.2.15.0/24'),
++        c('10.2.16.0/24'),
++        c('10.2.101.0/24'),
++        c('10.2.102.0/24'),
++        c('10.2.103.0/24'),
++        c('10.2.104.0/24'),
++        c('10.2.105.0/24'),
++        c('10.2.106.0/24'),
++        c('10.2.107.0/24'),
++        c('10.2.108.0/24'),
++        c('10.2.109.0/24'),
++        c('10.2.110.0/24'),
++        c('10.2.111.0/24'),
++        c('10.2.112.0/24'),
++        c('10.2.113.0/24'),
++        c('10.2.114.0/24'),
++        c('10.2.115.0/24'),
++        c('10.2.116.0/24')
++    ];
++    driver(t, input_pairs, outputs);
++    t.end();
++});
++
++test('Gapless Test', function (t) {
++    var input_pairs = [
++        [c('10.0.1.0/24'), c('10.0.2.0/24')],
++        [c('10.0.2.0/24'), c('10.0.3.0/24')],
++        [c('10.0.3.0/24'), c('10.0.4.0/24')],
++        [c('10.0.4.0/24'), c('10.0.5.0/24')]
++    ];
++    var outputs = [
++        c('10.0.0.0/24'),
++        c('10.0.6.0/24'),
++        c('10.0.7.0/24'),
++        c('10.0.8.0/24'),
++        c('10.0.9.0/24'),
++        c('10.0.10.0/24'),
++        c('10.0.11.0/24'),
++        c('10.0.12.0/24'),
++        c('10.0.13.0/24'),
++        c('10.0.14.0/24'),
++        c('10.0.15.0/24'),
++        c('10.0.16.0/24'),
++        c('10.0.17.0/24'),
++        c('10.0.18.0/24'),
++        c('10.0.19.0/24'),
++        c('10.0.20.0/24')
++    ];
++    driver(t, input_pairs, outputs);
++    t.end();
++});
++
++test('Empty Test', function (t) {
++    var input_pairs = [];
++    var outputs = [
++        c('10.0.0.0/24'),
++        c('10.0.1.0/24'),
++        c('10.0.2.0/24'),
++        c('10.0.3.0/24'),
++        c('10.0.4.0/24'),
++        c('10.0.5.0/24'),
++        c('10.0.6.0/24'),
++        c('10.0.7.0/24'),
++        c('10.0.8.0/24'),
++        c('10.0.9.0/24'),
++        c('10.0.10.0/24'),
++        c('10.0.11.0/24'),
++        c('10.0.12.0/24'),
++        c('10.0.13.0/24'),
++        c('10.0.14.0/24'),
++        c('10.0.15.0/24')
++    ];
++    driver(t, input_pairs, outputs);
++    t.end();
++});
+diff --git a/test/unit/networks-subnet-alloc.test.js b/test/unit/networks-subnet-alloc.test.js
+new file mode 100644
+index 0000000..a57d673
+--- /dev/null
++++ b/test/unit/networks-subnet-alloc.test.js
+@@ -0,0 +1,381 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017, Joyent, Inc.
++ */
++
++/*
++ * Unit tests for subnet allocation.
++ */
++
++'use strict';
++
++var h = require('./helpers');
++var mod_err = require('../../lib/util/errors');
++var mod_fabric_net = require('../lib/fabric-net');
++var mod_server = require('../lib/server');
++var mod_uuid = require('node-uuid');
++var mod_vlan = require('../lib/vlan');
++var test = require('tape');
++
++
++// --- Globals
++
++var TAG;
++var VLAN = {
++    name: mod_vlan.randomName(),
++    owner_uuid: mod_uuid.v4(),
++    vlan_id: 20
++};
++var VLAN_extra = {
++    name: mod_vlan.randomName(),
++    owner_uuid: mod_uuid.v4(),
++    vlan_id: 21
++};
++var NAPI;
++
++
++// --- Setup
++
++test('Initial setup', function (t) {
++    h.reset();
++
++    t.test('Start server', function (t2) {
++        h.createClientAndServer(function (err, res) {
++            t2.ifError(err, 'server creation');
++            t2.ok(res, 'client');
++            NAPI = res;
++            if (!NAPI) {
++                t2.end();
++                return;
++            }
++
++            NAPI.createNicTag('sdc_overlay', function (err2, res2) {
++                TAG = res2;
++                t2.ifError(err2, 'nic tag');
++                t2.ok(TAG, 'created NIC tag');
++                t2.end();
++            });
++        });
++    });
++
++    t.test('Create VLAN', function (t2) {
++        mod_vlan.createAndGet(t2, {
++            params: VLAN,
++            exp: VLAN
++        }, function (err, res) {
++            t2.ifError(err, 'vlan get');
++            t2.ok(res, 'vlan');
++            t2.end();
++        });
++    });
++
++    t.test('Create VLAN extra', function (t2) {
++        mod_vlan.createAndGet(t2, {
++            params: VLAN_extra,
++            exp: VLAN_extra
++        }, function (err, res) {
++            t2.ifError(err, 'vlan get');
++            t2.ok(res, 'vlan');
++            t2.end();
++        });
++    });
++
++
++});
++
++var subnet_alloc_enabled;
++test('alloc-enabled?', function (t) {
++    NAPI.ping(function (err, res) {
++        t.ok(err === null);
++        subnet_alloc_enabled = res.config.subnet_alloc_enabled;
++        t.end();
++    });
++});
++
++// Tests
++
++// We want to test the auto-allocation code, especially edge-cases in the
++// allocator --- i.e. out-of-subnets, no gap between 2 subnets, and so forth.
++// Since we control all the data that goes into postgres from these unit tests,
++// we can also verify that the expected subnet was allocated.
++
++
++// We also want to test the behaviour related to different prefix-lengths.
++
++// Want to test these code-paths:
++// auto-alloc when we have 0 subnets, should be 10.0.0.0/24
++// auto-alloc when we have >1 subnet, but no gaps
++//      So, auto-alloc again, and we have: 10.1.0.0/24 (no gap)
++//      Another auto-alloc should give us 10.2.0.0/24
++// auto-alloc when we have >1 subnets and 1 gap
++//      So, man-alloc 10.4.0.0/24
++//      Another auto-alloc should give us 10.3.0.0/24
++// Keep allocating subnets until we run out.
++// Unit test the increment and decrement functionality (isolated from PG)
++//      Ok we want to test each of the jumps between 10, 172, 192
++
++test('Create networks', function (t) {
++    if (!subnet_alloc_enabled) {
++        t.end();
++        return;
++    }
++    t.test('Create w/ auto1', function (t2) {
++        mod_fabric_net.create(t2, {
++            fillInMissing: true,
++            params: {
++                subnet_alloc: true,
++                owner_uuid: VLAN.owner_uuid,
++                family: 'ipv4',
++                subnet_prefix: 24,
++                name: mod_fabric_net.generateName(),
++                vlan_id: VLAN.vlan_id
++            },
++            partialExp: {
++                vlan_id: VLAN.vlan_id,
++                family: 'ipv4',
++                subnet: '10.0.0.0/24'
++            }
++        }, function (_, res) {
++            t2.end();
++        });
++    });
++    t.test('Create w/ auto2', function (t2) {
++        mod_fabric_net.create(t2, {
++            fillInMissing: true,
++            params: {
++                subnet_alloc: true,
++                family: 'ipv4',
++                owner_uuid: VLAN.owner_uuid,
++                subnet_prefix: 24,
++                name: mod_fabric_net.generateName(),
++                vlan_id: VLAN.vlan_id
++            },
++            partialExp: {
++                vlan_id: VLAN.vlan_id,
++                family: 'ipv4',
++                subnet: '10.0.1.0/24'
++            }
++        }, function (_, res) {
++            t2.end();
++        });
++    });
++    t.test('Create w/ manual', function (t2) {
++        mod_fabric_net.create(t2, {
++            fillInMissing: true,
++            params: {
++                subnet: '10.0.3.0/24',
++                provision_start_ip: '10.0.3.1',
++                provision_end_ip: '10.0.3.254',
++                name: mod_fabric_net.generateName(),
++                owner_uuid: VLAN.owner_uuid,
++                vlan_id: VLAN.vlan_id
++            },
++            partialExp: {
++                vlan_id: VLAN.vlan_id,
++                family: 'ipv4',
++                subnet: '10.0.3.0/24'
++            }
++        }, function (_, res) {
++            t2.end();
++        });
++    });
++    t.test('Create w/ manual missing/mixed params', function (t2) {
++        var errs = [];
++        errs.push(new mod_err.missingParam('provision_start_ip'));
++        errs.push(new mod_err.invalidParam('subnet_prefix',
++            'Auto allocation parameter not allowed'));
++        mod_err.sortErrsByField(errs);
++        var errBody = {
++            code: 'InvalidParameters',
++            errors: errs,
++            message: 'Invalid parameters'
++        };
++        mod_fabric_net.create(t2, {
++            fillInMissing: false,
++            params: {
++                subnet: '10.0.3.0/24',
++                subnet_prefix: 24,
++                provision_end_ip: '10.0.3.254',
++                name: mod_fabric_net.generateName(),
++                owner_uuid: VLAN.owner_uuid,
++                vlan_id: VLAN.vlan_id
++            },
++            expCode: 422,
++            expErr: errBody
++        }, function (_, res) {
++            t2.end();
++        });
++    });
++    t.test('Create w/ auto3', function (t2) {
++        mod_fabric_net.create(t2, {
++            fillInMissing: true,
++            params: {
++                subnet_alloc: true,
++                family: 'ipv4',
++                owner_uuid: VLAN.owner_uuid,
++                subnet_prefix: 24,
++                name: mod_fabric_net.generateName(),
++                vlan_id: VLAN.vlan_id
++            },
++            partialExp: {
++                vlan_id: VLAN.vlan_id,
++                family: 'ipv4',
++                subnet: '10.0.2.0/24'
++            }
++        }, function (_, res) {
++            t2.end();
++        });
++    });
++
++    t.test('Create w/ auto4 missing/mixed params', function (t2) {
++        var errs = [];
++        errs.push(new mod_err.missingParam('family'));
++        errs.push(new mod_err.missingParam('subnet_prefix'));
++        errs.push(new mod_err.invalidParam('subnet',
++            'Manual allocation parameter not allowed'));
++        mod_err.sortErrsByField(errs);
++        var errBody = {
++            code: 'InvalidParameters',
++            errors: errs,
++            message: 'Invalid parameters'
++        };
++        mod_fabric_net.create(t2, {
++            fillInMissing: true,
++            params: {
++                subnet_alloc: true,
++                subnet: '10.0.0.0/8',
++                owner_uuid: VLAN.owner_uuid,
++                name: mod_fabric_net.generateName(),
++                vlan_id: VLAN.vlan_id
++            },
++            expCode: 422,
++            expErr: errBody
++        });
++    });
++
++
++    t.test('Delete Networks', function (t2) {
++        mod_fabric_net.delAllCreated(t2);
++    });
++
++
++    // We create 3 subnets, that consume all available addresses:
++    // 10.0.0.0/8, 172.16.0.0/16, 192.168.0.0/24
++    // When we try to auto-alloc we should get an exhausted-subnets error
++    t.test('Exhaustion and Owner Test', function (t2) {
++        t2.test('Create sub 1/3', function (t3) {
++            mod_fabric_net.create(t3, {
++                fillInMissing: true,
++                params: {
++                    subnet: '10.0.0.0/8',
++                    provision_start_ip: '10.0.0.1',
++                    provision_end_ip: '10.255.255.254',
++                    owner_uuid: VLAN.owner_uuid,
++                    name: mod_fabric_net.generateName(),
++                    vlan_id: VLAN.vlan_id
++                },
++                partialExp: {
++                    vlan_id: VLAN.vlan_id,
++                    family: 'ipv4'
++                }
++            }, function (_, res) {
++                t3.end();
++            });
++        });
++        t2.test('Create sub 2/3', function (t3) {
++            mod_fabric_net.create(t3, {
++                fillInMissing: true,
++                params: {
++                    subnet: '172.16.0.0/12',
++                    provision_start_ip: '172.16.0.1',
++                    provision_end_ip: '172.31.255.254',
++                    owner_uuid: VLAN.owner_uuid,
++                    name: mod_fabric_net.generateName(),
++                    vlan_id: VLAN.vlan_id
++                },
++                partialExp: {
++                    vlan_id: VLAN.vlan_id,
++                    family: 'ipv4'
++                }
++            }, function (_, res) {
++                t3.end();
++            });
++        });
++        t2.test('Create sub 3/3', function (t3) {
++            mod_fabric_net.create(t3, {
++                fillInMissing: true,
++                params: {
++                    subnet: '192.168.0.0/16',
++                    provision_start_ip: '192.168.0.1',
++                    provision_end_ip: '192.168.255.254',
++                    owner_uuid: VLAN.owner_uuid,
++                    name: mod_fabric_net.generateName(),
++                    vlan_id: VLAN.vlan_id
++                },
++                partialExp: {
++                    vlan_id: VLAN.vlan_id,
++                    family: 'ipv4'
++                }
++            }, function (_, res) {
++                t3.end();
++            });
++        });
++        var err = new mod_err.SubnetsExhaustedError();
++        var errBody = err.body;
++        t2.test('Attempt Auto Alloc', function (t3) {
++            mod_fabric_net.create(t3, {
++                fillInMissing: true,
++                params: {
++                    subnet_alloc: true,
++                    family: 'ipv4',
++                    owner_uuid: VLAN.owner_uuid,
++                    subnet_prefix: 24,
++                    name: mod_fabric_net.generateName(),
++                    vlan_id: VLAN.vlan_id
++                },
++                expCode: 507,
++                expErr: errBody
++            }, function () {
++                t3.end();
++            });
++        });
++        t2.test('Auto Alloc Diff Owner', function (t3) {
++            mod_fabric_net.create(t3, {
++                fillInMissing: true,
++                params: {
++                    subnet_alloc: true,
++                    family: 'ipv4',
++                    owner_uuid: VLAN_extra.owner_uuid,
++                    subnet_prefix: 24,
++                    name: mod_fabric_net.generateName(),
++                    vlan_id: VLAN_extra.vlan_id
++                },
++                partialExp: {
++                    vlan_id: VLAN_extra.vlan_id,
++                    family: 'ipv4'
++                }
++            }, function (_, res) {
++                t3.equal(res.subnet, '10.0.0.0/24');
++                t3.end();
++            });
++        });
++    });
++
++});
++
++// --- Teardown
++
++test('delete networks', function (t) {
++    if (!subnet_alloc_enabled) {
++        t.end();
++        return;
++    }
++    t.test('inner delete networks', mod_fabric_net.delAllCreated);
++});
++
++test('Stop server', mod_server.close);
+diff --git a/test/unit/networks.test.js b/test/unit/networks.test.js
+index b21b6fd..6bdef92 100644
+--- a/test/unit/networks.test.js
++++ b/test/unit/networks.test.js
+@@ -153,8 +153,7 @@ test('Create network - missing parameters', function (t) {
+ 
+         t.equal(err.statusCode, 422, 'status code');
+         t.deepEqual(err.body, h.invalidParamErr({
+-            errors: ['name', 'nic_tag', 'provision_end_ip',
+-                'provision_start_ip', 'subnet', 'vlan_id'].map(function (name) {
++            errors: ['name', 'nic_tag', 'vlan_id'].map(function (name) {
+                     return {
+                         code: 'MissingParameter',
+                         field: name,
+@@ -178,8 +177,7 @@ test('Create network - missing and invalid parameters', function (t) {
+ 
+         t.equal(err.statusCode, 422, 'status code');
+         t.deepEqual(err.body, h.invalidParamErr({
+-            errors: ['name', 'nic_tag', 'provision_end_ip',
+-                'subnet', 'vlan_id'].map(function (name) {
++            errors: ['name', 'nic_tag', 'vlan_id'].map(function (name) {
+                     return {
+                         code: 'MissingParameter',
+                         field: name,
+@@ -356,6 +354,7 @@ test('Create network - invalid parameters', function (t) {
+                     util.format('status code for: %s: %s',
+                     data[0], typeof (data[1]) === 'object' ?
+                     JSON.stringify(data[1]) : data[1]));
++
+                 var invalidErr;
+ 
+                 if (data.length === 3) {
+diff --git a/test/unit/util-alloc.test.js b/test/unit/util-alloc.test.js
+new file mode 100644
+index 0000000..6d71c8f
+--- /dev/null
++++ b/test/unit/util-alloc.test.js
+@@ -0,0 +1,127 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright 2017, Joyent, Inc.
++ */
++
++'use strict';
++var test = require('tape');
++var mod_alloc = require('../../lib/util/autoalloc');
++var ipaddr = require('ip6addr');
++var assert = require('assert');
++
++function c(s) {
++    return (ipaddr.createCIDR(s));
++}
++
++
++// --- Unit test functions in lib/util/autoalloc.js
++
++test('Alloc Utility Functions', function (t) {
++    t.test('incrementSubnets', function (t2) {
++        var incrementSubnet = mod_alloc.incrementSubnet;
++        t2.deepEqual(null, incrementSubnet(c('192.168.255.0/24'),
++            24));
++        t2.deepEqual(c('10.0.1.0/24'), incrementSubnet(c('10.0.0.0/24'), 24));
++        t2.deepEqual(c('172.16.0.0/24'),
++            incrementSubnet(c('10.255.255.0/24'), 24));
++        t2.deepEqual(c('192.168.0.0/24'),
++            incrementSubnet(c('172.31.255.0/24'), 24));
++        t2.deepEqual(c('10.0.3.0/24'),
++            incrementSubnet(c('10.0.2.0/25'), 24));
++        t2.deepEqual(c('10.2.0.0/24'),
++            incrementSubnet(c('10.1.2.128/16'), 24));
++        t2.deepEqual(c('172.16.0.0/18'),
++            incrementSubnet(c('10.255.0.0/16'), 18));
++        t2.end();
++    });
++    t.test('decrementSubnets', function (t2) {
++        var decrementSubnet = mod_alloc.decrementSubnet;
++        t2.deepEqual(null, decrementSubnet(c('10.0.0.0/24'), 24));
++        t2.deepEqual(c('10.0.0.0/24'),
++            decrementSubnet(c('10.0.1.0/24'), 24));
++        t2.deepEqual(c('10.255.255.0/24'),
++            decrementSubnet(c('172.16.0.0/24'), 24));
++        t2.deepEqual(c('10.255.192.0/18'),
++            decrementSubnet(c('172.16.0.0/16'), 18));
++        t2.deepEqual(c('172.31.255.0/24'),
++            decrementSubnet(c('192.168.0.0/24'), 24));
++        t2.deepEqual(c('10.0.1.0/24'),
++            decrementSubnet(c('10.0.2.128/25'), 24));
++        t2.deepEqual(c('10.0.255.0/24'),
++            decrementSubnet(c('10.1.2.128/16'), 24));
++
++        t2.end();
++    });
++});
++
++test('Adjacency Tests', function (t) {
++
++    // Moving up through /24s:
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.0.0/24'), c('10.0.1.0/24')),
++        true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.1.0/24'), c('10.0.2.0/24')),
++        true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.2.0/24'), c('10.0.3.0/24')),
++        true);
++
++    // Non-adjacent /24s:
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.0.0/24'), c('10.0.2.0/24')),
++        false);
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.5.0/24'),
++        c('172.16.0.0/24')), false);
++    assert.equal(mod_alloc.subnetsAdjacent(c('172.16.0.0/24'),
++        c('172.16.2.0/24')), false);
++    assert.equal(mod_alloc.subnetsAdjacent(c('192.168.0.0/24'),
++        c('192.168.2.0/24')), false);
++
++    // Adjacent subnets of different prefix lengths:
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.1.128/25'),
++        c('10.0.2.0/26')), true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.1.0/24'), c('10.0.2.0/26')),
++        true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.1.0/24'), c('10.0.2.0/30')),
++        true);
++
++    // Non-adjacent subnets of different prefix lengths:
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.0.0/25'), c('10.0.1.0/24')),
++        false);
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.1.0/30'), c('10.0.2.0/24')),
++        false);
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.2.0/32'), c('10.0.3.0/24')),
++        false);
++
++    // Ignore non-RFC 1918 spaces for the purposes of adjacency:
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.0.0/8'), c('172.16.0.0/30')),
++        true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('172.31.0.0/16'),
++        c('192.168.0.0/26')), true);
++
++    // Non-adjacent spaces:
++    assert.equal(mod_alloc.subnetsAdjacent(c('10.0.0.0/24'),
++        c('172.16.0.0/30')), false);
++    assert.equal(mod_alloc.subnetsAdjacent(c('172.31.0.0/24'),
++        c('192.168.0.0/26')), false);
++
++    // IPv6 ULA adjacent:
++    assert.equal(mod_alloc.subnetsAdjacent(c('fd00::/16'), c('fd01::/16')),
++        true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('fd01::/16'), c('fd02::/16')),
++        true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('fd00:3::/32'), c('fd00:4::/32')),
++        true);
++    assert.equal(mod_alloc.subnetsAdjacent(c('fd00:3::/32'), c('fd00:4::/64')),
++        true);
++
++    // IPv6 ULA non-adjacent:
++    assert.equal(mod_alloc.subnetsAdjacent(c('fd00::/16'), c('fd02::/16')),
++        false);
++    assert.equal(mod_alloc.subnetsAdjacent(c('fd00::/16'), c('fd4e::/16')),
++        false);
++    t.end();
++
++});

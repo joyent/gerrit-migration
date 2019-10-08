@@ -1,0 +1,627 @@
+commit 0b730cead090a0ff078cb51cb23852675cf5f41e (refs/changes/82/2582/2)
+Author: Jordan Hendricks <jordan.hendricks@joyent.com>
+Date:   2017-09-15T18:20:46+00:00 (2 years, 1 month ago)
+    
+    MANTA-3427 Support changing multipart upload PREFIX_LENGTH in SAPI
+    Reviewed by:
+    Approved by:
+
+diff --git a/etc/config.coal.json b/etc/config.coal.json
+index 53a3e04..ea3521f 100644
+--- a/etc/config.coal.json
++++ b/etc/config.coal.json
+@@ -10,6 +10,9 @@
+     "maxObjectCopies": 6,
+     "maxRequestAge": 600,
+     "enableMPU": true,
++    "multipartUpload": {
++        "prefixDirLen": 1
++    },
+     "numWorkers": 4,
+     "port": 8080,
+     "auth": {
+diff --git a/lib/common.js b/lib/common.js
+index fc966fb..fcac826 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -888,6 +888,9 @@ module.exports = {
+         assert.object(options.storage, 'options.storage');
+         assert.number(options.storage.defaultMaxStreamingSizeMB,
+             'options.storage.defaultMaxStreamingSizeMB');
++        assert.object(options.multipartUpload, 'options.multipartUpload');
++        assert.number(options.multipartUpload.prefixDirLen,
++            'options.multipartUpload.prefixDirLen');
+ 
+         function setup(req, res, next) {
+             req.config = options;
+@@ -917,7 +920,8 @@ module.exports = {
+             req.medusa = options.medusa();
+             req.msk_defaults = {
+                 maxStreamingSize: options.storage.defaultMaxStreamingSizeMB *
+-                    1024 * 1024
++                    1024 * 1024,
++                mpuPrefixDirLen: options.multipartUpload.prefixDirLen
+             };
+ 
+             var _opts = {
+diff --git a/lib/uploads/abort.js b/lib/uploads/abort.js
+index 1816c14..6bc49b3 100644
+--- a/lib/uploads/abort.js
++++ b/lib/uploads/abort.js
+@@ -90,7 +90,7 @@ function abort(req, res, next) {
+ module.exports = {
+     abortHandler: function abortHandler() {
+         var chain = [
+-            uploadsCommon.loadUpload,
++            uploadsCommon.loadUploadFromURL,
+             uploadsCommon.uploadContext,
+             auth.authorizationHandler(),
+             finalizingState,
+diff --git a/lib/uploads/commit.js b/lib/uploads/commit.js
+index a3976d2..ee0210f 100644
+--- a/lib/uploads/commit.js
++++ b/lib/uploads/commit.js
+@@ -542,7 +542,7 @@ function ensureNotRoot(req, res, next) {
+ module.exports = {
+     commitHandler: function commitHandler() {
+         var chain = [
+-            uploadsCommon.loadUpload,
++            uploadsCommon.loadUploadFromURL,
+             uploadsCommon.uploadContext,
+             auth.authorizationHandler(),
+             loadOwner,
+diff --git a/lib/uploads/common.js b/lib/uploads/common.js
+index 696b8ec..0cc8f4d 100644
+--- a/lib/uploads/common.js
++++ b/lib/uploads/common.js
+@@ -170,22 +170,28 @@ var hasKey = jsprim.hasKey;
+ // Regex of an upload id (which is just a uuid).
+ var ID_REGEX = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+ var PART_NUM_REGEX = /^([0-9]|[1-9][0-9]{0,3})$/;
+-
++/* JSSTYLED */
++var UPLOAD_DIR_REGEX = new RegExp('^/([a-z0-9]+)/uploads/([0-9a-f-]+)/([0-9a-f-]+)/([a-z0-9]+)$');
+ /*
+  * Multipart upload parts are stored in the directory:
+- *   /:account/uploads/<prefix directory>/:id.
++ *    /:account/uploads/<prefix directory>/:id.
+  *
+  * The purpose of the prefix directory is to prevent us from hitting the
+  * max number of directory entries within the "uploads" folder. As such,
+  * we want to divide uploads roughly evenly into subdirectories.
+  * Because uuids are randomly generated, we expect that they would be uniformly
+- * distributed based on the first PREFIX_LENGTH characters of the upload id.
++ * distributed based on the first $PREFIX_LENGTH characters of the upload id.
++ *
++ * We default to a $PREFIX_LENGTH of 1 -- that is, /:account/uploads will have
++ * a maximum of 16 directories. If needed, this value can be tuned in SAPI to
++ * allow for more ongoing multipart uploads.
+  *
+- * For now, we use a PREFIX_LENGTH of 1, so /:account/uploads has a maximum
+- * of 16 directories, which allows for 16 million ongoing multipart uploads.
+- * If needed, we can bump this prefix length to allow for more.
++ * We cap the prefix length at 4, as this is the highest prefix length that will
++ * allow for under a million entries in the /:account/uploads directory.
+  */
+-var PREFIX_LENGTH = 1;
++var DEF_PREFIX_LEN = 1;
++var MIN_PREFIX_LEN = 1;
++var MAX_PREFIX_LEN = 4;
+ 
+ // Range of allowed part numbers is [0, 10000).
+ var MIN_PART_NUM = 0;
+@@ -473,6 +479,9 @@ function persistUploadRecord(upload, state, type, cb) {
+  * copy that can be modified throughout the request.
+  */
+ function loadUploadRecord(upload, cb) {
++    assert.object(upload, 'upload');
++    assert.object(upload.req, 'upload.req');
++
+     var record = upload.uploadMd;
+ 
+     var options = {
+@@ -501,7 +510,7 @@ function loadUploadRecord(upload, cb) {
+ /*
+  * Loads the finalizing record.
+  */
+-function loadFinalizingMetadata(upload, cb) {
++function loadFinalizingRecord(upload, cb) {
+     var record = upload.finalizingMd;
+ 
+     record.key = upload.constructKey();
+@@ -544,19 +553,64 @@ function normalize(req, mPath, cb) {
+ 
+ 
+ /*
+- * Given an upload ID, returns the prefix to use for the parent directory
+- * of the upload directory. For now, this is the just the first character of
+- * the upload uuid, but we may want to use more characters later to allow for
+- * more simultaneous uploads.
++ * Given an upload ID and a prefix length, returns the prefix to use for the
++ * parent directory of the upload directory, also referred to as the "prefix"
++ * directory.
+  *
+  * For example, for the input id '0bb83e47-32df-4833-a6fd-94d77e8c7dd3' and a
+  * prefix length of 1, this function will return '0'.
+  */
+-function idToPrefix(id) {
+-    assert.string(id);
++function idToPrefix(id, prefixLen) {
++    assert.uuid(id, 'id');
++    assert.number(prefixLen, 'prefixLen');
++    assert.ok(prefixLen >= MIN_PREFIX_LEN && prefixLen <= MAX_PREFIX_LEN,
++        sprintf('prefix len %d not in range', prefixLen));
+     assert.ok(id.match(ID_REGEX), 'upload ID does not match uuid regex');
+ 
+-    return (id.substring(0, PREFIX_LENGTH));
++    return (id.substring(0, prefixLen));
++}
++
++
++// TODO comment
++function idToPrefixLen(id) {
++    assert.uuid(id, 'id');
++
++    var c = id.charAt(id.length - 1);
++    var len = jsprim.parseInteger(c, { base: 16 });
++    assert.number(len, sprintf('invalid hex value "%s" from uuid "%s"', c, id));
++
++    return (len);
++}
++
++function newUploadId(prefixLen) {
++    assert.number(prefixLen, 'prefixLen');
++
++    var id = libuuid.create().slice(0, -1) + prefixLen.toString(16);
++    assert.uuid(id, sprintf('invalid id generated: "%s"', id));
++    assert.ok(id.charAt(id.length - 1) !== 0, '0 is a reserved suffix char');
++
++    return (id);
++}
++
++// TODO comment
++function generateUploadPath(opts) {
++    assert.object(opts, 'opts');
++    assert.uuid(opts.id, 'opts.id');
++    assert.string(opts.login, 'opts.login');
++    assert.optionalBool(opts.legacy, 'opts.legacy');
++
++    var prefixLen = idToPrefixLen(opts.id);
++    if (opts.legacy) {
++        prefixLen = 1;
++    }
++    assert.number(prefixLen, sprintf('invalid prefix len: %s', prefixLen));
++    assert.ok(prefixLen >= MIN_PREFIX_LEN && prefixLen <= MAX_PREFIX_LEN,
++        sprintf('invalid prefix len: %s', prefixLen));
++
++    var uploadPath = '/' + opts.login + '/uploads/' +
++        idToPrefix(opts.id, prefixLen) + '/' + opts.id;
++
++    return (uploadPath);
+ }
+ 
+ 
+@@ -567,7 +621,7 @@ function idToPrefix(id) {
+  * that loads the upload record, which is used in subsequent handlers,
+  * and stores information about the upload at req.upload.
+  */
+-function loadUpload(req, res, next) {
++function loadUploadFromURL(req, res, next) {
+     var log = req.log;
+ 
+     /*
+@@ -586,7 +640,13 @@ function loadUpload(req, res, next) {
+         return;
+     }
+ 
+-    req.upload = new MultipartUpload(req, id);
++    var matches = UPLOAD_DIR_REGEX.exec(req.url);
++    assert.ok(matches.length >= 4);
++    var arr = ['', matches[1], 'uploads', matches[2], matches[3]];
++    var uploadPath = arr.join('/');
++
++    req.upload = new MultipartUpload(id, uploadPath, req);
++
+     loadUploadRecord(req.upload, function (err, upload) {
+         if (err) {
+             next(err);
+@@ -653,8 +713,9 @@ function uploadContext(req, res, next) {
+  * request object at `req.upload`.
+  *
+  * The inputs to the constructor are:
+- *      - id, the upload uuid
+- *      - req, the request object for this multipart upload related request
++ *   - id: the upload uuid
++ *   - uploadPath: path to the upload directory
++ *   - req: the request object for this multipart upload related request
+  *
+  *
+  * The structure of this object is as follows:
+@@ -699,12 +760,19 @@ function uploadContext(req, res, next) {
+  * }
+  *
+  */
+-function MultipartUpload(req, id) {
++function MultipartUpload(id, uploadPath, req) {
++    assert.uuid(id, 'id');
++    assert.string(uploadPath, 'uploadPath');
++    assert.object(req, 'req');
++    assert.object(req.msk_defaults, 'req.msk_defaults');
++    assert.number(req.msk_defaults.mpuPrefixDirLen,
++        'req.msk_defaults.mpuPrefixDirLen');
++
+     var self = this;
++
+     self.id = id;
++    self.uploadPath = uploadPath;
+     self.req = req;
+-    self.uploadPath = '/' + req.owner.account.login + '/uploads/' +
+-        idToPrefix(id) + '/' + id;
+ 
+     self.mpuHeaders = null;
+     self.mpuSize = null;
+@@ -720,6 +788,7 @@ function MultipartUpload(req, id) {
+         toSave: null
+     };
+ 
++    assert.string(self.uploadPath, 'self.uploadPath');
+     normalize(req, self.uploadPath, function (err, p) {
+         if (err) {
+             throw (new InvalidPathError(self.uploadPath));
+@@ -759,7 +828,6 @@ MultipartUpload.prototype.createUpload = function createUpload(opts, cb) {
+     assert.object(opts.headers);
+ 
+     var self = this;
+-
+     createUploadRecord(self, opts, function (err, uploadMd) {
+         if (err) {
+             cb(err);
+@@ -957,6 +1025,28 @@ MultipartUpload.prototype.getUpload = function getUpload(cb) {
+ 
+ ///--- Common methods for API endpoints
+ 
++
++/*
++ * Attempts to load the upload's finalizing record, and if it exists,
++ * passes the callback the record. This is useful for both committing
++ * and aborting uploads.
++ */
++MultipartUpload.prototype.uploadRecordExists =
++function uploadRecordExists(cb) {
++    loadUploadRecord(this, function (err, upload) {
++        if (err) {
++            if (verror.hasCauseWithName(err, 'ObjectNotFoundError')) {
++                cb(null, false);
++            } else {
++                cb(err);
++            }
++        } else {
++            cb(null, true, upload);
++        }
++    });
++};
++
++
+ /*
+  * Attempts to load the upload's finalizing record, and if it exists,
+  * passes the callback the record. This is useful for both committing
+@@ -964,7 +1054,7 @@ MultipartUpload.prototype.getUpload = function getUpload(cb) {
+  */
+ MultipartUpload.prototype.finalizingRecordExists =
+ function finalizingRecordExists(cb) {
+-    loadFinalizingMetadata(this, function (err, upload) {
++    loadFinalizingRecord(this, function (err, upload) {
+         if (err) {
+             if (verror.hasCauseWithName(err, 'ObjectNotFoundError')) {
+                 cb(null, false);
+@@ -1138,6 +1228,9 @@ module.exports = {
+ 
+     ID_REGEX: ID_REGEX,
+     PART_NUM_REGEX: PART_NUM_REGEX,
++    DEF_PREFIX_LEN: DEF_PREFIX_LEN,
++    MIN_PREFIX_LEN: MIN_PREFIX_LEN,
++    MAX_PREFIX_LEN: MAX_PREFIX_LEN,
+     MIN_PART_NUM: MIN_PART_NUM,
+     MAX_PART_NUM: MAX_PART_NUM,
+     MAX_NUM_PARTS: MAX_NUM_PARTS,
+@@ -1150,7 +1243,10 @@ module.exports = {
+ 
+     MultipartUpload: MultipartUpload,
+ 
++    newUploadId: newUploadId,
++    generateUploadPath: generateUploadPath,
++
+     // Common handlers for API endpoints
+-    loadUpload: loadUpload,
++    loadUploadFromURL: loadUploadFromURL,
+     uploadContext: uploadContext
+ };
+diff --git a/lib/uploads/create.js b/lib/uploads/create.js
+index e2be04f..1fb859d 100644
+--- a/lib/uploads/create.js
++++ b/lib/uploads/create.js
+@@ -99,9 +99,6 @@ function uploadContextRoot(req, res, next) {
+             return;
+         }
+ 
+-        var id = libuuid.create();
+-        req.upload = new uploadsCommon.MultipartUpload(req, id);
+-
+         req.authContext.resource = {
+             owner: req.owner,
+             key: md.key || req.key,
+@@ -112,6 +109,24 @@ function uploadContextRoot(req, res, next) {
+     });
+ }
+ 
++function setupUpload(req, res, next) {
++    assert.object(req.msk_defaults, 'req.msk_defaults');
++    assert.number(req.msk_defaults.mpuPrefixDirLen,
++        'req.msk_defaults.mpuPrefixDirLen');
++
++    var prefixLen = req.msk_defaults.mpuPrefixDirLen;
++    var id = uploadsCommon.newUploadId(prefixLen);
++
++    var opts = {
++        id: id,
++        login: req.owner.account.login
++    };
++    var uploadPath = uploadsCommon.generateUploadPath(opts);
++    req.upload = new uploadsCommon.MultipartUpload(id, uploadPath, req);
++    next();
++}
++
++
+ 
+ /*
+  * Validates that all parameters needed for creating an upload exist, including:
+@@ -329,6 +344,7 @@ module.exports = {
+                 mapParams: false,
+                 maxBodySize: 100000
+             }),
++            setupUpload,
+             validateParams,
+             ensurePrefixDir,
+             createUpload
+diff --git a/lib/uploads/get.js b/lib/uploads/get.js
+index 5f01b4f..bb73021 100644
+--- a/lib/uploads/get.js
++++ b/lib/uploads/get.js
+@@ -8,6 +8,7 @@
+  * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
++var auth = require('../auth');
+ var uploadsCommon = require('./common');
+ 
+ 
+@@ -43,7 +44,9 @@ module.exports = {
+ 
+     getHandler: function getHandler() {
+         var chain = [
+-            uploadsCommon.loadUpload,
++            uploadsCommon.loadUploadFromURL,
++            uploadsCommon.uploadContext,
++            auth.authorizationHandler(),
+             getUpload
+         ];
+         return (chain);
+diff --git a/lib/uploads/redirect.js b/lib/uploads/redirect.js
+index 6bc92b2..c021884 100644
+--- a/lib/uploads/redirect.js
++++ b/lib/uploads/redirect.js
+@@ -31,6 +31,7 @@ function partNumDefined(pn) {
+ 
+ ///--- API
+ 
++
+ /*
+  * Gets the ID from the request URL, which is either of the form:
+  *      /<account>/uploads/<id>
+@@ -46,6 +47,12 @@ function parseId(req, res, next) {
+         method: req.method
+     }, 'redirect: requested');
+ 
++    // Disallow subusers.
++    if (req.caller.user) {
++        next(new AuthorizationError(req.caller.user.login, req.url));
++        return;
++    }
++
+     var pn = req.params.partNum;
+ 
+     if (!partNumDefined(pn)) {
+@@ -63,15 +70,73 @@ function parseId(req, res, next) {
+ }
+ 
+ 
++function checkUploadDir(req, res, next) {
++    var id = req.params.id;
++    assert.uuid(id, 'id');
++
++    var opts = {
++        id: id,
++        login: req.owner.account.login
++    };
++
++    var uploadPath = uploadsCommon.generateUploadPath(opts);
++
++    req.upload = new uploadsCommon.MultipartUpload(id, uploadPath, req);
++    req.upload.uploadRecordExists(function (err, exists) {
++        if (err) {
++            next(err);
++        } else {
++            if (exists) {
++                redirect(req, res);
++                next(false);
++            } else {
++                next();
++            }
++        }
++    });
++}
++
++function checkUploadDirLegacy(req, res, next) {
++    var id = req.params.id;
++    assert.uuid(id, 'id');
++
++    var opts = {
++        id: id,
++        login: req.owner.account.login,
++        legacy: true
++    };
++
++    var uploadPath = uploadsCommon.generateUploadPath(opts);
++
++    req.upload = new uploadsCommon.MultipartUpload(id, uploadPath, req);
++    req.upload.uploadRecordExists(function (err, exists) {
++        if (err) {
++            next(err);
++        } else {
++            if (exists) {
++                redirect(req, res);
++                next();
++            } else {
++                next(new ResourceNotFoundError(req.path()));
++            }
++        }
++    });
++}
++
++
++
++
+ /*
+  * Redirects the request by looking up the upload path using the upload ID.
+  */
+-function redirect(req, res, next) {
++function redirect(req, res) {
++    assert.object(req, 'req');
++    assert.object(req.upload, 'req.upload');
++    assert.string(req.upload.uploadPath, 'req.upload.uploadPath');
++
+     var log = req.log;
+ 
+-    // We want to get the upload path from the loaded metadata of the upload,
+-    // as opposed to what's on the object itself.
+-    var url = req.upload.get(uploadsCommon.mdKeys.UPLOAD_PATH);
++    var url = req.upload.uploadPath;
+ 
+     var pn = req.params.partNum;
+     if (partNumDefined(pn)) {
+@@ -83,11 +148,10 @@ function redirect(req, res, next) {
+         url: req.url,
+         method: req.method,
+         redirectLocation: url
+-    }, 'redirect: completed');
++    }, 'redirect: sending');
+ 
+     res.setHeader('Location', url);
+     res.send(301);
+-    next();
+ }
+ 
+ 
+@@ -97,8 +161,8 @@ module.exports = {
+     redirectHandler: function redirectHandler() {
+         var chain = [
+             parseId,
+-            uploadsCommon.loadUpload,
+-            redirect
++            checkUploadDir,
++            checkUploadDirLegacy
+         ];
+         return (chain);
+     }
+diff --git a/lib/uploads/upload.js b/lib/uploads/upload.js
+index c89c339..40dc934 100644
+--- a/lib/uploads/upload.js
++++ b/lib/uploads/upload.js
+@@ -101,7 +101,7 @@ function setupPutState(req, res, next) {
+ module.exports = {
+     uploadPartHandler: function uploadPartHandler() {
+         var chain = [
+-            uploadsCommon.loadUpload,
++            uploadsCommon.loadUploadFromURL,
+             uploadsCommon.uploadContext,
+             auth.authorizationHandler(),
+             validate,
+diff --git a/main.js b/main.js
+index 4c76d87..63a67cb 100644
+--- a/main.js
++++ b/main.js
+@@ -18,8 +18,11 @@ var artedi = require('artedi');
+ var assert = require('assert-plus');
+ var bsyslog = require('bunyan-syslog');
+ var bunyan = require('bunyan');
++var cueball = require('cueball');
+ var dashdash = require('dashdash');
+ var dtrace = require('dtrace-provider');
++var kang = require('kang');
++var keyapi = require('keyapi');
+ var libmanta = require('libmanta');
+ var LRU = require('lru-cache');
+ var mahi = require('mahi');
+@@ -28,11 +31,9 @@ var once = require('once');
+ var restify = require('restify');
+ var vasync = require('vasync');
+ var medusa = require('./lib/medusa');
+-var keyapi = require('keyapi');
+-var cueball = require('cueball');
+-var kang = require('kang');
+ 
+ var app = require('./lib');
++var uploadsCommon = require('./lib/uploads/common');
+ 
+ 
+ 
+@@ -150,6 +151,34 @@ function configure() {
+         cfg.storage.defaultMaxStreamingSizeMB = 51200;
+     }
+ 
++    if (!cfg.hasOwnProperty('multipartUpload')) {
++        cfg.multipartUpload = {};
++    }
++
++    if (cfg.multipartUpload.hasOwnProperty('prefixDirLen')) {
++        var len = cfg.multipartUpload.prefixDirLen;
++        assert.number(len, '"prefixDirLen" value must be a number');
++
++        if (len < uploadsCommon.MIN_PREFIX_LEN ||
++            len > uploadsCommon.MAX_PREFIX_LEN) {
++
++            LOG.fatal('invalid "prefixDirLen" value: must be between ' +
++            '1 and 4');
++            process.exit(1);
++        }
++    } else {
++        cfg.multipartUpload.prefixDirLen = uploadsCommon.DEF_PREFIX_LEN;
++    }
++
++    cfg.collector = artedi.createCollector({
++        labels: {
++            datacenter: cfg.datacenter,
++            server: cfg.server_uuid,
++            zonename: cfg.zone_uuid,
++            pid: process.pid
++        }
++    });
++
+     cfg.collector = artedi.createCollector({
+         labels: {
+             datacenter: cfg.datacenter,
+diff --git a/sapi_manifests/muskie/template b/sapi_manifests/muskie/template
+index a7c8b60..5b2c192 100644
+--- a/sapi_manifests/muskie/template
++++ b/sapi_manifests/muskie/template
+@@ -156,6 +156,10 @@
+ 
+   {{#MPU_ENABLE}}
+   "enableMPU": true,
++
++  "multipartUpload" {
++    "prefixDirLen": {{MUSKIE_MPU_PREFIX_DIR_LEN{{/MUSKIE_MPU_PREFIX_DIR_LEN}},
++  }
+   {{/MPU_ENABLE}}
+ 
+   "medusa": {

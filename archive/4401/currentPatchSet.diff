@@ -1,0 +1,576 @@
+commit f05954c2945fa3885d572539a7ff185c569692f5 (refs/changes/01/4401/8)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2018-06-22T17:28:06+00:00 (1 year, 4 months ago)
+    
+    MANTA-3782 waferlock should support polling SAPI for new morays
+    Reviewed by: Cody Peter Mello <cody.mello@joyent.com>
+    Approved by: Cody Peter Mello <cody.mello@joyent.com>
+
+diff --git a/lib/ipf.js b/lib/ipf.js
+index 38e84a2..5a9f6d9 100644
+--- a/lib/ipf.js
++++ b/lib/ipf.js
+@@ -8,6 +8,8 @@
+  * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++'use strict';
++
+ var mod_assert = require('assert-plus');
+ var mod_vasync = require('vasync');
+ var mod_verror = require('verror');
+diff --git a/lib/sapi.js b/lib/sapi.js
+new file mode 100644
+index 0000000..c9e4ef2
+--- /dev/null
++++ b/lib/sapi.js
+@@ -0,0 +1,324 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++'use strict';
++
++var mod_assert = require('assert-plus');
++var mod_verror = require('verror');
++var mod_fsm = require('mooremachine');
++var mod_util = require('util');
++var mod_restify = require('restify-clients');
++var mod_qs = require('querystring');
++
++var VError = mod_verror.VError;
++
++function SapiPoller(options) {
++	mod_assert.object(options.log, 'options.log');
++	mod_assert.object(options.pool, 'options.pool');
++	mod_assert.object(options.agent, 'options.agent');
++
++	mod_assert.string(options.url, 'options.url');
++	mod_assert.string(options.service, 'options.service');
++	mod_assert.string(options.dns_domain, 'options.dns_domain');
++
++	mod_assert.number(options.minPoll, 'options.minPoll');
++	mod_assert.number(options.maxPoll, 'options.maxPoll');
++
++	this.sp_log = options.log.child({
++		component: 'SapiPoller',
++		service: options.service
++	});
++	this.sp_pool = options.pool;
++	this.sp_url = options.url;
++	this.sp_suffix = options.dns_domain;
++
++	var parts = options.service.split('/');
++	mod_assert.equal(parts.length, 2);
++	this.sp_app = parts[0];
++	this.sp_svc = parts[1];
++	this.sp_app_uuid = undefined;
++	this.sp_svc_uuid = undefined;
++
++	this.sp_dc = undefined;
++	this.sp_vmq = [];
++
++	this.sp_minp = options.minPoll;
++	this.sp_maxp = options.maxPoll;
++	this.sp_lastp = new Date();
++	this.sp_lastp.setTime(0);
++
++	this.sp_errdelay = options.minPoll;
++
++	this.sp_insts = {};
++	this.sp_lastError = undefined;
++
++	this.sp_agent = options.agent;
++
++	this.sp_sapi = new mod_restify.createJsonClient({
++		url: this.sp_url,
++		agent: this.sp_agent,
++		requestTimeout: 10000,
++		retry: false
++	});
++	this.sp_vmapis = {};
++
++	mod_fsm.FSM.call(this, 'app');
++}
++mod_util.inherits(SapiPoller, mod_fsm.FSM);
++
++SapiPoller.prototype.state_app = function (S) {
++	var self = this;
++	var opts = { name: this.sp_app };
++	if (this.sp_app !== 'sdc')
++		opts.include_master = '1';
++	var qs = mod_qs.stringify(opts);
++	this.sp_sapi.get('/applications?' + qs, S.callback(
++	    function (err, req, res, objs) {
++		if (err) {
++			self.sp_lastError = new VError(err, 'failed to fetch ' +
++			    'app data from SAPI');
++			S.gotoState('error');
++			return;
++		}
++
++		mod_assert.arrayOfObject(objs);
++		if (objs.length !== 1) {
++			self.sp_lastError = new VError('ambiguous SAPI app ' +
++			    'name: "%s"', self.sp_app);
++			S.gotoState('error');
++			return;
++		}
++
++		self.sp_app_uuid = objs[0].uuid;
++		if (self.sp_app === 'sdc')
++			self.sp_dc = objs[0].metadata['datacenter_name'];
++		S.gotoState('svc');
++	}));
++};
++
++SapiPoller.prototype.state_svc = function (S) {
++	var self = this;
++	var opts = {
++		name: this.sp_svc,
++		application_uuid: this.sp_app_uuid
++	};
++	if (this.sp_app !== 'sdc')
++		opts.include_master = '1';
++	var qs = mod_qs.stringify(opts);
++	this.sp_sapi.get('/services?' + qs, S.callback(
++	    function (err, req, res, objs) {
++		if (err) {
++			self.sp_lastError = new VError(err, 'failed to fetch ' +
++			    'service data from SAPI');
++			S.gotoState('error');
++			return;
++		}
++
++		mod_assert.arrayOfObject(objs);
++		if (objs.length !== 1) {
++			self.sp_lastError = new VError('ambiguous SAPI svc ' +
++			    'name: "%s"', self.sp_svc);
++			S.gotoState('error');
++			return;
++		}
++
++		self.sp_svc_uuid = objs[0].uuid;
++		S.gotoState('insts');
++	}));
++};
++
++SapiPoller.prototype.state_insts = function (S) {
++	var self = this;
++	var opts = {
++		service_uuid: this.sp_svc_uuid
++	};
++	if (this.sp_app !== 'sdc')
++		opts.include_master = '1';
++	var qs = mod_qs.stringify(opts);
++	this.sp_sapi.get('/instances?' + qs, S.callback(
++	    function (err, req, res, objs) {
++		if (err) {
++			self.sp_lastError = new VError(err, 'failed to fetch ' +
++			    'instance list from SAPI');
++			S.gotoState('error');
++			return;
++		}
++
++		mod_assert.arrayOfObject(objs);
++		var oldids = self.sp_insts;
++		var newids = {};
++		objs.forEach(function (i) {
++			newids[i.uuid] = i;
++		});
++
++		var added = Object.keys(newids).filter(function (id) {
++			return (oldids[id] === undefined);
++		});
++		var removed = Object.keys(oldids).filter(function (id) {
++			return (newids[id] === undefined);
++		});
++
++		self.sp_insts = newids;
++		if (added.length > 0 || removed.length > 0) {
++			self.sp_log.debug('detected %d added, %d removed',
++			    added.length, removed.length);
++		}
++
++		removed.forEach(function (id) {
++			self.sp_pool.refreshTag('sapi:' + id, []);
++		});
++
++		var bydc = {};
++		added.forEach(function (id) {
++			var inst = newids[id];
++			var dc = inst.metadata['DATACENTER'];
++			if (dc === undefined)
++				dc = self.sp_dc;
++			if (dc === undefined) {
++				self.sp_log.warn('dropping sapi inst %s: ' +
++				    'cannot determine dc', id);
++				return;
++			}
++			if (bydc[dc] === undefined)
++				bydc[dc] = [];
++			bydc[dc].push(id);
++		});
++
++		Object.keys(bydc).forEach(function (dc) {
++			var vms = bydc[dc];
++			for (var i = 0; i < vms.length; i += 50) {
++				self.sp_vmq.push({
++					dc: dc,
++					vms: vms.slice(i, i + 50)
++				});
++			}
++		});
++
++		S.gotoState('runq');
++	}));
++};
++
++SapiPoller.prototype.state_runq = function (S) {
++	this.sp_ent = this.sp_vmq.shift();
++	if (this.sp_ent === undefined) {
++		this.sp_lastp = new Date();
++		S.gotoState('sleep');
++		return;
++	}
++	S.gotoState('runq_do');
++};
++
++SapiPoller.prototype.state_runq_do = function (S) {
++	var ent = this.sp_ent;
++	var self = this;
++	var vmapi = this.sp_vmapis[ent.dc];
++	if (vmapi === undefined) {
++		vmapi = new mod_restify.createJsonClient({
++			url: 'http://vmapi.' + ent.dc + '.' + this.sp_suffix,
++			agent: this.sp_agent
++		});
++		this.sp_vmapis[ent.dc] = vmapi;
++	}
++
++	var pred = { 'or': [] };
++	ent.vms.forEach(function (uuid) {
++		pred.or.push({ eq: ['uuid', uuid] });
++	});
++	if (pred.or.length === 1)
++		pred = pred.or[0];
++
++	var qs = mod_qs.stringify({
++		predicate: JSON.stringify(pred)
++	});
++	vmapi.get('/vms?' + qs, S.callback(function (err, req, res, objs) {
++		if (err) {
++			self.sp_vmq.push(ent);
++			self.sp_lastError = new VError(err, 'failed to fetch ' +
++			    'VM data from %s VMAPI', ent.dc);
++			S.gotoState('error');
++			return;
++		}
++
++		mod_assert.arrayOfObject(objs);
++
++		objs.forEach(function (vm) {
++			var ips = [];
++
++			vm.nics.forEach(function (nic) {
++				nic.ips.forEach(function (ip) {
++					var parts = ip.split('/');
++					ips.push(parts[0]);
++				});
++			});
++
++			self.sp_pool.refreshTag('sapi:' + vm.uuid, ips);
++		});
++
++		S.gotoState('runq');
++	}));
++};
++
++SapiPoller.prototype.state_sleep = function (S) {
++	var now = (new Date()).getTime();
++	var last = this.sp_lastp.getTime();
++	var nextMin = last + this.sp_minp * 1000;
++	var nextMax = last + this.sp_maxp * 1000;
++
++	var maxDelay = nextMax - now;
++	S.timeout(maxDelay, function () {
++		S.gotoState('insts');
++	});
++
++	S.on(this, 'trigger', function () {
++		var newNow = (new Date()).getTime();
++		if (newNow > nextMin) {
++			S.gotoState('insts');
++		} else {
++			var minDelay = nextMin - newNow;
++			S.timeout(minDelay, function () {
++				S.gotoState('insts');
++			});
++		}
++	});
++
++	this.sp_errdelay = this.sp_minp;
++};
++
++SapiPoller.prototype.trigger = function () {
++	this.emit('trigger');
++};
++
++SapiPoller.prototype.state_error = function (S) {
++	var self = this;
++
++	var delay = this.sp_errdelay;
++	var newDelay = delay * 2;
++	if (newDelay > this.sp_maxp)
++		newDelay = this.sp_maxp;
++	this.sp_errdelay = newDelay;
++
++	this.sp_log.error(this.sp_lastError, 'error during poll, retry ' +
++	    'after %d sec', delay);
++	S.timeout(delay * 1000, function () {
++		if (!self.sp_app_uuid) {
++			S.gotoState('app');
++			return;
++		}
++		if (!self.sp_svc_uuid) {
++			S.gotoState('svc');
++			return;
++		}
++		S.gotoState('insts');
++	});
++};
++
++module.exports = {
++	SapiPoller: SapiPoller
++};
+diff --git a/lib/zk.js b/lib/zk.js
+index b532450..e5a9657 100644
+--- a/lib/zk.js
++++ b/lib/zk.js
+@@ -8,6 +8,8 @@
+  * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++'use strict';
++
+ var mod_assert = require('assert-plus');
+ var mod_zkstream = require('zkstream');
+ 
+diff --git a/package.json b/package.json
+index 057c6b8..2a6e37a 100644
+--- a/package.json
++++ b/package.json
+@@ -21,10 +21,12 @@
+   "dependencies": {
+     "assert-plus": "^1.0.0",
+     "bunyan": "^1.8.12",
++    "cueball": "^2.5.2",
+     "forkexec": "^1.1.0",
+     "ipaddr.js": "^1.7.0",
+     "lstream": "0.0.4",
+     "mooremachine": "^2.2.1",
++    "restify-clients": "^2.2.0",
+     "vasync": "^2.2.0",
+     "verror": "^1.10.0",
+     "zkstream": "^0.10.1"
+diff --git a/sapi_manifests/waferlock/template b/sapi_manifests/waferlock/template
+index c404496..bff129b 100644
+--- a/sapi_manifests/waferlock/template
++++ b/sapi_manifests/waferlock/template
+@@ -8,25 +8,40 @@
+ 			{{/ZK_SERVERS}}
+ 		]
+ 	},
++
+ 	"holdTime": 600,
+-	"paths": [
+-		{{! "dns_domain" being set means we are in Triton (not Manta) }}
+-		{{#dns_domain}}
+-			"/moray"
+-		{{/dns_domain}}
+-	],
+-	"domains": [
+-		{{#dns_domain}}
++
++	{{! The SAPI polling interval can be shortened when ipmon shows
++	    denials are taking place. }}
++	"sapiPollingInterval": {
++		"max": 240,	{{! Poll at least once every 240s }}
++		"min": 30	{{! Never poll more than once every 30s }}
++	},
++
++	{{! "dns_domain" being set means we are in Triton (not Manta) }}
++	{{#dns_domain}}
++		{{! sdc-manatee registers itself under /moray :( }}
++		"paths": ["/moray"],
++		"domains": [
+ 			"{{{moray_domain}}}",
+ 			{{! Don't use pgstatsmon_domain, might not be set. }}
+ 			"pgstatsmon.{{{datacenter_name}}}.{{{dns_domain}}}"
+-		{{/dns_domain}}
+-		{{^dns_domain}}
++		],
++		"sapi_url": "{{{sapi-url}}}",
++		"sapi_services": ["sdc/moray"],
++		"dns_domain": "{{{dns_domain}}}"
++	{{/dns_domain}}
++	{{^dns_domain}}
++		"paths": [],
++		"domains": [
+ 			"moray.{{{DOMAIN_NAME}}}",
+ 			"ops.{{{DOMAIN_NAME}}}",
+ 			"madtom.{{{DOMAIN_NAME}}}",
+ 			"pgstatsmon.{{{DOMAIN_NAME}}}",
+ 			"reshard.{{{DOMAIN_NAME}}}"
+-		{{/dns_domain}}
+-	]
++		],
++		"sapi_url": "{{{SAPI_URL}}}",
++		"sapi_services": ["manta/moray"],
++		"dns_domain": "{{{DNS_DOMAIN}}}"
++	{{/dns_domain}}
+ }
+diff --git a/server.js b/server.js
+index 5f20dde..eafb9db 100644
+--- a/server.js
++++ b/server.js
+@@ -8,6 +8,8 @@
+  * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++'use strict';
++
+ var mod_assert = require('assert-plus');
+ var mod_verror = require('verror');
+ var mod_bunyan = require('bunyan');
+@@ -15,6 +17,8 @@ var mod_fs = require('fs');
+ var mod_util = require('util');
+ var mod_path = require('path');
+ var mod_fsm = require('mooremachine');
++var mod_cueball = require('cueball');
++var mod_url = require('url');
+ 
+ var lib_ipf = require('./lib/ipf');
+ var Ipf = lib_ipf.Ipf;
+@@ -24,6 +28,9 @@ var IpMon = lib_ipf.IpMon;
+ var lib_zk = require('./lib/zk');
+ var ZKCache = lib_zk.ZKCache;
+ 
++var lib_sapi = require('./lib/sapi');
++var SapiPoller = lib_sapi.SapiPoller;
++
+ var VError = mod_verror.VError;
+ 
+ var confDir = mod_path.join(__dirname, 'etc');
+@@ -34,8 +41,17 @@ var config = JSON.parse(mod_fs.readFileSync(confFile, 'utf-8'));
+ mod_assert.object(config, 'config');
+ mod_assert.object(config.zookeeper, 'config.zookeeper');
+ mod_assert.number(config.holdTime, 'config.holdTime');
++mod_assert.string(config.dns_domain, 'config.dns_domain');
++mod_assert.string(config.sapi_url, 'config.sapi_url');
++mod_assert.object(config.sapiPollingInterval, 'config.sapiPollingInterval');
++mod_assert.number(config.sapiPollingInterval.min,
++    'config.sapiPollingInterval.min');
++mod_assert.number(config.sapiPollingInterval.max,
++    'config.sapiPollingInterval.max');
++
+ mod_assert.optionalArrayOfString(config.paths, 'config.paths');
+ mod_assert.optionalArrayOfString(config.domains, 'config.domains');
++mod_assert.optionalArrayOfString(config.sapi_services, 'config.sapi_services');
+ 
+ if (config.paths === undefined)
+ 	config.paths = [];
+@@ -59,6 +75,32 @@ function AppFSM() {
+ 	this.af_err = null;
+ 	this.af_denials = {};
+ 	this.af_log = log;
++	this.af_sapis = {};
++
++	var agopts = {
++		spares: 1,
++		maximum: 3,
++		ping: '/ping',
++		pingInterval: 90000,
++		tcpKeepAliveInitialDelay: 5000,
++		recovery: {
++			default: {
++				timeout: 2000,
++				maxTimeout:
++				    config.sapiPollingInterval.min * 1000,
++				retries: 6,
++				delay: 5000,
++				maxDelay: config.sapiPollingInterval.max * 1000
++			}
++		}
++	};
++	var url = mod_url.parse(config.sapi_url);
++	if (/^sapi\./.test(url.hostname)) {
++		agopts.resolvers = [
++		    url.hostname.replace(/^sapi\./, 'binder.') ];
++	}
++	this.af_agent = new mod_cueball.HttpAgent(agopts);
++
+ 	mod_fsm.FSM.call(this, 'init');
+ }
+ mod_util.inherits(AppFSM, mod_fsm.FSM);
+@@ -131,13 +173,43 @@ AppFSM.prototype.state_waitInitialData = function (S) {
+ 		if (nodes === lastNodes && nodes > roots) {
+ 			/* Wait an extra sec just in case */
+ 			S.timeout(1000, function () {
+-				S.gotoState('loadRules');
++				S.gotoState('setupSapi');
+ 			});
+ 		}
+ 		lastNodes = nodes;
+ 	});
+ };
+ 
++AppFSM.prototype.state_setupSapi = function (S) {
++	if (!config.sapi_services || config.sapi_services.length === 0) {
++		S.gotoState('loadRules');
++		return;
++	}
++	var self = this;
++	config.sapi_services.forEach(function (svc) {
++		self.af_sapis[svc] = new SapiPoller({
++			log: log,
++			pool: self.af_pool,
++			url: config.sapi_url,
++			service: svc,
++			dns_domain: config.dns_domain,
++			minPoll: config.sapiPollingInterval.min,
++			maxPoll: config.sapiPollingInterval.max,
++			agent: self.af_agent
++		});
++		/*
++		 * Wait for any one of these to finish polling and go to sleep.
++		 * We don't care which one -- the first one that does will kick
++		 * us out of this state.
++		 */
++		S.on(self.af_sapis[svc], 'stateChanged', function (st) {
++			if (st === 'sleep') {
++				S.gotoState('loadRules');
++			}
++		});
++	});
++};
++
+ AppFSM.prototype.state_loadRules = function (S) {
+ 	var self = this;
+ 	Ipf.loadRulesFile(ipfConfigFile, S.callback(function (err) {
+@@ -179,6 +251,9 @@ AppFSM.prototype.state_enforcing = function (S) {
+ 		var ds = self.af_denials[fromIp];
+ 		if (ds === undefined) {
+ 			ds = (self.af_denials[fromIp] = {});
++			Object.keys(self.af_sapis).forEach(function (k) {
++				self.af_sapis[k].trigger();
++			});
+ 		}
+ 		if (ds[toPort] === undefined) {
+ 			self.af_log.debug({ fromIp: fromIp, fromPort: fromPort,

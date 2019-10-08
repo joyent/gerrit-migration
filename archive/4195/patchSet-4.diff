@@ -1,0 +1,3684 @@
+commit 2d4f310b2a732a558403f40f6b082333a8cdffd9 (refs/changes/95/4195/4)
+Author: Josh Wilsdon <josh@wilsdon.ca>
+Date:   2018-06-13T10:54:57-07:00 (1 year, 4 months ago)
+    
+    TRITON-381 cn-agent should have dummy backend
+
+diff --git a/bin/cn-agent.js b/bin/cn-agent.js
+index 5644f90..94a0402 100755
+--- a/bin/cn-agent.js
++++ b/bin/cn-agent.js
+@@ -44,6 +44,11 @@ function loadBackend(opts) {
+         backendName = 'smartos';
+     }
+ 
++    // Special case for the dummy backend, we allow to specify the server uuid.
++    if (backendName === 'dummy' && process.env.CN_AGENT_SERVER_UUID) {
++        opts.serverUuid = process.env.CN_AGENT_SERVER_UUID;
++    }
++
+     // This will throw if backend doesn't exist
+     Backend = require(path.join(BACKEND_DIR, backendName));
+ 
+diff --git a/lib/app.js b/lib/app.js
+index 0899e99..071c69f 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -300,7 +300,8 @@ App.prototype.startHeartbeater = function () {
+ 
+     statusReporter = new StatusReporter({
+         backend: self.backend,
+-        log: self.log
++        log: self.log,
++        serverUuid: self.uuid
+     });
+ 
+     self.log.info('cnapi ip was %s', cnapiAddr);
+@@ -344,11 +345,15 @@ App.prototype.startHeartbeater = function () {
+ // Whenever we start up, we want to ensure we've updated the sysinfo in CNAPI
+ // before we continue further. This ensures we've got the correct 'Boot Time'
+ // for example. (See also: TRITON-69)
++//
++// We also pass the cnAgentPort which CNAPI can use to communicate with this
++// cn-agent instance.
+ App.prototype.registerServer = function registerServer(callback) {
+     var self = this;
+ 
+     var cnapiAddr = self.cnapiAddr;
+     var restifyOptions;
++    var sysinfo = self.sysinfo;
+     var url = 'http://' + cnapiAddr;
+     var urlPath = path.join('/servers', self.uuid, 'sysinfo');
+ 
+@@ -361,6 +366,11 @@ App.prototype.registerServer = function registerServer(callback) {
+ 
+     self.client = restify.createJsonClient(restifyOptions);
+ 
++    // We'll add our IP and port to the sysinfo here so that if we're not
++    // using the default port, CNAPI knows where to send requests to us.
++    sysinfo['CN Agent Port'] = self.agentserver.server.address().port;
++    sysinfo['CN Agent IP'] = self.agentserver.server.address().address;
++
+     // Make an attempt, if that fails, schedule a new attempt with a delay
+     self.client.post({
+         path: urlPath
+diff --git a/lib/backends/dummy/common.js b/lib/backends/dummy/common.js
+new file mode 100644
+index 0000000..5c8efaa
+--- /dev/null
++++ b/lib/backends/dummy/common.js
+@@ -0,0 +1,106 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ *
++ * Common functions that don't belong anywhere else.
++ *
++ */
++
++var child_process = require('child_process');
++var execFile = child_process.execFile;
++var fs = require('fs');
++
++var assert = require('assert-plus');
++var async = require('async');
++
++var SERVER_ROOT = '/opt/custom/virtual/servers';
++
++function mdataGet(key, callback) {
++    assert.string(key, 'key');
++    assert.func(callback, 'callback');
++
++    child_process.execFile('/usr/sbin/mdata-get', [
++        key
++    ], function _onMdata(err, stdout, stderr) {
++        assert.ifError(err, 'mdata-get should always work');
++
++        callback(null, stdout.trim());
++    });
++}
++
++function getPlatformBuildstamp(callback) {
++    child_process.execFile('/usr/bin/uname', [
++        '-v'
++    ], function _onUname(err, stdout, stderr) {
++        assert.ifError(err, 'uname should always work');
++
++        var buildstamp = (stdout.trim().split('_'))[1];
++
++        callback(null, buildstamp);
++    });
++}
++
++function provisionInProgressFile(uuidOrZonename, callback) {
++    var filename = '/var/tmp/machine-provision-' + uuidOrZonename;
++
++    fs.writeFile(filename, '', function (error) {
++        return callback(error, filename);
++    });
++}
++
++function ensureProvisionComplete(uuid, callback) {
++    var filename = '/var/tmp/machine-provision-' + uuid;
++    var expiresAt;
++    var timeoutMinutes = 10;
++
++    function checkIfReady() {
++        fs.exists(filename, function (exists) {
++            if (!exists) {
++                return callback();
++            }
++
++            return async.waterfall([
++                function (wf$callback) {
++                    if (!expiresAt) {
++                        fs.stat(filename, function (error, stats) {
++                            expiresAt =
++                                timeoutMinutes * 60 * 1000 + stats.ctime;
++                            return wf$callback(error);
++                        });
++                    }
++                    return wf$callback();
++                }
++            ],
++            function (error) {
++                // Check if we exceeded the timeout duration.
++                var now = Number(new Date());
++                if (now > expiresAt) {
++                    fs.unlink(filename, function () {
++                        return callback();
++                    });
++                } else {
++                    setTimeout(checkIfReady, 10 * 1000);
++                }
++            });
++        });
++    }
++
++    checkIfReady();
++}
++
++
++module.exports = {
++    ensureProvisionComplete: ensureProvisionComplete,
++    getPlatformBuildstamp: getPlatformBuildstamp,
++    mdataGet: mdataGet,
++    provisionInProgressFile: provisionInProgressFile,
++    SERVER_ROOT: SERVER_ROOT
++};
+diff --git a/lib/backends/dummy/index.js b/lib/backends/dummy/index.js
+new file mode 100644
+index 0000000..0276ff9
+--- /dev/null
++++ b/lib/backends/dummy/index.js
+@@ -0,0 +1,304 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var execFile = require('child_process').execFile;
++var fs = require('fs');
++var os = require('os');
++var path = require('path');
++
++var assert = require('assert-plus');
++var jsprim = require('jsprim');
++var vasync = require('vasync');
++
++var common = require('./common');
++var sysinfoGetter = require('./lib/sysinfo');
++
++// These are used for caching the results of mdata-get so we don't need to
++// re-run that for every server when we have multiple servers.
++var cachedDatacenterName;
++var cachedDNSDomain;
++
++
++// This defines which tasks we'll handle.
++var queueDefns = [
++    {
++        name: 'machine_creation',
++        tasks: [ 'machine_create' ]
++    },
++    {
++        name: 'image_import_tasks',
++        tasks: [ 'image_ensure_present' ]
++    },
++    {
++        name: 'machine_tasks',
++        tasks: [
++            'machine_boot',
++            'machine_destroy',
++            'machine_kill',
++            'machine_reboot',
++            'machine_shutdown',
++            'machine_update'
++        ]
++    },
++    {
++        name: 'machine_query',
++        logging: false,
++        tasks: [
++            'machine_load'
++        ]
++    },
++    {
++        name: 'nop',
++        tasks: [ 'nop' ]
++    }
++];
++
++
++function DummyBackend(opts) {
++    var self = this;
++
++    assert.object(opts.log, 'opts.log');
++
++    self.log = opts.log;
++    self.name = opts.backendName;
++    self.queueDefns = queueDefns;
++
++    // This is only passed when we're handling for a single server. If there are
++    // multiple servers, the opts.serverUuid should be passed in to the
++    // backend.* functions.
++    self.serverUuid = opts.serverUuid;
++}
++
++
++DummyBackend.prototype.getAgentConfig =
++function getAgentConfig(opts, callback) {
++    var config = {
++        no_rabbit: true,
++        skip_agents_update: true
++    };
++
++    callback(null, config);
++};
++
++
++DummyBackend.prototype.getSdcConfig = function getSdcConfig(opts, callback) {
++    var config = {};
++
++    if (cachedDatacenterName !== undefined && cachedDNSDomain !== undefined) {
++        callback(null, {
++            datacenter_name: cachedDatacenterName,
++            dns_domain: cachedDNSDomain
++        });
++        return;
++    }
++
++    common.mdataGet('sdc:datacenter_name', function _onDC(dcErr, datacenter) {
++        if (dcErr) {
++            callback(dcErr);
++            return;
++        }
++
++        config.datacenter_name = datacenter;
++
++        common.mdataGet('dnsDomain', function _onDomain(domErr, dnsDomain) {
++            if (domErr) {
++                callback(domErr);
++                return;
++            }
++
++            config.dns_domain = dnsDomain;
++
++            // Since we succeeded, cache these values.
++            cachedDatacenterName = datacenter;
++            cachedDNSDomain = dnsDomain;
++
++            callback(null, config);
++        });
++    });
++};
++
++DummyBackend.prototype.getSysinfo = function getSysinfo(opts, callback) {
++    var self = this;
++    var serverUuid = opts.serverUuid || self.serverUuid;
++
++    var getter = new sysinfoGetter();
++
++    getter.get({
++        serverUuid: serverUuid
++    }, function _onSysinfo(err, sysinfo) {
++        callback(err, sysinfo);
++    });
++};
++
++
++DummyBackend.prototype.getMemoryInfo = function getMemoryInfo(opts, callback) {
++    // TODO: implement something here
++    callback(null, {
++        availrmem_bytes: 256 * 1024 * 1024 * 1024,
++        arcsize_bytes: 42,
++        total_bytes: 256 * 1024 * 1024 * 1024
++    });
++};
++
++// getPoolSpaceStats() calls:
++//
++//  callback(err, spaceStats)
++//
++// where spaceStats looks like:
++//
++//  {
++//      bytes_available: <number>,
++//      bytes_used: <number>
++//  }
++//
++// NOTE: this function is used by getZpoolInfo and not exported itself.
++//
++function getPoolSpaceStats(pool, opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++
++    var spaceStats = {};
++
++    // TODO: implement something here
++    spaceStats = {
++        bytes_available: 3 * 1024 * 1024 * 1024 * 1024,
++        bytes_used: 42
++    };
++
++    callback(null, spaceStats);
++}
++
++// getZpoolInfo() calls:
++//
++//  callback(err, zpoolStatus)
++//
++// where zpoolStatus looks like:
++//
++//  {
++//      <pool_name>: {
++//          bytes_available,
++//          bytes_used
++//      }
++//  }
++//
++function getZpoolInfo(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++
++    var pool = 'zones';
++    var zpoolStatus = {};
++
++    getPoolSpaceStats(pool, opts, function _onSpaceStats(err, ss) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        zpoolStatus[pool] = ss;
++        callback(err, zpoolStatus);
++    });
++}
++
++
++DummyBackend.prototype.getZpoolInfo = function _getZpoolInfo(opts, callback) {
++    var self = this;
++    var serverUuid = opts.serverUuid || self.serverUuid;
++
++    assert.object(self.log, 'self.log');
++
++    getZpoolInfo({
++        log: self.log,
++        serverUuid: serverUuid
++    }, function onPoolInfo(err, info) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        callback(null, info);
++    });
++};
++
++
++DummyBackend.prototype.getDiskUsage =
++function getDiskUsage(vms, opts, callback) {
++    // XXX implement this
++
++    var diskUsage = {
++        kvm_zvol_used_bytes: 0,
++        kvm_zvol_volsize_bytes: 0,
++        kvm_quota_bytes: 0,
++        kvm_quota_used_bytes: 0,
++        zone_quota_bytes: 0,
++        zone_quota_used_bytes: 0,
++        cores_quota_bytes: 0,
++        cores_quota_used_bytes: 0,
++        installed_images_used_bytes: 0,
++        pool_size_bytes: 1024 * 1024 * 1024 * 1024,
++        pool_alloc_bytes: 512 * 1024 * 1024 * 1024,
++        system_used_bytes: 256 * 1024 * 1024
++    };
++
++    callback(null, diskUsage);
++};
++
++
++DummyBackend.prototype.getBootTime = function getBootTime(opts, callback) {
++    var self = this;
++    var getter = new sysinfoGetter();
++    var serverUuid = opts.serverUuid || self.serverUuid;
++
++    getter.get({
++        serverUuid: serverUuid
++    }, function _onSysinfo(err, sysinfo) {
++        var epochTime = jsprim.parseInteger(sysinfo['Boot Time'], {});
++        callback(err, new Date(epochTime * 1000).toISOString());
++    });
++};
++
++
++// opts will have:
++//
++//  {
++//    fields: <array of field names to include in objects>,
++//    log: <bunyan logger>,
++//  }
++DummyBackend.prototype.loadVms = function loadVms(opts, callback) {
++    var vms = []; // would be an array of VM objects limited to opts.fields
++
++    callback(null, vms);
++};
++
++
++// Dummy needs no watchers, other backends would start watching whatever they
++// need in the filesystem/system and whenever they decide something changed that
++// might cause cn-agent's cache to be dirty, they should call dirtyFn() with no
++// arguments. This will tell cn-agent to reload its data asap. Otherwise the
++// change might not be noticed for up to a minute.
++//
++// opts will have:
++//
++//  {
++//     dirtyFn: <function>,
++//     log: <bunyan logger>
++//  }
++//
++DummyBackend.prototype.startWatchers = function startWatchers(opts) {
++    // TODO: fs.watch the instance JSON dir
++};
++
++
++// This will never actually be called unless we returned watchers from
++// startWatchers. In that case, we'll get passed the object we returned there
++// and be expected to stop any watchers we created.
++DummyBackend.prototype.stopWatchers = function stopWatchers(watchers) {
++};
++
++
++module.exports = DummyBackend;
+diff --git a/lib/backends/dummy/lib/sysinfo.js b/lib/backends/dummy/lib/sysinfo.js
+new file mode 100644
+index 0000000..224ff42
+--- /dev/null
++++ b/lib/backends/dummy/lib/sysinfo.js
+@@ -0,0 +1,54 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var fs = require('fs');
++
++var assert = require('assert-plus');
++
++var common = require('../common');
++
++function sysinfo() {
++}
++
++sysinfo.prototype.get = function get(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++    assert.func(callback, 'callback');
++
++    var filename = common.SERVER_ROOT + '/' + opts.serverUuid + '/sysinfo.json';
++
++    fs.readFile(filename, function onData(err, data) {
++        var sinfo;
++
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        sinfo = JSON.parse(data.toString());
++        callback(null, sinfo);
++    });
++};
++
++module.exports = sysinfo;
++
++if (require.main === module) {
++    var sysinfoGetter = new sysinfo();
++    var uuid = process.argv[2];
++
++    assert.uuid(uuid, 'uuid');
++
++    sysinfoGetter.get({
++        serverUuid: uuid
++    }, function onSysinfo(err, info) {
++        assert.ifError(err, 'unexpected error loading sysinfo');
++        console.log(JSON.stringify(info, null, 4));
++    });
++}
+diff --git a/lib/backends/dummy/lib/vmadm.js b/lib/backends/dummy/lib/vmadm.js
+new file mode 100644
+index 0000000..e4b5ec7
+--- /dev/null
++++ b/lib/backends/dummy/lib/vmadm.js
+@@ -0,0 +1,922 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * A dummy version of node-vmadm
++ *
++ * XXX eventually this could just go in node-vmadm probably.
++ */
++
++var cp = require('child_process');
++var fs = require('fs');
++var path = require('path');
++var spawn = cp.spawn;
++var stream = require('stream');
++var util = require('util');
++
++var assert = require('assert-plus');
++var jsprim = require('jsprim');
++var vasync = require('vasync');
++
++var common = require('../common');
++
++
++function vmadm() {}
++
++
++function addSystemProperties(arg, callback) {
++    // we know we loaded sysinfo if we got here
++    assert.object(arg, 'arg');
++    assert.object(arg.sysinfo, 'arg.sysinfo');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    assert.uuid(arg.sysinfo.UUID, 'arg.sysinfo.UUID');
++    arg.vmobj.server_uuid = arg.sysinfo.UUID;
++
++    assert.string(arg.sysinfo['Datacenter Name'],
++        'arg.sysinfo[\'Datacenter Name\']');
++    arg.vmobj.datacenter_name = arg.sysinfo['Datacenter Name'];
++
++    assert.string(arg.sysinfo['Live Image'], 'arg.sysinfo[\'Live Image\']');
++    arg.vmobj.platform_buildstamp = arg.sysinfo['Live Image'];
++
++    // zpool?
++
++    callback();
++}
++
++function addInstanceExecutionInfo(arg, callback) {
++    var last_modified;
++
++    // XXX we just make stuff up for now
++    assert.object(arg, 'arg');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    if (arg.vmobj.state === undefined) {
++        arg.vmobj.state = 'running';
++    }
++
++    if (arg.vmobj.state === 'running') {
++        last_modified = (new Date(arg.vmobj.last_modified)).getTime();
++        arg.vmobj.pid = Math.floor(last_modified / 1000) % 100000;
++        if (arg.vmobj.boot_timestamp === undefined) {
++            arg.vmobj.boot_timestamp = arg.vmobj.last_modified;
++        }
++    } else if (arg.vmobj.state === 'stopped') {
++        arg.vmobj.exit_status = 0;
++        if (arg.vmobj.exit_timestamp === undefined) {
++            arg.vmobj.exit_timestamp = arg.vmobj.last_modified;
++        }
++    }
++
++    callback();
++}
++
++function addHardcodedProperties(arg, callback) {
++    // these make no sense here, so we hardcode them to something for compat
++    assert.object(arg, 'arg');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    assert.uuid(arg.vmobj.uuid, 'arg.vmobj.uuid');
++    arg.vmobj.zonename = arg.vmobj.uuid;
++
++    assert.string(arg.vmobj.state, 'arg.vmobj.state');
++    arg.vmobj.zone_state = arg.vmobj.state;
++
++    assert.optionalNumber(arg.vmobj.pid, 'arg.vmobj.pid');
++    if (arg.vmobj.pid !== undefined) {
++        arg.vmobj.zoneid = arg.vmobj.pid;
++    }
++
++    callback();
++}
++
++function loadTimestamp(arg, callback) {
++    assert.object(arg, 'arg');
++    assert.string(arg.file, 'arg.file');
++    assert.object(arg.vmobj, 'arg.vmobj');
++
++    fs.stat(arg.file, function _onStat(err, stats) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        arg.vmobj.last_modified = stats.mtime.toISOString();
++
++        callback();
++    });
++}
++
++function loadVm(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++    assert.uuid(opts.sysinfo.UUID, 'opts.sysinfo.UUID');
++    assert.uuid(opts.uuid, 'opts.uuid');
++
++    var filename;
++    var server_uuid = opts.sysinfo.UUID;
++    var sysinfo = opts.sysinfo;
++    var uuid = opts.uuid;
++    var vmobj = {};
++
++    filename =
++        path.join(common.SERVER_ROOT, server_uuid, 'vms', uuid + '.json');
++
++    fs.readFile(filename, function _onRead(err, data) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        // XXX will throw on bad data
++        vmobj = JSON.parse(data.toString());
++
++        vasync.pipeline({
++            arg: {
++                file: filename,
++                sysinfo: sysinfo,
++                vmobj: vmobj
++            },
++            funcs: [
++                loadTimestamp,
++                addInstanceExecutionInfo,
++                addSystemProperties,
++                addHardcodedProperties
++            ]
++        }, function _afterPipeline(pipelineErr) {
++            callback(pipelineErr, vmobj);
++        });
++    });
++}
++
++function loadVms(opts, callback) {
++    var vmdir;
++
++    vmdir = path.join(common.SERVER_ROOT, opts.sysinfo.UUID, 'vms');
++
++    fs.readdir(vmdir, function _onReadDir(err, files) {
++        var filename;
++        var idx;
++        var matches;
++        var toLoad = [];
++
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        for (idx = 0; idx < files.length; idx++) {
++            filename = files[idx];
++
++            /* jsl:ignore (assignment in if()) */
++            if (matches = filename.match(/^([a-f0-9\-]*).json$/)) {
++                toLoad.push(matches[1]);
++            } else {
++                console.error('XXX WARNING: IGNORING: ' + filename);
++            }
++            /* jsl:end */
++        }
++
++        vasync.forEachParallel({
++            func: function _loadVm(uuid, cb) {
++                loadVm({
++                    sysinfo: opts.sysinfo,
++                    uuid: uuid
++                }, cb);
++            },
++            inputs: toLoad
++        }, function _afterLoading(loadErr, results) {
++            callback(loadErr, results.successes);
++        });
++    });
++}
++
++
++/**
++ * Check whether a VM exists or not.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} The VM uuid.
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, return VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err, exists)`
++ *      - err is set on unhandled error
++ *      - otherwise; exists will be true or false
++ */
++
++vmadm.exists = function vmExists(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    vmadm.load(opts, {fields: ['uuid']}, function _onLoad(err, vm) {
++        if (err) {
++            if (err.restCode === 'VmNotFound') {
++                callback(null, false);
++                return;
++            }
++            callback(err);
++            return;
++        }
++
++        if (vm.do_not_inventory && !opts.include_dni) {
++            /*
++             * VM is marked do_not_inventory. And we don't have include_dni
++             * option set indicating we want to include those, so we treat the
++             * same as not existing.
++             */
++            opts.log.trace(err, 'vmadm.exists(): ' + opts.uuid +
++                ' has do_not_inventory');
++            callback(null, false);
++            return;
++        }
++
++        callback(null, true);
++        return;
++    });
++};
++
++
++/**
++ * Call `vmadm get UUID`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} The VM uuid.
++ *      - log {Logger object}
++ * @param vmopts {Object} Optional vm options
++ *      - fields {Array} Return only the keys give in `fields` array
++ *      - include_dni {Boolean} If true, return VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++vmadm.load = function vmLoad(opts, vmopts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++    assert.uuid(opts.sysinfo.UUID, 'opts.sysinfo.UUID');
++
++    if (!callback) {
++        callback = vmopts;
++    }
++
++    opts.log.trace({
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'loading VM');
++
++    loadVm({
++        sysinfo: opts.sysinfo,
++        uuid: opts.uuid
++    }, function _onVmLoad(err, vm) {
++        var notFoundErr;
++
++        if (err && err.code === 'ENOENT') {
++            notFoundErr = new Error('vmadm load ' + opts.uuid +
++                ' failed: No such zone');
++            notFoundErr.restCode = 'VmNotFound';
++            callback(notFoundErr);
++            return;
++        } else if (err) {
++            callback(err);
++            return;
++        }
++
++        if (vm.do_not_inventory && !opts.include_dni) {
++            // Unless the caller is specifically asking for VMs that are
++            // do_not_inventory, we treat them the same a VMs that don't exist.
++            notFoundErr = new Error('vmadm load ' + opts.uuid +
++                ' failed: No such zone');
++            notFoundErr.restCode = 'VmNotFound';
++            callback(notFoundErr);
++            return;
++        }
++
++        if (opts.fields) {
++            Object.keys(vm).forEach(function _removeUnwantedFields(field) {
++                if (opts.fields.indexOf(field) === -1) {
++                    // not a field we want
++                    delete vm[field];
++                }
++            });
++        }
++
++        callback(null, vm);
++        return;
++    });
++};
++
++
++/**
++ * Call `vmadm create`.
++ *
++ * @param opts {Object} Options
++ *      - log {Logger object}
++ * @param callback {Function} `function (err, info)`
++ */
++
++vmadm.create = function vmCreate(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++
++    var log = opts.log;
++    var payload = opts;
++    var sysinfo = jsprim.deepCopy(payload.sysinfo);
++    var req_id;
++
++    req_id = opts.req_id;
++
++    delete payload.log;
++    delete payload.req_id;
++    delete payload.sysinfo;
++    delete payload.vmadmLogger;
++
++    log.trace({
++        req_id: req_id,
++        payload: payload
++    }, 'creating VM');
++
++    assert.uuid(payload.uuid, 'payload.uuid');
++
++    payload.state = 'running';
++    payload.autoboot = true;
++    payload.create_timestamp = (new Date()).toISOString();
++
++    // TODO:
++    //
++    //   strip out properties we don't care about, validate ones we do.
++    //   convert disks to final versions
++    //   fill in other fields that happen in real vmadm
++    //
++
++    writeVm(payload, {
++        log: log,
++        sysinfo: sysinfo
++    }, function _onWrite(err) {
++        callback(err);
++    });
++};
++
++
++/**
++ * Call `vmadm delete <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to delete
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, delete VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++vmadm.delete = function vmDelete(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var filename;
++    var vmdir;
++
++    vmdir = path.join(common.SERVER_ROOT, opts.sysinfo.UUID, 'vms');
++
++    opts.log.trace({
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'deleting VM');
++
++    assert.uuid(opts.uuid, 'opts.uuid');
++    filename = path.join(vmdir, opts.uuid + '.json');
++
++    vasync.pipeline({
++        funcs: [
++            // TODO: stop the instance, do any other cleanup
++            function _unlinkFile(_, cb) {
++                fs.unlink(filename, function _onUnlink(err) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++
++                    cb();
++                });
++            }
++        ]
++    }, function _onDeleted(err) {
++        opts.log.info({err: err, uuid: opts.uuid}, 'delete VM');
++        callback(err);
++    });
++};
++
++
++/**
++ * Call `vmadm update`.
++ *
++ * @param opts {Object} VMADM update payload
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, update VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++vmadm.update = function vmUpdate(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var log = opts.log;
++    var payload = opts;
++    var req_id = opts.req_id;
++
++    delete payload.log;
++    delete payload.req_id;
++    delete payload.vmadmLogger;
++
++    log.trace({
++        payload: payload,
++        req_id: req_id,
++        uuid: opts.uuid
++    }, 'updating VM');
++
++    // TODO: this should actually update
++
++    callback();
++};
++
++
++function writeVm(vmobj, opts, callback) {
++    var fd;
++    var filename;
++    var finalFilename;
++    var vmdir;
++
++    vmdir = path.join(common.SERVER_ROOT, opts.sysinfo.UUID, 'vms');
++    filename = path.join(vmdir, vmobj.uuid + '.json');
++
++    if (opts.atomicReplace) {
++        finalFilename = filename;
++        filename = filename + '.' + process.pid;
++    }
++
++    vasync.pipeline({
++        funcs: [
++            function _openFile(_, cb) {
++                fs.open(filename, 'wx', function _onOpen(err, openedFd) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++
++                    fd = openedFd;
++                    cb();
++                });
++            }, function _writeThenCloseFile(_, cb) {
++                var buf = new Buffer(JSON.stringify(vmobj, null, 2));
++
++                fs.write(fd, buf, 0, buf.length, null, function _onWrite(err) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++                    fs.close(fd, function _onWritten() {
++                        cb();
++                    });
++                });
++            }, function _atomicReplace(_, cb) {
++                if (!opts.atomicReplace) {
++                    cb();
++                    return;
++                }
++
++                fs.rename(filename, finalFilename, cb);
++            }
++        ]
++    }, function _onWroteVm(err) {
++        opts.log.info({err: err, uuid: vmobj.uuid}, 'wrote VM');
++        callback(err);
++    });
++}
++
++
++/**
++ * Call `vmadm reboot <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to reboot
++ *      - force {Boolean} Whether to force the reboot.
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, reboot VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++vmadm.reboot = function vmReboot(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    var args = [];
++
++    if (opts.force) {
++        args.push('-F');
++    }
++
++    opts.log.trace({
++        args: args,
++        force: Boolean(opts.force),
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'rebooting VM');
++
++    // TODO: this should actually reboot
++
++    callback();
++};
++
++
++/**
++ * Call `vmadm lookup -j`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} The VM uuid.
++ *      - log {Logger object}
++ * @param vmopts {Object} Optional vm options
++ *      - fields {Array} Return only the keys give in `fields` array
++ *      - include_dni {Boolean} If true, return VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err, vms)`
++ */
++
++vmadm.lookup = function vmLookup(search, opts, callback) {
++    assert.object(search, 'search');
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    opts.log.error({
++        req_id: opts.req_id,
++        search: search
++    }, 'lookup VMs');
++
++
++    // XXX can't we also specify fields in opts?
++
++    loadVms({}, function _onLoadVms(err, loadedVms) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        if (JSON.stringify(search) === '{}') {
++            // no search, just return all VMs
++            callback(null, loadedVms);
++            return;
++        }
++
++        assert.ok(false, 'Don\'t yet know how to handle search: ' +
++            JSON.stringify(search));
++    });
++};
++
++
++/**
++ * Call `vmadm start <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to start
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, start VMs that have do_not_inventory
++ *        set. default: false.
++ * @param callback {Function} `function (err)`
++ */
++
++vmadm.start = function vmStart(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    opts.log.trace({
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'start VM');
++
++
++    // TODO: this should actually do the start
++
++    loadVm({
++        sysinfo: opts.sysinfo,
++        uuid: opts.uuid
++    }, function _onLoad(err, vmobj) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        vmobj.autoboot = true;
++        vmobj.state = 'running';
++
++        writeVm(vmobj, {
++            atomicReplace: true,
++            log: opts.log,
++            sysinfo: opts.sysinfo
++        }, function _onWrite(writeErr) {
++            callback(writeErr);
++        });
++    });
++};
++
++
++/**
++ * Call `vmadm stop <uuid>`.
++ *
++ * @param opts {Object} Options
++ *      - uuid {String} UUID of VM to stop
++ *      - force {Boolean} Whether to force the stop
++ *      - log {Logger object}
++ *      - include_dni {Boolean} If true, stop VMs that have do_not_inventory
++ *        set. default: false.
++ *      - timeout {Number} If set, timeout in seconds between sending SIGTERM
++ *        and SIGKILL when stopping docker containers.
++ * @param callback {Function} `function (err)`
++ */
++
++vmadm.stop = function vmStop(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.optionalString(opts.req_id, 'opts.req_id');
++    assert.optionalNumber(opts.timeout, 'opts.timeout');
++    assert.string(opts.uuid, 'opts.uuid');
++    assert.optionalBool(opts.include_dni, 'opts.include_dni');
++
++    opts.log.trace({
++        req_id: opts.req_id,
++        uuid: opts.uuid
++    }, 'stop VM');
++
++    // TODO: this should actually do the stop
++
++    loadVm({
++        sysinfo: opts.sysinfo,
++        uuid: opts.uuid
++    }, function _onLoad(err, vmobj) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        vmobj.autoboot = false;
++        vmobj.state = 'stopped';
++
++        writeVm(vmobj, {
++            atomicReplace: true,
++            log: opts.log,
++            sysinfo: opts.sysinfo
++        }, function _onWrite(writeErr) {
++            callback(err);
++        });
++    });
++};
++
++
++vmadm._deleteAllWatchers = function _deleteAllWatchers() {
++    var self = this;
++    var filename;
++    var idx;
++    var keys;
++
++    keys = Object.keys(self.fileWatches);
++    for (idx = 0; idx < keys.length; idx++) {
++        filename = keys[idx];
++
++        console.error('DELETE WATCH: ' + filename);
++
++        self.fileWatches[filename].close();
++        delete self.fileWatches[filename];
++    }
++};
++
++// wrap handler in a closure so we can keep the filename
++function wrapHandler(filename, handler) {
++    var fn = filename.slice(0);
++
++    return (function _onFileEvent(evt) {
++        handler(evt, fn);
++    });
++}
++
++function zoneFromFilename(filename) {
++    var matches;
++
++    /* jsl:ignore (assignment in if()) */
++    if (matches = filename.match(/^(.*)\.json$/)) {
++        assert.uuid(matches[1], 'zonename');
++        return (matches[1]);
++    }
++    /* jsl:end */
++
++    return undefined;
++}
++
++vmadm._dispatchEvent =
++function _dispatchEvent(evtName, zonename, opts, handler) {
++    var self = this;
++
++    assert.string(evtName, 'evtName');
++    assert.uuid(zonename, 'zonename');
++    assert.object(opts, 'opts');
++    assert.object(opts.sysinfo, 'opts.sysinfo');
++    assert.func(handler, 'handler');
++
++    if (self.loadingVms[zonename]) {
++        console.error('skipping ' + zonename
++            + ' which is already being loaded');
++        return;
++    }
++    self.loadingVms[zonename] = (new Date()).getTime();
++
++    loadVm({
++        sysinfo: opts.sysinfo,
++        uuid: zonename
++    }, function _onVmLoad(err, vmobj) {
++        delete self.loadingVms[zonename];
++
++        if (err && err.code === 'ENOENT') {
++            if (evtName === 'delete') {
++                handler({
++                    type: 'delete',
++                    vm: {},
++                    zonename: zonename
++                });
++            } else {
++                console.error('VM ' + zonename + ' unexpectedly disappeared '
++                    + 'while loading after ' + evtName);
++            }
++            return;
++        }
++
++       if (err) {
++            console.error('error loading ' + zonename + ': ' + err.message);
++            return;
++        }
++
++        handler({
++            type: evtName,
++            vm: vmobj,
++            zonename: zonename
++        });
++    });
++};
++
++vmadm.events = function vmEvents(opts, handler, callback) {
++    var self = this;
++
++    var vmdir = path.join(common.SERVER_ROOT, opts.sysinfo.UUID, 'vms');
++
++    self.fileWatches = {};
++    self.loadingVms = {};
++
++    // load initial set of files so we know when things change
++    fs.readdir(vmdir, function _onReadDir(err, files) {
++        var filename;
++        var idx;
++        var modifyHandler;
++
++        // XXX what to do on error
++
++        self.instanceFiles = files;
++
++        for (idx = 0; idx < files.length; idx++) {
++            filename = files[idx];
++
++            if (!zoneFromFilename(filename)) {
++                console.error('ignoring non-vm: ' + filename);
++                continue;
++            }
++
++            // need to make a closure with a copy of the filename since
++            // node doesn't give it to us w/ the event.
++            modifyHandler = wrapHandler(filename, function _onModify(evt, fn) {
++                fs.exists(path.join(vmdir, fn), function _onExists(exists) {
++                    if (exists) {
++                        self._dispatchEvent('modify', zoneFromFilename(fn),
++                            {sysinfo: opts.sysinfo}, handler);
++                    } else {
++                        console.error('ignoring modify event for deleted '
++                            + 'file: ' + fn);
++                    }
++                });
++            });
++
++            self.fileWatches[filename] =
++                fs.watch(path.join(vmdir, filename), {}, modifyHandler);
++        }
++    });
++
++    self.fileWatches[vmdir] =
++    fs.watch(vmdir, {}, function _onDirEvent(evt) {
++        fs.readdir(vmdir, function _onRead(err, files) {
++            var filename;
++            var idx;
++            var modifyHandler;
++
++            // XXX what to do on error
++
++            // XXX this is a pretty inefficient way to generate the
++            // added/deleted
++
++            for (idx = 0; idx < files.length; idx++) {
++                filename = files[idx];
++
++                if (!zoneFromFilename(filename)) {
++                    console.error('ignoring non-vm: ' + filename);
++                    continue;
++                }
++
++                if (self.instanceFiles.indexOf(filename) === -1) {
++                    // didn't exist before, exists now: added
++                    assert.equal(self.fileWatches[filename], undefined,
++                        'file should not already have a watcher');
++
++                    // need to make a closure with a copy of the filename since
++                    // node doesn't give it to us w/ the event.
++                    modifyHandler = wrapHandler(filename,
++                        function _onModify(_, fn) {
++
++                        fs.exists(path.join(vmdir, fn),
++                            function _onExists(exists) {
++
++                            if (exists) {
++                                self._dispatchEvent('modify',
++                                    zoneFromFilename(fn),
++                                    {sysinfo: opts.sysinfo}, handler);
++                            } else {
++                                console.error('ignoring modify event for '
++                                    + 'deleted file: ' + fn);
++                            }
++                        });
++                    });
++
++                    self.fileWatches[filename] =
++                        fs.watch(path.join(vmdir, filename), {},
++                            modifyHandler);
++
++                    self._dispatchEvent('create', zoneFromFilename(filename),
++                        {sysinfo: opts.sysinfo}, handler);
++                }
++            }
++
++            for (idx = 0; idx < self.instanceFiles.length; idx++) {
++                filename = self.instanceFiles[idx];
++                if (files.indexOf(filename) === -1) {
++                    // existed before, doesn't exist now: deleted
++                    if (self.fileWatches[filename]) {
++                        self.fileWatches[filename].close();
++                        delete self.fileWatches[filename];
++                    }
++
++                    self._dispatchEvent('delete', zoneFromFilename(filename),
++                        {sysinfo: opts.sysinfo}, handler);
++                }
++            }
++
++            // replace with new list
++            self.instanceFiles = files;
++        });
++    });
++
++    callback(null, {
++        ev: {
++            date: (new Date()).toISOString(),
++            type: 'ready'
++            // uuid: ?
++            // vms: { "uuid": { ...
++        },
++        stop: function _stop() {
++            self._deleteAllWatchers();
++        }
++    });
++};
++
++module.exports = vmadm;
+diff --git a/lib/backends/dummy/tasks/image_ensure_present.js b/lib/backends/dummy/tasks/image_ensure_present.js
+new file mode 100644
+index 0000000..189c394
+--- /dev/null
++++ b/lib/backends/dummy/tasks/image_ensure_present.js
+@@ -0,0 +1,44 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++var Task = require('../../../task_agent/task');
++
++function ImageEnsurePresentTask(req) {
++    Task.call(this);
++    this.req = req;
++}
++
++Task.createTask(ImageEnsurePresentTask);
++
++function start() {
++    var self = this;
++
++    assert.object(self.log, 'self.log');
++    assert.object(self.req, 'self.req');
++    assert.object(self.req.params, 'self.req.params');
++
++    // XXX
++    //
++    // ensure_image doesn't really seem necessary. If the image doesn't exist
++    // but we need it, we'll import it at create_machine.
++    //
++
++    self.log.info({
++        params: self.req.params
++    }, 'pretending to ensure_image');
++
++    self.finish();
++}
++
++ImageEnsurePresentTask.setStart(start);
++
++module.exports = ImageEnsurePresentTask;
+diff --git a/lib/backends/dummy/tasks/machine_boot.js b/lib/backends/dummy/tasks/machine_boot.js
+new file mode 100644
+index 0000000..e84d806
+--- /dev/null
++++ b/lib/backends/dummy/tasks/machine_boot.js
+@@ -0,0 +1,125 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var execFile = require('child_process').execFile;
++
++var Task = require('../../../task_agent/task');
++var vmadm = require('../lib/vmadm');
++
++var MachineBootTask = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(MachineBootTask);
++
++function ignoreError(err, log) {
++    if (err && err.code) {
++        switch (err.code) {
++            case 'EALREADYRUNNING':
++                log.warn({err: err},
++                    'ignoring vmadm.start() failure, idempotent flag set');
++                return (true);
++            default:
++                break;
++        }
++    }
++
++    return (false);
++}
++
++function start(callback) {
++    var idempotent = false;
++    var self = this;
++    var uuid = self.req.params.uuid;
++    var vmadmOpts = {};
++
++    vmadmOpts.log = self.log;
++    vmadmOpts.req_id = self.req.req_id;
++    vmadmOpts.sysinfo = self.req.sysinfo;
++
++    if (self.req.params.idempotent === true ||
++        self.req.params.idempotent === 'true') {
++
++        idempotent = true;
++    }
++
++    function _addVmadmOpts(obj) {
++        var newobj = obj;
++
++        for (var prop in vmadmOpts) {
++            if (!vmadmOpts.hasOwnProperty(prop)) {
++                continue;
++            }
++            newobj[prop] = vmadmOpts[prop];
++        }
++
++        return newobj;
++    }
++
++    function startVM() {
++        vmadm.start(_addVmadmOpts(self.req.params),  function (error) {
++            if (error && (!idempotent || !ignoreError(error, self.log))) {
++                var msg = error instanceof Error ? error.message : error;
++                if (error) {
++                    if (error.restCode) {
++                        self.fatal('vmadm.start error: ' + msg,
++                            { restCode: error.restCode });
++                    } else {
++                        self.fatal('vmadm.start error: ' + msg);
++                    }
++                    return;
++                }
++                return;
++            }
++
++            vmadm.load(
++                _addVmadmOpts({ uuid: uuid }),
++                function (loadError, machine)
++            {
++                if (loadError) {
++                    if (loadError.restCode) {
++                        self.fatal('vmadm.load error: ' + loadError.message,
++                            { restCode: loadError.restCode });
++                    } else {
++                        self.fatal('vmadm.load error: ' + loadError.message);
++                    }
++                    return;
++                }
++
++                self.finish({ vm: machine });
++            });
++        });
++    }
++
++    // If 'update' param exists, update before starting the vm.
++    if (self.req.params.hasOwnProperty('update')) {
++        self.log.info('updating vm before starting');
++        self.req.params.update.uuid = self.req.params.uuid;
++        vmadm.update(_addVmadmOpts(self.req.params.update), function (error) {
++            if (error) {
++                var msg = error instanceof Error ? error.message : error;
++                if (error.restCode) {
++                    self.fatal('vmadm.update error: ' + msg,
++                        { restCode: error.restCode });
++                } else {
++                    self.fatal('vmadm.update error: ' + msg);
++                }
++                return;
++            }
++            startVM();
++        });
++
++    } else {
++        startVM();
++    }
++}
++
++MachineBootTask.setStart(start);
+diff --git a/lib/backends/dummy/tasks/machine_create.js b/lib/backends/dummy/tasks/machine_create.js
+new file mode 100644
+index 0000000..024b7b5
+--- /dev/null
++++ b/lib/backends/dummy/tasks/machine_create.js
+@@ -0,0 +1,396 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++// node
++var fs = require('fs');
++var path = require('path');
++
++// node_modules
++var assert = require('assert-plus');
++var vasync = require('vasync');
++var vmadm = require('../lib/vmadm');
++
++// local
++var common = require('../common');
++var Task = require('../../../task_agent/task');
++
++var DISK_PAYLOAD = {
++    image_name: true,
++    image_size: true,
++    image_uuid: true,
++    refreservation: true,
++    size: true
++};
++var NIC_PAYLOAD = {
++    belongs_to_type: false,
++    belongs_to_uuid: false,
++    cn_uuid: false,
++    created_timestamp: false,
++    ip: true,
++    mac: true,
++    modified_timestamp: false,
++    mtu: true,
++    netmask: true,
++    network_uuid: true,
++    nic_tag: true,
++    primary: true,
++    resolvers: false,
++    state: false,
++    owner_uuid: false,
++    vlan_id: true
++};
++var VM_PAYLOAD = {
++    alias: true,
++    archive_on_delete: true,
++    billing_id: true,
++    brand: true,
++    cpu_cap: true,
++    cpu_shares: true,
++    cpu_type: true,
++    customer_metadata: true,
++    dataset_url: false,
++    dataset_url_compression: false,
++    disk_driver: true,
++    disks: true,
++    firewall_enabled: false,
++    image: false,
++    image_uuid: true,
++    gpus: true,
++    max_lwps: true,
++    max_physical_memory: true,
++    max_swap: true,
++    nic_driver: true,
++    nics: true,
++    owner_uuid: true,
++    server_uuid: true,
++    quota: true,
++    ram: true,
++    resolvers: true,
++    uuid: true,
++    vcpus: true,
++    zfs_io_priority: false
++};
++
++
++var MachineCreateTask = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(MachineCreateTask);
++
++
++function start(callback) {
++    var self = this;
++
++    assert.object(self.sysinfo, 'self.sysinfo');
++    assert.uuid(self.sysinfo.UUID, 'self.sysinfo.UUID');
++
++    var creationGuardFilename;
++
++    vasync.pipeline({
++        arg: {
++            sysinfo: self.sysinfo
++        },
++        funcs: [
++            function _doPrecheck(_, cb) {
++                self.pre_check(function _afterPrecheck(err) {
++                    if (err) {
++                        self.fatal(err.message);
++                        return;
++                    }
++                    cb();
++                });
++            },
++            function _createProvisionLockFile(_, cb) {
++                common.provisionInProgressFile(
++                    self.req.params.uuid,
++                    function _afterCreateLock(err, filename) {
++                        creationGuardFilename = filename;
++                        cb();
++                        return;
++                    });
++            },
++            self.ensure_dataset_present.bind(self),
++            self.fetch_dataset.bind(self),
++            self.build_payload.bind(self),
++            self.create_machine.bind(self),
++            function _deleteProvisionLockFile(_, cb) {
++                fs.unlink(creationGuardFilename, function _afterUnlink(err) {
++                    if (err) {
++                        self.log.error(err.message);
++                    }
++                    cb();
++                });
++            }
++        ]
++    }, function _afterPipeline(pipelineErr) {
++        var loadOpts = {};
++
++        loadOpts.log = self.log;
++        loadOpts.req_id = self.req.req_id;
++        loadOpts.sysinfo = self.sysinfo;
++        loadOpts.uuid = self.req.params.uuid;
++
++        vmadm.load(loadOpts, function _onLoad(loadError, machine) {
++            if (pipelineErr) {
++                if (machine) {
++                    self.fatal(pipelineErr.message, null, {
++                        vm: machine
++                    });
++                    return;
++                } else {
++                    self.fatal(pipelineErr.message);
++                    return;
++                }
++            } else {
++                if (loadError) {
++                    self.log.error(loadError.message);
++                    self.finish();
++                    return;
++                }
++
++                self.finish({
++                    vm: machine
++                });
++            }
++        });
++    });
++}
++
++function pre_check(callback) {
++    var self = this;
++
++    assert.uuid(self.req.params.uuid, 'params.uuid');
++    assert.uuid(self.req.sysinfo.UUID, 'sysinfo.UUID');
++
++    vasync.pipeline({
++        funcs: [
++            function _checkAlreadyExists(_, cb) {
++                 // Fail if VM with uuid exists
++                vmadm.exists({
++                    include_dni: true,
++                    log: self.log,
++                    sysinfo: self.req.sysinfo,
++                    uuid: self.req.params.uuid
++                }, function _onExistsResult(err, exists) {
++                    if (err) {
++                        cb(err);
++                        return;
++                    }
++                    if (exists) {
++                        cb(new Error('Machine ' + self.req.params.uuid +
++                            ' exists.'));
++                        return;
++                    }
++                    cb();
++                    return;
++                });
++            }, function _checkDatasetExists(_, cb) {
++                // TODO: Fail if zfs dataset already exists
++                cb();
++                return;
++            }
++        ]
++    }, function _afterPipeline(err) {
++        callback(err);
++    });
++}
++
++function ensure_dataset_present(arg, callback) {
++    // TODO: check whether dataset exists, set arg.dataset_exists appropriately.
++    arg.dataset_exists = true;
++
++    callback();
++}
++
++function fetch_dataset(arg, callback) {
++    var self = this;
++
++    if (arg.dataset_exists) {
++        self.log.info('dataset exists, not fetching');
++        callback();
++        return;
++    }
++
++    /* BEGIN JSSTYLED */
++    //
++    // TODO: fetch dataset
++    //
++    //    "image_uuid": "fd2cc906-8938-11e3-beab-4359c665ac99",
++    //    "dataset_url_compression": "bzip2",
++    //    "dataset_url": "http://10.192.0.21/images/fd2cc906-8938-11e3-beab-4359c665ac99/file",
++    //
++    // in req.params.* will tell us where/how to get the image.
++    //
++    /* END JSSTYLED */
++
++    callback();
++}
++
++function map_thing(opts, MAP_PAYLOAD, name, things) {
++    var idx;
++    var key;
++    var keys;
++    var newThing;
++    var newThings = [];
++    var thing;
++    var thingIdx;
++
++    assert.arrayOfObject(things, 'things');
++
++    for (thingIdx = 0; thingIdx < things.length; thingIdx++) {
++        newThing = {};
++        thing = things[thingIdx];
++
++        keys = Object.keys(thing);
++        for (idx = 0; idx < keys.length; idx++) {
++            key = keys[idx];
++            if (MAP_PAYLOAD[key] === undefined) {
++                opts.ignored.push(name + '.' + thingIdx + '.' + key);
++            } else if (MAP_PAYLOAD[key]) {
++                newThing[key] = thing[key];
++            }
++        }
++
++        newThings.push(newThing);
++    }
++
++    return newThings;
++}
++
++function map_payload(opts, payload) {
++    var idx;
++    var keys;
++    var key;
++    var newPayload = {};
++
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.object(payload, 'payload');
++
++    opts.ignored = [];
++
++    keys = Object.keys(payload);
++    for (idx = 0; idx < keys.length; idx++) {
++        key = keys[idx];
++
++        if (key === 'nics') {
++            // special case, we want to map specific NIC fields
++            newPayload[key] = map_thing(opts, NIC_PAYLOAD, 'nic', payload[key]);
++        } else if (key === 'disks') {
++            // special case, we want to map specific disk fields
++            newPayload[key] = map_thing(opts, DISK_PAYLOAD, 'disk',
++                payload[key]);
++        } else if (VM_PAYLOAD[key] === undefined) {
++            opts.ignored.push(key);
++        } else if (VM_PAYLOAD[key]) {
++            newPayload[key] = payload[key];
++        }
++    }
++
++    // fill in things we want default values for
++    if (newPayload.nics === undefined) {
++        newPayload.nics = {};
++    }
++    if (['bhyve', 'kvm'].indexOf(newPayload.brand) !== -1) {
++        if (newPayload.disks === undefined) {
++            newPayload.disks = {};
++        }
++    }
++    newPayload.autoboot = true;
++    newPayload.datasets = [];
++    newPayload.limit_priv = 'default';
++    if (newPayload.max_locked_memory === undefined &&
++        newPayload.max_swap !== undefined) {
++
++        newPayload.max_locked_memory = newPayload.max_swap;
++    }
++    if (newPayload.zpool === undefined) {
++        newPayload.zpool = 'zones';
++    }
++    newPayload.zfs_filesystem = newPayload.zpool + '/' + newPayload.uuid;
++    newPayload.zonepath = '/' + newPayload.zfs_filesystem;
++    if (newPayload.zfs_io_priority === undefined) {
++        newPayload.zfs_io_priority = 100;
++    }
++
++    if (opts.ignored.length > 0) {
++        opts.log.warn({ignored: opts.ignored},
++            'Warning: ignored some unrecognized payload properties');
++    }
++
++    return newPayload;
++}
++
++function build_payload(arg, callback) {
++    var self = this;
++    var req = self.req;
++    var payload;
++
++    payload = map_payload({log: self.log}, req.params);
++
++    self.log.info({payload: payload}, 'built payload');
++
++    arg.payload = payload;
++
++    callback();
++}
++
++function create_machine(arg, callback) {
++    var self = this;
++    var payload;
++    var req = self.req;
++
++    payload = arg.payload;
++
++    // Unfortunately vmadm.create conflates the payload and the opts, so we need
++    // to add the log and req_id and sysinfo which it then removes later. :/
++    payload.log = self.log;
++    payload.req_id = req.req_id;
++    payload.sysinfo = self.sysinfo;
++
++    vmadm.create(payload, function _onCreate(err, vmobj) {
++        if (err) {
++            return callback(err);
++        }
++        return callback();
++    });
++}
++
++MachineCreateTask.setStart(start);
++
++MachineCreateTask.createSteps({
++    pre_check: {
++        fn: pre_check,
++        progress: 20,
++        description: 'Performing pre-flight sanity check'
++    },
++    ensure_dataset_present: {
++        fn: ensure_dataset_present,
++        progress: 30,
++        description: 'Checking for required image/dataset'
++    },
++    fetch_dataset: {
++        fn: fetch_dataset,
++        progress: 50,
++        description: 'Fetching image/dataset'
++    },
++    build_payload: {
++        fn: build_payload,
++        progress: 60,
++        description: 'Building VM payload'
++    },
++    create_machine: {
++        fn: create_machine,
++        progress: 100,
++        description: 'Creating machine'
++    }
++});
+diff --git a/lib/backends/dummy/tasks/machine_destroy.js b/lib/backends/dummy/tasks/machine_destroy.js
+new file mode 100644
+index 0000000..63a8762
+--- /dev/null
++++ b/lib/backends/dummy/tasks/machine_destroy.js
+@@ -0,0 +1,79 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var vasync = require('vasync');
++
++var common = require('../common');
++var Task = require('../../../task_agent/task');
++var vmadm = require('../lib/vmadm');
++
++
++var MachineDestroyTask = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(MachineDestroyTask);
++
++function start() {
++    var self = this;
++    var uuid = self.req.params.uuid;
++    var vmadmOpts = {};
++
++    vmadmOpts.log = self.log;
++    vmadmOpts.req_id = self.req.req_id;
++    vmadmOpts.uuid = uuid;
++    vmadmOpts.sysinfo = self.req.sysinfo;
++
++    vasync.pipeline({
++        funcs: [
++            function ensureProvisionComplete(_, cb) {
++                common.ensureProvisionComplete(self.req.uuid, cb);
++            },
++            function deleteVm(_, cb) {
++                /* this will pass the error (if any) to _pipelineCompleted */
++                vmadm.delete(vmadmOpts, cb);
++            }
++        ]
++    }, function _pipelineComplete(err) {
++        var errLines = [];
++        var lastErrLine = '';
++        var msg;
++
++        if (!err) {
++            /* Success! */
++            self.finish();
++            return;
++        }
++
++        if (err.stderrLines) {
++            errLines = err.stderrLines.split('\n');
++            if (errLines.length > 0) {
++                lastErrLine = errLines[errLines.length - 1];
++            }
++        }
++
++        if (lastErrLine.match(': No such zone') ||
++            (err.restCode && (err.restCode === 'VmNotFound'))) {
++
++            /*
++             * The zone doesn't exist, so consider the delete a success (so
++             * we're idempotent)
++             */
++            self.finish();
++            return;
++        }
++
++        msg = err instanceof Error ? err.message : err;
++        self.fatal('delete error: ' + msg);
++    });
++}
++
++MachineDestroyTask.setStart(start);
+diff --git a/lib/backends/dummy/tasks/machine_load.js b/lib/backends/dummy/tasks/machine_load.js
+new file mode 100644
+index 0000000..2185870
+--- /dev/null
++++ b/lib/backends/dummy/tasks/machine_load.js
+@@ -0,0 +1,59 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++
++var Task = require('../../../task_agent/task');
++var vmadm = require('../lib/vmadm');
++
++var MachineLoadTask = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(MachineLoadTask);
++
++function start(callback) {
++    var self = this;
++    var opts = {};
++
++    assert.object(self.log, 'self.log');
++    assert.object(self.req, 'self.req');
++    assert.string(self.req.req_id, 'self.req.req_id');
++    assert.object(self.req.params, 'self.req.params');
++    assert.uuid(self.req.params.uuid, 'self.req.params.uuid');
++    assert.object(self.sysinfo, 'self.sysinfo');
++    assert.uuid(self.sysinfo.UUID, 'self.sysinfo.UUID');
++
++    opts.log = self.log;
++    opts.req_id = self.req.req_id;
++    opts.sysinfo = self.sysinfo;
++    opts.uuid = self.req.params.uuid;
++
++    vmadm.load(opts, function _onLoad(error, vmobj) {
++        var msg;
++
++        if (error) {
++            msg = error instanceof Error ? error.message : error;
++
++            if (error.restCode) {
++                self.fatal('VM.load error: ' + msg,
++                    { restCode: error.restCode });
++            } else {
++                self.fatal('VM.load error: ' + msg);
++            }
++            return;
++        }
++
++        self.finish(vmobj);
++    });
++}
++
++MachineLoadTask.setStart(start);
+diff --git a/lib/backends/dummy/tasks/machine_reboot.js b/lib/backends/dummy/tasks/machine_reboot.js
+new file mode 100644
+index 0000000..9e01a5e
+--- /dev/null
++++ b/lib/backends/dummy/tasks/machine_reboot.js
+@@ -0,0 +1,145 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var execFile = require('child_process').execFile;
++
++var Task = require('../../../task_agent/task');
++var vmadm = require('../lib/vmadm');
++
++var MachineRebootTask = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(MachineRebootTask);
++
++function ignoreError(err, log) {
++    if (err && err.code) {
++        switch (err.code) {
++            case 'ENOTRUNNING':
++                log.warn({err: err},
++                    'ignoring vmadm.reboot() failure, idempotent flag set');
++                return (true);
++            default:
++                break;
++        }
++    }
++
++    return (false);
++}
++
++function start(callback) {
++    var idempotent = false;
++    var self = this;
++    var force = self.req.params.force;
++    var opts = {};
++    var timeout = self.req.params.timeout;
++    var uuid = self.req.params.uuid;
++    var vmadmOpts = {};
++
++    vmadmOpts.log = self.log;
++    vmadmOpts.req_id = self.req.req_id;
++    vmadmOpts.sysinfo = self.req.sysinfo;
++
++    function _addVmadmOpts(obj) {
++        var newobj = obj;
++
++        for (var prop in vmadmOpts) {
++            if (!vmadmOpts.hasOwnProperty(prop)) {
++                continue;
++            }
++            newobj[prop] = vmadmOpts[prop];
++        }
++
++        return newobj;
++    }
++
++    if (force) {
++        opts.force = true;
++    }
++
++    if (timeout) {
++        if ((typeof (timeout) === 'string') && timeout.match(/^[0-9]+$/)) {
++            opts.timeout = Number(timeout);
++        } else if (typeof (timeout) === 'number') {
++            opts.timeout = timeout;
++        } else {
++            self.fatal('Invalid type: "' + typeof (timeout) + '" for timeout');
++            return;
++        }
++    }
++
++    if (self.req.params.idempotent === true ||
++        self.req.params.idempotent === 'true') {
++
++        idempotent = true;
++    }
++
++    function rebootVM() {
++        var rebootopts = _addVmadmOpts({ uuid: uuid });
++        if (opts.force) {
++            rebootopts.force = true;
++        }
++
++        vmadm.reboot(rebootopts, function (error) {
++            if (error && (!idempotent || !ignoreError(error, self.log))) {
++                var msg = error instanceof Error ? error.message : error;
++                if (error.restCode) {
++                    self.fatal('vmadm.reboot error: ' + msg,
++                        { restCode: error.restCode });
++                } else {
++                    self.fatal('vmadm.reboot error: ' + msg);
++                }
++                return;
++            }
++            self.progress(100);
++            vmadm.load(
++                _addVmadmOpts({ uuid: uuid }),
++                function (loadError, machine)
++            {
++                if (loadError) {
++                    if (loadError.restCode) {
++                        self.fatal('vmadm.load error: ' + loadError.message,
++                            { restCode: loadError.restCode });
++                    } else {
++                        self.fatal('vmadm.load error: ' + loadError.message);
++                    }
++                    return;
++                }
++
++                self.finish({ vm: machine });
++            });
++        });
++    }
++
++    // If 'update' param exists, update before rebooting the vm.
++    if (self.req.params.hasOwnProperty('update')) {
++        self.log.info('updating vm before rebooting');
++        self.req.params.update.uuid = self.req.params.uuid;
++        vmadm.update(_addVmadmOpts(self.req.params.update), function (error) {
++            if (error) {
++                var msg = error instanceof Error ? error.message : error;
++                if (error.restCode) {
++                    self.fatal('vmadm.update error: ' + msg,
++                        { restCode: error.restCode });
++                } else {
++                    self.fatal('vmadm.update error: ' + msg);
++                }
++                return;
++            }
++            rebootVM();
++        });
++
++    } else {
++        rebootVM();
++    }
++}
++
++MachineRebootTask.setStart(start);
+diff --git a/lib/backends/dummy/tasks/machine_shutdown.js b/lib/backends/dummy/tasks/machine_shutdown.js
+new file mode 100644
+index 0000000..205d88a
+--- /dev/null
++++ b/lib/backends/dummy/tasks/machine_shutdown.js
+@@ -0,0 +1,111 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var execFile = require('child_process').execFile;
++
++var Task = require('../../../task_agent/task');
++var vmadm = require('../lib/vmadm');
++
++var MachineShutdownTask = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(MachineShutdownTask);
++
++function ignoreError(err, log) {
++    if (err && err.code) {
++        switch (err.code) {
++            case 'ESRCH':
++            case 'ENOTRUNNING':
++                log.warn({err: err},
++                    'ignoring vmadm.stop() failure, idempotent flag set');
++                return (true);
++            default:
++                break;
++        }
++    }
++
++    return (false);
++}
++
++function start(callback) {
++    var self = this;
++
++    var idempotent = false;
++    var loadOpts = {};
++    var stopOpts = {};
++    var timeout = self.req.params.timeout;
++    var vmadmOpts = {};
++
++    vmadmOpts.log = self.log;
++    vmadmOpts.req_id = self.req.req_id;
++    vmadmOpts.sysinfo = self.req.sysinfo;
++
++    loadOpts = vmadmOpts;
++    loadOpts.uuid = self.req.params.uuid;
++
++    stopOpts = vmadmOpts;
++    stopOpts.uuid = self.req.params.uuid;
++
++    if (self.req.params.force) {
++        stopOpts.force = true;
++    }
++
++    if (timeout) {
++        if ((typeof (timeout) === 'string') && timeout.match(/^[0-9]+$/)) {
++            stopOpts.timeout = Number(timeout);
++        } else if (typeof (timeout) === 'number') {
++            stopOpts.timeout = timeout;
++        } else {
++            self.fatal('Invalid type: "' + typeof (timeout) + '" for timeout');
++            return;
++        }
++    }
++
++    if (self.req.params.idempotent === true ||
++        self.req.params.idempotent === 'true') {
++
++        idempotent = true;
++    }
++
++    vmadm.stop(stopOpts, function (error) {
++        if (error && (!idempotent || !ignoreError(error, self.log))) {
++            var msg = error instanceof Error ? error.message : error;
++            if (error.restCode) {
++                self.fatal('vmadm.stop error: ' + msg,
++                    { restCode: error.restCode });
++            } else {
++                self.fatal('vmadm.stop error: ' + msg);
++            }
++            return;
++        }
++
++        vmadm.load(
++            loadOpts,
++            function (loadError, machine)
++        {
++            if (loadError) {
++                if (loadError.restCode) {
++                    self.fatal('vmadm.load error: ' + loadError.message,
++                        { restCode: loadError.restCode });
++                } else {
++                    self.fatal('vmadm.load error: ' + loadError.message);
++                }
++                return;
++            }
++
++            self.finish({ vm: machine });
++        });
++        return;
++    });
++}
++
++MachineShutdownTask.setStart(start);
+diff --git a/lib/backends/dummy/tasks/machine_update.js b/lib/backends/dummy/tasks/machine_update.js
+new file mode 100644
+index 0000000..985dc20
+--- /dev/null
++++ b/lib/backends/dummy/tasks/machine_update.js
+@@ -0,0 +1,100 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var execFile = require('child_process').execFile;
++
++var Task = require('../../../task_agent/task');
++var vmadm = require('../lib/vmadm');
++
++var MachineUpdateTask = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(MachineUpdateTask);
++
++function start(callback) {
++    var self = this;
++    var uuid = self.req.params.uuid;
++    var vmadmOpts = {};
++
++    vmadmOpts.log = self.log;
++    vmadmOpts.req_id = self.req.req_id;
++    vmadmOpts.sysinfo = self.req.sysinfo;
++
++    function _addVmadmOpts(obj) {
++        var newobj = obj;
++
++        for (var prop in vmadmOpts) {
++            if (!vmadmOpts.hasOwnProperty(prop)) {
++                continue;
++            }
++            newobj[prop] = vmadmOpts[prop];
++        }
++
++        return newobj;
++    }
++
++    vmadm.update(_addVmadmOpts(self.req.params), function (error) {
++        if (error) {
++            var msg = error instanceof Error ? error.message : error;
++            if (error.restCode) {
++                self.fatal('vmadm.update error: ' + msg,
++                    { restCode: error.restCode });
++            } else {
++                self.fatal('vmadm.update error: ' + msg);
++            }
++            return;
++        }
++
++        vmadm.load(_addVmadmOpts({ uuid: uuid }), function (error2, vm) {
++            if (error2) {
++                if (error2.restCode) {
++                    self.fatal('vmadm.load error: ' + error2.message,
++                        { restCode: error2.restCode });
++                } else {
++                    self.fatal('vmadm.load error: ' + error2.message);
++                }
++                return;
++            }
++
++            if (!self.req.params.hasOwnProperty('add_nics') &&
++                !self.req.params.hasOwnProperty('remove_nics')) {
++                self.progress(100);
++                self.finish({ vm: vm });
++                return;
++            }
++
++            if (vm.state !== 'running') {
++                self.progress(100);
++                self.finish({ vm: vm });
++                return;
++            }
++
++            self.progress(75);
++            vmadm.reboot(_addVmadmOpts({ uuid: uuid }), function (error3) {
++                if (error3) {
++                    if (error3.restCode) {
++                        self.fatal('vmadm.reboot error: ' + error3.message,
++                            { restCode: error3.restCode });
++                    } else {
++                        self.fatal('vmadm.reboot error: ' + error3.message);
++                    }
++                    return;
++                }
++
++                self.progress(100);
++                self.finish({ vm: vm });
++            });
++        });
++    });
++}
++
++MachineUpdateTask.setStart(start);
+diff --git a/lib/backends/dummy/tasks/nop.js b/lib/backends/dummy/tasks/nop.js
+new file mode 100644
+index 0000000..5e835fa
+--- /dev/null
++++ b/lib/backends/dummy/tasks/nop.js
+@@ -0,0 +1,43 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var execFile = require('child_process').execFile;
++
++var Task = require('../../../task_agent/task');
++
++var Sleep = module.exports = function (req) {
++    Task.call(this);
++    this.req = req;
++};
++
++Task.createTask(Sleep);
++
++Sleep.setStart(start);
++
++function start(callback) {
++    var self = this;
++
++    if (self.req.params.sleep) {
++        setTimeout(function () {
++            end();
++        }, Number(self.req.params.sleep) * 1000);
++    } else {
++        end();
++    }
++
++    function end() {
++        if (self.req.params.error) {
++            self.fatal(self.req.params.error);
++            return;
++        } else {
++            self.finish();
++        }
++    }
++}
+diff --git a/lib/backends/dummy/tools/create-server.js b/lib/backends/dummy/tools/create-server.js
+new file mode 100644
+index 0000000..e680291
+--- /dev/null
++++ b/lib/backends/dummy/tools/create-server.js
+@@ -0,0 +1,330 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++//
++// For now, we do the same function that booter would do wrt adding NICs. In
++// the future we should probably instead include a dhcp client and actually send
++// DHCPDISCOVER and DHCPREQUEST messages to booter to emulate actual booting.
++//
++// Assumptions made include:
++//
++//  * The VM running this is on the admin network
++//  * The VM has customer_metadata keys:
++//      * ufdsAdmin -- set to the uuid of the admin user in ufds
++//      * dnsDomain -- set to the dns_domain from /usbkey/config
++//  * This runs as root
++//  * The DC we're attaching to is the same as `mdata-get sdc:datacenter_name`
++//  * NAPI is at napi.<datacenterName>.<dnsDomain>
++//
++// TODO:
++//
++//  * If MAC is used, generate a new one and try again instead of blowing up
++//
++// Eventually:
++//
++//  * allow custom disk setups
++//  * allow customizing other parameters: cpus, memory, product, serial, etc.
++//
++
++var fs = require('fs');
++
++var assert = require('assert-plus');
++var child_process = require('child_process');
++var jsprim = require('jsprim');
++var NAPI = require('sdc-clients').NAPI;
++var uuid = require('uuid');
++var vasync = require('vasync');
++
++var common = require('../common');
++
++var SERVER_ROOT = common.SERVER_ROOT;
++var TEMPLATE = {
++    'System Type': 'Virtual',
++    'SDC Version': '7.0',
++    'Manufacturer': 'Joyent',
++    'Product': 'Joyent-Virtual-CN-0001',
++    'SKU Number': '90210 rev 42',
++    'HW Version': '1.0',
++    'HW Family': 'JXX-0001',
++    'Setup': 'true',
++    'VM Capable': true,
++    'Bhyve Capable': true,
++    'Bhyve Max Vcpus': 32,
++    'CPU Type': 'Intel(R) Xeon(R) CPU E5-2670 0 @ 2.60GHz',
++    'CPU Virtualization': 'vmx',
++    'CPU Physical Cores': 2,
++    'CPU Total Cores': 32,
++    'MiB of Memory': '262111',
++    'Zpool': 'zones',
++    'Zpool Disks': '',
++    'Zpool Profile': 'mirror',
++    'Disks': {
++    },
++    'Boot Parameters': {
++        'console': 'ttyb',
++        'boot_args': '',
++        'bootargs': ''
++    },
++    'SDC Agents': [],
++    'Network Interfaces': {
++        'dnet0': {'ip4addr': '', 'Link Status': 'up', 'NIC Names': ['admin']},
++        'dnet1': {'ip4addr': '', 'Link Status': 'up', 'NIC Names': []}
++    },
++    'Virtual Network Interfaces': {},
++    'Link Aggregations': {}
++};
++var OUI = '00:10:fe'; // thanks DEC!
++
++function randomOctet() {
++    var octet;
++
++    octet = Math.floor(Math.random() * 256).toString(16);
++    while (octet.length < 2) {
++        octet = '0' + octet;
++    }
++
++    return (octet);
++}
++
++function generateMac() {
++    var octetIdx;
++    var mac = OUI;
++
++    for (octetIdx = 3; octetIdx <= 5; octetIdx++) {
++        mac = mac + ':' + randomOctet();
++    }
++
++    return (mac);
++}
++
++function populateNics(ctx, callback) {
++    assert.object(ctx, 'ctx');
++    assert.object(ctx.serverObj, 'ctx.serverObj');
++    assert.object(ctx.serverObj['Network Interfaces'],
++        'ctx.serverObj[Network Interfaces]');
++    assert.func(callback, 'callback');
++
++    var mac;
++    var nicKeys;
++    var nics;
++
++    if (!ctx.napi) {
++        ctx.napi = new NAPI({
++            url: 'http://napi.' +
++                ctx.datacenterName + '.' +
++                ctx.dnsDomain
++        });
++    }
++
++    nics = ctx.serverObj['Network Interfaces'];
++    nicKeys = Object.keys(nics);
++
++    function populateNic(nicName, cb) {
++        if (!nics[nicName]['MAC Address']) {
++            nics[nicName]['MAC Address'] = generateMac();
++        }
++        mac = nics[nicName]['MAC Address'];
++
++        ctx.napi.getNic(mac, function (err, res) {
++            var createParams = {};
++
++            if (!err) {
++                cb(new Error('NIC already exists in NAPI: ' +
++                    JSON.stringify(res)));
++                return;
++            }
++            if (err.name !== 'ResourceNotFoundError') {
++                console.error('Unexpected error: ' + err.message);
++                cb(err);
++                return;
++            }
++            // Here we know the NIC doesn't exist, so we add it.
++            if (nics[nicName]['NIC Names'].indexOf('admin') !== -1) {
++                createParams.belongs_to_type = 'other'; // what booter does
++                createParams.belongs_to_uuid = ctx.ufdsAdmin;
++                createParams.mac = mac;
++                createParams.nic_tags_provided = nics[nicName]['NIC Names'];
++                createParams.owner_uuid = ctx.ufdsAdmin;
++
++                ctx.napi.provisionNic('admin', createParams,
++                    function onProvision(provErr, provRes) {
++
++                    if (provErr) {
++                        console.error(provErr, 'Error provisioning NIC[' + mac +
++                            ']: ' + provErr.message);
++                        cb(provErr);
++                        return;
++                    }
++
++                    assert.string(provRes.ip, 'res.ip');
++                    nics[nicName].ip4addr = provRes.ip;
++
++                    cb();
++                });
++            } else {
++                cb();
++            }
++        });
++    }
++
++    vasync.forEachPipeline({
++        func: populateNic,
++        inputs: nicKeys
++    }, function (err) {
++        callback(err);
++    });
++}
++
++function generateUuid(ctx, callback) {
++    ctx.serverObj.UUID = uuid.v4();
++    callback();
++}
++
++function fillInBlanks(ctx, callback) {
++    var shortId = ctx.serverObj.UUID.substr(0, 8).toUpperCase();
++    var now = Math.floor((new Date()).getTime() / 1000);
++
++    ctx.serverObj['Boot Time'] = now.toString(); // goofy, but compatible
++    ctx.serverObj['Hostname'] = 'VC' + shortId;
++    ctx.serverObj['Serial Number'] = shortId;
++    ctx.serverObj['Zpool Creation'] = now;
++
++    callback();
++}
++
++function diskName(idx) {
++    var disk = '';
++    var prefix = 'c' + idx + 't5000';
++    var suffix = 'd0';
++
++    disk = prefix +
++        (randomOctet() +
++        randomOctet() +
++        randomOctet()).toUpperCase() +
++        suffix;
++
++    return (disk);
++}
++
++function addDisks(ctx, callback) {
++    var disk;
++    var idx = 0;
++
++     ctx.serverObj['Zpool Size in GiB'] = 3770;
++     for (idx = 0; idx < 16; idx++) {
++         disk = diskName(idx);
++         if (ctx.serverObj['Zpool Disks'].length > 0) {
++             ctx.serverObj['Zpool Disks'] += ',';
++         }
++         ctx.serverObj['Zpool Disks'] += disk;
++         ctx.serverObj['Disks'][disk] = {'Size in GB': 600};
++     }
++
++     callback();
++}
++
++function getDatacenterName(ctx, callback) {
++    common.mdataGet('sdc:datacenter_name', function _onMdata(err, datacenter) {
++        ctx.datacenterName = datacenter;
++        ctx.serverObj['Datacenter Name'] = datacenter;
++        callback();
++    });
++}
++
++function getDNSDomain(ctx, callback) {
++    common.mdataGet('dnsDomain', function _onMdata(err, dnsDomain) {
++        assert.string(dnsDomain, 'dnsDomain');
++        ctx.dnsDomain = dnsDomain;
++        callback();
++    });
++}
++
++function getUfdsAdmin(ctx, callback) {
++    common.mdataGet('ufdsAdmin', function _onMdata(err, ufdsAdmin) {
++        assert.uuid(ufdsAdmin, 'ufdsAdmin');
++        ctx.ufdsAdmin = ufdsAdmin;
++        callback();
++    });
++}
++
++function getPlatformBuildstamp(ctx, callback) {
++    common.getPlatformBuildstamp(function _onBuildstamp(err, buildstamp) {
++        if (!err) {
++            ctx.serverObj['Live Image'] = buildstamp;
++        }
++
++        callback(err);
++    });
++}
++
++function makeDirs(ctx, callback) {
++    var serverDir = SERVER_ROOT + '/' + ctx.serverObj.UUID;
++
++    child_process.execFile('/bin/mkdir', [
++        '-p', serverDir + '/vms'
++    ], function _onMkdir(err, stdout, stderr) {
++        assert.ifError(err, 'mkdir should always work');
++
++        ctx.serverDir = serverDir;
++
++        callback(err);
++    });
++}
++
++function writeSysinfo(ctx, callback) {
++    var data;
++    var filename = ctx.serverDir + '/sysinfo.json';
++
++    data = JSON.stringify(ctx.serverObj, null, 4) + '\n';
++
++    fs.writeFile(filename, data, function _wroteSysinfo(err) {
++        if (!err) {
++            console.log('wrote sysinfo');
++        }
++
++        callback(err);
++    });
++}
++
++function createServer(callback) {
++    var ctx = {};
++
++    ctx.serverObj = jsprim.deepCopy(TEMPLATE);
++
++    vasync.pipeline({
++        arg: ctx,
++        funcs: [
++            getUfdsAdmin,
++            getDatacenterName,
++            getDNSDomain,
++            generateUuid,
++            makeDirs,
++            populateNics,
++            addDisks,
++            getPlatformBuildstamp,
++            fillInBlanks,
++            writeSysinfo
++        ]
++    }, function _pipelineComplete(err) {
++        callback(err, ctx.serverObj);
++    });
++}
++
++function main() {
++    createServer(function _created(err, serverObj) {
++        if (err) {
++            console.error('failed to create server: ' + err.message);
++            return;
++        }
++        console.error('created server: ' + serverObj.UUID);
++    });
++}
++
++main();
+diff --git a/lib/backends/dummy/tools/delete-server.js b/lib/backends/dummy/tools/delete-server.js
+new file mode 100644
+index 0000000..ed631b5
+--- /dev/null
++++ b/lib/backends/dummy/tools/delete-server.js
+@@ -0,0 +1,235 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++//
++// Assumptions made include:
++//
++//  * This runs as root
++//  * The DC we're attaching to is the same as `mdata-get sdc:datacenter_name`
++//  * CNAPI is at cnapi.<datacenterName>.<dnsDomain>
++//  * NAPI is at napi.<datacenterName>.<dnsDomain>
++//  * VMAPI is at vmapi.<datacenterName>.<dnsDomain>
++//
++
++var fs = require('fs');
++
++var assert = require('assert-plus');
++var CNAPI = require('sdc-clients').CNAPI;
++var child_process = require('child_process');
++var jsprim = require('jsprim');
++var NAPI = require('sdc-clients').NAPI;
++var uuid = require('uuid');
++var vasync = require('vasync');
++var VMAPI = require('sdc-clients').VMAPI;
++
++var common = require('../common');
++
++var SERVER_ROOT = common.SERVER_ROOT;
++
++function getDatacenterName(ctx, callback) {
++    common.mdataGet('sdc:datacenter_name', function _onMdata(err, datacenter) {
++        assert.string(datacenter, 'datacenter');
++        ctx.datacenterName = datacenter;
++        callback();
++    });
++}
++
++function getDNSDomain(ctx, callback) {
++    common.mdataGet('dnsDomain', function _onMdata(err, dnsDomain) {
++        assert.string(dnsDomain, 'dnsDomain');
++        ctx.dnsDomain = dnsDomain;
++        callback();
++    });
++}
++
++function deleteServerDir(ctx, callback) {
++    var server_uuid = ctx.server_uuid;
++    var serverDir = SERVER_ROOT + '/' + server_uuid;
++
++    child_process.execFile('/bin/rm', [
++        '-rf', serverDir
++    ], function _onRmdir(err, stdout, stderr) {
++        if (!err) {
++            console.error('> deleted directory');
++        }
++        callback(err);
++    });
++}
++
++function deleteServerRecord(ctx, callback) {
++    var server_uuid = ctx.server_uuid;
++
++    if (!ctx.cnapi) {
++        ctx.cnapi = new CNAPI({
++            url: 'http://cnapi.' +
++                ctx.datacenterName + '.' +
++                ctx.dnsDomain
++        });
++    }
++
++    ctx.cnapi.del('/servers/' + server_uuid, function _onDel(err, req, res) {
++        var code;
++
++        if (err) {
++            code = err.statusCode;
++        } else {
++            code = res.statusCode;
++        }
++
++        console.error('> delete CNAPI server: ' + code);
++
++        if (err && err.restCode !== 'ResourceNotFound') {
++            callback(err);
++            return;
++        }
++
++        callback();
++    });
++}
++
++function deleteNics(ctx, target_uuid, callback) {
++
++    if (!ctx.napi) {
++        ctx.napi = new NAPI({
++            url: 'http://napi.' +
++                ctx.datacenterName + '.' +
++                ctx.dnsDomain
++        });
++    }
++
++    function _deleteNic(nicObj, cb) {
++        var mac = nicObj.mac;
++
++        ctx.napi.deleteNic(mac, {}, {}, function _onDelete(err) {
++            if (err) {
++                console.error('error: ');
++                console.dir(err);
++            } else {
++                console.error('> deleted %s', mac);
++            }
++            cb(err);
++        });
++    }
++
++    ctx.napi.getNics(target_uuid, {}, function _onGet(err, nics) {
++        if (err) {
++            console.error('error: ');
++            console.dir(err);
++            callback(err);
++            return;
++        } else {
++            console.error('> found %d NICs in NAPI', nics.length);
++        }
++
++        vasync.forEachPipeline({
++            func: _deleteNic,
++            inputs: nics
++        }, function (pipelineErr) {
++            callback(pipelineErr);
++        });
++    });
++
++}
++
++function deleteVMs(ctx, callback) {
++    var server_uuid = ctx.server_uuid;
++
++    if (!ctx.vmapi) {
++        ctx.vmapi = new VMAPI({
++            url: 'http://vmapi.' +
++                ctx.datacenterName + '.' +
++                ctx.dnsDomain
++        });
++    }
++
++    function _deleteVm(vmObj, cb) {
++        if (['destroyed', 'failed'].indexOf(vmObj.state) !== -1) {
++            console.error('> VM %s is already %s', vmObj.uuid, vmObj.state);
++            // Still clean up straggler NICs
++            deleteNics(ctx, vmObj.uuid, cb);
++            return;
++        }
++
++        // Since we deleted the server, we can remove the VM from the list by
++        // just doing a sync GET.
++        ctx.vmapi.get('/vms/' + vmObj.uuid + '?sync=true',
++            function _onGet(err, req, res, data) {
++
++            if (err) {
++                console.error('error deleting %s: %s', vmObj.uuid, err.message);
++                cb(err);
++            } else {
++                console.error('> deleted VM %s', vmObj.uuid);
++                // Now clean up straggler NICs
++                deleteNics(ctx, vmObj.uuid, cb);
++            }
++        });
++    }
++
++    ctx.vmapi.listVms({server_uuid: server_uuid}, {},
++        function _onList(err, vms) {
++
++        if (err) {
++            console.error('error:');
++            console.dir(err);
++            callback(err);
++            return;
++        } else {
++            console.error('> found %d VMs in VMAPI', vms.length);
++        }
++
++        vasync.forEachPipeline({
++            func: _deleteVm,
++            inputs: vms
++        }, function pipelineComplete(pipelineErr) {
++            callback(pipelineErr);
++        });
++    });
++}
++
++function deleteServer(server_uuid, callback) {
++    var ctx = {};
++
++    ctx.server_uuid = server_uuid;
++
++    vasync.pipeline({
++        arg: ctx,
++        funcs: [
++            getDatacenterName,
++            getDNSDomain,
++            deleteServerDir,
++            deleteServerRecord,
++            function _deleteNics(_ctx, cb) {
++                deleteNics(_ctx, server_uuid, cb);
++            },
++            deleteVMs
++        ]
++    }, function _pipelineComplete(err) {
++        callback(err);
++    });
++}
++
++function main() {
++    var server_uuid = process.argv[2];
++
++    assert.uuid(server_uuid, 'server_uuid');
++
++    console.error('deleting: %s', server_uuid);
++
++    deleteServer(server_uuid, function _deleted(err) {
++        if (err) {
++            console.error('failed to delete server: ' + err.message);
++            return;
++        }
++        console.error('DELETED');
++    });
++}
++
++main();
+diff --git a/lib/backends/dummy/tools/run-servers.js b/lib/backends/dummy/tools/run-servers.js
+new file mode 100644
+index 0000000..9109774
+--- /dev/null
++++ b/lib/backends/dummy/tools/run-servers.js
+@@ -0,0 +1,209 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var fs = require('fs');
++var path = require('path');
++var util = require('util');
++
++var assert = require('assert-plus');
++var bunyan = require('bunyan');
++var vasync = require('vasync');
++var verror = require('verror');
++
++var AgentHttpServer = require('../../../server');
++var App = require('../../../app');
++var common = require('../common');
++
++function createLog(ctx, callback) {
++    var logname = 'cn-agent';
++
++    ctx.log = bunyan.createLogger({
++        level: 'info',
++        name: logname
++    });
++
++    callback();
++}
++
++function loadSysinfo(ctx, callback) {
++    var filename = common.SERVER_ROOT + '/' + ctx.uuid + '/sysinfo.json';
++
++    fs.readFile(filename, function onData(err, data) {
++        if (err) {
++            callback(err);
++            return;
++        }
++
++        ctx.sysinfo = JSON.parse(data.toString());
++        callback();
++    });
++}
++
++function findZoneAdminIp(ctx, callback) {
++    common.mdataGet('sdc:nics', function _onMdata(err, nicsData) {
++        var idx;
++        var nic;
++        var nics = JSON.parse(nicsData.toString());
++
++        for (idx = 0; idx < nics.length; idx++) {
++            nic = nics[idx];
++            if (nic.nic_tag === 'admin') {
++                ctx.bindIP = nic.ip;
++                break;
++            }
++        }
++
++        assert.string(ctx.bindIP, 'ctx.bindIP');
++
++        callback();
++    });
++}
++
++function createAgentServer(ctx, callback) {
++    ctx.agentserver = new AgentHttpServer({
++        bindip: ctx.bindIP,
++        log: ctx.log,
++        port: 0,
++        uuid: ctx.sysinfo.UUID
++    });
++
++    ctx.agentserver.start(function _onStart() {
++        callback();
++    });
++}
++
++function setupBackend(ctx, callback) {
++    var Backend;
++    var baseDir = path.resolve(__dirname, '../../../..');
++    var opts = {};
++
++    assert.object(ctx.log, 'ctx.log');
++
++    Backend = require(path.join(baseDir, 'lib/backends/dummy'));
++
++    opts.log = ctx.log;
++    opts.backendName = 'dummy';
++
++    ctx.backend = new Backend(opts);
++    ctx.taskspath = path.join(baseDir, 'lib/backends/dummy/tasks');
++
++    ctx.backend.getAgentConfig({
++        serverUuid: ctx.uuid
++    }, function onAgentConfig(err, config) {
++        if (err) {
++            callback(new verror.VError(err, 'fetching agent config'));
++            return;
++        }
++        ctx.config = config;
++
++        ctx.backend.getSdcConfig({
++            serverUuid: ctx.uuid
++        }, function onSdcConfig(sdcErr, sdcConfig) {
++            if (sdcErr) {
++                callback(new verror.VError(sdcErr, 'fetching SDC config'));
++                return;
++            }
++            ctx.sdc_config = sdcConfig;
++            callback();
++        });
++    });
++}
++
++function setTaskParams(ctx, callback) {
++    ctx.tasklogdir = path.join(common.SERVER_ROOT, ctx.uuid, 'logs/cn-agent');
++
++    callback();
++}
++
++function runServer(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.backend, 'opts.backend');
++    assert.object(opts.log, 'opts.log');
++    assert.uuid(opts.serverUuid, 'opts.serverUuid');
++
++    var ctx = {};
++    var inst = opts.serverUuid.split('-')[0];
++
++    ctx.backend = opts.backend;
++    ctx.bindIP = opts.bindIP;
++    ctx.config = opts.config;
++    ctx.log = opts.log.child({instance: inst});
++    ctx.logname = 'cn-agent-' + inst;
++    ctx.sdc_config = opts.sdc_config;
++    ctx.taskspath = opts.taskspath;
++    ctx.uuid = opts.serverUuid;
++
++    vasync.pipeline({
++        arg: ctx,
++        funcs: [
++            loadSysinfo,
++            setTaskParams,
++            createAgentServer
++        ]
++    }, function pipelineComplete(err) {
++        var app;
++
++        if (err) {
++            console.error('failed to start CN: %s', err.message);
++            callback(err);
++            return;
++        }
++
++        app = new App(ctx);
++        app.start();
++        callback();
++    });
++}
++
++function main() {
++    fs.readdir(common.SERVER_ROOT, function _onReadDir(err, dirs) {
++        var state = {};
++
++        if (err) {
++            console.error('FATAL: %s', err.message);
++            process.exit(2);
++            return;
++        }
++
++        vasync.pipeline({
++           arg: state,
++           funcs: [
++               createLog,
++               setupBackend,
++               findZoneAdminIp
++           ]
++        }, function pipelineComplete(pipelineErr) {
++            assert.ifError(pipelineErr);
++
++            vasync.forEachPipeline({
++                func: function _runServer(serverUuid, cb) {
++                    assert.uuid(serverUuid, 'serverUuid');
++
++                    runServer({
++                        backend: state.backend,
++                        bindIP: state.bindIP,
++                        config: state.config,
++                        log: state.log,
++                        sdc_config: state.sdc_config,
++                        serverUuid: serverUuid,
++                        taskspath: state.taskspath
++                    }, cb);
++                },
++                inputs: dirs
++            }, function _pipelineComplete(_pipelineErr, results) {
++                assert.ifError(_pipelineErr);
++
++                state.log.info('started all servers');
++            });
++        });
++    });
++}
++
++main();
+diff --git a/lib/backends/smartos/index.js b/lib/backends/smartos/index.js
+index 7df68b7..770b688 100644
+--- a/lib/backends/smartos/index.js
++++ b/lib/backends/smartos/index.js
+@@ -576,7 +576,7 @@ function SmartosBackend(opts) {
+  * https://github.com/joyent/smartos-live/blob/master/src/node_modules/system.js
+  *
+  */
+-SmartosBackend.prototype.getMemoryInfo = function getMemoryInfo(callback) {
++SmartosBackend.prototype.getMemoryInfo = function getMemoryInfo(_, callback) {
+     var arcstats_val, systempages_val;
+ 
+     // Setup readers if we've not already done so.
+@@ -633,7 +633,7 @@ SmartosBackend.prototype.getMemoryInfo = function getMemoryInfo(callback) {
+ };
+ 
+ 
+-SmartosBackend.prototype.getAgentConfig = function getAgentConfig(callback) {
++SmartosBackend.prototype.getAgentConfig = function getAgentConfig(_, callback) {
+     var self = this;
+ 
+     // The plan is to migrate to using this file as the entire configuration
+@@ -655,12 +655,16 @@ SmartosBackend.prototype.getAgentConfig = function getAgentConfig(callback) {
+ };
+ 
+ 
+-// These just proxy to smartdc_config
+-SmartosBackend.prototype.getSdcConfig = smartdc_config.sdcConfig;
+-SmartosBackend.prototype.getSysinfo = smartdc_config.sysinfo;
++// These just proxy to smartdc_config, ignoring the first (opts) argument
++SmartosBackend.prototype.getSdcConfig = function getSdcConfig(_, callback) {
++    return smartdc_config.sdcConfig(callback);
++};
++SmartosBackend.prototype.getSysinfo = function getSysinfo(_, callback) {
++    return smartdc_config.sysinfo(callback);
++};
+ 
+ 
+-SmartosBackend.prototype.getBootTime = function getBootTime(callback) {
++SmartosBackend.prototype.getBootTime = function getBootTime(_, callback) {
+     // sysinfo will have the 'Boot Time' cached, so we use that
+     smartdc_config.sysinfo(function onSysinfo(err, sysinfo) {
+         var boot_time;
+@@ -678,7 +682,8 @@ SmartosBackend.prototype.getBootTime = function getBootTime(callback) {
+ };
+ 
+ 
+-SmartosBackend.prototype.getDiskUsage = function _getDiskUsage(vms, callback) {
++SmartosBackend.prototype.getDiskUsage =
++function _getDiskUsage(vms, _, callback) {
+     var self = this;
+ 
+     getDiskUsage({log: self.log}, vms, callback);
+@@ -703,7 +708,7 @@ SmartosBackend.prototype.loadVms = function loadVms(opts, callback) {
+ };
+ 
+ 
+-SmartosBackend.prototype.getZpoolInfo = function _getZpoolInfo(callback) {
++SmartosBackend.prototype.getZpoolInfo = function _getZpoolInfo(_, callback) {
+     var self = this;
+ 
+     getZpoolInfo({log: self.log}, function onPoolInfo(err, info) {
+@@ -752,7 +757,7 @@ SmartosBackend.prototype.startWatchers = function startWatchers(opts) {
+ };
+ 
+ 
+-SmartosBackend.prototype.stopWatchers = function stopWatchers(watchers) {
++SmartosBackend.prototype.stopWatchers = function stopWatchers(_, watchers) {
+     // Not implemented. If in the future we want to be able to stop the watchers
+     // we started with startWatchers, we will be passed the same object we
+     // returned there.
+@@ -760,7 +765,7 @@ SmartosBackend.prototype.stopWatchers = function stopWatchers(watchers) {
+ 
+ 
+ SmartosBackend.prototype.cleanupStaleLocks =
+-function cleanupStaleLocks(callback) {
++function cleanupStaleLocks(_, callback) {
+     // AGENT-640: Ensure we clean up any stale machine creation guard
+     // files, then set queues up as per usual.
+     var cmd = '/usr/bin/rm -f /var/tmp/machine-creation-*';
+diff --git a/lib/heartbeater.js b/lib/heartbeater.js
+index a9a8da6..0011d27 100644
+--- a/lib/heartbeater.js
++++ b/lib/heartbeater.js
+@@ -77,6 +77,8 @@ function StatusReporter(opts) {
+ 
+     this.log = opts.log;
+ 
++    this.serverUuid = opts.serverUuid;
++
+     EventEmitter.call(this);
+ }
+ 
+@@ -114,7 +116,8 @@ StatusReporter.prototype.updateSample = function () {
+             function _getVmInfo(_, cb) {
+                 self.backend.loadVms({
+                     fields: VM_LOOKUP_FIELDS,
+-                    log: self.log
++                    log: self.log,
++                    serverUuid: self.serverUuid
+                 }, function onLoadVms(err, vmobjs) {
+                     var vmobj;
+ 
+@@ -151,7 +154,9 @@ StatusReporter.prototype.updateSample = function () {
+                     cb();
+                 });
+             }, function _getZpoolInfo(_, cb) {
+-                self.backend.getZpoolInfo(function onZpoolInfo(err, zpoolInfo) {
++                self.backend.getZpoolInfo({
++                    serverUuid: self.serverUuid
++                }, function onZpoolInfo(err, zpoolInfo) {
+                     if (err) {
+                         self.log.error({err: err}, 'unable to get zpool info');
+                         cb(err);
+@@ -162,7 +167,9 @@ StatusReporter.prototype.updateSample = function () {
+                 });
+             },
+             function _getMemoryInfo(_, cb) {
+-                self.backend.getMemoryInfo(function onMemoryInfo(err, meminfo) {
++                self.backend.getMemoryInfo({
++                    serverUuid: self.serverUuid
++                }, function onMemoryInfo(err, meminfo) {
+                     if (err) {
+                         self.log.warn({err: err}, 'unable to get memory info');
+                     } else {
+@@ -172,19 +179,22 @@ StatusReporter.prototype.updateSample = function () {
+                 });
+             },
+             function _getDiskUsage(_, cb) {
+-                self.backend.getDiskUsage(vms,
+-                    function onDiskUsage(err, diskusage) {
+-                        if (err) {
+-                            self.log.warn({err: err},
+-                                'unable to get disk usage');
+-                        } else {
+-                            newSample.diskinfo = diskusage;
+-                        }
+-                        cb(err);
+-                    });
++                self.backend.getDiskUsage(vms, {
++                    serverUuid: self.serverUuid
++                }, function onDiskUsage(err, diskusage) {
++                    if (err) {
++                        self.log.warn({err: err},
++                            'unable to get disk usage');
++                    } else {
++                        newSample.diskinfo = diskusage;
++                    }
++                    cb(err);
++                });
+             },
+             function _getBootTime(_, cb) {
+-                self.backend.getBootTime(function onBootTime(err, boot_time) {
++                self.backend.getBootTime({
++                    serverUuid: self.serverUuid
++                }, function onBootTime(err, boot_time) {
+                     if (err) {
+                         self.log.warn({err: err},
+                             'unable to get system boot time');
+@@ -249,7 +259,8 @@ StatusReporter.prototype.startWatchers = function startWatchers() {
+ 
+     self.watchers = self.backend.startWatchers({
+         dirtyFn: self.markDirty.bind(self),
+-        log: self.log
++        log: self.log,
++        serverUuid: self.serverUuid
+     });
+ };
+ 
+@@ -258,7 +269,9 @@ StatusReporter.prototype.stopWatchers = function stopWatchers() {
+     var self = this;
+ 
+     if (self.watchers) {
+-        self.backend.stopWatchers(self.watchers);
++        self.backend.stopWatchers({
++            serverUuid: self.serverUuid
++        }, self.watchers);
+     }
+ };
+ 
+diff --git a/lib/server.js b/lib/server.js
+index ca9e15b..6758ca3 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2017, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -34,6 +34,11 @@ function AgentHttpServer(opts) {
+     self.bindip = opts.bindip;
+     self.log = opts.log;
+ 
++    // port can be set to 0 to have the system choose a port
++    if (opts.hasOwnProperty('port')) {
++        self.port = opts.port;
++    }
++
+     this.server = restify.createServer({
+         log: opts.log,
+         name: 'Compute Node Agent'
+@@ -44,12 +49,21 @@ function AgentHttpServer(opts) {
+ util.inherits(AgentHttpServer, EventEmitter);
+ 
+ 
+-AgentHttpServer.prototype.start = function (register) {
+-    var port = process.env.PORT ? process.env.PORT : 5309;
++AgentHttpServer.prototype.start = function start(callback) {
+     var self = this;
++    var port = self.port;
++
++    if (self.port === undefined) {
++        port = process.env.PORT ? process.env.PORT : 5309;
++    }
++
+     self.server.listen(port, self.bindip, function () {
+         self.log.info(
+             '%s listening at %s', self.server.name, self.server.url);
++
++        if (callback !== undefined) {
++            callback();
++        }
+     });
+ };
+ 
+diff --git a/lib/task_agent/task_agent.js b/lib/task_agent/task_agent.js
+index 3d4456e..199800c 100644
+--- a/lib/task_agent/task_agent.js
++++ b/lib/task_agent/task_agent.js
+@@ -81,6 +81,15 @@ TaskAgent.prototype.setupTaskRoutes = function (defns) {
+     this.agentserver.registerTaskHandler(self.uuid, handler);
+ 
+     function handler(req, res, next) {
++        var target = req.header('x-server-uuid');
++
++        // Ensure this request was intended for our server uuid
++        if (target !== undefined && target !== self.uuid) {
++            next(new restify.InternalError('received request for wrong server' +
++                '. we are: "' + self.uuid + '" received: "' + target + '"'));
++            return;
++        }
++
+         if (!req.params.hasOwnProperty('task')) {
+             next(new restify.InvalidArgumentError(
+                 'Missing key \'task\''));
+diff --git a/package.json b/package.json
+index 83bc438..4508124 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "cn-agent",
+   "description": "Triton Compute Node Agent",
+-  "version": "2.1.2",
++  "version": "2.2.1",
+   "author": "Joyent (joyent.com)",
+   "private": true,
+   "dependencies": {

@@ -1,0 +1,540 @@
+commit 77a73e2f7eaf0d1f32e4e16337fafafc47940ba2 (refs/changes/86/2286/2)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2017-07-26T23:24:41+00:00 (2 years, 2 months ago)
+    
+    NAPI-424 Don't allow fabrics to have multiple owners
+    NAPI-425 Don't allow updates to "ip_use_strings"
+    NAPI-306 NAPI update returns 200 and does nothing
+
+diff --git a/lib/endpoints/networks/ips.js b/lib/endpoints/networks/ips.js
+index ed708fa..38fde2f 100644
+--- a/lib/endpoints/networks/ips.js
++++ b/lib/endpoints/networks/ips.js
+@@ -35,7 +35,7 @@ function validateIP(req, res, next) {
+             'Invalid IP address'));
+     }
+ 
+-    if (ip.kind() !== req._network.subnetType) {
++    if (ip.kind() !== req._network.family) {
+         return next(new restify.ResourceNotFoundError(
+             'IP and subnet are of different address families'));
+     }
+diff --git a/lib/models/ip/provision.js b/lib/models/ip/provision.js
+index 00c5419..7a4c249 100644
+--- a/lib/models/ip/provision.js
++++ b/lib/models/ip/provision.js
+@@ -434,7 +434,7 @@ function nextIPonNetwork(opts, network, callback) {
+     assert.object(opts.baseParams, 'opts.baseParams');
+ 
+     opts.log.debug('nextIPonNetwork: attempting IP allocation on %s network %s',
+-        network.subnetType, network.uuid);
++        network.family, network.uuid);
+ 
+     if (!opts.ipProvisions) {
+         opts.ipProvisions = {};
+diff --git a/lib/models/network.js b/lib/models/network.js
+index ddc62ec..4f6e65b 100644
+--- a/lib/models/network.js
++++ b/lib/models/network.js
+@@ -94,6 +94,7 @@ var BUCKET = {
+     morayVersion: 2,        // moray version must be > than this
+     version: 4
+ };
++
+ // Names that are allowed to be used in the "fields" filter
+ var VALID_FIELDS = [
+     'description',
+@@ -114,12 +115,33 @@ var VALID_FIELDS = [
+     'vlan_id'
+ ];
+ 
++/*
++ * These are fields that can never be changed. (Note that "subnet"
++ * is one of them, but we handle that separately, since it needs
++ * to be compared differently.)
++ */
++var IMMUTABLE_NET_FIELDS = [
++    'fabric',
++    'family',
++    'gateway_provisioned',
++    'internet_nat',
++    'nic_tag',
++    'vlan_id',
++    'vnet_id'
++];
++
++/*
++ * These are fields that can be changed on normal networks, but not
++ * on fabrics:
++ */
++var IMMUTABLE_FABRIC_FIELDS = [
++    'gateway',
++    'owner_uuids'
++];
++
+ var CONTAINING_NET_SQL = 'SELECT uuid FROM ' + BUCKET.name +
+     ' WHERE subnet >> $1 AND vlan_id = $2 AND nic_tag = $3';
+ 
+-var IMMUTABLE_FAB_PROP =
+-    'Fabric network updates for this field are not supported';
+-
+ 
+ // --- Schema validation objects
+ 
+@@ -150,6 +172,7 @@ var CREATE_SCHEMA = {
+         vnet_id: validate.VxLAN
+     },
+     after: [
++        validateFabricOwner,
+         validateProvisionRange,
+         validateNicTagMTU
+     ]
+@@ -157,10 +180,6 @@ var CREATE_SCHEMA = {
+ 
+ var UPDATE_SCHEMA = {
+     optional: {
+-        // Immutable fabrics properties
+-        gateway_provisioned: validate.bool,
+-        internet_nat: validate.bool,
+-
+         // moray-only
+         name: validate.string,
+         description: validate.string,
+@@ -178,33 +197,21 @@ var UPDATE_SCHEMA = {
+         // to kick off a workflow
+         resolvers: validate.ipArray,
+         routes: validateRoutes,
+-        // TODO: subnet, vlan_id?
+ 
+-        ip_use_strings: validate.bool
++        // Immutable network properties
++        fabric: validate.bool,
++        family: validate.enum([ 'ipv4', 'ipv6' ]),
++        nic_tag: validate.string,
++        subnet: validate.subnet,
++        vlan_id: validate.VLAN,
++        vnet_id: validate.VxLAN,
++
++        // Immutable fabrics properties
++        gateway_provisioned: validate.bool,
++        internet_nat: validate.bool
+     },
+     after: [
+-        function checkImmutable(opts, __, parsed, cb) {
+-            if (opts.network.fabric) {
+-                if (parsed.hasOwnProperty('gateway')) {
+-                    cb(new errors.invalidParam('gateway',
+-                        IMMUTABLE_FAB_PROP));
+-                    return;
+-                }
+-                if (parsed.hasOwnProperty('gateway_provisioned')) {
+-                    cb(new errors.invalidParam('gateway_provisioned',
+-                        IMMUTABLE_FAB_PROP +
+-                        ': delete the gateway NIC instead'));
+-                    return;
+-                }
+-                if (parsed.hasOwnProperty('internet_nat')) {
+-                    cb(new errors.invalidParam('internet_nat',
+-                        IMMUTABLE_FAB_PROP));
+-                    return;
+-                }
+-            }
+-
+-            cb();
+-        },
++        validateImmutableFields,
+         validateProvisionRangeUpdate,
+         validateNicTagMTU
+     ]
+@@ -567,6 +574,81 @@ function validateAndGetIP(opts, name, val, cb) {
+ }
+ 
+ 
++/**
++ * Fabric networks are only allowed to have a single owner. During network
++ * creation, we check that only one owner is specified. Updates to the list
++ * are prevented by validateImmutableFields().
++ */
++function validateFabricOwner(_opts, _original, parsedParams, cb) {
++    if (!parsedParams.fabric) {
++        cb();
++        return;
++    }
++
++    if (!jsprim.hasKey(parsedParams, 'owner_uuids')) {
++        cb(errors.missingParam('owner_uuids'));
++        return;
++    }
++
++    if (parsedParams.owner_uuids.length !== 1) {
++        cb(errors.invalidParam('owner_uuids',
++            constants.msg.FABRIC_SINGLE_OWNER));
++        return;
++    }
++
++    cb();
++}
++
++
++/**
++ * Fabric networks have a handful of properties that shouldn't be updated.
++ * We check them here to make sure they don't get changed.
++ */
++function validateImmutableFields(opts, _original, parsed, cb) {
++    var network = opts.network;
++    var errs = [];
++
++    function done() {
++        if (errs.length === 0) {
++            cb();
++        } else {
++            cb(errs);
++        }
++    }
++
++    IMMUTABLE_NET_FIELDS.forEach(function (field) {
++        if (!parsed.hasOwnProperty(field)) {
++            return;
++        }
++
++        if (network[field] !== parsed[field]) {
++            errs.push(errors.invalidParam(field,
++                constants.msg.NET_PROP_IMMUTABLE));
++        }
++    });
++
++    if (parsed.hasOwnProperty('subnet') &&
++        network.subnet.compare(parsed.subnet) !== 0) {
++        errs.push(errors.invalidParam('subnet',
++            constants.msg.NET_PROP_IMMUTABLE));
++    }
++
++    if (!network.fabric) {
++        done();
++        return;
++    }
++
++    IMMUTABLE_FABRIC_FIELDS.forEach(function (field) {
++        if (parsed.hasOwnProperty(field)) {
++            errs.push(errors.invalidParam(field,
++                constants.msg.FABRIC_PROP_IMMUTABLE));
++        }
++    });
++
++    done();
++}
++
++
+ /**
+  * Validates that all provision range params are present in an update request,
+  * and if so validates the provision range.
+@@ -1107,7 +1189,6 @@ function Network(params) {
+     this.provisionMin = this.params.provision_start_ip;
+     this.subnetBits = this.params.subnet_bits;
+     this.subnetStart = this.params.subnet_start;
+-    this.subnetType = this.params.subnet_type;
+     this.subnet = this.params.subnet;
+ 
+ 
+@@ -1486,7 +1567,7 @@ function createNetwork(opts, callback) {
+             }
+ 
+             // IPv4 only: Don't allow provisioning on the broadcast address.
+-            if (network.subnetType === 'ipv4') {
++            if (network.family === 'ipv4') {
+                 var maxIP = network.subnet.broadcast();
+                 if (!ipsToCreate.hasOwnProperty(maxIP.toString())) {
+                     ipsToCreate[maxIP.toString()] = adminReservedIP(network,
+@@ -1578,7 +1659,7 @@ function updateNetwork(opts, callback) {
+             value: params.network.raw()
+         } ];
+ 
+-        var isIPv4 = params.network.subnetType === 'ipv4';
++        var isIPv4 = params.network.family === 'ipv4';
+ 
+         // -- moray-only values
+ 
+diff --git a/lib/util/constants.js b/lib/util/constants.js
+index 2fe9836..2b891fe 100644
+--- a/lib/util/constants.js
++++ b/lib/util/constants.js
+@@ -25,6 +25,9 @@ var MESSAGES = {
+     CIDR_BITS: 'Subnet bits invalid',
+     CIDR_INVALID: 'invalid CIDR format',
+     FABRIC_IPV4_ONLY: 'Fabric networks must be IPv4',
++    FABRIC_PROP_IMMUTABLE:
++        'Network updates for this field are not supported on fabrics',
++    FABRIC_SINGLE_OWNER: 'Fabric networks must have exactly one owner',
+     INVALID_PARAMS: 'Invalid parameters',
+     INVALID_UUID: 'invalid UUID',
+     IP_NO_VLAN_TAG: 'required if IP specified but not network_uuid',
+@@ -35,6 +38,7 @@ var MESSAGES = {
+     NET_NAME_IN_USE: 'name is in use by another network',
+     NET_OWNER: 'owner cannot provision on network',
+     NET_ON_VLAN: 'VLAN must have no networks',
++    NET_PROP_IMMUTABLE: 'Network updates for this field are not supported',
+     NIC_ON_NET: 'network must have no NICs provisioned',
+     NIC_TAG_SLASH: 'only one slash is allowed after the tag name',
+     NO_POOL_INTERSECTION: 'Specified pools do not contain networks ' +
+diff --git a/test/integration/fabrics.test.js b/test/integration/fabrics.test.js
+index a75110a..b8c2228 100644
+--- a/test/integration/fabrics.test.js
++++ b/test/integration/fabrics.test.js
+@@ -1587,7 +1587,7 @@ test('provision gateway', function (t) {
+                 gateway: NETS[0].gateway
+             },
+             expErr: mod_err.invalidParam('gateway',
+-                'Fabric network updates for this field are not supported')
++                constants.msg.FABRIC_PROP_IMMUTABLE)
+         });
+     });
+ 
+@@ -1599,8 +1599,7 @@ test('provision gateway', function (t) {
+                 gateway_provisioned: false
+             },
+             expErr: mod_err.invalidParam('gateway_provisioned',
+-                'Fabric network updates for this field are not supported: ' +
+-                'delete the gateway NIC instead')
++                constants.msg.NET_PROP_IMMUTABLE)
+         });
+     });
+ 
+@@ -1612,7 +1611,7 @@ test('provision gateway', function (t) {
+                 internet_nat: false
+             },
+             expErr: mod_err.invalidParam('internet_nat',
+-                'Fabric network updates for this field are not supported')
++                constants.msg.NET_PROP_IMMUTABLE)
+         });
+     });
+ 
+@@ -1823,6 +1822,37 @@ test('delete server nic', function (t) {
+ });
+ 
+ 
++/*
++ * Update Tests
++ *
++ * For now, fabric networks can't be updated at a /fabrics/... endpoint, but
++ * they can be updated at their /networks/<uuid> endpoint. We test updating
++ * several properties here that should not be allowed to change.
++ */
++
++test('"owner_uuids" is immutable', function (t) {
++    mod_net.update(t, {
++        params: {
++            uuid: NETS[0].uuid,
++            owner_uuids: [ OWNERS[1] ]
++        },
++        expErr: mod_err.invalidParam('owner_uuids',
++            constants.msg.FABRIC_PROP_IMMUTABLE)
++    });
++});
++
++test('"vlan_id" is immutable', function (t) {
++    mod_net.update(t, {
++        params: {
++            uuid: NETS[0].uuid,
++            vlan_id: VLANS[1].vlan_id
++        },
++        expErr: mod_err.invalidParam('vlan_id',
++            constants.msg.NET_PROP_IMMUTABLE)
++    });
++});
++
++
+ // Create network tests:
+ //
+ // - Can't create public (non-RFC1918) nets
+@@ -1837,11 +1867,6 @@ test('delete server nic', function (t) {
+ // - Make sure we can't use body params to override vlan_id or owner
+ 
+ 
+-// Update tests:
+-// - Can't update owner_uuids or vlan_id
+-// - Can't set another owner UUID on a fabric network
+-
+-
+ // Provision tests:
+ // - Pick IP not in subnet
+ 
+@@ -1871,7 +1896,6 @@ test('delete server nic', function (t) {
+ // - Don't allow deleting the overlay or underlay tags
+ // - Don't allow setting the underlay tag:
+ //   - on more than one server nic
+-//   - if belongs_to_type !== 'server'
+ // - Validation of underlay param
+ // - Update a server's nic to add the underlay param
+ // - Only allow provisioning fabric networks on the overlay nic
+diff --git a/test/unit/networks.test.js b/test/unit/networks.test.js
+index 060d80c..36cc567 100644
+--- a/test/unit/networks.test.js
++++ b/test/unit/networks.test.js
+@@ -21,6 +21,7 @@ var fmt = require('util').format;
+ var h = require('./helpers');
+ var mod_err = require('../../lib/util/errors');
+ var mod_ip = require('../../lib/models/ip');
++var mod_jsprim = require('jsprim');
+ var mod_moray = require('../lib/moray');
+ var mod_net = require('../lib/net');
+ var mod_server = require('../lib/server');
+@@ -460,11 +461,13 @@ test('Create fabric network - automatic gateway assignment', function (t) {
+     var gateway = fmt('10.0.%d.1', h.NET_NUM);
+     NAPI.createNetwork(h.validNetworkParams({
+         fabric: true,
++        owner_uuids: [ mod_uuid.v4() ],
+         internet_nat: true,
+         vnet_id: 1234
+     }), function (err, obj, req, res) {
+         if (h.ifErr(t, err, 'network creation')) {
+-            return t.end();
++            t.end();
++            return;
+         }
+ 
+         t.equal(res.statusCode, 200, 'status code');
+@@ -643,10 +646,31 @@ test('Create network where mtu == nic_tag == max', function (t) {
+ });
+ 
+ 
++test('Create fabric network - multiple owners', function (t) {
++    mod_net.create(t, {
++        params: h.validNetworkParams({
++            fabric: true,
++            owner_uuids: [ mod_uuid.v4(), mod_uuid.v4() ],
++            provision_start_ip: fmt('10.0.%d.1', h.NET_NUM),
++            provision_end_ip: fmt('10.0.%d.254', h.NET_NUM),
++            subnet: fmt('10.0.%d.0/24', h.NET_NUM)
++        }),
++        expCode: 422,
++        expErr: h.invalidParamErr({
++            errors: [
++                mod_err.invalidParam('owner_uuids',
++                    constants.msg.FABRIC_SINGLE_OWNER)
++            ]
++        })
++    });
++});
++
++
+ test('Create IPv4 fabric network - non-private subnet', function (t) {
+     mod_net.create(t, {
+         params: h.validNetworkParams({
+             fabric: true,
++            owner_uuids: [ mod_uuid.v4() ],
+             provision_start_ip: fmt('123.0.%d.1', h.NET_NUM),
+             provision_end_ip: fmt('123.0.%d.254', h.NET_NUM),
+             subnet: fmt('123.0.%d.0/24', h.NET_NUM)
+@@ -665,6 +689,7 @@ test('Create IPv6 fabric network - non-private subnet', function (t) {
+     mod_net.create(t, {
+         params: h.validIPv6NetworkParams({
+             fabric: true,
++            owner_uuids: [ mod_uuid.v4() ],
+             provision_start_ip: fmt('fe80:%d::1', h.NET_NUM),
+             provision_end_ip: fmt('fe80:%d::ffff', h.NET_NUM),
+             subnet: fmt('fe80:%d::/64', h.NET_NUM)
+@@ -683,6 +708,7 @@ test('Create IPv6 fabric network - disallowed for now', function (t) {
+     mod_net.create(t, {
+         params: h.validIPv6NetworkParams({
+             fabric: true,
++            owner_uuids: [ mod_uuid.v4() ],
+             provision_start_ip: fmt('fd89:%d::1', h.NET_NUM),
+             provision_end_ip: fmt('fd89:%d::ffff', h.NET_NUM),
+             subnet: fmt('fd89:%d::/64', h.NET_NUM)
+@@ -1270,6 +1296,33 @@ test('Update network - invalid parameters', function (t) {
+           { gateway: constants.GATEWAY_SUBNET_MSG }
+         ],
+ 
++        // Immutable network properties:
++        [ { fabric: true },
++          { fabric: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++        [ { family: 'ipv6' },
++          { family: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++        [ { gateway_provisioned: true },
++          { gateway_provisioned: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++        [ { internet_nat: true },
++          { internet_nat: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++        [ { nic_tag: 'foobar' },
++          { nic_tag: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++        [ { subnet: '192.168.0.0/16' },
++          { subnet: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++        [ { vlan_id: 30 },
++          { vlan_id: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++        [ { vnet_id: 200 },
++          { vnet_id: constants.msg.NET_PROP_IMMUTABLE }
++        ],
++
++
+         [ { name: 1 }, { name: mod_test_err.msg.str } ],
+         [ { name: LONG_STR }, { name: mod_test_err.msg.longStr } ],
+ 
+@@ -1286,39 +1339,38 @@ test('Update network - invalid parameters', function (t) {
+ 
+     NAPI.createNetwork(vals, function (err, net) {
+         if (h.ifErr(t, err, 'creating network')) {
+-            return t.end();
++            t.end();
++            return;
+         }
+ 
+         vasync.forEachParallel({
+             inputs: invalid,
+             func: function (data, cb) {
+-                NAPI.updateNetwork(net.uuid, data[0], function (err2, res) {
+-                    t.ok(err2, util.format('error returned: %s',
+-                        JSON.stringify(data[0])));
+-                    if (!err2) {
+-                        return cb();
++                var invalidErrs = Object.keys(data[1]).sort().map(function (k) {
++                    var msg = util.isArray(data[1][k]) ?
++                        data[1][k][0] :
++                        data[1][k];
++                    var iErr = mod_err.invalidParam(k, msg);
++
++                    if (util.isArray(data[1][k])) {
++                        iErr.invalid = data[1][k][1];
+                     }
+ 
+-                    t.equal(err2.statusCode, 422, 'status code');
+-                    var invalidErrs = [];
+-
+-                    Object.keys(data[1]).sort().forEach(function (k) {
+-                        var iErr = mod_err.invalidParam(k,
+-                            util.isArray(data[1][k]) ?
+-                                data[1][k][0] : data[1][k]);
+-                        if (util.isArray(data[1][k])) {
+-                            iErr.invalid = data[1][k][1];
+-                        }
+-
+-                        invalidErrs.push(iErr);
+-                    });
++                    return iErr;
++                });
+ 
+-                    t.deepEqual(err2.body, h.invalidParamErr({
+-                        errors: invalidErrs,
+-                        message: 'Invalid parameters'
+-                    }), 'Error body');
++                var expErr = h.invalidParamErr({
++                    errors: invalidErrs,
++                    message: 'Invalid parameters'
++                });
+ 
+-                    return cb();
++                mod_net.update(t, {
++                    params: mod_jsprim.mergeObjects(data[0], {
++                        uuid: net.uuid
++                    }),
++                    expErr: expErr
++                }, function (_) {
++                    cb();
+                 });
+             }
+         }, function () {

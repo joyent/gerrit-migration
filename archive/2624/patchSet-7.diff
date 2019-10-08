@@ -1,0 +1,349 @@
+commit fa48c9f5e6aa3eaa1a54d51e24587556858b4a30 (refs/changes/24/2624/7)
+Author: Tim Kordas <tim.kordas@joyent.com>
+Date:   2017-09-22T15:05:06-07:00 (2 years, 1 month ago)
+    
+    MORAY-418 moray should queue requests when new PG connections fail
+
+diff --git a/lib/manatee.js b/lib/manatee.js
+index a7263b3..321f257 100644
+--- a/lib/manatee.js
++++ b/lib/manatee.js
+@@ -19,6 +19,7 @@ var url = require('url');
+ var vasync = require('vasync');
+ var VError = require('verror').VError;
+ var xtend = require('xtend');
++var libuuid = require('libuuid');
+ 
+ var postgresPool = require('./pg');
+ 
+@@ -120,7 +121,10 @@ util.inherits(Manatee, EventEmitter);
+ module.exports = {
+     createClient: function createClient(options) {
+         return (new Manatee(options));
+-    }
++    },
++
++    // exported for testing/external fixtures' use.
++    PGResolver: PGResolver
+ };
+ 
+ 
+@@ -206,7 +210,57 @@ Manatee.prototype.close = function close(cb) {
+     this.emit('close');
+ };
+ 
++/// --- Resolver-class for giving node-cueball its PG-connect-string
++
++function PGResolver(options) {
++    this.backend = null;
++    this.key = null;
++    this.state = 'idle';
++}
++util.inherits(PGResolver, EventEmitter);
++
++PGResolver.prototype.start = function startResolver() {
++    this.state = 'running';
++};
++
++PGResolver.prototype.stop = function stopResolver() {
++    this.state = 'stopped';
++};
++
++PGResolver.prototype.getState = function getResolverState() {
++    return (this.state);
++};
++
++PGResolver.prototype.isInState = function isInResolverState(state) {
++    return (this.state === state);
++};
+ 
++PGResolver.prototype.list = function listBackends(state) {
++    var self = this;
++    var l = {};
++    if (self.key) {
++        l[this.key] = this.backend;
++    }
++    return l;
++};
++
++// We allow one backend at a time.
++PGResolver.prototype.updateBackend = function updateBackend(backend) {
++    assert.string(backend);
++    var self = this;
++    if (self.key) {
++        var oldkey = self.key;
++        self.key = null;
++        self.emit('removed', oldkey);
++    }
++
++    self.key = libuuid.create();
++    self.backend = {
++        'url' : backend
++    };
++    self.emit('added', self.key);
++};
++/// --- End PGResolver Class
+ 
+ ///--- Private Methods
+ 
+@@ -245,6 +299,18 @@ Manatee.prototype._refresh = function _refresh(topology) {
+ 
+         log.info({url: opts.url}, '_refresh.createPGPool: create new pg pool');
+ 
++        /*
++         * We're using node-cueball in a slightly weird way here:
++         *
++         * Manatee handles our failover (which is non-DNS driven). We only ever
++         * want to have a single-backend in node-cueball's resolver. And the
++         * resolver "backend" data consists of a PG-Connection-Info string for
++         * use by the pooled clients.
++         */
++        var pgResolver = new PGResolver();
++        pgResolver.start();
++        pgResolver.updateBackend(opts.url);
++
+         var pool = postgresPool.createPool({
+             log: opts.log,
+             checkInterval: opts.pgConfig.checkInterval,
+@@ -253,6 +319,7 @@ Manatee.prototype._refresh = function _refresh(topology) {
+             maxIdleTime: opts.pgConfig.maxIdleTime,
+             role: 'primary',
+             queryTimeout: opts.pgConfig.queryTimeout,
++            resolver: pgResolver,
+             url: opts.url
+         });
+ 
+diff --git a/lib/pg.js b/lib/pg.js
+index 2f2f2ef..e7bdcea 100644
+--- a/lib/pg.js
++++ b/lib/pg.js
+@@ -20,7 +20,9 @@ var libuuid = require('libuuid');
+ var once = require('once');
+ var pg = require('pg');
+ require('pg-parse-float')(pg);
+-var pooling = require('pooling');
++
++const mod_cueball = require('cueball');
++var pg_url_parse = require('pg-connection-string').parse;
+ 
+ var dtrace = require('./dtrace');
+ 
+@@ -83,7 +85,7 @@ function PGClient(options) {
+         moray_id: this._moray_id
+     }, true);
+ }
+-
++util.inherits(PGClient, EventEmitter);
+ 
+ /*
+  * The underlying Postgres will emit errors when it has a connection
+@@ -365,8 +367,12 @@ PGClient.prototype.close = function closePGClient() {
+         self.client = null;
+         self._deadbeef = true;
+     });
++    self.emit('close');
+ };
+ 
++// synonym for close (for node-cueball's API).
++PGClient.prototype.destroy = PGClient.prototype.close;
++
+ 
+ ///--- End Postgres Client Wrapper Class
+ 
+@@ -416,14 +422,21 @@ function pgCreate(opts) {
+ 
+     var log = opts.log;
+ 
+-    function _pgCreate(cb) {
+-        cb = once(cb);
+-
++    function _pgCreate(backend) {
+         var client = new pg.Client({
+-            connectionString: opts.url,
++            connectionString: backend.url,
+             keepAlive: true
+         });
+ 
++        var pgc = new PGClient({
++            client: client,
++            connectTimeout: opts.connectTimeout,
++            log: opts.log,
++            pool: opts.pool,
++            queryTimeout: opts.queryTimeout,
++            url: backend.url
++        });
++
+         if (opts.connectTimeout > 0) {
+             var timer = setTimeout(function () {
+                 // do not remove error listener as node may
+@@ -435,25 +448,14 @@ function pgCreate(opts) {
+                 }
+ 
+                 var t = opts.connectTimeout;
+-                cb(new ConnectTimeoutError(t));
++                pgc.emit('error', new ConnectTimeoutError(t));
+             }, opts.connectTimeout);
+         }
+ 
+         client.once('connect', function onConnect() {
+             clearTimeout(timer);
+-
+             client.removeAllListeners('error');
+-
+-            var pgc = new PGClient({
+-                client: client,
+-                connectTimeout: opts.connectTimeout,
+-                log: opts.log,
+-                pool: opts.pool,
+-                queryTimeout: opts.queryTimeout,
+-                url: opts.url
+-            });
+-
+-            cb(null, pgc);
++            pgc.emit('connect');
+         });
+ 
+         client.once('error', function onError(err) {
+@@ -464,11 +466,12 @@ function pgCreate(opts) {
+ 
+             if (client.connection && client.connection.stream)
+                 client.connection.stream.destroy();
+-
+-            cb(err);
++            var t = opts.connectTimeout;
++            pgc.emit('error', new ConnectTimeoutError(t));
+         });
+ 
+         client.connect();
++        return (pgc);
+     }
+ 
+     return (_pgCreate);
+@@ -482,11 +485,11 @@ function pgDestroy(opts) {
+ 
+     return (_pgDestroy);
+ }
+-
+ ///--- End Pool Functions
+ 
+ 
+ 
++
+ ///--- API
+ 
+ /**
+@@ -521,6 +524,7 @@ function PGPool(options) {
+     assert.number(options.checkInterval, 'options.checkInterval');
+     assert.number(options.connectTimeout, 'options.connectTimeout');
+     assert.object(options.log, 'options.log');
++    assert.object(options.resolver, 'options.resolver');
+     assert.number(options.maxConnections, 'options.maxConnections');
+     assert.number(options.maxIdleTime, 'options.maxIdleTime');
+     assert.number(options.queryTimeout, 'options.queryTimeout');
+@@ -549,29 +553,28 @@ function PGPool(options) {
+         queryTimeout: self.queryTimeout,
+         url: options.url
+     };
+-    this.pool = pooling.createPool({
+-        assert: pgAssert,
+-        checkInterval: options.checkInterval,
+-        max: options.maxConnections,
+-        maxIdleTime: options.maxIdleTime,
+-        log: self.log,
+-        name: 'moray-pgpool' + (options.role ? '-' + options.role : ''),
+-        check: pgCheck(pgOpts),
+-        create: pgCreate(pgOpts),
+-        destroy: pgDestroy(pgOpts)
++    /*
++     * Our node-cueball connection-pool constructor is built with the smarts
++     * required to connect to the current primary (see pgOpts above).
++     */
++    var pgConnInfo = pg_url_parse(options.url);
++    this.pool = new mod_cueball.ConnectionPool({
++        domain: pgConnInfo['host'],
++        service: '_postgres._tcp',
++        defaultPort: parseInt(pgConnInfo['port'], 10),
++        spares: 2,
++        maximum: 8,
++        constructor: pgCreate(pgOpts),
++        resolver: options.resolver,
++        recovery: {
++            default: {
++                timeout: 2000,
++                retries: 5,
++                delay: 250,
++                maxDelay: 1000
++            }
++        }
+     });
+-
+-    this.url = options.url;
+-
+-    function reEmit(event) {
+-        self.log.debug('pool event: %s', event);
+-        self.emit.apply(self, arguments);
+-    }
+-
+-    this.pool.on('death', reEmit.bind(this, 'death'));
+-    this.pool.on('drain', reEmit.bind(this, 'drain'));
+-    this.pool.once('end', reEmit.bind(this, 'end'));
+-    this.pool.once('error', reEmit.bind(this, 'error'));
+ }
+ util.inherits(PGPool, EventEmitter);
+ 
+@@ -603,15 +606,20 @@ PGPool.prototype.checkout = function checkout(callback) {
+     var log = this.log;
+ 
+     log.trace({pool: this.pool}, 'checkout: entered');
+-    this.pool.acquire(function (err, client) {
++    //    this.pool.acquire(function (err, client) {
++    this.pool.claim(function (err, h, client) {
+         if (err) {
+             log.trace(err, 'checkout: failed');
+             callback(err);
+         } else {
++            /*
++             * Save the pool-handle into our client object (callback
++             * will need it for pool management.
++             */
++            client.handle = h;
+             log.trace({
+                 client: client
+             }, 'checkout: done');
+-
+             callback(null, client);
+         }
+     });
+@@ -621,7 +629,11 @@ PGPool.prototype.checkout = function checkout(callback) {
+ PGPool.prototype.release = function release(client) {
+     assert.object(client, 'client');
+ 
+-    this.pool.release(client);
++    //    this.pool.release(client);
++    if (client.handle) {
++        client.handle.release();
++        client.handle = undefined;
++    }
+ 
+     this.log.trace({
+         client: client,
+diff --git a/package.json b/package.json
+index f150d9b..6d5ef7a 100644
+--- a/package.json
++++ b/package.json
+@@ -12,6 +12,7 @@
+         "bunyan-syslog": "0.2.2",
+         "clone": "0.1.11",
+         "crc": "0.2.1",
++        "cueball": "2.2.9",
+         "dtrace-provider": "0.2.8",
+         "deep-equal": "0.0.0",
+         "fast": "2.2.4",
+@@ -27,6 +28,7 @@
+         "microtime": "0.5.1",
+         "once": "1.3.0",
+         "pg": "6.2.4",
++        "pg-connection-string": "0.1.3",
+         "pg-parse-float": "0.0.1",
+         "pooling": "0.4.5",
+         "posix-getopt": "1.0.0",

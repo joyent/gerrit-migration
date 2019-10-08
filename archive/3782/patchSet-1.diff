@@ -1,0 +1,381 @@
+commit f322783760faefd49751a006bb56781b3daee8b8 (refs/changes/82/3782/1)
+Author: dyep49 <dyep49@gmail.com>
+Date:   2018-04-06T17:46:05-07:00 (1 year, 6 months ago)
+    
+    WORKFLOW-222 artedi metrics for job times
+
+diff --git a/lib/api.js b/lib/api.js
+index ac1e5d6..f779037 100644
+--- a/lib/api.js
++++ b/lib/api.js
+@@ -1,5 +1,5 @@
+ // Copyright 2014 Pedro P. Candel <kusorbox@gmail.com> All rights reserved.
+-// Copyright (c) 2017, Joyent, Inc.
++// Copyright (c) 2018, Joyent, Inc.
+ 
+ var restify = require('restify');
+ var util = require('util');
+@@ -11,6 +11,7 @@ var trace_event = require('trace-event');
+ var vm = require('vm');
+ var Logger = require('bunyan');
+ var Factory = require('../lib/index').Factory;
++var createMetricsManager = require('triton-metrics').createMetricsManager;
+ 
+ 
+ var API = module.exports = function (opts) {
+@@ -56,7 +57,24 @@ var API = module.exports = function (opts) {
+     }
+ 
+     opts.api.log = log;
++
++    var metricsManager = createMetricsManager({
++        address: opts.adminIp,
++        log: log.child({ component: 'metrics' }),
++        port: opts.api.metricsPort || 8882,
++        restify: restify,
++        staticLabels: {
++            datacenter: opts.datacenterName,
++            instance: opts.instanceUuid,
++            server: opts.serverUuid,
++            service: opts.serviceName
++        }
++    });
++    metricsManager.createRestifyMetrics();
++    opts.backend.opts.metricsManager = metricsManager;
++
+     var server = restify.createServer(opts.api);
++
+     var Backend = require(opts.backend.module);
+     opts.backend.opts.log = log;
+     var backend = Backend(opts.backend.opts);
+@@ -198,6 +216,9 @@ var API = module.exports = function (opts) {
+         })(req, res, route, err);
+     });
+ 
++    server.on('after', metricsManager.collectRestifyMetrics
++        .bind(metricsManager));
++
+     // Define handlers:
+     function listWorkflows(req, res, next) {
+         backend.getWorkflows(req.params, function (err, workflows) {
+@@ -761,6 +782,8 @@ var API = module.exports = function (opts) {
+                 log.info('API backend initialized');
+             });
+ 
++            metricsManager.listen(function () {});
++
+             return server.listen(port_or_path, function () {
+                 log.info('%s listening at %s', server.name, server.url);
+                 return onInit();
+@@ -770,6 +793,7 @@ var API = module.exports = function (opts) {
+         // These are properties, maybe it's a good idea to define getters:
+         server: server,
+         backend: backend,
+-        log: log
++        log: log,
++        metricsManager: metricsManager
+     };
+ };
+diff --git a/lib/runner.js b/lib/runner.js
+index 5af7590..efdb4da 100644
+--- a/lib/runner.js
++++ b/lib/runner.js
+@@ -1,5 +1,5 @@
+ // Copyright 2013 Pedro P. Candel <kusorbox@gmail.com> All rights reserved.
+-// Copyright (c) 2017, Joyent, Inc.
++// Copyright (c) 2018, Joyent, Inc.
+ 
+ var assert = require('assert-plus');
+ var util = require('util');
+@@ -12,6 +12,8 @@ var WorkflowJobRunner = require('./job-runner');
+ var Factory = require('../lib/index').Factory;
+ var exists = fs.exists || path.exists;
+ var trace_event = require('trace-event');
++var createMetricsManager = require('triton-metrics').createMetricsManager;
++var restify = require('restify');
+ 
+ // - opts - configuration options:
+ //    - identifier: Unique identifier for this runner.
+@@ -103,6 +105,90 @@ var WorkflowRunner = module.exports = function (opts) {
+         log = bunyan.createLogger(opts.logger);
+     }
+ 
++    var metricsManager = createMetricsManager({
++        address: opts.adminIp,
++        log: log.child({ component: 'metrics' }),
++        port: opts.metricsPort || 8881,
++        restify: restify,
++        staticLabels: {
++            datacenter: opts.datacenterName,
++            instance: opts.instanceUuid,
++            server: opts.serverUuid,
++            service: opts.serviceName
++        }
++    });
++
++    var metricJobCounter = metricsManager.collector.counter({
++        name: 'wf_jobs_total',
++        help: 'count of Workflow jobs completed'
++    });
++
++    var metricJobTimeHistogram = metricsManager.collector.histogram({
++        name: 'wfjob_duration_seconds',
++        help: 'total time to complete a Workflow job'
++    });
++
++    var metricJobOverheadTimeHistogram = metricsManager.collector.histogram({
++        name: 'wf_job_overhead_seconds',
++        help: 'total overhead time for a Workflow job'
++    });
++
++    var collectJobMetrics = function (job) {
++        var labels = {
++            name: job.name,
++            execution: job.execution
++        };
++
++        metricJobCounter.increment(labels);
++
++        function calculateDuration(job) {
++            var durationSeconds;
++            if (job.chain_results.length) {
++                var lastTask = job.chain_results[job.chain_results.length - 1];
++                var endMs = new Date(lastTask.finished_at).getTime();
++                var startMs = new Date(job.created_at).getTime();
++                durationSeconds = (endMs - startMs) / 1000;
++            } else {
++                durationSeconds = job.elapsed;
++            }
++
++            return durationSeconds;
++        }
++
++        // Sum the time between job creation and job start and the time
++        // between tasks
++        function calculateOverhead(job) {
++            var jobCreated = new Date(job.created_at).getTime();
++            var firstJobStarted = new Date(job.chain_results[0].started_at)
++                .getTime();
++            var startOverhead = (firstJobStarted - jobCreated) / 1000;
++            var overheadSeconds = job.chain_results.reduce(
++                function sumOverhead(total, result, idx, chainResults) {
++                var nextTask = chainResults[idx + 1];
++                if (nextTask) {
++                    var nextTaskStartMs = new Date(nextTask.started_at)
++                        .getTime();
++                    var currentTaskEndMs = new Date(result.finished_at)
++                        .getTime();
++                    total = (nextTaskStartMs - currentTaskEndMs) / 1000 + total;
++                }
++
++                return total;
++            }, startOverhead);
++
++            return overheadSeconds;
++        }
++
++        metricJobTimeHistogram.observe(calculateDuration(job), labels);
++        metricJobOverheadTimeHistogram.observe(calculateOverhead(job), labels);
++    };
++
++    metricsManager.createMetrics('jobMetrics', collectJobMetrics);
++
++    metricsManager.listen(function () {});
++    opts.runner.metricsManager = metricsManager;
++    opts.backend.opts.metricsManager = metricsManager;
++
+     opts.backend.log = log;
+     var backend = Backend(opts.backend.opts);
+ 
+@@ -415,7 +501,8 @@ var WorkflowRunner = module.exports = function (opts) {
+         inactiveRunners: inactiveRunners,
+         staleJobs: staleJobs,
+         getSlot: getSlot,
+-        releaseSlot: releaseSlot
++        releaseSlot: releaseSlot,
++        metricsManager: metricsManager
+     };
+ 
+     // This is the main runner method, where jobs execution takes place.
+diff --git a/package.json b/package.json
+index 1b4069c..fc20310 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+     "name": "wf",
+     "description": "Tasks Workflows orchestration API and runners",
+-    "version": "1.1.0",
++    "version": "2.0.0",
+     "repository": {
+         "type": "git",
+         "url": "git://github.com/kusor/node-workflow.git"
+@@ -24,14 +24,15 @@
+     "main": "lib/index.js",
+     "dependencies": {
+         "assert-plus": "1.0.0",
+-        "uuid": "3.0.1",
+-        "bunyan": "1.8.1",
+-        "vasync": "1.6.4",
+         "backoff": "1.2.0",
++        "bunyan": "1.8.1",
+         "clone": "0.1.6",
+         "restify": "4.1.1",
+         "sigyan": "0.2.0",
+-        "trace-event": "1.3.0"
++        "trace-event": "1.3.0",
++        "triton-metrics": "0.1.1",
++        "uuid": "3.0.1",
++        "vasync": "1.6.4"
+     },
+     "scripts": {
+         "test": "./node_modules/.bin/tap ./test/*.test.js"
+diff --git a/test/api.test.js b/test/api.test.js
+index d4a2485..eedf979 100644
+--- a/test/api.test.js
++++ b/test/api.test.js
+@@ -1,5 +1,5 @@
+ // Copyright 2012 Pedro P. Candel <kusorbox@gmail.com>. All rights reserved.
+-// Copyright (c) 2017, Joyent, Inc.
++// Copyright (c) 2018, Joyent, Inc.
+ 
+ var test = require('tap').test,
+     uuid = require('uuid'),
+@@ -27,6 +27,13 @@ config.logger = {
+     }]
+ };
+ 
++config.datacenterName = 'test-datacenter';
++config.instanceUuid = 'test-instance-uuid';
++config.serverUuid = 'test-server-uuid';
++config.serviceName = 'workflow';
++config.adminIp = '127.0.0.1';
++config.metricsPort = 8881;
++
+ var helper = require('./helper');
+ 
+ var REQ_ID = uuid();
+@@ -736,6 +743,7 @@ test('DELETE /workflows/:uuid 404', function (t) {
+ 
+ 
+ test('teardown', function (t) {
++    api.metricsManager.close(function () {});
+     client.close();
+     server.close(function () {
+         backend.quit(function () {
+diff --git a/test/runner.test.js b/test/runner.test.js
+index f8af832..1e92fa1 100644
+--- a/test/runner.test.js
++++ b/test/runner.test.js
+@@ -1,5 +1,5 @@
+ // Copyright 2012 Pedro P. Candel <kusorbox@gmail.com>. All rights reserved.
+-// Copyright (c) 2017, Joyent, Inc.
++// Copyright (c) 2018, Joyent, Inc.
+ 
+ var util = require('util');
+ var path = require('path');
+@@ -72,6 +72,7 @@ var helper = require('./helper');
+ 
+ var DTRACE = createDTrace('workflow');
+ 
++
+ test('throws on missing opts', function (t) {
+     t.throws(function () {
+         return WorkflowRunner();
+@@ -109,6 +110,14 @@ test('setup', function (t) {
+             path: path.resolve(__dirname, './test.runner.log')
+         }]
+     };
++
++    config.datacenterName = 'test-datacenter';
++    config.instanceUuid = 'test-instance-uuid';
++    config.serverUuid = 'test-server-uuid';
++    config.serviceName = 'workflow';
++    config.adminIp = '127.0.0.1';
++    config.metricsPort = 8881;
++
+     runner = WorkflowRunner(config);
+     t.ok(runner);
+     t.ok(runner.backend, 'backend ok');
+@@ -171,9 +180,16 @@ test('setup', function (t) {
+ test('runner identifier', function (t) {
+     var cfg = {
+         backend: helper.config().backend,
+-        dtrace: DTRACE
++        dtrace: DTRACE,
++        datacenterName: 'test-datacenter',
++        instanceUuid: 'test-instance-uuid',
++        serverUuid: 'test-server-uuid',
++        serviceName: 'workflow',
++        adminIp: '127.0.0.1',
++        metricsPort: 8882
+     }, aRunner = WorkflowRunner(cfg),
+     identifier;
++
+     // run getIdentifier twice, one to create the file,
+     // another to just read it:
+     aRunner.init(function (err) {
+@@ -186,6 +202,7 @@ test('runner identifier', function (t) {
+                 t.ifError(err, 'get identifier error');
+                 t.equal(id, identifier, 'correct id');
+                 aRunner.backend.quit(function () {
++                    aRunner.metricsManager.close(function () {});
+                     t.end();
+                 });
+             });
+@@ -391,7 +408,13 @@ test('inactive runners', function (t) {
+             forks: 2,
+             run_interval: 250
+         },
+-        dtrace: DTRACE
++        dtrace: DTRACE,
++        datacenterName: 'test-datacenter',
++        instanceUuid: 'test-instance-uuid',
++        serverUuid: 'test-server-uuid',
++        serviceName: 'workflow',
++        adminIp: '127.0.0.1',
++        metricsPort: 8882
+     },
+     anotherRunner = WorkflowRunner(cfg);
+     t.ok(anotherRunner, 'another runner ok');
+@@ -415,6 +438,8 @@ test('inactive runners', function (t) {
+                             t.equal(runners.length, 1, 'runners length');
+                             t.equal(runners[0], theUUID, 'runner uuid error');
+                             anotherRunner.backend.quit(function () {
++                                anotherRunner.metricsManager
++                                    .close(function () {});
+                                 t.end();
+                             });
+                         });
+@@ -435,7 +460,13 @@ test('stale jobs', function (t) {
+             forks: 2,
+             run_interval: 250
+         },
+-        dtrace: DTRACE
++        dtrace: DTRACE,
++        datacenterName: 'test-datacenter',
++        instanceUuid: 'test-instance-uuid',
++        serverUuid: 'test-server-uuid',
++        serviceName: 'workflow',
++        adminIp: '127.0.0.1',
++        metricsPort: 8882
+     },
+     anotherRunner = WorkflowRunner(cfg),
+     aJob;
+@@ -489,6 +520,8 @@ test('stale jobs', function (t) {
+                                             t.equivalent(jobs, []);
+                                             anotherRunner.backend.quit(
+                                               function () {
++                                                anotherRunner.metricsManager
++                                                    .close(function () {});
+                                                 t.end();
+                                             });
+                                         });
+@@ -506,6 +539,7 @@ test('stale jobs', function (t) {
+ 
+ test('teardown', function (t) {
+     var cfg_file = path.resolve(__dirname, '../workflow-indentifier');
++    runner.metricsManager.close(function () {});
+     runner.backend.quit(function () {
+         exists(cfg_file, function (exist) {
+             if (exist) {

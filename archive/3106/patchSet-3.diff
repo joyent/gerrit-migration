@@ -1,0 +1,865 @@
+commit 47e075efea8ec3b0cfdc2c98cd603d0f85481afe (refs/changes/06/3106/3)
+Author: Kody A Kantor <kody.kantor@gmail.com>
+Date:   2017-12-14T21:27:02+00:00 (1 year, 10 months ago)
+    
+    joyent/pgstatsmon#1 support Prometheus-style metric collection
+
+diff --git a/README.md b/README.md
+index 969b614..62c2820 100644
+--- a/README.md
++++ b/README.md
+@@ -1,9 +1,8 @@
+ # pgstatsmon
+ 
+ This is a *prototype* Node service to use the Postgres client interface to
+-periodically fetch stats from multiple postgres instances and shovel them to
+-statsd.
+-
++periodically fetch stats from multiple postgres instances and export them
++through a Prometheus server.
+ 
+ ## Running
+ 
+diff --git a/bin/pgstatsmon.js b/bin/pgstatsmon.js
+index b91dbd6..f362202 100644
+--- a/bin/pgstatsmon.js
++++ b/bin/pgstatsmon.js
+@@ -1,6 +1,6 @@
+ /*
+- * pgstatsmon: service that monitors Postgres stats tables and shovels data to
+- * statsd.  See README.md for details.
++ * pgstatsmon: service that monitors Postgres stats tables and exposes metrics
++ * via the Prometheus format.  See README.md for details.
+  */
+ 
+ var mod_bunyan = require('bunyan');
+diff --git a/etc/config.json b/etc/config.json
+index bc6d127..a9af07d 100644
+--- a/etc/config.json
++++ b/etc/config.json
+@@ -1,11 +1,12 @@
+ {
+-    "statprefix": "stats.coal.postgres",
+-    "interval": 1000,
++    "interval": 10000,
+     "dbs": [ {
+ 	"name": "primary",
+ 	"url": "postgres://postgres@10.99.99.16:5432/moray"
+     } ],
+-    "targets": [ {
+-        "statsd": "localhost"
+-    } ]
++    "target": {
++	"ip": "0.0.0.0",
++	"port": 9187,
++	"route": "/metrics"
++    }
+ }
+diff --git a/lib/pgstatsmon.js b/lib/pgstatsmon.js
+index 501f4af..1943265 100644
+--- a/lib/pgstatsmon.js
++++ b/lib/pgstatsmon.js
+@@ -3,72 +3,23 @@
+  * to one or more targets.
+  */
+ 
++var mod_artedi = require('artedi');
+ var mod_assertplus = require('assert-plus');
+ var mod_jsprim = require('jsprim');
+ var mod_pg = require('pg');
+-var mod_statsd_client = require('statsd-client');
++var mod_restify = require('restify');
+ var mod_util = require('util');
+ var mod_vasync = require('vasync');
+ 
++var queries = require('./queries').getQueries();
++
+ /* Public interface */
+ module.exports = pgstatsmon;
+ 
+-var queries = [ {
+-    'name': 'usertbl',
+-    'sql': 'SELECT * from pg_stat_user_tables',
+-    'statkey': 'relname',
+-    'counters': [
+-	'analyze_count',
+-	'autoanalyze_count',
+-	'autovacuum_count',
+-	'idx_scan',
+-	'idx_tup_fetch',
+-	'n_tup_del',
+-	'n_tup_hot_upd',
+-	'n_tup_ins',
+-	'n_tup_upd',
+-	'seq_scan',
+-	'seq_tup_read',
+-	'vacuum_count'
+-    ],
+-    'gauges': [
+-	'n_live_tup',
+-	'n_dead_tup'
+-    ]
+-}, {
+-    'name': 'repl',
+-    'sql': [
+-	'SELECT ',
+-	'sync_state, ',
+-	'pg_xlog_location_diff(sent_location, write_location) as write_lag, ',
+-	'pg_xlog_location_diff(write_location, flush_location) as flush_lag, ',
+-	'pg_xlog_location_diff(flush_location, replay_location) as replay_lag',
+-	'from pg_stat_replication'
+-    ].join('\n'),
+-    'gauges': [ 'write_lag', 'flush_lag', 'replay_lag' ],
+-    'xlatename': function (fieldname, row) {
+-	return (row['sync_state'] + '_' + fieldname);
+-    },
+-    'minfrequency': 10000 // XXX not used
+-}, {
+-    'name': 'freezeage',
+-    'statkey': 'table_name',
+-    'sql': [
+-	'SELECT c.oid::regclass as table_name,',
+-	'       greatest(age(c.relfrozenxid),age(t.relfrozenxid)) as freezeage',
+-	'FROM pg_class c',
+-	'LEFT JOIN pg_class t ON c.reltoastrelid = t.oid',
+-	'WHERE c.relkind = \'r\';'
+-    ].join('\n'),
+-    'gauges': [ 'freezeage' ]
+-} ];
+-
+ /*
+  * Monitor several postgres instances.  Configuration requires several
+  * properties:
+  *
+- *    statprefix    prefix to use for all statsd stats.
+- *
+  *    interval      period at which to query Postgres instances.  We use an
+  *                  interval timer rather than timeouts to try to keep
+  *                  intervals as regular as possible.  If a query is still
+@@ -77,22 +28,26 @@ var queries = [ {
+  *
+  *    dbs           array of databases to monitor, each with:
+  *
+- *         name     human-readable label, used as part of stat names
++ *         name     human-readable label, used as a metadata label for metrics
+  *
+  *         url      Postgres url (i.e., "postgres://user@host:port/database")
+  *
+- *    targets       array of targets to send stats data to; each may have:
++ *    target        object describing how to configure the Prometheus server.
++ *                  It must include:
++ *
++ *         ip       ip address for server to listen on
+  *
+- *         statsd   hostname of a statsd service to send to
++ *         port     port number for server to listen on
++ *
++ *         route    http route used to expose metrics
+  *
+  *    log           bunyan-style logger
+  */
+ function pgstatsmon(config)
+ {
+-	mod_assertplus.string(config['statprefix'], 'config.statprefix');
+ 	mod_assertplus.number(config['interval'], 'config.interval');
+ 	mod_assertplus.arrayOfObject(config['dbs'], 'config.dbs');
+-	mod_assertplus.arrayOfObject(config['targets'], 'config.targets');
++	mod_assertplus.object(config['target'], 'config.target');
+ 	mod_assertplus.object(config['log'], 'config.log');
+ 
+ 	config['dbs'].forEach(function (dbconf, pi) {
+@@ -102,10 +57,10 @@ function pgstatsmon(config)
+ 		    'config.dbs[' + pi + '].url');
+ 	});
+ 
+-	config['targets'].forEach(function (targetconf, pi) {
+-		mod_assertplus.string(targetconf['statsd'],
+-		    'config.targets[' + pi + '].statsd');
+-	});
++	var target = config['target'];
++	mod_assertplus.string(target['ip'], 'config.target.ip');
++	mod_assertplus.number(target['port'], 'config.target.port');
++	mod_assertplus.string(target['route'], 'config.target.route');
+ 
+ 	var mon = new PgMon(config);
+ 	mon.start();
+@@ -125,9 +80,9 @@ function PgMon(config)
+ 	/* Save log and configuration */
+ 	this.pm_log = log;
+ 	this.pm_dbs = mod_jsprim.deepCopy(config['dbs']);
+-	this.pm_targetconfs = mod_jsprim.deepCopy(config['targets']);
++	this.pm_targetconf = mod_jsprim.deepCopy(config['target']);
+ 	this.pm_interval = config['interval'];
+-	this.pm_prefix = config['statprefix'];
++	this.pm_targets = [];
+ 
+ 	/* queries to run */
+ 	this.pm_queries = queries.map(
+@@ -144,22 +99,21 @@ function PgMon(config)
+ 		/* JSSTYLED */
+ 		return (mon.pm_queries.map(function () { return ({}); }));
+ 	});
+-	/* target objects */
+-	this.pm_targets = this.pm_targetconfs.map(
+-	    function (targetconf) { return (mon.createTarget(targetconf)); });
++	/* Prometheus target */
++	this.pm_targets.push(mon.createTarget(this.pm_targetconf));
+ 
+-	/* always prepend a "log" target */
+-	this.pm_targets.unshift(new LogTarget(log));
++	/* always add a "log" target */
++	this.pm_targets.push(new LogTarget(log));
+ 
+ }
+ 
+ /*
+- * [private] Create a backend target.  Only statsd targets are currently
++ * [private] Create a backend target.  Only Prometheus targets are currently
+  * supported, which is validated by the caller.
+  */
+ PgMon.prototype.createTarget = function (targetconf)
+ {
+-	return (new StatsdTarget(targetconf['statsd'], this.pm_log));
++	return (new PrometheusTarget(targetconf, this.pm_log));
+ };
+ 
+ PgMon.prototype.start = function ()
+@@ -191,16 +145,18 @@ PgMon.prototype.start = function ()
+ 		log.info('all clients connected');
+ 		mon.tick();
+ 		setInterval(function () { mon.tick(); }, mon.pm_interval);
++		mon.pm_targets.forEach(function (target) {
++			target.start();
++		});
+ 	});
+ };
+ 
+ /*
+- * [private] Invoked once per INTERVAL to run checks.
++ * [private] Invoked once per INTERVAL to run checks..
+  */
+ PgMon.prototype.tick = function ()
+ {
+ 	var pi, qi;
+-
+ 	for (pi = 0; pi < this.pm_pgs.length; pi++) {
+ 		for (qi = 0; qi < this.pm_queries.length; qi++)
+ 			this.tickPgQuery(pi, qi);
+@@ -216,6 +172,7 @@ PgMon.prototype.tickPgQuery = function (pi, qi)
+ 	var query = this.pm_queries[qi];
+ 	var state = this.pm_state[pi][qi];
+ 	var time;
++	var timer, errmetric;
+ 
+ 	/*
+ 	 * If the last check is still running, either the interval is configured
+@@ -248,13 +205,24 @@ PgMon.prototype.tickPgQuery = function (pi, qi)
+ 		mon.pm_state[pi][qi] = null;
+ 		time = process.hrtime(time);
+ 
++		/*
++		 * If we see an error running the query, create a metric for
++		 * the DB we were contacting and the query we were running
++		 */
+ 		if (err) {
+-			/* XXX does this do the right thing? */
+-			mon.emitCounter(mon.estatname(pi, qi, 'queryerr'), 1);
++			errmetric = {
++				'name': 'pg_query_error',
++				'help': 'error performing PG query',
++				'metadata': {
++					'query': query.q_name
++				}
++			};
++
+ 			log.error({
+ 			    'url': url,
+ 			    'query': query.q_name
+ 			}, 'query failed');
++			mon.emitCounter(errmetric, 1);
+ 			return;
+ 		}
+ 
+@@ -264,9 +232,13 @@ PgMon.prototype.tickPgQuery = function (pi, qi)
+ 		 * query itself.
+ 		 */
+ 		mon.record(pi, qi, result);
+-		mon.emitTimer(
+-		    mon.qstatname(pi, qi, null, 'querytime'),
+-		    (time[0] * 1000 + Math.floor(time[1] / 1000000)));
++		timer = {
++			'attr': 'querytime',
++			'help': 'time to run stat query',
++			'unit': 'ms'
++		};
++		mon.emitTimer(mon.qstatname(pi, qi, null, timer),
++		    mod_jsprim.hrtimeMillisec(time));
+ 	});
+ };
+ 
+@@ -285,13 +257,7 @@ PgMon.prototype.record = function (pi, qi, datum)
+ 	oldresult = this.pm_data[pi][qi];
+ 	this.pm_data[pi][qi] = {};
+ 	datum['rows'].forEach(function (row) {
+-		/*
+-		 * This assumes that if there's no statkey, then there's exactly
+-		 * one row.  This isn't necessarily true if you're doing
+-		 * replication to multiple peers from the same postgres
+-		 * instance.  XXX Is that supported?
+-		 */
+-		var key = query.q_statkey ? row[query.q_statkey] : 'repl';
++		var key = row[query.q_statkey];
+ 		mon.pm_data[pi][qi][key] = row;
+ 		oldrow = oldresult[key];
+ 
+@@ -306,74 +272,119 @@ PgMon.prototype.record = function (pi, qi, datum)
+ 		query.q_counters.forEach(function (c) {
+ 			mon.emitCounter(
+ 			    mon.qstatname(pi, qi, row, c),
+-			    row[c] - oldrow[c]);
++			    row[c.attr] - oldrow[c.attr]);
+ 		});
+ 
+ 		query.q_gauges.forEach(function (g) {
+ 			mon.emitGauge(
+-			    mon.qstatname(pi, qi, row, g), row[g]);
++			    mon.qstatname(pi, qi, row, g), row[g.attr]);
+ 		});
+ 	});
+ };
+ 
+ /*
+- * [private] Returns the statsd counter name for the the error called "label"
+- * when encountered processing query "qi" from postgres instance "pi".
++ * [private] Returns an object describing the metric stored as row[fieldname]
++ * for postgres instance "pi", query "qi".
+  */
+-PgMon.prototype.estatname = function (pi, qi, label)
++PgMon.prototype.qstatname = function (pi, qi, row, field)
+ {
+ 	var dbname = this.pm_dbs[pi]['name'];
+ 	var query = this.pm_queries[qi];
+-	return (mod_util.format('%s.%s.%s.%s',
+-	    this.pm_prefix, dbname, query.q_name, label));
+-};
+-
+-/*
+- * [private] Returns the statsd counter name for the value stored as
+- * row[fieldname] for postgres instance "pi", query "qi".
+- */
+-PgMon.prototype.qstatname = function (pi, qi, row, fieldname)
+-{
+-	var dbname = this.pm_dbs[pi]['name'];
+-	var query = this.pm_queries[qi];
+-	var xlated, breakout;
+-
+-	if (row !== null && query.q_statkey !== null)
+-		breakout = row[query.q_statkey];
+-	else
+-		breakout = query.q_name;
+-
+-	if (row !== null && query.q_xlate !== null)
+-		xlated = query.q_xlate(fieldname, row);
+-	else
+-		xlated = fieldname;
++	var fieldname = field.attr;
++	var help = field.help;
++	var metadata = query.q_metadata;
++	var mdvalues = {};
++	var name;
++
++	mdvalues['name'] = dbname;
++	if (metadata && row) {
++		metadata.forEach(function (attr) {
++			mdvalues[attr] = row[attr];
++		});
++	}
+ 
+-	return (mod_util.format('%s.%s.%s.%s',
+-	    this.pm_prefix, dbname, breakout, xlated));
++	/*
++	 * Returns something like this:
++	 * {
++	 *   'name': 'postgres_repl_write_lag',
++	 *   'help': 'write lag',
++	 *   'metadata': {
++	 *     'name': 'primary'
++	 *     'sync_state': 'async',
++	 * }
++	 */
++	name = mod_util.format('%s_%s', query.q_name, fieldname);
++	if (field.unit) {
++		/* many metrics provide units (e.g. 'ms') */
++		name = mod_util.format('%s_%s', name, field.unit);
++	}
++	return ({
++		'name': name,
++		'help': help,
++		'metadata': mdvalues
++	});
+ };
+ 
+ /*
+  * Emit the named counter to all targets.
+  */
+-PgMon.prototype.emitCounter = function (name, value)
++PgMon.prototype.emitCounter = function (metric, value)
+ {
+-	this.pm_targets.forEach(function (t) { t.emitCounter(name, value); });
++	/*
++	 * It's possible that the user we're using to connect to the DB doesn't
++	 * have permissions to view certain tables, or we ran a bad query. In
++	 * these cases we won't attempt to increment counters, but will log
++	 * a warning and increment a separate counter to track this behavior.
++	 */
++	if (value === null) {
++		this.pm_log.warn(metric, 'null value observed');
++		this.pm_targets.forEach(function (t) {
++			t.emitCounter({
++				'name': 'pg_null_value_observed',
++				'help': 'pgstatsmon read a null value from' +
++				    ' a SQL query',
++				'metadata': {
++					'name': metric.name
++				}
++			}, 1);
++		});
++		return;
++	}
++	this.pm_targets.forEach(function (t) {
++		t.emitCounter(metric, value);
++	});
+ };
+ 
+ /*
+  * Emit the named gauge to all targets.
+  */
+-PgMon.prototype.emitGauge = function (name, value)
++PgMon.prototype.emitGauge = function (metric, value)
+ {
+-	this.pm_targets.forEach(function (t) { t.emitGauge(name, value); });
++	if (value === null) {
++		this.pm_log.warn(metric, 'null value observed');
++		this.pm_targets.forEach(function (t) {
++			t.emitCounter({
++				'name': 'pg_null_value_observed',
++				'help': 'pgstatsmon read a null value from' +
++				    ' a SQL query',
++				'metadata': {
++					'name': metric.name
++				}
++			}, 1);
++		});
++		return;
++	}
++	this.pm_targets.forEach(function (t) { t.emitGauge(metric, value); });
+ };
+ 
+ /*
+  * Emit the named timer to all targets.
+  */
+-PgMon.prototype.emitTimer = function (name, duration)
++PgMon.prototype.emitTimer = function (metric, duration)
+ {
+-	this.pm_targets.forEach(function (t) { t.emitTimer(name, duration); });
++	this.pm_targets.forEach(function (t) {
++		t.emitTimer(metric, duration);
++	});
+ };
+ 
+ 
+@@ -385,9 +396,9 @@ function Query(conf, log)
+ 	this.q_name = conf['name'];
+ 	this.q_sql = conf['sql'];
+ 	this.q_statkey = conf['statkey'] || null;
+-	this.q_xlate = conf['xlatename'] || null;
+ 	this.q_counters = (conf['counters'] || []).slice(0);
+ 	this.q_gauges = (conf['gauges'] || []).slice(0);
++	this.q_metadata = (conf['metadata'] || []).slice(0);
+ }
+ 
+ 
+@@ -399,56 +410,92 @@ function LogTarget(log)
+ 	this.lt_log = log;
+ }
+ 
+-LogTarget.prototype.emitCounter = function (name, value)
++LogTarget.prototype.emitCounter = function (metric, value)
+ {
+-	this.lt_log.trace(name, value);
++	this.lt_log.trace(metric.name, metric.metadata, value);
+ };
+ 
+-LogTarget.prototype.emitGauge = function (name, value)
++LogTarget.prototype.emitGauge = function (metric, value)
+ {
+-	this.lt_log.trace(name, value);
++	this.lt_log.trace(metric.name, metric.metadata, value);
+ };
+ 
+-LogTarget.prototype.emitTimer = function (name, duration)
++LogTarget.prototype.emitTimer = function (metric, duration)
+ {
+-	this.lt_log.trace(name, duration);
++	this.lt_log.trace(metric.name, metric.metadata, duration);
+ };
+ 
++LogTarget.prototype.start = function ()
++{
++};
+ 
+ /*
+- * Backend target that reports data to statsd.
+- * XXX This prototype implementation uses the statsd-client package, but that's
+- * not very efficient because it sends one packet *per stat* emitted, every
+- * time.  Since we know we're going to emit a bunch of stats on the same tick,
+- * we'd be much better off buffering them for a tick and then emitting them all
+- * in as few packets as possible.  (Maximum IP packet size (and not MTU) will
+- * prevent that from being one packet, so we also have to deal with
+- * fragmentation.)
++ * Exposes metrics in the Prometheus format via a Restify web server.
+  */
+-function StatsdTarget(host, log)
++function PrometheusTarget(conf, log)
+ {
+-	this.st_log = log;
+-	this.st_host = host;
+-	this.st_client = new mod_statsd_client({ 'host': host });
+-	this.st_emitted = {};
+-	log.info({ 'host': host }, 'creating statsd target');
++	this.pe_log = log;
++	this.pe_ip = conf.ip;
++	this.pe_port = conf.port;
++	this.pe_route = conf.route;
++	this.pe_collector = mod_artedi.createCollector();
++	this.pe_server = mod_restify.createServer({
++		name: 'Monitor'
++	});
++
++	var prom = this;
++	/*
++	 * PgMon periodically 'ticks' to collect metrics from PG instances. When
++	 * a user scrapes metrics we return the most recently collected data.
++	 */
++	this.pe_server.get('/metrics', function (req, res, next) {
++		req.on('end', function () {
++			prom.pe_collector.collect(mod_artedi.FMT_PROM,
++			    function (err, metrics) {
++				if (err) {
++					next(err);
++					return;
++				}
++				res.setHeader('Content-Type',
++				    'text/plain; version=0.0.4');
++				res.send(metrics);
++				next();
++			});
++		});
++		req.resume();
++	});
+ }
+ 
+-StatsdTarget.prototype.emitCounter = function (name, value)
++PrometheusTarget.prototype.emitCounter = function (metric, value)
+ {
+-	if (value === 0 && this.st_emitted[name])
+-		return;
++	this.pe_collector.counter({
++		name: metric.name,
++		help: metric.help
++	}).add(value, metric.metadata);
++};
++
++PrometheusTarget.prototype.emitGauge = function (metric, value)
++{
++	this.pe_collector.gauge({
++		name: metric.name,
++		help: metric.help
++	}).set(value, metric.metadata);
+ 
+-	this.st_emitted[name] = true;
+-	this.st_client.counter(name, value);
+ };
+ 
+-StatsdTarget.prototype.emitGauge = function (name, value)
++PrometheusTarget.prototype.emitTimer = function (metric, duration)
+ {
+-	this.st_client.gauge(name, value);
++	this.pe_collector.histogram({
++		name: metric.name,
++		help: metric.help
++	}).observe(duration, metric.metadata);
+ };
+ 
+-StatsdTarget.prototype.emitTimer = function (name, duration)
++PrometheusTarget.prototype.start = function ()
+ {
+-	this.st_client.timing(name, duration);
++	var prom = this;
++	this.pe_server.listen(this.pe_port, this.pe_ip, function () {
++		prom.pe_log.info('monitoring server started on port %d',
++		    prom.pe_port);
++	});
+ };
+diff --git a/lib/queries.js b/lib/queries.js
+new file mode 100644
+index 0000000..55e8cec
+--- /dev/null
++++ b/lib/queries.js
+@@ -0,0 +1,230 @@
++var mod_ajv = require('ajv');
++
++/*
++ * queries.js: a list of queries to be executed by pgstatsmon to collect
++ * metrics.
++ *
++ * Each object in the query array contains a number of required fields:
++ *
++ *    queries          array of query objects
++ *
++ *        name         human-readable name of the resulting metric
++ *
++ *        sql          sql statement string that will be executed on each
++ *                     Postgres instance
++ *
++ *        statkey      unique per-row attribute name that pgstatsmon will use as
++ *                     an index to store metrics in memory
++ *
++ *        metadata     array of attribute names to be used as metadata labels in
++ *                     the resulting metric
++ *
++ *        counters     array of counter objects. Each counter object tracks the
++ *                     value of the provided attribute from the sql result set.
++ *                     Counters are used to represent things that only move up,
++ *                     like bytes written or vacuum counts.
++ *
++ *            attr     attribute name from the sql result set. Used to find the
++ *                     value of the metric.
++ *
++ *            help     human-readable string to assist in understanding what a
++ *                     metric represents
++ *
++ *            unit     [optional] unit by which the metric should be measured
++ *                     (e.g. 'ms' for 'milliseconds')
++ *
++ *        gauges       array of gauge objects. Each gauge object tracks the
++ *                     value of the provided attribute from teh sql result set.
++ *                     Gauges are used to represent things that can move up or
++ *                     down, like connection counts and table sizes.
++ *
++ *            attr     attribute name from the sql result set. Used to find the
++ *                     value of the metric.
++ *
++ *            help     human-readable string to assist in understanding what a
++ *                     metric represents
++ *
++ *            unit     [optional] unit by which the metric should be measured
++ *                     (e.g. 'ms' for 'milliseconds')
++ *
++ *
++ * The query schema is validated when pgstatsmon starts.
++ */
++
++var queries = [ {
++    'name': 'pg_stat_user_tables',
++    'sql': 'SELECT * FROM pg_stat_user_tables',
++    'statkey': 'relname',
++    'metadata': [ 'relname' ],
++    'counters': [
++	{ 'attr': 'analyze_count', 'help': 'manual anaylze operations' },
++	{ 'attr': 'autoanalyze_count', 'help': 'autoanalyze operations' },
++	{ 'attr': 'autovacuum_count', 'help': 'autovacuum operations' },
++	{ 'attr': 'idx_scan', 'help': 'index scans' },
++	{ 'attr': 'idx_tup_fetch', 'help': 'index tuples fetched' },
++	{ 'attr': 'n_tup_del', 'help': 'tuples deleted' },
++	{ 'attr': 'n_tup_hot_upd', 'help': 'tuples updated (hot)' },
++	{ 'attr': 'n_tup_ins', 'help': 'tuples inserted' },
++	{ 'attr': 'n_tup_upd', 'help': 'tuples updated' },
++	{ 'attr': 'seq_scan', 'help': 'sequential table scans' },
++	{ 'attr': 'seq_tup_read', 'help': 'sequential tuples read' },
++	{ 'attr': 'vacuum_count', 'help': 'manual vacuum operations' }
++    ],
++    'gauges': [
++	{ 'attr': 'n_live_tup', 'help': 'estimated live tuples' },
++	{ 'attr': 'n_dead_tup', 'help': 'estimated dead tuples' }
++    ]
++}, {
++    'name': 'pg_stat_replication',
++    'statkey': 'application_name',
++    'metadata': [ 'sync_state' ],
++    'sql': [
++	'SELECT ',
++	'sync_state, ',
++	'pg_xlog_location_diff(sent_location, write_location) AS write_lag, ',
++	'pg_xlog_location_diff(write_location, flush_location) AS flush_lag, ',
++	'pg_xlog_location_diff(flush_location, replay_location) AS replay_lag',
++	'FROM pg_stat_replication'
++    ].join('\n'),
++    'gauges': [
++	{ 'attr': 'write_lag', 'help': 'write lag', 'unit': 'bytes' },
++	{ 'attr': 'flush_lag', 'help': 'flush lag', 'unit': 'bytes' },
++	{ 'attr': 'replay_lag', 'help': 'replay lag', 'unit': 'bytes' }
++    ]
++}, {
++    'name': 'pg_class',
++    'statkey': 'relname',
++    'metadata': [ 'relname' ],
++    'sql': [
++	'SELECT c.oid::regclass AS relname,',
++	'       greatest(age(c.relfrozenxid),age(t.relfrozenxid)) AS freezeage',
++	'FROM pg_class c',
++	'LEFT JOIN pg_class t ON c.reltoastrelid = t.oid',
++	'WHERE c.relkind = \'r\';'
++    ].join('\n'),
++    'gauges': [ { 'attr': 'freezeage', 'help': 'xids since last vacuum' } ]
++}, {
++    'name': 'pg_stat_activity',
++    'statkey': 'datname',
++    'metadata': [ 'datname', 'state' ],
++    'sql': [
++	'SELECT datname, state, count(*) AS connections',
++	'FROM pg_stat_activity',
++	'GROUP BY datname, state;'
++    ].join('\n'),
++    'gauges': [ { 'attr': 'connections', 'help': 'worker process state' } ]
++}, {
++    'name': 'pg_stat_database',
++    'statkey': 'datname',
++    'metadata': [ 'datname' ],
++    'sql': [
++	'SELECT *',
++	'FROM pg_stat_database'
++    ].join('\n'),
++    'gauges': [ { 'attr': 'numbackends', 'help': 'number of connections' } ],
++    'counters': [
++	{ 'attr': 'tup_returned', 'help': 'tuples returned' },
++	{ 'attr': 'tup_fetched', 'help': 'tuples fetched' },
++	{ 'attr': 'tup_inserted', 'help': 'tuples inserted' },
++	{ 'attr': 'tup_updated', 'help': 'tuples updated' },
++	{ 'attr': 'tup_deleted', 'help': 'tuples deleted' },
++	{ 'attr': 'blks_read', 'help': 'blocks read from disk' },
++	{ 'attr': 'blks_hit', 'help': 'blocks read from buffercache' },
++	{ 'attr': 'xact_commit', 'help': 'transactions committed' },
++	{ 'attr': 'xact_rollback', 'help': 'transactions rolled back' },
++	{ 'attr': 'blk_read_time', 'help': 'time spent reading blocks',
++	    'unit': 'ms' },
++	{ 'attr': 'blk_write_time', 'help': 'time spent writing blocks',
++	    'unit': 'ms' }
++    ]
++}, {
++    'name': 'pg_relation_size',
++    'statkey': 'relname',
++    'metadata': [ 'relname' ],
++    'sql': [
++	'SELECT relname, ',
++	'       c.reltuples AS row_estimate,',
++	'       pg_total_relation_size(c.oid) AS total_bytes,',
++	'       pg_indexes_size(c.oid) AS index_bytes,',
++	'       pg_total_relation_size(reltoastrelid) AS toast_bytes',
++	'FROM pg_class c',
++	'LEFT JOIN pg_namespace n ON n.oid = c.relnamespace',
++	'WHERE relkind = \'r\' AND nspname LIKE \'public\';'
++    ].join('\n'),
++    'gauges': [
++	{ 'attr': 'row_estimate', 'help': 'estimated number of tuples' },
++	{ 'attr': 'total_bytes', 'help': 'total bytes used' },
++	{ 'attr': 'index_bytes', 'help': 'bytes used by indexes' },
++	{ 'attr': 'toast_bytes', 'help': 'bytes used by toast files' }
++    ]
++}, {
++    'name': 'pg_stat_bgwriter',
++    'statkey': 'bgwriter',
++    'metadata': [],
++    'sql': [
++	'SELECT *',
++	'FROM pg_stat_bgwriter;'
++    ].join('\n'),
++    'counters': [
++	{ 'attr': 'checkpoints_timed', 'help': 'scheduled checkpoints' },
++	{ 'attr': 'checkpoints_req', 'help': 'requested checkpoints' },
++	{ 'attr': 'checkpoint_write_time', 'help': 'time spent writing' +
++	    ' checkpoints to disk', 'unit': 'ms' },
++	{ 'attr': 'checkpoint_sync_time', 'help': 'time spent synchronizing' +
++	    ' checkpoints to disk', 'unit': 'ms' },
++	{ 'attr': 'buffers_checkpoint', 'help': 'buffers written during' +
++	    ' checkpoints' },
++	{ 'attr': 'buffers_clean', 'help': 'buffers written by bgwriter' },
++	{ 'attr': 'maxwritten_clean', 'help': 'number of times bgwriter' +
++	    ' stopped a cleaning scan because too many buffers were written' },
++	{ 'attr': 'buffers_backend', 'help': 'buffers written by a backend' },
++	{ 'attr': 'buffers_backend_fsync', 'help': 'number of fsync calls by' +
++	    ' backends' },
++	{ 'attr': 'buffers_alloc', 'help': 'number of buffers allocated' }
++    ]
++} ];
++
++/*
++ * Validate the query schema. Returns the query object if valid.
++ */
++function getQueries()
++{
++	var ajv = new mod_ajv();
++	var metric = {
++		'type': 'object',
++		'properties': {
++			'attr': { 'type': 'string' },
++			'help': { 'type': 'string' },
++			'unit': { 'type': 'string' }
++		},
++		'required': [ 'attr', 'help' ]
++	};
++	var query = {
++		'type': 'object',
++		'properties': {
++			'name': { 'type': 'string' },
++			'sql': { 'type': 'string' },
++			'statkey': { 'type': 'string' },
++			'metadata': { 'type': 'array',
++			    'items': { 'type': 'string' } },
++			'counters': { 'type': 'array',
++			    'items': metric },
++			'gauges': { 'type': 'array',
++			    'items': metric }
++		},
++		'required': [ 'name', 'sql', 'statkey' ]
++	};
++	var queryArray = {
++		'type': 'array',
++		'items': query
++	};
++
++	/* check the 'query' object against the queryArray schema */
++	if (ajv.validate(queryArray, queries)) {
++		return (queries);
++	}
++	/* if validation fails, try to print a decent message */
++	throw new Error(JSON.stringify(ajv.errors, null, 4));
++}
++
++module.exports.getQueries = getQueries;
+diff --git a/package.json b/package.json
+index ba6bc7d..0a24a4d 100644
+--- a/package.json
++++ b/package.json
+@@ -1,16 +1,17 @@
+ {
+         "name": "pgstatsmon",
+-        "description": "Monitor postgres databases and pipe data to statsd",
++        "description": "Monitor Postgres databases",
+ 	"repository": {
+ 		"type": "git",
+ 		"url": "https://github.com/joyent/pgstatsmon.git"
+ 	},
+         "dependencies": {
+-		"assert-plus": "0.1.5",
++		"assert-plus": "1.0.0",
++		"ajv": "5.5.1",
++		"artedi": "1.1.1",
+ 		"bunyan": "0.22.1",
+-		"jsprim": "0.5.1",
++		"jsprim": "2.0.0",
+                 "pg": "0.7.0",
+-		"statsd-client": "0.0.15",
+ 		"vasync": "1.4.0"
+         }
+ }

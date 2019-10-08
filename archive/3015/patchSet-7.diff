@@ -1,0 +1,234 @@
+commit f761c3764f3c9079bc4259a7ec4e904ca94adc75 (refs/changes/15/3015/7)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2017-12-04T22:20:33+00:00 (1 year, 10 months ago)
+    
+    MANTA-3503 moray pgclient query function creates its own request id
+    Reviewed by: Cody Peter Mello <cody.mello@joyent.com>
+    Reviewed by: Tim Kordas <tim.kordas@joyent.com>
+    Approved by: Cody Peter Mello <cody.mello@joyent.com>
+
+diff --git a/lib/control.js b/lib/control.js
+index f7b8b39..db4623b 100644
+--- a/lib/control.js
++++ b/lib/control.js
+@@ -52,7 +52,7 @@ function _getPGHandleAfter(req, cb) {
+             if (req.opts.hasOwnProperty('timeout')) {
+                 pg.setTimeout(req.opts.timeout);
+             }
+-
++            pg.setRequestId(req.req_id);
+             req.pg = pg;
+             cb(null);
+         }
+@@ -68,10 +68,27 @@ function getPGHandle(req, cb) {
+ 
+ 
+ function getPGHandleAndTransaction(req, cb) {
+-    // run pg.begin before returning control
+-    req.manatee.start(_getPGHandleAfter(req, cb));
++    req.manatee.pg(_getPGHandleAfter(req, function (err) {
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        req.pg.begin(function (bErr) {
++            if (bErr) {
++                req.log.debug({
++                    pg: req.pg,
++                    err: err
++                }, 'getPGHandleAndTransaction: BEGIN failed');
++                cb(bErr);
++                return;
++            }
++            cb(null);
++        });
++    }));
+ }
+ 
++
+ function handlerPipeline(options) {
+     assert.object(options, 'options');
+     assert.arrayOfFunc(options.funcs, 'options.funcs');
+@@ -148,7 +165,7 @@ function handlerPipeline(options) {
+                     });
+                 }
+                 dtrace.fire('handler-done', function () {
+-                    return [req.msgid, route, handler.name];
++                    return [req.msgid, route, handler.name, req.req_id];
+                 });
+                 cb(err);
+             });
+diff --git a/lib/dtrace.js b/lib/dtrace.js
+index b3636ce..85a4dbd 100644
+--- a/lib/dtrace.js
++++ b/lib/dtrace.js
+@@ -91,8 +91,8 @@ var PROBES = {
+     // msgid, req_id, route, handler_name, error message
+     'handler-error': ['int', 'char *', 'char *', 'char *', 'char *'],
+ 
+-    // msgid, request_type, handler_name
+-    'handler-done': ['int', 'char *', 'char *'],
++    // msgid, request_type, handler_name, req_id
++    'handler-done': ['int', 'char *', 'char *', 'char *'],
+ 
+     // msgid, req_id, bucket
+     'getbucket-start': ['int', 'char *', 'char *'],
+diff --git a/lib/manatee.js b/lib/manatee.js
+index 451022a..b5e8d0b 100644
+--- a/lib/manatee.js
++++ b/lib/manatee.js
+@@ -170,33 +170,6 @@ Manatee.prototype.pg = function pg(callback) {
+ };
+ 
+ 
+-Manatee.prototype.start = function start(cb) {
+-    assert.func(cb, 'cb');
+-
+-    var log = this._log;
+-
+-    this.pg(function (pool_err, client) {
+-        if (pool_err) {
+-            cb(pool_err);
+-            return;
+-        }
+-
+-        client.begin(function (err) {
+-            if (err) {
+-                log.debug({
+-                    pg: client,
+-                    err: err
+-                }, 'start: BEGIN failed');
+-                cb(err);
+-                return;
+-            }
+-
+-            cb(null, client);
+-        });
+-    });
+-};
+-
+-
+ Manatee.prototype.toString = function toString() {
+     var self = this;
+     var str = '[object Manatee <';
+diff --git a/lib/pg.js b/lib/pg.js
+index 521bde9..c5f9f83 100644
+--- a/lib/pg.js
++++ b/lib/pg.js
+@@ -78,6 +78,7 @@ function PGClient(options) {
+     this._defaultTimeout = options.queryTimeout;
+     this._queryTimeout = options.queryTimeout;
+     this._moray_txn = false;
++    this._reqid = null;
+ 
+     this.log = options.log.child({
+         component: 'PGClient',
+@@ -113,6 +114,28 @@ PGClient.prototype.setTimeout = function setQueryTimeout(timeout) {
+ };
+ 
+ 
++/*
++ * Set the request id for this client. This allows us to associate database
++ * queries with a specific RPC being processed by Moray by passing it as an
++ * argument to the 'query-*' dtrace probes.
++ */
++PGClient.prototype.setRequestId = function setRequestId(reqid) {
++    assert.string(reqid, 'reqid');
++    this._reqid = reqid;
++};
++
++
++/*
++ * Called when the postgres client is released back into the pool. Currently,
++ * all new RPCs will overwrite the request id anyway, but this guards against
++ * accidential request id re-use by future users of this client.
++ */
++PGClient.prototype.clearRequestId = function clearRequestId() {
++    assert.string(this._reqid, 'this._reqid');
++    this._reqid = null;
++};
++
++
+ /*
+  * Restore default timeout in case it was changed, and return this
+  * client back to the pool.
+@@ -120,6 +143,7 @@ PGClient.prototype.setTimeout = function setQueryTimeout(timeout) {
+ PGClient.prototype.release = function clientRelease() {
+     assert.equal(false, this._moray_txn, 'finished transaction');
+     this.setTimeout(this._defaultTimeout);
++    this.clearRequestId();
+     this.pool.release(this);
+ };
+ 
+@@ -136,7 +160,12 @@ PGClient.prototype.query = function clientQuery(sql, args) {
+     var res = new EventEmitter();
+     var self = this;
+     var timer;
+-    var reqid = libuuid.create();
++
++    // Moray will periodically issue the query 'SELECT NOW() AS when' to
++    // available PGClients via the node-pooling library health checking
++    // facility (see pgCheck). These queries originate at Moray and are not
++    // associated with an RPC. Therefore, the _reqid member will be null.
++    var reqid = (this._reqid === null) ? libuuid.create() : this._reqid;
+     var aborted = false;
+ 
+     function done(event, arg) {
+@@ -258,7 +287,6 @@ PGClient.prototype.begin = function transactionBegin(level, cb) {
+ 
+     q.once('error', function (err) {
+         self._moray_had_err = true;
+-        self.release();
+         cb(err);
+     });
+ 
+diff --git a/lib/ping.js b/lib/ping.js
+index 8407350..22550ef 100644
+--- a/lib/ping.js
++++ b/lib/ping.js
+@@ -68,7 +68,7 @@ function ping(options) {
+                 rpc.fail(startErr);
+                 return;
+             }
+-
++            pg.setRequestId(req_id);
+             var req = pg.query('SELECT name FROM buckets_config ' +
+                                'LIMIT 1');
+ 
+diff --git a/lib/standalone.js b/lib/standalone.js
+index 8ac0f29..5d79a9f 100644
+--- a/lib/standalone.js
++++ b/lib/standalone.js
+@@ -157,31 +157,6 @@ Standalone.prototype.pg = function pg(callback) {
+ };
+ 
+ 
+-Standalone.prototype.start = function start(cb) {
+-    var log = this.log;
+-
+-    this.pg(function (pool_err, client) {
+-        if (pool_err) {
+-            cb(pool_err);
+-            return;
+-        }
+-
+-        client.begin(function (err) {
+-            if (err) {
+-                log.debug({
+-                    pg: client,
+-                    err: err
+-                }, 'start: BEGIN failed');
+-                cb(err);
+-                return;
+-            }
+-
+-            cb(null, client);
+-        });
+-    });
+-};
+-
+-
+ Standalone.prototype.toString = function toString() {
+     var str = '[object Standalone <';
+     str += 'listening=' + (this.listener ? 'yes' : 'no') + ', ';

@@ -1,0 +1,414 @@
+commit 711b3667f09286085d37c8952c5e26add7d5e651 (refs/changes/03/5003/1)
+Author: Dave Eddy <dave@daveeddy.com>
+Date:   2018-10-26T17:15:59-04:00 (12 months ago)
+    
+    OS-7326 vminfod not blocking on initial metadata properly
+
+diff --git a/overlay/generic/usr/lib/brand/jcommon/cinstall b/overlay/generic/usr/lib/brand/jcommon/cinstall
+index 98b9322b..2fd33cf7 100644
+--- a/overlay/generic/usr/lib/brand/jcommon/cinstall
++++ b/overlay/generic/usr/lib/brand/jcommon/cinstall
+@@ -19,7 +19,7 @@
+ #
+ # CDDL HEADER END
+ #
+-# Copyright (c) 2016, Joyent, Inc. All rights reserved.
++# Copyright (c) 2018, Joyent, Inc.
+ # Use is subject to license terms.
+ #
+ 
+@@ -34,7 +34,6 @@ ZONENAME=""
+ ZONEPATH=""
+ # Default to 10GB diskset quota
+ ZQUOTA=10
+-ZVOL_NAME=`/usr/bin/uuid -v 4`
+ 
+ #
+ # The following are the list of features that a corresponding brand may
+@@ -46,23 +45,13 @@ ZVOL_NAME=`/usr/bin/uuid -v 4`
+ # o jst_tmplopt - Template image optional
+ #
+ 
+-function fixup_images
++function clone_image
+ {
+-	# New imgadm renames the dataset's snapshot at import to @final for us
+-	# and when it exists, we use that. However, when it does not exist we
+-	# still use the old method of creating a zones/<uuid>@<uuid> snapshot
+-	# so we can support old datasets.
+-	exists=$(zfs list -Ho name ${PDS_NAME}/${TMPLZONE}@final 2>&1)
+-	if [[ $? == 0 && ${exists} == "${PDS_NAME}/${TMPLZONE}@final" ]]; then
+-		zfs clone -o devices=off -F ${QUOTA_ARG} ${PDS_NAME}/${TMPLZONE}@final \
+-		    ${PDS_NAME}/${bname} || fatal "failed to clone zone dataset"
+-	elif [[ ${exists} =~ "dataset does not exist" ]]; then
+-		zfs snapshot ${PDS_NAME}/${TMPLZONE}@${bname}
+-		zfs clone -o devices=off -F ${QUOTA_ARG} ${PDS_NAME}/${TMPLZONE}@${bname} \
+-		    ${PDS_NAME}/${bname} || fatal "failed to clone zone dataset"
+-	else
+-		fatal "Unable to determine snapshot for ${PDS_NAME}/${TMPLZONE}"
+-	fi
++	typeset snapshot="$PDS_NAME/$TMPLZONE@final-fixed"
++	typeset dataset="$PDS_NAME/$bname"
++
++	zfs clone -o devices=off -F $QUOTA_ARG "$snapshot" "$dataset" \
++	    || fatal "failed to clone zone dataset $snapshot -> $dataset"
+ }
+ 
+ while getopts "rR:t:U:q:z:" opt
+@@ -148,7 +137,7 @@ if [[ -z ${REPROVISIONING} ]]; then
+ 	if [[ -z ${TMPLZONE} ]]; then
+ 		zfs set quota=${ZQUOTA}g ${PDS_NAME}/${bname}
+ 	else
+-		fixup_images
++		clone_image
+ 	fi
+ 
+ fi
+diff --git a/overlay/generic/usr/lib/brand/jcommon/cuninstall b/overlay/generic/usr/lib/brand/jcommon/cuninstall
+index 9be35bc7..f6dc35b4 100644
+--- a/overlay/generic/usr/lib/brand/jcommon/cuninstall
++++ b/overlay/generic/usr/lib/brand/jcommon/cuninstall
+@@ -12,7 +12,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2016 Joyent, Inc.  All rights reserved.
++# Copyright (c) 2018 Joyent, Inc.
+ #
+ 
+ unset LD_LIBRARY_PATH
+@@ -50,8 +50,13 @@ if [[ -z "$PDS_NAME" ]]; then
+ 	exit $ZONE_SUBPROC_USAGE
+ fi
+ 
+-# check if the origin is not an @final dataset, if not, we'll destroy it
+-ORIGIN=`zfs get -H -ovalue origin $PDS_NAME/$bname | grep -v "@final$"`
++# Destroy the origin dataset if it is not a @final or @final-fixed snapshot.
++ORIGIN=`zfs get -H -ovalue origin "$PDS_NAME/$bname"`
++snap=${ORIGIN##*@}
++case "$snap" in
++final) ORIGIN=;;
++final-fixed) ORIGIN=;;
++esac
+ 
+ zfs destroy -rF $PDS_NAME/cores/$bname
+ zfs destroy -rF $PDS_NAME/$bname
+diff --git a/src/vm/node_modules/VM.js b/src/vm/node_modules/VM.js
+index 30280a8a..78be1f8a 100644
+--- a/src/vm/node_modules/VM.js
++++ b/src/vm/node_modules/VM.js
+@@ -885,6 +885,10 @@ function validateImage(image, log, callback)
+ }
+ 
+ function createConfigDir(zonepath, log, cb) {
++    assert.string(zonepath, 'zonepath');
++    assert(log, 'log');
++    assert.func(cb, 'cb');
++
+     var configDir = path.join(zonepath, 'config');
+     var files = [
+         'tags.json',
+@@ -4081,6 +4085,7 @@ function zfs(args, log, callback)
+ 
+     assert(log, 'no logger passed to zfs()');
+     assert.arrayOfString(args, 'zfs args');
++    assert.func(callback, 'callback');
+ 
+     traceExecFile(cmd, args, log, evtname, function (error, stdout, stderr) {
+         if (error) {
+@@ -7845,8 +7850,179 @@ function installZone(payload, log, callback)
+             }
+             cb();
+         }, function (cb) {
+-            // Install the zone.
+-            // This will create the dataset and mark the zone 'installed'.
++            /*
++             * Repair the image we are about to clone from if `image_uuid` is
++             * specified.  See OS-7326 for more details.
++             *
++             * We ensure that a "@final-fixed" snapshot is present, and create
++             * it if it is not.  To do this we:
++             *
++             * 1. Rollback the image dataset to "@final"
++             * 2. Do any "repairs" (like remove and recreate the /config
++             *    directory)
++             * 3. Create a new @final-fixed snapshot
++             */
++            if (reprovisioning) {
++                cb();
++                return;
++            }
++
++            if (!payload.hasOwnProperty('image_uuid')) {
++                log.debug('no image_uuid found - skipping repair');
++                cb();
++                return;
++            }
++
++            assert.string(payload.zpool, 'payload.zpool');
++            assert.uuid(payload.image_uuid, 'payload.image_uuid');
++
++            log.debug({image_uuid: payload.image_uuid}, 'repairing image %s',
++                payload.image_uuid);
++
++            var imageDataset = sprintf('%s/%s', payload.zpool,
++                payload.image_uuid);
++            var imagePath = sprintf('/%s', imageDataset);
++            var datasetNotFoundRe = /dataset does not exist$/;
++            var finalSnap = sprintf('%s@final', imageDataset);
++            var finalSnapFixed = sprintf('%s@final-fixed', imageDataset);
++            var finalSnapFixedFound;
++            var lockpath = sprintf('/var/run/image.%s.repair.lockfile',
++                payload.image_uuid);
++            var unlock;
++
++            vasync.pipeline({funcs: [
++                // Acquire lockfile
++                function (_, cb2) {
++                    log.debug('acquiring lock on %s', lockpath);
++                    lock(lockpath, function (err, _unlock) {
++                        if (err) {
++                            log.error('failed to acquire lock on %s', lockpath);
++                            cb2(err);
++                            return;
++                        }
++
++                        log.debug('acquired lock on %s', lockpath);
++                        unlock = _unlock;
++                        cb2();
++                    });
++                },
++
++                // Check to see if a fixed snapshot exists
++                function (_, cb2) {
++                    var args = [
++                        'get',
++                        '-H',
++                        '-o', 'value',
++                        'name',
++                        finalSnapFixed
++                    ];
++                    zfs(args, log, function (err, fds) {
++                        if (err) {
++                            if (fds.stderr.trim().match(datasetNotFoundRe)) {
++                                log.debug('%s not found - repairing image',
++                                    finalSnapFixed);
++                                finalSnapFixedFound = false;
++                                cb2();
++                                return;
++                            }
++
++                            cb2(err);
++                            return;
++                        }
++
++                        assert.equal(fds.stdout.trim(), finalSnapFixed,
++                            'unexpected ZFS output');
++
++                        log.debug('%s found - no repairs needed',
++                            finalSnapFixed);
++                        finalSnapFixedFound = true;
++                        cb2();
++                    });
++                },
++
++                // Ensure our current context is correct
++                function (_, cb2) {
++                    assert.bool(finalSnapFixedFound, 'finalSnapFixedFound');
++                    cb2();
++                },
++
++                // Rollback the dataset to the @final snapshot
++                function (_, cb2) {
++                    if (finalSnapFixedFound) {
++                        cb2();
++                        return;
++                    }
++
++                    var args = [
++                        'rollback',
++                        finalSnap
++                    ];
++
++                    zfs(args, log, cb2);
++                },
++
++                // Trash and recreate the /config/ dir for the image
++                function (_, cb2) {
++                    if (finalSnapFixedFound) {
++                        cb2();
++                        return;
++                    }
++
++                    createConfigDir(imagePath, log, cb2);
++                },
++
++                // Create the new snapshot
++                function (_, cb2) {
++                    if (finalSnapFixedFound) {
++                        cb2();
++                        return;
++                    }
++
++                    var args = [
++                        'snapshot',
++                        finalSnapFixed
++                    ];
++                    zfs(args, log, function (err, fds) {
++                        if (err) {
++                            cb2(err);
++                            return;
++                        }
++
++                        log.debug('snapshot created %s -> %s', imageDataset,
++                            finalSnapFixed);
++                        cb2();
++                    });
++                }
++            ]}, function (err) {
++                if (err) {
++                    log.error(err, 'repair image %s failed',
++                        payload.image_uuid);
++                }
++
++                if (unlock) {
++                    log.debug('unlocking %s', lockpath);
++                    unlock(function (unlock_err) {
++                        if (unlock_err) {
++                            log.error({err: unlock_err},
++                                'failed to unlock %s', lockpath);
++                        } else {
++                            log.debug('unlocked %s', lockpath);
++                        }
++                        cb(err || unlock_err);
++                    });
++                    return;
++                }
++
++                cb(err);
++            });
++        }, function (cb) {
++            /*
++             * Install the zone.
++             * This will create the dataset and mark the zone 'installed'.
++             *
++             * At this point, if an `image_uuid` was specified, the
++             * `@final-fixed` snapshot is guaranteed to exist.
++             */
+             var args;
+ 
+             if (reprovisioning) {
+@@ -8178,77 +8354,6 @@ function installZone(payload, log, callback)
+                     cb(e);
+                 }
+             );
+-        }, function (cb) {
+-            if (receiving || reprovisioning) {
+-                cb();
+-                return;
+-            }
+-
+-            var cancelFn;
+-
+-            vasync.parallel({funcs: [
+-                function (cb2) {
+-                    var shouldBlock = false;
+-
+-                    var obj = {
+-                        uuid: payload.uuid,
+-                        vm: {}
+-                    };
+-
+-                    /*
+-                     * Check the following keys for modifications.  If any key
+-                     * has been modified then shouldBlock will be set to true,
+-                     * and we will block on vminfod below for the changes to be
+-                     * reflected.
+-                     */
+-                    [
+-                        'customer_metadata',
+-                        'internal_metadata',
+-                        'routes',
+-                        'tags'
+-                    ].forEach(function (key) {
+-                        obj.vm[key] = {};
+-
+-                        if (vmobj.hasOwnProperty(key)
+-                            && Object.keys(vmobj[key]).length > 1) {
+-
+-                            shouldBlock = true;
+-                        }
+-                    });
+-
+-                    /*
+-                     * Skip blocking on vminfod if no metadata has been
+-                     * modified
+-                     */
+-                    if (!shouldBlock) {
+-                        cb2();
+-                        return;
+-                    }
+-
+-                    var opts = {
+-                        timeout: VMINFOD_TIMEOUT,
+-                        catchErrors: true,
+-                        startFresh: true
+-                    };
+-
+-
+-                    cancelFn = vs.watchForEvent(obj, opts, cb2);
+-                }, function (cb2) {
+-                    createConfigDir(vmobj.zonepath, log, function (err) {
+-                        if (err) {
+-                            if (cancelFn) {
+-                                cancelFn();
+-                            }
+-                            cb2(err);
+-                            return;
+-                        }
+-
+-                        cb2();
+-                    });
+-                }
+-            ]}, function (err) {
+-                cb(err);
+-            });
+         }, function (cb) {
+             var createFileOpts = {};
+ 
+diff --git a/src/vm/node_modules/vminfod/vminfod.js b/src/vm/node_modules/vminfod/vminfod.js
+index 9ea2bd69..b58d0f24 100644
+--- a/src/vm/node_modules/vminfod/vminfod.js
++++ b/src/vm/node_modules/vminfod/vminfod.js
+@@ -2149,6 +2149,19 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+         uuid = extractUUID(parts[1]);
+     }
+ 
++    /*
++     * If we extracted a UUID, we then check to see if it maps to a VM that
++     * we know about.  It can be the case where the ZFS dataset being
++     * modified here has a UUID as the second part of its name but does not
++     * belong to a VM (a simple example is the ZFS dataset of an image).  We
++     * unset the `uuid` variable if it does not belong to a valid VM and
++     * proceed as usual without refreshing a specific VM at the end.
++     */
++    if (uuid && !self.vmobjs.hasOwnProperty(uuid)) {
++        self.log.debug('UUID "%s" extracted for a non-vm', uuid);
++        uuid = null;
++    }
++
+     /*
+      * If the dataset name matches "/zones/<uuid>" exactly we use that as the
+      * zonepath argument to getDatasets.  Otherwise, we use the parent dataset.
+@@ -2346,10 +2359,8 @@ Vminfod.prototype.handleZpoolEvent = function handleZpoolEvent(obj) {
+                     cb();
+                     return;
+                 }
+-                // if we happen to grab an image uuid here,
+-                // the refreshVmobj will return immediately
+-                extras.log.debug('refreshing vmobj %s after zfs event', uuid);
+ 
++                extras.log.debug('refreshing vmobj %s after zfs event', uuid);
+                 self.refreshVmobj(uuid, cb);
+             }
+         }
