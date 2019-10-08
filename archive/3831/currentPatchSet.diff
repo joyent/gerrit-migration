@@ -1,0 +1,509 @@
+commit 78dc0130d5402f19783b696837ada4e5880726be (refs/changes/31/3831/5)
+Author: Robert Mustacchi <rm@joyent.com>
+Date:   2018-04-18T23:01:02+00:00 (1 year, 6 months ago)
+    
+    OS-6744 Socket CMCI mismatch can lead to boot hang
+    Reviewed by: Jerry Jelinek <jerry.jelinek@joyent.com>
+    Reviewed by: John Levon <john.levon@joyent.com>
+    Reviewed by: Patrick Mooney <patrick.mooney@joyent.com>
+    Approved by: John Levon <john.levon@joyent.com>
+
+diff --git a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu.h b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu.h
+index 4034fced9d..316fb89334 100644
+--- a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu.h
++++ b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu.h
+@@ -21,6 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ #ifndef _GCPU_H
+@@ -181,6 +182,8 @@ typedef struct gcpu_mce_status {
+  * Flags for gcpu_mca_flags
+  */
+ #define	GCPU_MCA_F_UNFAULTING		0x1	/* CPU exiting faulted state */
++#define	GCPU_MCA_F_CMCI_CAPABLE		0x2	/* CPU supports CMCI */
++#define	GCPU_MCA_F_CMCI_ENABLE		0x4	/* CPU CMCI enabled */
+ 
+ /*
+  * State shared by all cpus on a chip
+@@ -212,7 +215,8 @@ extern void gcpu_post_mpstartup(cmi_hdl_t);
+ extern void gcpu_faulted_enter(cmi_hdl_t);
+ extern void gcpu_faulted_exit(cmi_hdl_t);
+ extern void gcpu_mca_init(cmi_hdl_t);
+-extern void gcpu_mca_fini(cmi_hdl_t hdl);
++extern void gcpu_mca_fini(cmi_hdl_t);
++extern void gcpu_mca_cmci_enable(cmi_hdl_t);
+ extern cmi_errno_t gcpu_msrinject(cmi_hdl_t, cmi_mca_regs_t *, uint_t, int);
+ #ifndef __xpv
+ extern uint64_t gcpu_mca_trap(cmi_hdl_t, struct regs *);
+@@ -222,11 +226,6 @@ extern void gcpu_hdl_poke(cmi_hdl_t);
+ extern void gcpu_xpv_panic_callback(void);
+ #endif
+ 
+-/*
+- * CMI global variable
+- */
+-extern int cmi_enable_cmci;
+-
+ /*
+  * Local functions
+  */
+diff --git a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_main.c b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_main.c
+index 761d942f27..c321d27501 100644
+--- a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_main.c
++++ b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_main.c
+@@ -22,6 +22,7 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ /*
+  * Copyright (c) 2010, Intel Corporation.
+@@ -145,6 +146,15 @@ gcpu_post_startup(cmi_hdl_t hdl)
+ 	 * be run on cpu 0 so we can assure that by starting from here.
+ 	 */
+ 	gcpu_mca_poll_start(hdl);
++#else
++	/*
++	 * The boot CPU has a bit of a chicken and egg problem for CMCI. Its MCA
++	 * initialization is run before we have initialized the PSM module that
++	 * we would use for enabling CMCI. Therefore, we use this as a chance to
++	 * enable CMCI for the boot CPU. For all other CPUs, this chicken and
++	 * egg problem will have already been solved.
++	 */
++	gcpu_mca_cmci_enable(hdl);
+ #endif
+ }
+ 
+diff --git a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_mca.c b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_mca.c
+index 1b9e259bd8..348ec93761 100644
+--- a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_mca.c
++++ b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_mca.c
+@@ -21,6 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ /*
+  * Copyright (c) 2010, Intel Corporation.
+@@ -49,6 +50,7 @@
+ #include <sys/fm/smb/fmsmb.h>
+ #include <sys/sysevent.h>
+ #include <sys/ontrap.h>
++#include <sys/smp_impldefs.h>
+ 
+ #include "gcpu.h"
+ 
+@@ -82,6 +84,12 @@ int gcpu_mca_telemetry_retries = 5;
+ #ifndef __xpv
+ int gcpu_mca_cmci_throttling_threshold = 10;
+ int gcpu_mca_cmci_reenable_threshold = 1000;
++
++/*
++ * This is used to determine whether or not we have registered the CMCI CPU
++ * setup function. This is protected by cpu_lock.
++ */
++static boolean_t gcpu_mca_cpu_registered = B_FALSE;
+ #endif
+ 
+ static gcpu_error_disp_t gcpu_errtypes[] = {
+@@ -1031,6 +1039,83 @@ gcpu_errorq_init(size_t datasz)
+ 
+ static uint_t global_nbanks;
+ 
++#ifndef __xpv
++/*ARGSUSED*/
++int
++gcpu_cmci_cpu_setup(cpu_setup_t what, int cpuid, void *arg)
++{
++	/*
++	 * In general, we'd expect that in a multi-socket configuration, either
++	 * all CPUs would support CMCI or none of them would.  Unfortunately,
++	 * that may not be the case in the wild.  While we'd rather check the
++	 * handle's enablement state here, that itself is a bit complicated. We
++	 * don't have a guarantee in a heterogenous situation that the CPU in
++	 * question is using the generic CPU module or not, even though we've
++	 * been registered. As such, we allow the interrupt to be registered and
++	 * written to the local apic anyways. We won't have a CMCI interrupt
++	 * generated anyways because the MCA banks will not be programmed as
++	 * such for that CPU by the polling thread.
++	 */
++	switch (what) {
++	case CPU_ON:
++		psm_cmci_setup(cpuid, B_TRUE);
++		break;
++	case CPU_OFF:
++		psm_cmci_setup(cpuid, B_FALSE);
++		break;
++	default:
++		break;
++	}
++
++	return (0);
++}
++
++void
++gcpu_mca_cmci_enable(cmi_hdl_t hdl)
++{
++	gcpu_data_t *gcpu = cmi_hdl_getcmidata(hdl);
++	gcpu_mca_t *mca = &gcpu->gcpu_mca;
++
++	/*
++	 * If this CPU doesn't support CMCI, don't do anything.
++	 */
++	if ((mca->gcpu_mca_flags & GCPU_MCA_F_CMCI_CAPABLE) == 0)
++		return;
++
++	/*
++	 * If we don't have support from the PSM module, then there's nothing we
++	 * can do. Note that this changes as we start up the system. The only
++	 * case where it may be mistakenly NULL is for the boot CPU. The boot
++	 * CPU will have this taken care of for it in gcpu_post_startup(), once
++	 * we know for certain whether or not the PSM module supports CMCI.
++	 */
++	if (psm_cmci_setup == NULL) {
++		return;
++	}
++
++	mca->gcpu_mca_flags |= GCPU_MCA_F_CMCI_ENABLE;
++	if (MUTEX_HELD(&cpu_lock)) {
++		if (!gcpu_mca_cpu_registered) {
++			register_cpu_setup_func(gcpu_cmci_cpu_setup, NULL);
++			gcpu_mca_cpu_registered = B_TRUE;
++		}
++	} else {
++		mutex_enter(&cpu_lock);
++		if (!gcpu_mca_cpu_registered) {
++			register_cpu_setup_func(gcpu_cmci_cpu_setup, NULL);
++			gcpu_mca_cpu_registered = B_TRUE;
++		}
++		mutex_exit(&cpu_lock);
++	}
++
++	/*
++	 * Call the PSM op to make sure that we initialize things on
++	 * this CPU.
++	 */
++	psm_cmci_setup(cmi_hdl_logical_id(hdl), B_TRUE);
++}
++#endif	/* !__xpv */
++
+ void
+ gcpu_mca_init(cmi_hdl_t hdl)
+ {
+@@ -1257,8 +1342,10 @@ gcpu_mca_init(cmi_hdl_t hdl)
+ 	}
+ 
+ #ifndef __xpv
+-	if (cmci_capable)
+-		cmi_enable_cmci = 1;
++	if (cmci_capable) {
++		mca->gcpu_mca_flags |= GCPU_MCA_F_CMCI_CAPABLE;
++		gcpu_mca_cmci_enable(hdl);
++	}
+ #endif
+ 
+ #ifndef __xpv
+diff --git a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_poll_ntv.c b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_poll_ntv.c
+index 361d147b56..55cf607aac 100644
+--- a/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_poll_ntv.c
++++ b/usr/src/uts/i86pc/cpu/generic_cpu/gcpu_poll_ntv.c
+@@ -22,6 +22,7 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ /*
+  * Copyright (c) 2010, Intel Corporation.
+@@ -94,7 +95,8 @@ gcpu_ntv_mca_poll(cmi_hdl_t hdl, int what)
+ 	ASSERT(MUTEX_HELD(&gcpu->gcpu_shared->gcpus_poll_lock));
+ 
+ 	/* Enable CMCI in first poll if is supported */
+-	if (cmi_enable_cmci && (!mca->gcpu_mca_first_poll_cmci_enabled)) {
++	if ((mca->gcpu_mca_flags & GCPU_MCA_F_CMCI_ENABLE) != 0 &&
++	    (!mca->gcpu_mca_first_poll_cmci_enabled)) {
+ 		int i;
+ 		uint64_t ctl2;
+ 
+diff --git a/usr/src/uts/i86pc/io/apix/apix.c b/usr/src/uts/i86pc/io/apix/apix.c
+index f61b54e2c8..545d3a0d05 100644
+--- a/usr/src/uts/i86pc/io/apix/apix.c
++++ b/usr/src/uts/i86pc/io/apix/apix.c
+@@ -168,6 +168,7 @@ static struct	psm_ops apix_ops = {
+ 
+ 	apic_get_pir_ipivect,
+ 	apic_send_pir_ipi,
++	apic_cmci_setup
+ };
+ 
+ struct psm_ops *psmops = &apix_ops;
+@@ -546,27 +547,18 @@ apix_init_intr()
+ 		apic_reg_ops->apic_write(APIC_ERROR_STATUS, 0);
+ 	}
+ 
+-	/* Enable CMCI interrupt */
+-	if (cmi_enable_cmci) {
+-		mutex_enter(&cmci_cpu_setup_lock);
+-		if (cmci_cpu_setup_registered == 0) {
+-			mutex_enter(&cpu_lock);
+-			register_cpu_setup_func(cmci_cpu_setup, NULL);
+-			mutex_exit(&cpu_lock);
+-			cmci_cpu_setup_registered = 1;
+-		}
+-		mutex_exit(&cmci_cpu_setup_lock);
+-
+-		if (apic_cmci_vect == 0) {
+-			int ipl = 0x2;
+-			apic_cmci_vect = apix_get_ipivect(ipl, -1);
+-			ASSERT(apic_cmci_vect);
+-
+-			(void) add_avintr(NULL, ipl,
+-			    (avfunc)cmi_cmci_trap, "apic cmci intr",
+-			    apic_cmci_vect, NULL, NULL, NULL, NULL);
+-		}
+-		apic_reg_ops->apic_write(APIC_CMCI_VECT, apic_cmci_vect);
++	/*
++	 * Ensure a CMCI interrupt is allocated, regardless of whether it is
++	 * enabled or not.
++	 */
++	if (apic_cmci_vect == 0) {
++		const int ipl = 0x2;
++		apic_cmci_vect = apix_get_ipivect(ipl, -1);
++		ASSERT(apic_cmci_vect);
++
++		(void) add_avintr(NULL, ipl,
++		    (avfunc)cmi_cmci_trap, "apic cmci intr",
++		    apic_cmci_vect, NULL, NULL, NULL, NULL);
+ 	}
+ 
+ 	apic_reg_ops->apic_write_task_reg(0);
+diff --git a/usr/src/uts/i86pc/io/pcplusmp/apic.c b/usr/src/uts/i86pc/io/pcplusmp/apic.c
+index 93ee3380ed..0649afa3f3 100644
+--- a/usr/src/uts/i86pc/io/pcplusmp/apic.c
++++ b/usr/src/uts/i86pc/io/pcplusmp/apic.c
+@@ -203,6 +203,7 @@ static struct	psm_ops apic_ops = {
+ 
+ 	apic_get_pir_ipivect,
+ 	apic_send_pir_ipi,
++	apic_cmci_setup,
+ };
+ 
+ struct psm_ops *psmops = &apic_ops;
+@@ -428,31 +429,21 @@ apic_init_intr(void)
+ 		apic_reg_ops->apic_write(APIC_ERROR_STATUS, 0);
+ 	}
+ 
+-	/* Enable CMCI interrupt */
+-	if (cmi_enable_cmci) {
+-
+-		mutex_enter(&cmci_cpu_setup_lock);
+-		if (cmci_cpu_setup_registered == 0) {
+-			mutex_enter(&cpu_lock);
+-			register_cpu_setup_func(cmci_cpu_setup, NULL);
+-			mutex_exit(&cpu_lock);
+-			cmci_cpu_setup_registered = 1;
+-		}
+-		mutex_exit(&cmci_cpu_setup_lock);
+-
+-		if (apic_cmci_vect == 0) {
+-			int ipl = 0x2;
+-			int irq = apic_get_ipivect(ipl, -1);
++	/*
++	 * Ensure a CMCI interrupt is allocated, regardless of whether it is
++	 * enabled or not.
++	 */
++	if (apic_cmci_vect == 0) {
++		const int ipl = 0x2;
++		int irq = apic_get_ipivect(ipl, -1);
+ 
+-			ASSERT(irq != -1);
+-			apic_cmci_vect = apic_irq_table[irq]->airq_vector;
+-			ASSERT(apic_cmci_vect);
++		ASSERT(irq != -1);
++		apic_cmci_vect = apic_irq_table[irq]->airq_vector;
++		ASSERT(apic_cmci_vect);
+ 
+-			(void) add_avintr(NULL, ipl,
+-			    (avfunc)cmi_cmci_trap,
+-			    "apic cmci intr", irq, NULL, NULL, NULL, NULL);
+-		}
+-		apic_reg_ops->apic_write(APIC_CMCI_VECT, apic_cmci_vect);
++		(void) add_avintr(NULL, ipl,
++		    (avfunc)cmi_cmci_trap,
++		    "apic cmci intr", irq, NULL, NULL, NULL, NULL);
+ 	}
+ }
+ 
+diff --git a/usr/src/uts/i86pc/io/pcplusmp/apic_common.c b/usr/src/uts/i86pc/io/pcplusmp/apic_common.c
+index d849d96ea1..2ae8b5cd92 100644
+--- a/usr/src/uts/i86pc/io/pcplusmp/apic_common.c
++++ b/usr/src/uts/i86pc/io/pcplusmp/apic_common.c
+@@ -122,12 +122,8 @@ int apic_enable_cpcovf_intr = 1;
+ 
+ /* vector at which CMCI interrupts come in */
+ int apic_cmci_vect;
+-extern int cmi_enable_cmci;
+ extern void cmi_cmci_trap(void);
+ 
+-kmutex_t cmci_cpu_setup_lock;	/* protects cmci_cpu_setup_registered */
+-int cmci_cpu_setup_registered;
+-
+ lock_t apic_mode_switch_lock;
+ 
+ int apic_pir_vect;
+@@ -382,30 +378,20 @@ apic_cmci_disable(xc_arg_t arg1, xc_arg_t arg2, xc_arg_t arg3)
+ 	return (0);
+ }
+ 
+-/*ARGSUSED*/
+-int
+-cmci_cpu_setup(cpu_setup_t what, int cpuid, void *arg)
++void
++apic_cmci_setup(processorid_t cpuid, boolean_t enable)
+ {
+ 	cpuset_t	cpu_set;
+ 
+ 	CPUSET_ONLY(cpu_set, cpuid);
+ 
+-	switch (what) {
+-		case CPU_ON:
+-			xc_call(NULL, NULL, NULL, CPUSET2BV(cpu_set),
+-			    (xc_func_t)apic_cmci_enable);
+-			break;
+-
+-		case CPU_OFF:
+-			xc_call(NULL, NULL, NULL, CPUSET2BV(cpu_set),
+-			    (xc_func_t)apic_cmci_disable);
+-			break;
+-
+-		default:
+-			break;
++	if (enable) {
++		xc_call(NULL, NULL, NULL, CPUSET2BV(cpu_set),
++		    (xc_func_t)apic_cmci_enable);
++	} else {
++		xc_call(NULL, NULL, NULL, CPUSET2BV(cpu_set),
++		    (xc_func_t)apic_cmci_disable);
+ 	}
+-
+-	return (0);
+ }
+ 
+ static void
+diff --git a/usr/src/uts/i86pc/io/psm/uppc.c b/usr/src/uts/i86pc/io/psm/uppc.c
+index c22154d1a7..23ed56a11b 100644
+--- a/usr/src/uts/i86pc/io/psm/uppc.c
++++ b/usr/src/uts/i86pc/io/psm/uppc.c
+@@ -179,6 +179,7 @@ static struct	psm_ops uppc_ops = {
+ 
+ 	(int (*)(void))NULL,			/* psm_get_pir_ipivect	*/
+ 	(void (*)(processorid_t))NULL,		/* psm_send_pir_ipi	*/
++	(void (*)(processorid_t, boolean_t))NULL	/* psm_cmci_setup */
+ };
+ 
+ 
+diff --git a/usr/src/uts/i86pc/os/cmi.c b/usr/src/uts/i86pc/os/cmi.c
+index 4d27eb61d3..304cf65d9f 100644
+--- a/usr/src/uts/i86pc/os/cmi.c
++++ b/usr/src/uts/i86pc/os/cmi.c
+@@ -69,13 +69,6 @@ int cmi_force_generic = 0;
+  */
+ int cmi_panic_on_uncorrectable_error = 1;
+ 
+-#ifndef __xpv
+-/*
+- * Set to indicate whether we are able to enable cmci interrupt.
+- */
+-int cmi_enable_cmci = 0;
+-#endif
+-
+ /*
+  * Subdirectory (relative to the module search path) in which we will
+  * look for cpu modules.
+diff --git a/usr/src/uts/i86pc/os/mp_machdep.c b/usr/src/uts/i86pc/os/mp_machdep.c
+index 48e14c0f9f..69b65d216b 100644
+--- a/usr/src/uts/i86pc/os/mp_machdep.c
++++ b/usr/src/uts/i86pc/os/mp_machdep.c
+@@ -151,6 +151,7 @@ uint32_t (*psm_get_localapicid)(uint32_t) = NULL;
+ uchar_t (*psm_xlate_vector_by_irq)(uchar_t) = NULL;
+ int (*psm_get_pir_ipivect)(void) = NULL;
+ void (*psm_send_pir_ipi)(processorid_t) = NULL;
++void (*psm_cmci_setup)(processorid_t, boolean_t) = NULL;
+ 
+ int (*psm_clkinit)(int) = NULL;
+ void (*psm_timer_reprogram)(hrtime_t) = NULL;
+@@ -1158,6 +1159,7 @@ mach_smpinit(void)
+ 	psm_get_ipivect = pops->psm_get_ipivect;
+ 	psm_get_pir_ipivect = pops->psm_get_pir_ipivect;
+ 	psm_send_pir_ipi = pops->psm_send_pir_ipi;
++	psm_cmci_setup = pops->psm_cmci_setup;
+ 
+ 
+ 	(void) add_avintr((void *)NULL, XC_HI_PIL, xc_serv, "xc_intr",
+diff --git a/usr/src/uts/i86pc/sys/apic_common.h b/usr/src/uts/i86pc/sys/apic_common.h
+index 72bc05e817..9c08d73798 100644
+--- a/usr/src/uts/i86pc/sys/apic_common.h
++++ b/usr/src/uts/i86pc/sys/apic_common.h
+@@ -189,7 +189,7 @@ extern void	apic_send_pir_ipi(processorid_t);
+ 
+ extern int apic_error_intr();
+ extern void apic_cpcovf_mask_clear(void);
+-extern int cmci_cpu_setup(cpu_setup_t what, int cpuid, void *arg);
++extern void apic_cmci_setup(processorid_t, boolean_t);
+ extern void apic_intrmap_init(int apic_mode);
+ extern processorid_t apic_find_cpu(int flag);
+ extern processorid_t apic_get_next_bind_cpu(void);
+diff --git a/usr/src/uts/i86pc/sys/psm_types.h b/usr/src/uts/i86pc/sys/psm_types.h
+index 6b779373b5..e79e4c3d75 100644
+--- a/usr/src/uts/i86pc/sys/psm_types.h
++++ b/usr/src/uts/i86pc/sys/psm_types.h
+@@ -194,6 +194,7 @@ struct 	psm_ops {
+ 
+ 	int	(*psm_get_pir_ipivect)(void);
+ 	void	(*psm_send_pir_ipi)(processorid_t cpu);
++	void	(*psm_cmci_setup)(processorid_t cpu, boolean_t);
+ #endif
+ };
+ 
+diff --git a/usr/src/uts/i86pc/sys/smp_impldefs.h b/usr/src/uts/i86pc/sys/smp_impldefs.h
+index 2848b1b3c2..cd3a607317 100644
+--- a/usr/src/uts/i86pc/sys/smp_impldefs.h
++++ b/usr/src/uts/i86pc/sys/smp_impldefs.h
+@@ -76,6 +76,7 @@ extern uint32_t (*psm_get_localapicid)(uint32_t);	/* get local-apic id */
+ extern uchar_t (*psm_xlate_vector_by_irq)(uchar_t); /* get vector for an irq */
+ extern int (*psm_get_pir_ipivect)(void); /* get PIR (for VMM) ipi vect	*/
+ extern void (*psm_send_pir_ipi)(processorid_t);	/* send PIR ipi		*/
++extern void (*psm_cmci_setup)(processorid_t, boolean_t); /* Control CPU CMCI */
+ 
+ extern int (*slvltovect)(int);	/* ipl interrupt priority level		*/
+ extern int (*setlvl)(int, int *); /* set intr pri represented by vect	*/
+diff --git a/usr/src/uts/i86xpv/io/psm/xpv_psm.c b/usr/src/uts/i86xpv/io/psm/xpv_psm.c
+index 7f1ac2170a..bc0ab7748d 100644
+--- a/usr/src/uts/i86xpv/io/psm/xpv_psm.c
++++ b/usr/src/uts/i86xpv/io/psm/xpv_psm.c
+@@ -1678,6 +1678,7 @@ static struct psm_ops xen_psm_ops = {
+ 
+ 	(int (*)(void))NULL,			/* psm_get_pir_ipivect	*/
+ 	(void (*)(processorid_t))NULL,		/* psm_send_pir_ipi	*/
++	(void (*)(processorid_t, boolean_t))NULL	/* psm_cmci_setup */
+ };
+ 
+ static struct psm_info xen_psm_info = {
+diff --git a/usr/src/uts/i86xpv/io/psm/xpv_uppc.c b/usr/src/uts/i86xpv/io/psm/xpv_uppc.c
+index fa6a079826..0281a0ca43 100644
+--- a/usr/src/uts/i86xpv/io/psm/xpv_uppc.c
++++ b/usr/src/uts/i86xpv/io/psm/xpv_uppc.c
+@@ -897,6 +897,7 @@ static struct psm_ops xen_uppc_ops = {
+ 
+ 	(int (*)(void))NULL,			/* psm_get_pir_ipivect	*/
+ 	(void (*)(processorid_t))NULL,		/* psm_send_pir_ipi	*/
++	(void (*)(processorid_t, boolean_t))NULL	/* psm_cmci_setup */
+ };
+ 
+ static struct psm_info xen_uppc_info = {

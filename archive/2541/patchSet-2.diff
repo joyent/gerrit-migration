@@ -1,0 +1,772 @@
+commit 44888cbfedd9fb28e1ca1478dd8786b72bb7e2da (refs/changes/41/2541/2)
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2017-09-13T15:33:53+00:00 (2 years, 1 month ago)
+    
+    OS-6150 do not sq_wait unnecessarily
+
+diff --git a/usr/src/uts/common/inet/ip/ip_squeue.c b/usr/src/uts/common/inet/ip/ip_squeue.c
+index dedb4dadcc..3fb27abfbe 100644
+--- a/usr/src/uts/common/inet/ip/ip_squeue.c
++++ b/usr/src/uts/common/inet/ip/ip_squeue.c
+@@ -21,6 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -101,10 +102,6 @@
+  *
+  * ip_squeue_fanout can be accessed and changed using ndd on /dev/tcp or
+  * /dev/ip.
+- *
+- * ip_squeue_worker_wait: global value for the sq_wait field for all squeues *
+- * created. This is the time squeue code waits before waking up the worker
+- * thread after queuing a request.
+  */
+ 
+ #include <sys/types.h>
+@@ -142,13 +139,6 @@ kmutex_t		sqset_lock;
+ 
+ static void (*ip_squeue_create_callback)(squeue_t *) = NULL;
+ 
+-/*
+- * ip_squeue_worker_wait: global value for the sq_wait field for all squeues
+- *	created. This is the time squeue code waits before waking up the worker
+- *	thread after queuing a request.
+- */
+-uint_t ip_squeue_worker_wait = 10;
+-
+ static squeue_t *ip_squeue_create(pri_t);
+ static squeue_set_t *ip_squeue_set_create(processorid_t);
+ static int ip_squeue_cpu_setup(cpu_setup_t, int, void *);
+@@ -163,7 +153,7 @@ ip_squeue_create(pri_t pri)
+ {
+ 	squeue_t *sqp;
+ 
+-	sqp = squeue_create(ip_squeue_worker_wait, pri, B_TRUE);
++	sqp = squeue_create(pri, B_TRUE);
+ 	ASSERT(sqp != NULL);
+ 	if (ip_squeue_create_callback != NULL)
+ 		ip_squeue_create_callback(sqp);
+diff --git a/usr/src/uts/common/inet/squeue.c b/usr/src/uts/common/inet/squeue.c
+index 1009f0700f..9261c570ac 100644
+--- a/usr/src/uts/common/inet/squeue.c
++++ b/usr/src/uts/common/inet/squeue.c
+@@ -23,7 +23,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014 Joyent, Inc.  All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -136,21 +136,19 @@
+ 
+ #include <sys/squeue_impl.h>
+ 
+-static void squeue_fire(void *);
+ static void squeue_drain(squeue_t *, uint_t, hrtime_t);
+ static void squeue_worker(squeue_t *sqp);
+ static void squeue_polling_thread(squeue_t *sqp);
++static void squeue_worker_wakeup(squeue_t *sqp);
+ 
+ kmem_cache_t *squeue_cache;
+ 
+ #define	SQUEUE_MSEC_TO_NSEC 1000000
+ 
+ int squeue_drain_ms = 20;
+-int squeue_workerwait_ms = 0;
+ 
+ /* The values above converted to ticks or nano seconds */
+-static int squeue_drain_ns = 0;
+-static int squeue_workerwait_tick = 0;
++static uint_t squeue_drain_ns = 0;
+ 
+ uintptr_t squeue_drain_stack_needed = 10240;
+ uint_t squeue_drain_stack_toodeep;
+@@ -243,19 +241,16 @@ squeue_init(void)
+ 	    sizeof (squeue_t), 64, NULL, NULL, NULL, NULL, NULL, 0);
+ 
+ 	squeue_drain_ns = squeue_drain_ms * SQUEUE_MSEC_TO_NSEC;
+-	squeue_workerwait_tick = MSEC_TO_TICK_ROUNDUP(squeue_workerwait_ms);
+ }
+ 
+-/* ARGSUSED */
+ squeue_t *
+-squeue_create(clock_t wait, pri_t pri, boolean_t isip)
++squeue_create(pri_t pri, boolean_t isip)
+ {
+ 	squeue_t *sqp = kmem_cache_alloc(squeue_cache, KM_SLEEP);
+ 
+ 	bzero(sqp, sizeof (squeue_t));
+ 	sqp->sq_bind = PBIND_NONE;
+ 	sqp->sq_priority = pri;
+-	sqp->sq_wait = MSEC_TO_TICK(wait);
+ 	sqp->sq_worker = thread_create(NULL, 0, squeue_worker,
+ 	    sqp, 0, &p0, TS_RUN, pri);
+ 
+@@ -338,97 +333,6 @@ squeue_unbind(squeue_t *sqp)
+ 	mutex_exit(&sqp->sq_lock);
+ }
+ 
+-void
+-squeue_worker_wakeup(squeue_t *sqp)
+-{
+-	timeout_id_t tid = (sqp)->sq_tid;
+-
+-	ASSERT(MUTEX_HELD(&(sqp)->sq_lock));
+-
+-	if (sqp->sq_wait == 0) {
+-		ASSERT(tid == 0);
+-		ASSERT(!(sqp->sq_state & SQS_TMO_PROG));
+-		sqp->sq_awaken = ddi_get_lbolt();
+-		cv_signal(&sqp->sq_worker_cv);
+-		mutex_exit(&sqp->sq_lock);
+-		return;
+-	}
+-
+-	/*
+-	 * Queue isn't being processed, so take
+-	 * any post enqueue actions needed before leaving.
+-	 */
+-	if (tid != 0) {
+-		/*
+-		 * Waiting for an enter() to process mblk(s).
+-		 */
+-		clock_t now = ddi_get_lbolt();
+-		clock_t	waited = now - sqp->sq_awaken;
+-
+-		if (TICK_TO_MSEC(waited) >= sqp->sq_wait) {
+-			/*
+-			 * Times up and have a worker thread
+-			 * waiting for work, so schedule it.
+-			 */
+-			sqp->sq_tid = 0;
+-			sqp->sq_awaken = now;
+-			cv_signal(&sqp->sq_worker_cv);
+-			mutex_exit(&sqp->sq_lock);
+-			(void) untimeout(tid);
+-			return;
+-		}
+-		mutex_exit(&sqp->sq_lock);
+-		return;
+-	} else if (sqp->sq_state & SQS_TMO_PROG) {
+-		mutex_exit(&sqp->sq_lock);
+-		return;
+-	} else {
+-		clock_t	wait = sqp->sq_wait;
+-		/*
+-		 * Wait up to sqp->sq_wait ms for an
+-		 * enter() to process this queue. We
+-		 * don't want to contend on timeout locks
+-		 * with sq_lock held for performance reasons,
+-		 * so drop the sq_lock before calling timeout
+-		 * but we need to check if timeout is required
+-		 * after re acquiring the sq_lock. Once
+-		 * the sq_lock is dropped, someone else could
+-		 * have processed the packet or the timeout could
+-		 * have already fired.
+-		 */
+-		sqp->sq_state |= SQS_TMO_PROG;
+-		mutex_exit(&sqp->sq_lock);
+-		tid = timeout(squeue_fire, sqp, wait);
+-		mutex_enter(&sqp->sq_lock);
+-		/* Check again if we still need the timeout */
+-		if (((sqp->sq_state & (SQS_PROC|SQS_TMO_PROG)) ==
+-		    SQS_TMO_PROG) && (sqp->sq_tid == 0) &&
+-		    (sqp->sq_first != NULL)) {
+-				sqp->sq_state &= ~SQS_TMO_PROG;
+-				sqp->sq_tid = tid;
+-				mutex_exit(&sqp->sq_lock);
+-				return;
+-		} else {
+-			if (sqp->sq_state & SQS_TMO_PROG) {
+-				sqp->sq_state &= ~SQS_TMO_PROG;
+-				mutex_exit(&sqp->sq_lock);
+-				(void) untimeout(tid);
+-			} else {
+-				/*
+-				 * The timer fired before we could
+-				 * reacquire the sq_lock. squeue_fire
+-				 * removes the SQS_TMO_PROG flag
+-				 * and we don't need to	do anything
+-				 * else.
+-				 */
+-				mutex_exit(&sqp->sq_lock);
+-			}
+-		}
+-	}
+-
+-	ASSERT(MUTEX_NOT_HELD(&sqp->sq_lock));
+-}
+-
+ /*
+  * squeue_enter() - enter squeue sqp with mblk mp (which can be
+  * a chain), while tail points to the end and cnt in number of
+@@ -529,18 +433,14 @@ squeue_enter(squeue_t *sqp, mblk_t *mp, mblk_t *tail, uint32_t cnt,
+ 			sqp->sq_run = NULL;
+ 			if (sqp->sq_first == NULL ||
+ 			    process_flag == SQ_NODRAIN) {
+-				if (sqp->sq_first != NULL) {
+-					squeue_worker_wakeup(sqp);
+-					return;
+-				}
+ 				/*
+-				 * We processed inline our packet and nothing
+-				 * new has arrived. We are done. In case any
+-				 * control actions are pending, wake up the
+-				 * worker.
++				 * If work or control actions are pending, wake
++				 * up the worker thread.
+ 				 */
+-				if (sqp->sq_state & SQS_WORKER_THR_CONTROL)
+-					cv_signal(&sqp->sq_worker_cv);
++				if (sqp->sq_first != NULL ||
++				    sqp->sq_state & SQS_WORKER_THR_CONTROL) {
++					squeue_worker_wakeup(sqp);
++				}
+ 				mutex_exit(&sqp->sq_lock);
+ 				return;
+ 			}
+@@ -597,10 +497,9 @@ squeue_enter(squeue_t *sqp, mblk_t *mp, mblk_t *tail, uint32_t cnt,
+ 		 * up the worker.
+ 		 */
+ 		sqp->sq_run = NULL;
+-		if (sqp->sq_state & SQS_WORKER_THR_CONTROL)
+-			cv_signal(&sqp->sq_worker_cv);
+-		mutex_exit(&sqp->sq_lock);
+-		return;
++		if (sqp->sq_state & SQS_WORKER_THR_CONTROL) {
++			squeue_worker_wakeup(sqp);
++		}
+ 	} else {
+ 		/*
+ 		 * We let a thread processing a squeue reenter only
+@@ -696,54 +595,33 @@ squeue_enter(squeue_t *sqp, mblk_t *mp, mblk_t *tail, uint32_t cnt,
+ 			tail = mp = attrmp;
+ 		}
+ 		ENQUEUE_CHAIN(sqp, mp, tail, cnt);
+-		if (!(sqp->sq_state & SQS_PROC)) {
+-			squeue_worker_wakeup(sqp);
+-			return;
+-		}
+ 		/*
+-		 * In case any control actions are pending, wake
+-		 * up the worker.
++		 * If the worker isn't running or control actions are pending,
++		 * wake it it up now.
+ 		 */
+-		if (sqp->sq_state & SQS_WORKER_THR_CONTROL)
+-			cv_signal(&sqp->sq_worker_cv);
+-		mutex_exit(&sqp->sq_lock);
+-		return;
++		if ((sqp->sq_state & SQS_PROC) == 0 ||
++		    (sqp->sq_state & SQS_WORKER_THR_CONTROL) != 0) {
++			squeue_worker_wakeup(sqp);
++		}
+ 	}
++	mutex_exit(&sqp->sq_lock);
+ }
+ 
+ /*
+  * PRIVATE FUNCTIONS
+  */
+ 
++
++/*
++ * Wake up worker thread for squeue to process queued work.
++ */
+ static void
+-squeue_fire(void *arg)
++squeue_worker_wakeup(squeue_t *sqp)
+ {
+-	squeue_t	*sqp = arg;
+-	uint_t		state;
+-
+-	mutex_enter(&sqp->sq_lock);
+-
+-	state = sqp->sq_state;
+-	if (sqp->sq_tid == 0 && !(state & SQS_TMO_PROG)) {
+-		mutex_exit(&sqp->sq_lock);
+-		return;
+-	}
+-
+-	sqp->sq_tid = 0;
+-	/*
+-	 * The timeout fired before we got a chance to set it.
+-	 * Process it anyway but remove the SQS_TMO_PROG so that
+-	 * the guy trying to set the timeout knows that it has
+-	 * already been processed.
+-	 */
+-	if (state & SQS_TMO_PROG)
+-		sqp->sq_state &= ~SQS_TMO_PROG;
++	ASSERT(MUTEX_HELD(&(sqp)->sq_lock));
+ 
+-	if (!(state & SQS_PROC)) {
+-		sqp->sq_awaken = ddi_get_lbolt();
+-		cv_signal(&sqp->sq_worker_cv);
+-	}
+-	mutex_exit(&sqp->sq_lock);
++	cv_signal(&sqp->sq_worker_cv);
++	sqp->sq_awoken = gethrtime();
+ }
+ 
+ static void
+@@ -753,10 +631,8 @@ squeue_drain(squeue_t *sqp, uint_t proc_type, hrtime_t expire)
+ 	mblk_t 		*head;
+ 	sqproc_t 	proc;
+ 	conn_t		*connp;
+-	timeout_id_t 	tid;
+ 	ill_rx_ring_t	*sq_rx_ring = sqp->sq_rx_ring;
+ 	hrtime_t 	now;
+-	boolean_t	did_wakeup = B_FALSE;
+ 	boolean_t	sq_poll_capable;
+ 	ip_recv_attr_t	*ira, iras;
+ 
+@@ -768,8 +644,7 @@ squeue_drain(squeue_t *sqp, uint_t proc_type, hrtime_t expire)
+ 	if (proc_type != SQS_WORKER && STACK_BIAS + (uintptr_t)getfp() -
+ 	    (uintptr_t)curthread->t_stkbase < squeue_drain_stack_needed) {
+ 		ASSERT(mutex_owned(&sqp->sq_lock));
+-		sqp->sq_awaken = ddi_get_lbolt();
+-		cv_signal(&sqp->sq_worker_cv);
++		squeue_worker_wakeup(sqp);
+ 		squeue_drain_stack_toodeep++;
+ 		return;
+ 	}
+@@ -785,9 +660,6 @@ again:
+ 	sqp->sq_last = NULL;
+ 	sqp->sq_count = 0;
+ 
+-	if ((tid = sqp->sq_tid) != 0)
+-		sqp->sq_tid = 0;
+-
+ 	sqp->sq_state |= SQS_PROC | proc_type;
+ 
+ 	/*
+@@ -804,9 +676,6 @@ again:
+ 	SQS_POLLING_ON(sqp, sq_poll_capable, sq_rx_ring);
+ 	mutex_exit(&sqp->sq_lock);
+ 
+-	if (tid != 0)
+-		(void) untimeout(tid);
+-
+ 	while ((mp = head) != NULL) {
+ 
+ 		head = mp->b_next;
+@@ -908,11 +777,9 @@ again:
+ 			if (proc_type == SQS_WORKER)
+ 				SQS_POLL_RING(sqp);
+ 			goto again;
+-		} else {
+-			did_wakeup = B_TRUE;
+-			sqp->sq_awaken = ddi_get_lbolt();
+-			cv_signal(&sqp->sq_worker_cv);
+ 		}
++
++		squeue_worker_wakeup(sqp);
+ 	}
+ 
+ 	/*
+@@ -971,17 +838,14 @@ again:
+ 		    SQS_POLL_QUIESCE_DONE)));
+ 		SQS_POLLING_OFF(sqp, sq_poll_capable, sq_rx_ring);
+ 		sqp->sq_state &= ~(SQS_PROC | proc_type);
+-		if (!did_wakeup && sqp->sq_first != NULL) {
+-			squeue_worker_wakeup(sqp);
+-			mutex_enter(&sqp->sq_lock);
+-		}
+ 		/*
+ 		 * If we are not the worker and there is a pending quiesce
+ 		 * event, wake up the worker
+ 		 */
+ 		if ((proc_type != SQS_WORKER) &&
+-		    (sqp->sq_state & SQS_WORKER_THR_CONTROL))
+-			cv_signal(&sqp->sq_worker_cv);
++		    (sqp->sq_state & SQS_WORKER_THR_CONTROL)) {
++			squeue_worker_wakeup(sqp);
++		}
+ 	}
+ }
+ 
+@@ -1189,7 +1053,6 @@ poll_again:
+ 				 */
+ 			}
+ 
+-			sqp->sq_awaken = ddi_get_lbolt();
+ 			/*
+ 			 * Put the SQS_PROC_HELD on so the worker
+ 			 * thread can distinguish where its called from. We
+@@ -1205,7 +1068,7 @@ poll_again:
+ 			 */
+ 			sqp->sq_state |= SQS_PROC_HELD;
+ 			sqp->sq_state &= ~SQS_GET_PKTS;
+-			cv_signal(&sqp->sq_worker_cv);
++			squeue_worker_wakeup(sqp);
+ 		} else if (sqp->sq_first == NULL &&
+ 		    !(sqp->sq_state & SQS_WORKER)) {
+ 			/*
+@@ -1225,8 +1088,9 @@ poll_again:
+ 			 * wake up the worker, since it is currently
+ 			 * not running.
+ 			 */
+-			if (sqp->sq_state & SQS_WORKER_THR_CONTROL)
+-				cv_signal(&sqp->sq_worker_cv);
++			if (sqp->sq_state & SQS_WORKER_THR_CONTROL) {
++				squeue_worker_wakeup(sqp);
++			}
+ 		} else {
+ 			/*
+ 			 * Worker thread is already running. We don't need
+@@ -1556,9 +1420,7 @@ squeue_synch_exit(conn_t *connp)
+ 		sqp->sq_run = NULL;
+ 		connp->conn_on_sqp = B_FALSE;
+ 
+-		if (sqp->sq_first == NULL) {
+-			mutex_exit(&sqp->sq_lock);
+-		} else {
++		if (sqp->sq_first != NULL) {
+ 			/*
+ 			 * If this was a normal thread, then it would
+ 			 * (most likely) continue processing the pending
+@@ -1568,9 +1430,7 @@ squeue_synch_exit(conn_t *connp)
+ 			 * worker thread right away when there are outstanding
+ 			 * requests.
+ 			 */
+-			sqp->sq_awaken = ddi_get_lbolt();
+-			cv_signal(&sqp->sq_worker_cv);
+-			mutex_exit(&sqp->sq_lock);
++			squeue_worker_wakeup(sqp);
+ 		}
+ 	} else {
+ 		/*
+@@ -1583,6 +1443,6 @@ squeue_synch_exit(conn_t *connp)
+ 
+ 		/* There should be only one thread blocking on sq_synch_cv. */
+ 		cv_signal(&sqp->sq_synch_cv);
+-		mutex_exit(&sqp->sq_lock);
+ 	}
++	mutex_exit(&sqp->sq_lock);
+ }
+diff --git a/usr/src/uts/common/io/gsqueue/gsqueue.c b/usr/src/uts/common/io/gsqueue/gsqueue.c
+index b484b16142..1d5cf3f198 100644
+--- a/usr/src/uts/common/io/gsqueue/gsqueue.c
++++ b/usr/src/uts/common/io/gsqueue/gsqueue.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014 Joyent, Inc.  All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -84,9 +84,9 @@
+  *       |    |     |
+  *       |    |     * . . . gs_cpus
+  *       |    |     |
+- *       |    |     |      +-------------------------------------------------+
+- *       |    |     +----->| gsqueue_cpu_t || gsqueue_cpu_t || gsqueue_cpu_t |...
+- *       |    |            +-------------------------------------------------+
++ *       |    |     |    +-------------------------------------------------+
++ *       |    |     +--->| gsqueue_cpu_t || gsqueue_cpu_t || gsqueue_cpu_t |...
++ *       |    |          +-------------------------------------------------+
+  *       |    |
+  *       |    * . . . gs_defunct
+  *       |    |
+@@ -173,7 +173,6 @@ typedef struct gsqueue_cpu {
+ 
+ struct gsqueue_set {
+ 	list_node_t gs_next;
+-	uint_t gs_wwait;
+ 	pri_t gs_wpri;
+ 	kmutex_t gs_lock;
+ 	int gs_ncpus;
+@@ -189,7 +188,7 @@ static kmem_cache_t *gsqueue_cpu_cache;
+ static kmem_cache_t *gsqueue_set_cache;
+ 
+ static gsqueue_cpu_t *
+-gsqueue_cpu_create(uint_t wwait, pri_t wpri, processorid_t cpuid)
++gsqueue_cpu_create(pri_t wpri, processorid_t cpuid)
+ {
+ 	gsqueue_cpu_t *scp;
+ 
+@@ -197,7 +196,7 @@ gsqueue_cpu_create(uint_t wwait, pri_t wpri, processorid_t cpuid)
+ 
+ 	scp->gqc_next = NULL;
+ 	scp->gqc_cpuid = cpuid;
+-	scp->gqc_head = squeue_create(wwait, wpri, B_FALSE);
++	scp->gqc_head = squeue_create(wpri, B_FALSE);
+ 	scp->gqc_head->sq_state = SQS_DEFAULT;
+ 	squeue_bind(scp->gqc_head, cpuid);
+ 
+@@ -212,13 +211,12 @@ gsqueue_cpu_destroy(gsqueue_cpu_t *scp)
+ }
+ 
+ gsqueue_set_t *
+-gsqueue_set_create(uint_t wwait, pri_t wpri)
++gsqueue_set_create(pri_t wpri)
+ {
+ 	int i;
+ 	gsqueue_set_t *gssp;
+ 
+ 	gssp = kmem_cache_alloc(gsqueue_set_cache, KM_SLEEP);
+-	gssp->gs_wwait = wwait;
+ 	gssp->gs_wpri = wpri;
+ 	gssp->gs_ncpus = 0;
+ 
+@@ -234,7 +232,7 @@ gsqueue_set_create(uint_t wwait, pri_t wpri)
+ 		cpu_t *cp = cpu_get(i);
+ 		if (cp != NULL && CPU_ACTIVE(cp) &&
+ 		    cp->cpu_flags & CPU_EXISTS) {
+-			scp = gsqueue_cpu_create(wwait, wpri, cp->cpu_id);
++			scp = gsqueue_cpu_create(wpri, cp->cpu_id);
+ 			gssp->gs_cpus[gssp->gs_ncpus] = scp;
+ 			gssp->gs_ncpus++;
+ 		}
+@@ -414,8 +412,7 @@ gsqueue_handle_online(processorid_t id)
+ 		}
+ 
+ 		if (scp == NULL) {
+-			scp = gsqueue_cpu_create(gssp->gs_wwait,
+-			    gssp->gs_wpri, id);
++			scp = gsqueue_cpu_create(gssp->gs_wpri, id);
+ 		} else {
+ 			squeue_bind(scp->gqc_head, id);
+ 		}
+diff --git a/usr/src/uts/common/io/vnd/vnd.c b/usr/src/uts/common/io/vnd/vnd.c
+index f66d80fc1e..54f31932c5 100644
+--- a/usr/src/uts/common/io/vnd/vnd.c
++++ b/usr/src/uts/common/io/vnd/vnd.c
+@@ -5535,8 +5535,7 @@ vnd_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 		return (DDI_FAILURE);
+ 	}
+ 
+-	vnd_sqset = gsqueue_set_create(GSQUEUE_DEFAULT_WAIT,
+-	    GSQUEUE_DEFAULT_PRIORITY);
++	vnd_sqset = gsqueue_set_create(GSQUEUE_DEFAULT_PRIORITY);
+ 
+ 	return (DDI_SUCCESS);
+ }
+diff --git a/usr/src/uts/common/sys/gsqueue.h b/usr/src/uts/common/sys/gsqueue.h
+index 40ef4ce982..91ab46fc44 100644
+--- a/usr/src/uts/common/sys/gsqueue.h
++++ b/usr/src/uts/common/sys/gsqueue.h
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014 Joyent, Inc.  All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_GSQUEUE_H
+@@ -34,7 +34,7 @@ typedef struct gsqueue_set gsqueue_set_t;
+ typedef void (*gsqueue_cb_f)(gsqueue_set_t *, gsqueue_t *, void *, boolean_t);
+ typedef void (*gsqueue_proc_f)(void *, mblk_t *, gsqueue_t *, void *);
+ 
+-extern gsqueue_set_t *gsqueue_set_create(uint_t, pri_t);
++extern gsqueue_set_t *gsqueue_set_create(pri_t);
+ extern void gsqueue_set_destroy(gsqueue_set_t *);
+ extern gsqueue_t *gsqueue_set_get(gsqueue_set_t *, uint_t);
+ 
+@@ -48,12 +48,6 @@ extern int gsqueue_set_cb_remove(gsqueue_set_t *, uintptr_t);
+ extern void gsqueue_enter_one(gsqueue_t *, mblk_t *, gsqueue_proc_f, void *,
+     int, uint8_t);
+ 
+-/*
+- * The default wait is inherited from IP. This determines the amount of time
+- * that must pass after queuing work, before we wake up the worker thread. This
+- * value is in milliseconds.
+- */
+-#define	GSQUEUE_DEFAULT_WAIT	10
+ #define	GSQUEUE_DEFAULT_PRIORITY	MAXCLSYSPRI
+ 
+ #endif	/* _KERNEL */
+diff --git a/usr/src/uts/common/sys/squeue.h b/usr/src/uts/common/sys/squeue.h
+index 35e1cf64c7..2e391db3ea 100644
+--- a/usr/src/uts/common/sys/squeue.h
++++ b/usr/src/uts/common/sys/squeue.h
+@@ -20,6 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef	_SYS_SQUEUE_H
+@@ -87,7 +88,7 @@ typedef enum {
+ 
+ struct ip_recv_attr_s;
+ extern void squeue_init(void);
+-extern squeue_t *squeue_create(clock_t, pri_t, boolean_t);
++extern squeue_t *squeue_create(pri_t, boolean_t);
+ extern void squeue_bind(squeue_t *, processorid_t);
+ extern void squeue_unbind(squeue_t *);
+ extern void squeue_enter(squeue_t *, mblk_t *, mblk_t *,
+diff --git a/usr/src/uts/common/sys/squeue_impl.h b/usr/src/uts/common/sys/squeue_impl.h
+index d2418bbc15..2bb717fb52 100644
+--- a/usr/src/uts/common/sys/squeue_impl.h
++++ b/usr/src/uts/common/sys/squeue_impl.h
+@@ -21,6 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef	_SYS_SQUEUE_IMPL_H
+@@ -84,7 +85,6 @@ typedef void (*sq_enter_proc_t)(squeue_t *, mblk_t *, mblk_t *, uint32_t,
+ 	    struct ip_recv_attr_s *, int, uint8_t);
+ typedef void (*sq_drain_proc_t)(squeue_t *, uint_t, hrtime_t);
+ 
+-extern void squeue_worker_wakeup(squeue_t *);
+ extern int ip_squeue_flag;
+ 
+ struct squeue_s {
+@@ -99,14 +99,11 @@ struct squeue_s {
+ 	ill_rx_ring_t	*sq_rx_ring;	/* The Rx ring tied to this sq */
+ 	ill_t		*sq_ill;	/* The ill this squeue is tied to */
+ 
+-	clock_t		sq_curr_time;	/* Current tick (lbolt) */
++	hrtime_t	sq_awoken;	/* time of worker wake req */
+ 	kcondvar_t	sq_worker_cv;	/* cond var. worker thread blocks on */
+ 	kcondvar_t	sq_poll_cv;	/* cond variable poll_thr waits on */
+ 	kcondvar_t	sq_synch_cv;	/* cond var. synch thread waits on */
+ 	kcondvar_t	sq_ctrlop_done_cv; /* cond variable for ctrl ops */
+-	clock_t		sq_wait;	/* lbolts to wait after a fill() */
+-	timeout_id_t	sq_tid;		/* timer id of pending timeout() */
+-	clock_t		sq_awaken;	/* time async thread was awakened */
+ 
+ 	processorid_t	sq_bind;	/* processor to bind to */
+ 	kthread_t	*sq_worker;	/* kernel thread id */
+@@ -141,7 +138,6 @@ struct squeue_s {
+ #define	SQS_USER	0x00000010	/* A non interrupt user */
+ #define	SQS_BOUND	0x00000020	/* Worker thread is bound */
+ #define	SQS_REENTER	0x00000040	/* Re entered thread */
+-#define	SQS_TMO_PROG	0x00000080	/* Timeout is being set */
+ 
+ #define	SQS_POLL_CAPAB	0x00000100	/* Squeue can control interrupts */
+ #define	SQS_ILL_BOUND	0x00000200	/* Squeue bound to an ill */
+diff --git a/usr/src/uts/intel/ip/ip.global-objs.debug64 b/usr/src/uts/intel/ip/ip.global-objs.debug64
+index 3098f98265..d189c7a47c 100644
+--- a/usr/src/uts/intel/ip/ip.global-objs.debug64
++++ b/usr/src/uts/intel/ip/ip.global-objs.debug64
+@@ -21,7 +21,7 @@
+ #
+ # Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+ # Copyright 2011 Nexenta Systems, Inc. All rights reserved
+-# Copyright 2012 Joyent, Inc. All rights reserved
++# Copyright 2017 Joyent, Inc.
+ #
+ 
+ arp_m_tbl
+@@ -143,7 +143,6 @@ ip_squeue_create_callback
+ ip_squeue_enter
+ ip_squeue_fanout
+ ip_squeue_flag
+-ip_squeue_worker_wait
+ ip_thread_data
+ ip_thread_list
+ ip_thread_rwlock
+@@ -255,8 +254,6 @@ squeue_drain_ms
+ squeue_drain_ns
+ squeue_drain_stack_needed
+ squeue_drain_stack_toodeep
+-squeue_workerwait_ms
+-squeue_workerwait_tick
+ tcp_acceptor_rinit
+ tcp_acceptor_winit
+ tcp_conn_cache
+diff --git a/usr/src/uts/intel/ip/ip.global-objs.obj64 b/usr/src/uts/intel/ip/ip.global-objs.obj64
+index f182d7198e..e2b81e66a0 100644
+--- a/usr/src/uts/intel/ip/ip.global-objs.obj64
++++ b/usr/src/uts/intel/ip/ip.global-objs.obj64
+@@ -21,7 +21,7 @@
+ #
+ # Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+ # Copyright 2011 Nexenta Systems, Inc. All rights reserved
+-# Copyright 2012 Joyent, Inc. All rights reserved
++# Copyright 2017 Joyent, Inc.
+ #
+ 
+ arp_m_tbl
+@@ -143,7 +143,6 @@ ip_squeue_create_callback
+ ip_squeue_enter
+ ip_squeue_fanout
+ ip_squeue_flag
+-ip_squeue_worker_wait
+ ip_thread_data
+ ip_thread_list
+ ip_thread_rwlock
+@@ -252,8 +251,6 @@ squeue_drain_ms
+ squeue_drain_ns
+ squeue_drain_stack_needed
+ squeue_drain_stack_toodeep
+-squeue_workerwait_ms
+-squeue_workerwait_tick
+ tcp_acceptor_rinit
+ tcp_acceptor_winit
+ tcp_conn_cache
+diff --git a/usr/src/uts/sparc/ip/ip.global-objs.debug64 b/usr/src/uts/sparc/ip/ip.global-objs.debug64
+index 3098f98265..d189c7a47c 100644
+--- a/usr/src/uts/sparc/ip/ip.global-objs.debug64
++++ b/usr/src/uts/sparc/ip/ip.global-objs.debug64
+@@ -21,7 +21,7 @@
+ #
+ # Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+ # Copyright 2011 Nexenta Systems, Inc. All rights reserved
+-# Copyright 2012 Joyent, Inc. All rights reserved
++# Copyright 2017 Joyent, Inc.
+ #
+ 
+ arp_m_tbl
+@@ -143,7 +143,6 @@ ip_squeue_create_callback
+ ip_squeue_enter
+ ip_squeue_fanout
+ ip_squeue_flag
+-ip_squeue_worker_wait
+ ip_thread_data
+ ip_thread_list
+ ip_thread_rwlock
+@@ -255,8 +254,6 @@ squeue_drain_ms
+ squeue_drain_ns
+ squeue_drain_stack_needed
+ squeue_drain_stack_toodeep
+-squeue_workerwait_ms
+-squeue_workerwait_tick
+ tcp_acceptor_rinit
+ tcp_acceptor_winit
+ tcp_conn_cache
+diff --git a/usr/src/uts/sparc/ip/ip.global-objs.obj64 b/usr/src/uts/sparc/ip/ip.global-objs.obj64
+index f182d7198e..e2b81e66a0 100644
+--- a/usr/src/uts/sparc/ip/ip.global-objs.obj64
++++ b/usr/src/uts/sparc/ip/ip.global-objs.obj64
+@@ -21,7 +21,7 @@
+ #
+ # Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+ # Copyright 2011 Nexenta Systems, Inc. All rights reserved
+-# Copyright 2012 Joyent, Inc. All rights reserved
++# Copyright 2017 Joyent, Inc.
+ #
+ 
+ arp_m_tbl
+@@ -143,7 +143,6 @@ ip_squeue_create_callback
+ ip_squeue_enter
+ ip_squeue_fanout
+ ip_squeue_flag
+-ip_squeue_worker_wait
+ ip_thread_data
+ ip_thread_list
+ ip_thread_rwlock
+@@ -252,8 +251,6 @@ squeue_drain_ms
+ squeue_drain_ns
+ squeue_drain_stack_needed
+ squeue_drain_stack_toodeep
+-squeue_workerwait_ms
+-squeue_workerwait_tick
+ tcp_acceptor_rinit
+ tcp_acceptor_winit
+ tcp_conn_cache

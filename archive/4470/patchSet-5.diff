@@ -1,0 +1,163 @@
+commit ec230f99d71cccf9160c59f94f33fcb38992caae (refs/changes/70/4470/5)
+Author: John Levon <john.levon@joyent.com>
+Date:   2018-07-18T09:19:52+00:00 (1 year, 3 months ago)
+    
+    OS-7015 pagefault loop because somebody lost our %cr3
+
+diff --git a/usr/src/uts/intel/kdi/kdi_asm.s b/usr/src/uts/intel/kdi/kdi_asm.s
+index 5180dbb1b2..edfbea10c7 100644
+--- a/usr/src/uts/intel/kdi/kdi_asm.s
++++ b/usr/src/uts/intel/kdi/kdi_asm.s
+@@ -452,8 +452,8 @@
+ 
+ 	pushq	%rdi
+ 	call	kdi_trap_pass
+-	cmpq	$1, %rax
+-	je	kdi_pass_to_kernel
++	testq	%rax, %rax
++	jnz	kdi_pass_to_kernel
+ 	popq	%rax /* cpusave in %rax */
+ 
+ 	SAVE_IDTGDT
+@@ -569,17 +569,9 @@
+ 	/*NOTREACHED*/
+ 	SET_SIZE(kdi_resume)
+ 
+-	ENTRY_NP(kdi_pass_to_kernel)
+-
+-	popq	%rdi /* cpusave */
+-
+-	movq	$KDI_CPU_STATE_NONE, KRS_CPU_STATE(%rdi)
+ 
+ 	/*
+-	 * Find the trap and vector off the right kernel handler.  The trap
+-	 * handler will expect the stack to be in trap order, with %rip being
+-	 * the last entry, so we'll need to restore all our regs.  On i86xpv
+-	 * we'll need to compensate for XPV_TRAP_POP.
++	 * We took a trap that should be handled by the kernel, not KMDB.
+ 	 *
+ 	 * We're hard-coding the three cases where KMDB has installed permanent
+ 	 * handlers, since after we KDI_RESTORE_REGS(), we don't have registers
+@@ -587,15 +579,53 @@
+ 	 * through here at the same time.
+ 	 *
+ 	 * Note that we handle T_DBGENTR since userspace might have tried it.
++	 *
++	 * The trap handler will expect the stack to be in trap order, with %rip
++	 * being the last entry, so we'll need to restore all our regs.  On
++	 * i86xpv we'll need to compensate for XPV_TRAP_POP.
++	 *
++	 * %rax on entry is either 1 or 2, which is from kdi_trap_pass().
++	 * kdi_cmnint stashed the original %cr3 into KDIREG_CR3, then (probably)
++	 * switched us to the CPU's kf_kernel_cr3. But we're about to call, for
++	 * example:
++	 *
++	 * dbgtrap->trap()->tr_iret_kernel
++	 *
++	 * which, unlike, tr_iret_kdi, doesn't restore the original %cr3, so
++	 * we'll do so here if needed.
++	 *
++	 * This isn't just a matter of tidiness: for example, consider:
++	 *
++	 * hat_switch(oldhat=kas.a_hat, newhat=prochat)
++	 *  setcr3()
++	 *  reset_kpti()
++	 *   *brktrap* due to fbt on reset_kpti:entry
++	 *
++	 * Here, we have the new hat's %cr3, but we haven't yet updated
++	 * kf_kernel_cr3 (so its currently kas's). So if we don't restore here,
++	 * we'll stay on kas's cr3 value on returning from the trap: not good if
++	 * we fault on a userspace address.
+ 	 */
++	ENTRY_NP(kdi_pass_to_kernel)
++
++	popq	%rdi /* cpusave */
++	movq	$KDI_CPU_STATE_NONE, KRS_CPU_STATE(%rdi)
+ 	movq	KRS_GREGS(%rdi), %rsp
++
++	cmpq	$2, %rax
++	jne	no_restore_cr3
++	movq	REG_OFF(KDIREG_CR3)(%rsp), %r11
++	movq	%r11, %cr3
++
++no_restore_cr3:
+ 	movq	REG_OFF(KDIREG_TRAPNO)(%rsp), %rdi
++
+ 	cmpq	$T_SGLSTP, %rdi
+-	je	1f
++	je	kdi_pass_dbgtrap
+ 	cmpq	$T_BPTFLT, %rdi
+-	je	2f
++	je	kdi_pass_brktrap
+ 	cmpq	$T_DBGENTR, %rdi
+-	je	3f
++	je	kdi_pass_invaltrap
+ 	/*
+ 	 * Hmm, unknown handler.  Somebody forgot to update this when they
+ 	 * added a new trap interposition... try to drop back into kmdb.
+@@ -609,13 +639,13 @@
+ 	XPV_TRAP_PUSH; \
+ 	jmp	%cs:name
+ 
+-1:
++kdi_pass_dbgtrap:
+ 	CALL_TRAP_HANDLER(dbgtrap)
+ 	/*NOTREACHED*/
+-2:
++kdi_pass_brktrap:
+ 	CALL_TRAP_HANDLER(brktrap)
+ 	/*NOTREACHED*/
+-3:
++kdi_pass_invaltrap:
+ 	CALL_TRAP_HANDLER(invaltrap)
+ 	/*NOTREACHED*/
+ 
+diff --git a/usr/src/uts/intel/kdi/kdi_idt.c b/usr/src/uts/intel/kdi/kdi_idt.c
+index d801588954..6ea4681bce 100644
+--- a/usr/src/uts/intel/kdi/kdi_idt.c
++++ b/usr/src/uts/intel/kdi/kdi_idt.c
+@@ -164,8 +164,8 @@ struct idt_description {
+ 	{ T_GPFLT, 0,		kdi_traperr13, NULL },
+ 	{ T_PGFLT, 0,		kdi_traperr14, NULL },
+ 	{ 15, 0,		kdi_invaltrap, NULL },
+-	{ T_EXTERRFLT, 0, 	kdi_trap16, NULL },
+-	{ T_ALIGNMENT, 0, 	kdi_traperr17, NULL },
++	{ T_EXTERRFLT, 0,	kdi_trap16, NULL },
++	{ T_ALIGNMENT, 0,	kdi_traperr17, NULL },
+ 	{ T_MCE, 0,		kdi_trap18, NULL },
+ 	{ T_SIMDFPE, 0,		kdi_trap19, NULL },
+ 	{ T_DBGENTR, 0,		kdi_trap20, NULL },
+@@ -366,14 +366,16 @@ kdi_deactivate(void)
+ }
+ 
+ /*
+- * We receive all breakpoints and single step traps.  Some of them,
+- * including those from userland and those induced by DTrace providers,
+- * are intended for the kernel, and must be processed there.  We adopt
+- * this ours-until-proven-otherwise position due to the painful
+- * consequences of sending the kernel an unexpected breakpoint or
+- * single step.  Unless someone can prove to us that the kernel is
+- * prepared to handle the trap, we'll assume there's a problem and will
+- * give the user a chance to debug it.
++ * We receive all breakpoints and single step traps.  Some of them, including
++ * those from userland and those induced by DTrace providers, are intended for
++ * the kernel, and must be processed there.  We adopt this
++ * ours-until-proven-otherwise position due to the painful consequences of
++ * sending the kernel an unexpected breakpoint or single step.  Unless someone
++ * can prove to us that the kernel is prepared to handle the trap, we'll assume
++ * there's a problem and will give the user a chance to debug it.
++ *
++ * If we return 2, then the calling code should restore the trap-time %cr3: that
++ * is, it really is a kernel-originated trap.
+  */
+ int
+ kdi_trap_pass(kdi_cpusave_t *cpusave)
+@@ -390,7 +392,7 @@ kdi_trap_pass(kdi_cpusave_t *cpusave)
+ 
+ 	if (tt == T_BPTFLT && kdi_dtrace_get_state() ==
+ 	    KDI_DTSTATE_DTRACE_ACTIVE)
+-		return (1);
++		return (2);
+ 
+ 	/*
+ 	 * See the comments in the kernel's T_SGLSTP handler for why we need to

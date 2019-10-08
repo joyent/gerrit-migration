@@ -1,0 +1,297 @@
+commit 2b6ac32e33c114b8b47dd168f7935ee29f9557be (refs/changes/75/3375/3)
+Author: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date:   2018-02-16T22:51:58+00:00 (1 year, 8 months ago)
+    
+    OS-6612 reboot in bhyve guest should reboot, not poweroff
+    OS-6626 bhyve hangs forever when requesting too much kernel memory
+    OS-6627 bhyve needs to support 100+ GB RAM
+
+diff --git a/usr/src/uts/common/os/exit.c b/usr/src/uts/common/os/exit.c
+index 3edddcf61f..62176e76f0 100644
+--- a/usr/src/uts/common/os/exit.c
++++ b/usr/src/uts/common/os/exit.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1988, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2017 Joyent, Inc.
++ * Copyright 2018 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -319,6 +319,119 @@ proc_is_exiting(proc_t *p)
+ 	mutex_exit(&p->p_lock);
+ }
+ 
++/*
++ * Return true if zone's init is restarted, false if exit processing should
++ * proceeed.
++ */
++static boolean_t
++zone_init_exit(zone_t *z, int why, int what)
++{
++	/*
++	 * Typically we don't let the zone's init exit unless zone_start_init()
++	 * failed its exec, or we are shutting down the zone or the machine,
++	 * although the various flags handled within this function will control
++	 * the behavior.
++	 *
++	 * Since we are single threaded, we don't need to lock the following
++	 * accesses to zone_proc_initpid.
++	 */
++	if (z->zone_boot_err != 0 ||
++	    zone_status_get(z) >= ZONE_IS_SHUTTING_DOWN ||
++	    zone_status_get(global_zone) >= ZONE_IS_SHUTTING_DOWN) {
++		/*
++		 * Clear the zone's init pid and proceed with exit processing.
++		 */
++		z->zone_proc_initpid = -1;
++		return (B_FALSE);
++	}
++
++	/*
++	 * There are a variety of configuration flags on the zone to control
++	 * init exit behavior.
++	 *
++	 * If the init process should be restarted, the "zone_restart_init"
++	 * member will be set.
++	 */
++	if (!z->zone_restart_init) {
++		/*
++		 * The zone has been setup to halt when init exits.
++		 */
++		z->zone_init_status = wstat(why, what);
++		(void) zone_kadmin(A_SHUTDOWN, AD_HALT, NULL, zone_kcred());
++		z->zone_proc_initpid = -1;
++		return (B_FALSE);
++	}
++
++	/*
++	 * At this point we know we're configured to restart init, but there
++	 * are various modifiers to that behavior.
++	 */
++
++	if (z->zone_reboot_on_init_exit) {
++		/*
++		 * Some init programs in branded zones do not tolerate a
++		 * restart in the traditional manner; setting
++		 * "zone_reboot_on_init_exit" will cause the entire zone to be
++		 * rebooted instead.
++		 */
++
++		if (z->zone_restart_init_0) {
++			/*
++			 * Some init programs in branded zones only want to
++			 * restart if they exit 0, otherwise the zone should
++			 * shutdown. Setting the "zone_restart_init_0" member
++			 * controls this behavior.
++			 */
++			if (why == CLD_EXITED && what == 0) {
++				/* Trigger a zone reboot */
++				(void) zone_kadmin(A_REBOOT, 0, NULL,
++				    zone_kcred());
++			} else {
++				/* Shutdown instead of reboot */
++				(void) zone_kadmin(A_SHUTDOWN, AD_HALT, NULL,
++				    zone_kcred());
++			}
++		} else {
++			/* Trigger a zone reboot */
++			(void) zone_kadmin(A_REBOOT, 0, NULL, zone_kcred());
++		}
++
++		z->zone_init_status = wstat(why, what);
++		z->zone_proc_initpid = -1;
++		return (B_FALSE);
++	}
++
++	if (z->zone_restart_init_0) {
++		/*
++		 * Some init programs in branded zones only want to restart if
++		 * they exit 0, otherwise the zone should shutdown. Setting the
++		 * "zone_restart_init_0" member controls this behavior.
++		 *
++		 * In this case we only restart init if it exited successfully.
++		 */
++		if (why == CLD_EXITED && what == 0 &&
++		    restart_init(what, why) == 0) {
++			return (B_TRUE);
++		}
++	} else {
++		/*
++		 * No restart modifiers on the zone, attempt to restart init.
++		 */
++		if (restart_init(what, why) == 0) {
++			return (B_TRUE);
++		}
++	}
++
++
++	/*
++	 * The restart failed, the zone will shut down.
++	 */
++	z->zone_init_status = wstat(why, what);
++	(void) zone_kadmin(A_SHUTDOWN, AD_HALT, NULL, zone_kcred());
++	z->zone_proc_initpid = -1;
++	return (B_FALSE);
++}
++
+ /*
+  * Return value:
+  *   1 - exitlwps() failed, call (or continue) lwp_exit()
+@@ -366,55 +479,10 @@ proc_exit(int why, int what)
+ 	}
+ 	mutex_exit(&p->p_lock);
+ 
+-	/*
+-	 * Don't let init exit unless zone_start_init() failed its exec, or
+-	 * we are shutting down the zone or the machine.
+-	 *
+-	 * Since we are single threaded, we don't need to lock the
+-	 * following accesses to zone_proc_initpid.
+-	 */
+ 	if (p->p_pid == z->zone_proc_initpid) {
+-		if (z->zone_boot_err == 0 &&
+-		    zone_status_get(z) < ZONE_IS_SHUTTING_DOWN &&
+-		    zone_status_get(global_zone) < ZONE_IS_SHUTTING_DOWN) {
+-
+-			/*
+-			 * If the init process should be restarted, the
+-			 * "zone_restart_init" member will be set.  Some init
+-			 * programs in branded zones do not tolerate a restart
+-			 * in the traditional manner; setting the
+-			 * "zone_reboot_on_init_exit" member will cause the
+-			 * entire zone to be rebooted instead.  If neither of
+-			 * these flags is set the zone will shut down.
+-			 */
+-			if (z->zone_reboot_on_init_exit == B_TRUE &&
+-			    z->zone_restart_init == B_TRUE) {
+-				/*
+-				 * Trigger a zone reboot and continue
+-				 * with exit processing.
+-				 */
+-				z->zone_init_status = wstat(why, what);
+-				(void) zone_kadmin(A_REBOOT, 0, NULL,
+-				    zone_kcred());
+-
+-			} else {
+-				if (z->zone_restart_init == B_TRUE) {
+-					if (restart_init(what, why) == 0)
+-						return (0);
+-				}
+-
+-				z->zone_init_status = wstat(why, what);
+-				(void) zone_kadmin(A_SHUTDOWN, AD_HALT, NULL,
+-				    zone_kcred());
+-			}
+-		}
+-
+-		/*
+-		 * Since we didn't or couldn't restart init, we clear
+-		 * the zone's init state and proceed with exit
+-		 * processing.
+-		 */
+-		z->zone_proc_initpid = -1;
++		/* If zone's init restarts, we're done here. */
++		if (zone_init_exit(z, why, what))
++			return (0);
+ 	}
+ 
+ 	/*
+diff --git a/usr/src/uts/common/os/zone.c b/usr/src/uts/common/os/zone.c
+index 06a8549c5b..90e5e27d5c 100644
+--- a/usr/src/uts/common/os/zone.c
++++ b/usr/src/uts/common/os/zone.c
+@@ -2787,6 +2787,7 @@ zone_init(void)
+ 	mutex_exit(&p0.p_lock);
+ 	zone0.zone_restart_init = B_TRUE;
+ 	zone0.zone_reboot_on_init_exit = B_FALSE;
++	zone0.zone_restart_init_0 = B_FALSE;
+ 	zone0.zone_init_status = -1;
+ 	zone0.zone_brand = &native_brand;
+ 	rctl_prealloc_destroy(gp);
+@@ -5063,6 +5064,7 @@ zone_create(const char *zone_name, const char *zone_root,
+ 	zone->zone_ncpus_online = 0;
+ 	zone->zone_restart_init = B_TRUE;
+ 	zone->zone_reboot_on_init_exit = B_FALSE;
++	zone->zone_restart_init_0 = B_FALSE;
+ 	zone->zone_init_status = -1;
+ 	zone->zone_brand = &native_brand;
+ 	zone->zone_initname = NULL;
+@@ -6360,6 +6362,14 @@ zone_setattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 		zone->zone_restart_init = B_FALSE;
+ 		err = 0;
+ 		break;
++	case ZONE_ATTR_INITRESTART0:
++		zone->zone_restart_init_0 = B_TRUE;
++		err = 0;
++		break;
++	case ZONE_ATTR_INITREBOOT:
++		zone->zone_reboot_on_init_exit = B_TRUE;
++		err = 0;
++		break;
+ 	case ZONE_ATTR_BOOTARGS:
+ 		err = zone_set_bootargs(zone, (const char *)buf);
+ 		break;
+diff --git a/usr/src/uts/common/sys/zone.h b/usr/src/uts/common/sys/zone.h
+index 87253134fd..e871689f5f 100644
+--- a/usr/src/uts/common/sys/zone.h
++++ b/usr/src/uts/common/sys/zone.h
+@@ -120,6 +120,8 @@ extern "C" {
+ #define	ZONE_ATTR_APP_SVC_CT	19
+ #define	ZONE_ATTR_SCHED_FIXEDHI	20
+ #define	ZONE_ATTR_SECFLAGS	21
++#define	ZONE_ATTR_INITRESTART0	22
++#define	ZONE_ATTR_INITREBOOT	23
+ 
+ /* Start of the brand-specific attribute namespace */
+ #define	ZONE_ATTR_BRAND_ATTRS	32768
+@@ -609,6 +611,7 @@ typedef struct zone {
+ 
+ 	boolean_t	zone_restart_init;	/* Restart init if it dies? */
+ 	boolean_t	zone_reboot_on_init_exit; /* Reboot if init dies? */
++	boolean_t	zone_restart_init_0;	/* Restart only if it exits 0 */
+ 	boolean_t	zone_setup_app_contract; /* setup contract? */
+ 	struct brand	*zone_brand;		/* zone's brand */
+ 	void 		*zone_brand_data;	/* store brand specific data */
+diff --git a/usr/src/uts/common/vm/vm_page.c b/usr/src/uts/common/vm/vm_page.c
+index f8c5d8f6d9..abccf82057 100644
+--- a/usr/src/uts/common/vm/vm_page.c
++++ b/usr/src/uts/common/vm/vm_page.c
+@@ -22,7 +22,7 @@
+  * Copyright (c) 1986, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright (c) 2015, Josef 'Jeff' Sipek <jeffpc@josefsipek.net>
+  * Copyright (c) 2015, 2016 by Delphix. All rights reserved.
+- * Copyright 2017 Joyent, Inc.
++ * Copyright 2018 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1983, 1984, 1985, 1986, 1987, 1988, 1989  AT&T	*/
+@@ -441,10 +441,26 @@ init_pages_pp_maximum()
+ 	}
+ }
+ 
++/*
++ * In the past, we limited the maximum pages that could be gotten to essentially
++ * 1/2 of the total pages on the system. However, this is too conservative for
++ * some cases. For example, if we want to host a large virtual machine which
++ * needs to use a significant portion of the system's memory. In practice,
++ * allowing more than 1/2 of the total pages is fine, but becomes problematic
++ * as we approach or exceed 75% of the pages on the system. Thus, we limit the
++ * maximum to 23/32 of the total pages, which is ~72%.
++ */
+ void
+ set_max_page_get(pgcnt_t target_total_pages)
+ {
+-	max_page_get = target_total_pages / 2;
++	max_page_get = (target_total_pages >> 5) * 23;
++	ASSERT3U(max_page_get, >, 0);
++}
++
++pgcnt_t
++get_max_page_get()
++{
++	return (max_page_get);
+ }
+ 
+ static pgcnt_t pending_delete;

@@ -1,0 +1,411 @@
+commit 82eec1b55bef1c40ff71d107ea9a7ab87c6edc49 (refs/changes/18/1918/1)
+Author: Jason King <jason.king@joyent.com>
+Date:   2017-05-08T20:12:40+00:00 (2 years, 5 months ago)
+    
+    OS-3042 Unable to fix bad coreadm paths
+
+diff --git a/usr/src/cmd/coreadm/coreadm.c b/usr/src/cmd/coreadm/coreadm.c
+index 9ce0f27651..a2f181a3b4 100644
+--- a/usr/src/cmd/coreadm/coreadm.c
++++ b/usr/src/cmd/coreadm/coreadm.c
+@@ -21,6 +21,8 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ *
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <stdio.h>
+@@ -44,6 +46,15 @@
+ #define	E_ERROR		1		/* Exit status for error */
+ #define	E_USAGE		2		/* Exit status for usage error */
+ 
++#define	REFRESH_INTERVAL	(200)		/* ms */
++#define	REFRESH_TIMEOUT		(1000)		/* ms */
++
++enum {
++	ST_ONLINE,
++	ST_MAINT,
++	ST_OTHER
++};
++
+ static	const	char	PATH_CONFIG[] = "/etc/coreadm.conf";
+ static	const	char	PATH_CONFIG_OLD[] = "/etc/coreadm.conf.old";
+ 
+@@ -78,8 +89,10 @@ static	core_content_t	proc_content = CC_CONTENT_INVALID;
+ static	int		report_settings(void);
+ static	int		do_processes(int, char **);
+ static	int		do_modify(boolean_t);
+-static	int		do_update(void);
++static	int		do_update(boolean_t);
+ static	int		do_legacy(void);
++static	boolean_t	read_kernel(void);
++static	boolean_t	get_state(const char *, int *, char **);
+ 
+ static scf_propvec_t prop_gpattern = { GLOBAL_PATTERN, NULL, SCF_TYPE_ASTRING };
+ static scf_propvec_t prop_gcontent = { GLOBAL_CONTENT, NULL, SCF_TYPE_ASTRING };
+@@ -253,7 +266,7 @@ main(int argc, char **argv)
+ 	if (legacy_update)
+ 		return (do_legacy());
+ 	if (update)
+-		return (do_update());
++		return (do_update(B_FALSE));
+ 	if (modify)
+ 		return (do_modify(B_FALSE));
+ 	if (npids != 0)
+@@ -267,26 +280,8 @@ report_settings(void)
+ {
+ 	char content_str[PRCONTENTBUFSZ];
+ 
+-	if ((options = core_get_options()) == -1) {
+-		perror("core_get_options()");
+-		return (E_ERROR);
+-	}
+-	if (core_get_global_path(gpattern, sizeof (gpattern)) != 0) {
+-		perror("core_get_global_path()");
+-		return (E_ERROR);
+-	}
+-	if (core_get_default_path(ipattern, sizeof (ipattern)) != 0) {
+-		perror("core_get_default_path()");
++	if (!read_kernel())
+ 		return (E_ERROR);
+-	}
+-	if (core_get_global_content(&glob_content) != 0) {
+-		perror("core_get_global_content()");
+-		return (E_ERROR);
+-	}
+-	if (core_get_default_content(&init_content) != 0) {
+-		perror("core_get_default_content()");
+-		return (E_ERROR);
+-	}
+ 
+ 	(void) printf(gettext("     global core file pattern: %s\n"),
+ 	    gpattern);
+@@ -382,38 +377,51 @@ addprop(scf_propvec_t *props, int size, int count, scf_propvec_t *pv, void *ptr)
+ 	props[count].pv_ptr = ptr;
+ }
+ 
+-static boolean_t
+-is_online(const char *fmri)
+-{
+-	char *state = smf_get_state(fmri);
+-	boolean_t result = state != NULL &&
+-	    strcmp(state, SCF_STATE_STRING_ONLINE) == 0;
+-
+-	free(state);
+-	return (result);
+-}
+-
+ /*
+  * The user has specified the -g, -G, -i, -I, -d, or -e options to
+  * modify the given configuration parameter. Perform the modification
+  * in the smf repository and then perform a smf_refresh_instance which
+  * will cause a coreadm -u to occur which will transfer ALL coreadm
+  * configuration information from the repository to the kernel.
++ *
++ * If the service isn't online after the update, resync SMF configuration
++ * with current kernel configuration.
+  */
+ static int
+ do_modify(boolean_t method)
+ {
++	char *statestr = NULL;
+ 	char gcontentstr[PRCONTENTBUFSZ];
+ 	char icontentstr[PRCONTENTBUFSZ];
+ 	scf_propvec_t *prop;
+ 	scf_propvec_t properties[MAX_PROPS + 1];
+ 	int count = 0;
++	int state = -1;
++	int ret;
++	struct timespec ts;
++	hrtime_t deadline;
+ 
+-	if (!method && !is_online(COREADM_INST_FMRI)) {
+-		(void) fprintf(stderr,
+-		    gettext("%s: coreadm service not online\n"), command);
++	if (glob_pattern != NULL && glob_pattern[0] != '/') {
++		(void) fprintf(stderr, gettext(
++		    "%s: global core file pattern must start with '/'\n"),
++		    command);
++		return (E_ERROR);
++	}
++
++	if (!get_state(COREADM_INST_FMRI, &state, &statestr))
+ 		return (E_ERROR);
++
++	if (!method) {
++		if (state == ST_OTHER) {
++			(void) fprintf(stderr,
++			    gettext("%s: coreadm service in %s state\n"),
++			    command, statestr);
++			free(statestr);
++			return (E_ERROR);
++		}
+ 	}
++	free(statestr);
++	statestr = NULL;
+ 
+ 	if (glob_pattern != NULL)
+ 		addprop(properties, MAX_PROPS, count++, &prop_gpattern,
+@@ -437,9 +445,10 @@ do_modify(boolean_t method)
+ 		    icontentstr);
+ 	}
+ 
+-	for (prop = prop_option; prop->pv_prop != NULL; prop++)
++	for (prop = prop_option; prop->pv_prop != NULL; prop++) {
+ 		if ((alloptions & prop->pv_aux) != 0)
+ 			addprop(properties, MAX_PROPS, count++, prop, &options);
++	}
+ 
+ 	properties[count].pv_prop = NULL;
+ 
+@@ -448,7 +457,7 @@ do_modify(boolean_t method)
+ 	    &prop) == SCF_FAILED) {
+ 		if (prop != NULL) {
+ 			(void) fprintf(stderr, gettext(
+-			    "%s: Unable to write property '%s': %s"), command,
++			    "%s: Unable to write property '%s': %s\n"), command,
+ 			    prop->pv_prop, scf_strerror(scf_error()));
+ 		} else {
+ 			(void) fprintf(stderr, gettext(
+@@ -458,15 +467,94 @@ do_modify(boolean_t method)
+ 		return (E_ERROR);
+ 	}
+ 
+-	if (smf_refresh_instance(COREADM_INST_FMRI) != 0) {
++	/*
++ 	 * First time through is to set the passed in values; the second
++ 	 * time (if it occurs) is just to resynchronize the state.  If that
++ 	 * fails, there's anything else to try
++ 	 */
++	ret = E_SUCCESS;
++	for (count = 0; count < 2; count++) {
++		if (smf_refresh_instance(COREADM_INST_FMRI) != 0) {
++			(void) fprintf(stderr,
++			    gettext("%s: Unable to refresh %s: %s\n"
++			    "Configuration stored but not made active.\n"),
++			    command, COREADM_INST_FMRI,
++			    scf_strerror(scf_error()));
++			return (E_ERROR);
++		}
++
++		if (state == ST_MAINT &&
++		    smf_restore_instance(COREADM_INST_FMRI) != 0) {
++			(void) fprintf(stderr,
++			    gettext("%s: unable to clear %s: %s\n"),
++			    command, COREADM_INST_FMRI,
++			    scf_strerror(scf_error()));
++			return (E_ERROR);
++		}
++
++		deadline = gethrtime() + MSEC2NSEC(REFRESH_TIMEOUT);
++		ts.tv_sec = MSEC2NSEC(REFRESH_TIMEOUT) / NANOSEC;
++		ts.tv_nsec = MSEC2NSEC(REFRESH_TIMEOUT) % NANOSEC;
++
++		do {
++			(void) nanosleep(&ts, NULL);
++			if (!get_state(COREADM_INST_FMRI, &state, NULL))
++				return (E_ERROR);
++		} while (gethrtime() < deadline && state != ST_ONLINE);
++
++		if (state == ST_ONLINE)
++			return (ret);
++
++		if (state != ST_MAINT) {
++			(void) fprintf(stderr, gettext(
++			    "%s: Unable to online %s\n"),
++			    command, COREADM_INST_FMRI);
++			return (E_ERROR);
++		}
++
+ 		(void) fprintf(stderr,
+-		    gettext("%s: Unable to refresh %s: %s\n"
+-		    "Configuration stored but not made active.\n"),
+-		    command, COREADM_INST_FMRI, scf_strerror(scf_error()));
+-		return (E_ERROR);
++		    gettext("%s: %s is in maintenance after update; resetting "
++		    "configuration\n"),
++		    command, COREADM_INST_FMRI);
++
++		/*
++ 		 * If setting the intended value fails, try to restore
++ 		 * the SMF configuration to match the kernel configuration,
++ 		 * but should still return an error even if it was successful
++ 		 * in resetting the SMF configuration.
++ 		 */
++		ret = E_ERROR;
++		(void) do_update(B_TRUE);
+ 	}
+ 
+-	return (E_SUCCESS);
++	return (E_ERROR);
++}
++
++static boolean_t
++read_kernel(void)
++{
++	if ((options = core_get_options()) == -1) {
++		perror("core_get_options()");
++		return (B_FALSE);
++	}
++	if (core_get_global_path(gpattern, sizeof (gpattern)) != 0) {
++		perror("core_get_global_path()");
++		return (B_FALSE);
++	}
++	if (core_get_default_path(ipattern, sizeof (ipattern)) != 0) {
++		perror("core_get_default_path()");
++		return (B_FALSE);
++	}
++	if (core_get_global_content(&glob_content) != 0) {
++		perror("core_get_global_content()");
++		return (B_FALSE);
++	}
++	if (core_get_default_content(&init_content) != 0) {
++		perror("core_get_default_content()");
++		return (B_FALSE);
++	}
++
++	return (B_TRUE);
+ }
+ 
+ static const char *
+@@ -605,12 +693,12 @@ read_legacy(void)
+ 
+ /*
+  * Loads and applies the coreadm configuration stored in the default
+- * coreadm instance.  As this option is (only) used from within an SMF
++ * coreadm instance.  As this option is used from within an SMF
+  * service method, this function must return an SMF_EXIT_* exit status
+  * to its caller.
+  */
+ static int
+-do_update(void)
++do_update(boolean_t from_kernel)
+ {
+ 	char		*gcstr, *icstr;
+ 	scf_propvec_t	properties[MAX_PROPS + 1];
+@@ -618,41 +706,50 @@ do_update(void)
+ 	int		count = 0;
+ 	const char	*errstr;
+ 
+-	if (read_legacy()) {
+-		if ((errstr = write_kernel()) != NULL)
+-			goto error;
+-
+-		if (do_modify(B_TRUE) != 0 ||
+-		    rename(PATH_CONFIG, PATH_CONFIG_OLD) != 0) {
+-			(void) fprintf(stderr, gettext(
+-			    "%s: failed to import legacy configuration.\n"),
+-			    command);
+-			return (SMF_EXIT_ERR_FATAL);
++	if (!from_kernel) {
++		if (read_legacy()) {
++			if ((errstr = write_kernel()) != NULL)
++				goto error;
++
++			if (do_modify(B_TRUE) != 0 ||
++			    rename(PATH_CONFIG, PATH_CONFIG_OLD) != 0) {
++				(void) fprintf(stderr, gettext(
++				    "%s: failed to import legacy "
++				    "configuration.\n"),
++				    command);
++				return (SMF_EXIT_ERR_FATAL);
++			}
++			return (SMF_EXIT_OK);
+ 		}
+-		return (SMF_EXIT_OK);
+-	}
+-
+-	addprop(properties, MAX_PROPS, count++, &prop_gpattern, &glob_pattern);
+-	addprop(properties, MAX_PROPS, count++, &prop_gcontent, &gcstr);
+-	addprop(properties, MAX_PROPS, count++, &prop_ipattern, &init_pattern);
+-	addprop(properties, MAX_PROPS, count++, &prop_icontent, &icstr);
+-	for (prop = prop_option; prop->pv_prop != NULL; prop++)
+-		addprop(properties, MAX_PROPS, count++, prop, &options);
+-	properties[count].pv_prop = NULL;
+ 
+-	alloptions = CC_OPTIONS;
+-	if (scf_read_propvec(COREADM_INST_FMRI, CONFIG_PARAMS, B_TRUE,
+-	    properties, &prop) == SCF_FAILED) {
+-		if (prop != NULL) {
+-			(void) fprintf(stderr, gettext(
+-			    "%s: configuration property '%s' not found.\n"),
+-			    command, prop->pv_prop);
+-		} else {
+-			(void) fprintf(stderr, gettext(
+-			    "%s: unable to read configuration: %s\n"),
+-			    command, scf_strerror(scf_error()));
++		addprop(properties, MAX_PROPS, count++, &prop_gpattern,
++		    &glob_pattern);
++		addprop(properties, MAX_PROPS, count++, &prop_gcontent, &gcstr);
++		addprop(properties, MAX_PROPS, count++, &prop_ipattern,
++		    &init_pattern);
++		addprop(properties, MAX_PROPS, count++, &prop_icontent, &icstr);
++		for (prop = prop_option; prop->pv_prop != NULL; prop++)
++			addprop(properties, MAX_PROPS, count++, prop, &options);
++		properties[count].pv_prop = NULL;
++
++		alloptions = CC_OPTIONS;
++		if (scf_read_propvec(COREADM_INST_FMRI, CONFIG_PARAMS, B_TRUE,
++		    properties, &prop) == SCF_FAILED) {
++			if (prop != NULL) {
++				(void) fprintf(stderr, gettext(
++				    "%s: configuration property '%s' not "
++				    "found.\n"),
++				    command, prop->pv_prop);
++			} else {
++				(void) fprintf(stderr, gettext(
++				    "%s: unable to read configuration: %s\n"),
++				    command, scf_strerror(scf_error()));
++			}
++			return (SMF_EXIT_ERR_FATAL);
+ 		}
+-		return (SMF_EXIT_ERR_FATAL);
++	} else {
++		if (!read_kernel())
++			return (SMF_EXIT_ERR_FATAL);
+ 	}
+ 
+ 	(void) proc_str2content(gcstr, &glob_content);
+@@ -672,7 +769,8 @@ error:
+ 	return (SMF_EXIT_ERR_FATAL);
+ }
+ 
+-static int do_legacy()
++static int
++do_legacy()
+ {
+ 	const char *errstr;
+ 
+@@ -685,3 +783,30 @@ static int do_legacy()
+ 
+ 	return (E_SUCCESS);
+ }
++
++static boolean_t
++get_state(const char *fmri, int *statep, char **strp)
++{
++	char *state = NULL;
++
++	if ((state = smf_get_state(fmri)) == NULL) {
++		(void) fprintf(stderr, gettext(
++		    "%s: Unable to get SMF state: %s\n"),
++		    command, scf_strerror(scf_error()));
++		return (B_FALSE);
++	}
++
++	if (strcmp(state, SCF_STATE_STRING_ONLINE) == 0)
++		*statep = ST_ONLINE;
++	else if (strcmp(state, SCF_STATE_STRING_MAINT) == 0)
++		*statep = ST_MAINT;
++	else
++		*statep = ST_OTHER;
++
++	if (strp != NULL)
++		*strp = state;
++	else
++		free(state);
++
++	return (B_TRUE);
++}

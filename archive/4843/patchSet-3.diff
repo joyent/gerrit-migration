@@ -1,0 +1,1433 @@
+commit bdd46917fc7d601c322fd9632065e5b8d29a8a63 (refs/changes/43/4843/3)
+Author: Jason King <jason.king@joyent.com>
+Date:   2018-09-20T04:35:57+00:00 (1 year, 1 month ago)
+    
+    OS-6964 Cloud Firewall not affecting bhyve Instances
+
+diff --git a/usr/src/uts/common/inet/ipf/ip_fil_solaris.c b/usr/src/uts/common/inet/ipf/ip_fil_solaris.c
+index 1d8247e52a..a58fbdd5f3 100644
+--- a/usr/src/uts/common/inet/ipf/ip_fil_solaris.c
++++ b/usr/src/uts/common/inet/ipf/ip_fil_solaris.c
+@@ -22,6 +22,7 @@ static const char rcsid[] = "@(#)$Id: ip_fil_solaris.c,v 2.62.2.19 2005/07/13 21
+ #include <sys/filio.h>
+ #include <sys/systm.h>
+ #include <sys/strsubr.h>
++#include <sys/strsun.h>
+ #include <sys/cred.h>
+ #include <sys/ddi.h>
+ #include <sys/sunddi.h>
+@@ -92,9 +93,19 @@ static	int	ipf_hookvndl3v4_out __P((hook_event_token_t, hook_data_t,
+     void *));
+ static	int	ipf_hookvndl3v6_out __P((hook_event_token_t, hook_data_t,
+     void *));
++
++static	int	ipf_hookviona_in __P((hook_event_token_t, hook_data_t, void *));
++static	int	ipf_hookviona_out __P((hook_event_token_t, hook_data_t,
++    void *));
++
+ extern	int	ipf_geniter __P((ipftoken_t *, ipfgeniter_t *, ipf_stack_t *));
+ extern	int	ipf_frruleiter __P((void *, int, void *, ipf_stack_t *));
+ 
++static int	ipf_hook_protocol_notify __P((hook_notify_cmd_t, void *,
++    const char *, const char *, const char *));
++static int	ipf_hook_instance_notify __P((hook_notify_cmd_t, void *,
++    const char *, const char *, const char *));
++
+ #if SOLARIS2 < 10
+ #if SOLARIS2 >= 7
+ u_int		*ip_ttl_ptr = NULL;
+@@ -171,6 +182,12 @@ char *hook4_vnd_out_gz =	"ipfilter_hookvndl3v4_out_gz";
+ char *hook6_vnd_out =		"ipfilter_hookvndl3v6_out";
+ char *hook6_vnd_out_gz =	"ipfilter_hookvndl3v6_out_gz";
+ 
++/* viona hook names */
++char *hook_viona_in =		"ipfilter_hookviona_in";
++char *hook_viona_in_gz =	"ipfilter_hookviona_in_gz";
++char *hook_viona_out =		"ipfilter_hookviona_out";
++char *hook_viona_out_gz =	"ipfilter_hookviona_out_gz";
++
+ /* ------------------------------------------------------------------------ */
+ /* Function:    ipldetach                                                   */
+ /* Returns:     int - 0 == success, else error.                             */
+@@ -292,8 +309,40 @@ ipf_stack_t *ifs;
+ 		ifs->ifs_ipf_vndl3v6 = NULL;
+ 	}
+ 
++	/*
++	 * Remove notification of viona hooks
++	 */
++	net_instance_notify_unregister(ifs->ifs_netid,
++	    ipf_hook_instance_notify);
++
+ #undef UNDO_HOOK
+ 
++	/*
++	 * Normally, viona will unregister itself before ipldetach() is called,
++	 * so these will be no-ops, but out of caution, we try to make sure
++	 * we've removed any of our references.
++	 */
++	(void) ipf_hook_protocol_notify(HN_UNREGISTER, ifs, Hn_VIONA, NULL,
++	    NH_PHYSICAL_IN);
++	(void) ipf_hook_protocol_notify(HN_UNREGISTER, ifs, Hn_VIONA, NULL,
++	    NH_PHYSICAL_OUT);
++
++	{
++		char netidstr[12]; /* Large enough for INT_MAX + NUL */
++		(void) snprintf(netidstr, sizeof (netidstr), "%d",
++		    ifs->ifs_netid);
++
++		/*
++		 * The notify callbacks expect the netid value passed as a
++		 * string in the third argument.  To prevent confusion if
++		 * traced, we pass the same value the nethook framework would
++		 * pass, even though the callback does not currently use the
++		 * value.
++		 */
++		(void) ipf_hook_instance_notify(HN_UNREGISTER, ifs, netidstr,
++		    NULL, Hn_VIONA);
++	}
++
+ #ifdef	IPFDEBUG
+ 	cmn_err(CE_CONT, "ipldetach()\n");
+ #endif
+@@ -530,6 +579,22 @@ ipf_stack_t *ifs;
+ 	    NH_PHYSICAL_OUT, ifs->ifs_ipfhookvndl3v6_out) == 0);
+ 	if (!ifs->ifs_hookvndl3v6_physical_out)
+ 		goto hookup_failed;
++
++	/*
++	 * VIONA INET hooks.  While the nethook framework allows us to register
++	 * hooks for events that haven't been registered yet, we instead
++	 * register and unregister our hooks in response to notifications
++	 * about the viona hooks from the nethook framework.  This prevents
++	 * problems when the viona module gets unloaded while the ipf module
++	 * does not.  If we do not unregister our hooks after the viona module
++	 * is unloaded, the viona module cannot later re-register them if it
++	 * gets reloaded.  As the ip, vnd, and ipf modules are rarely unloaded
++	 * even on DEBUG kernels, they do not experience this issue.
++	 */
++	if (net_instance_notify_register(id, ipf_hook_instance_notify,
++	    ifs) != 0)
++		goto hookup_failed;
++
+ 	/*
+ 	 * Reacquire ipf_global, now it is safe.
+ 	 */
+@@ -593,6 +658,156 @@ hookup_failed:
+ 	return -1;
+ }
+ 
++/* ------------------------------------------------------------------------ */
++/*
++ * Called whenever a nethook protocol is registered or unregistered.  Currently
++ * only used to add or remove the hooks for viona.
++ *
++ * While the function signature requires returning int, nothing
++ * in usr/src/uts/common/io/hook.c that invokes the callbacks
++ * captures the return value (nor is there currently any documentation
++ * on what return values should be).  For now at least, we'll return 0
++ * on success (or 'not applicable') or an error value.  Even if the
++ * nethook framework doesn't use the return address, it can be observed via
++ * dtrace if needed.
++ */
++static int
++ipf_hook_protocol_notify(hook_notify_cmd_t command, void *arg,
++    const char *name, const char *dummy __unused, const char *he_name)
++{
++	ipf_stack_t *ifs = arg;
++	hook_t **hookpp;
++	char *hook_name, *hint_name;
++	hook_func_t hookfn;
++	boolean_t *hookedp;
++	hook_hint_t hint;
++	boolean_t out;
++	int ret = 0;
++
++	const boolean_t gz = ifs->ifs_gz_controlled;
++
++	/* We currently only care about viona hooks notifications */
++	if (strcmp(name, Hn_VIONA) != 0)
++		return (0);
++
++	if (strcmp(he_name, NH_PHYSICAL_IN) == 0) {
++		out = B_FALSE;
++	} else if (strcmp(he_name, NH_PHYSICAL_OUT) == 0) {
++		out = B_TRUE;
++	} else {
++		/*
++		 * If we've added more hook events to viona, we must add
++		 * the corresponding handling here (even if it's just to
++		 * ignore it) to prevent the firewall from not working as
++		 * intended.
++		 */
++		cmn_err(CE_PANIC, "%s: unhandled hook event %s", __func__,
++		    he_name);
++
++		return (0);
++	}
++
++	if (out) {
++		hookpp = &ifs->ifs_ipfhookviona_out;
++		hookfn = ipf_hookviona_out;
++		hookedp = &ifs->ifs_hookviona_physical_out;
++		name = gz ? hook_viona_out_gz : hook_viona_out;
++		hint = gz ? HH_AFTER : HH_BEFORE;
++		hint_name = gz ? hook_viona_out : hook_viona_out_gz;
++	} else {
++		hookpp = &ifs->ifs_ipfhookviona_in;
++		hookfn = ipf_hookviona_in;
++		hookedp = &ifs->ifs_hookviona_physical_in;
++		name = gz ? hook_viona_in_gz : hook_viona_in;
++		hint = gz ? HH_BEFORE : HH_AFTER;
++		hint_name = gz ? hook_viona_in : hook_viona_in_gz;
++	}
++
++	switch (command) {
++	default:
++	case HN_NONE:
++		break;
++	case HN_REGISTER:
++		HOOK_INIT(*hookpp, hookfn, (char *)name, ifs);
++		(*hookpp)->h_hint = hint;
++		(*hookpp)->h_hintvalue = (uintptr_t)hint_name;
++		ret = net_hook_register(ifs->ifs_ipf_viona,
++		    (char *)he_name, *hookpp);
++		if (ret != 0) {
++			cmn_err(CE_NOTE, "%s: could not register hook "
++			    "(hook family=%s hook=%s) err=%d", __func__,
++			    name, he_name, ret);
++			*hookedp = B_FALSE;
++			return (ret);
++		}
++		*hookedp = B_TRUE;
++		break;
++	case HN_UNREGISTER:
++		if (ifs->ifs_ipf_viona == NULL)
++			break;
++
++		ret = *hookedp ? net_hook_unregister(ifs->ifs_ipf_viona,
++		    (char *)he_name, *hookpp) : 0;
++		if ((ret == 0 || ret == ENXIO)) {
++			if (*hookpp != NULL) {
++				hook_free(*hookpp);
++				*hookpp = NULL;
++			}
++			*hookedp = B_FALSE;
++		}
++		break;
++	}
++
++	return (ret);
++}
++
++/*
++ * Called whenever a new nethook instance is created.  Currently only used
++ * with the Hn_VIONA nethooks.  Similar to ipf_hook_protocol_notify, the out
++ * function signature must return an int, though the result is never used.
++ * We elect to return 0 on success (or not applicable) or a non-zero value
++ * on error.
++ */
++static int
++ipf_hook_instance_notify(hook_notify_cmd_t command, void *arg,
++    const char *netid, const char *dummy __unused, const char *instance)
++{
++	ipf_stack_t *ifs = arg;
++	int ret;
++
++	/* We currently only care about viona hooks */
++	if (strcmp(instance, Hn_VIONA) != 0)
++		return (0);
++
++	switch (command) {
++	case HN_NONE:
++	default:
++		return (0);
++	case HN_REGISTER:
++		ifs->ifs_ipf_viona = net_protocol_lookup(ifs->ifs_netid,
++		    NHF_VIONA);
++
++		/* XXX: Better return value? */
++		if (ifs->ifs_ipf_viona == NULL)
++			return (EPROTONOSUPPORT);
++
++		ret = net_protocol_notify_register(ifs->ifs_ipf_viona,
++		    ipf_hook_protocol_notify, ifs);
++		VERIFY(ret == 0 || ret == ESHUTDOWN);
++		break;
++	case HN_UNREGISTER:
++		if (ifs->ifs_ipf_viona == NULL)
++			break;
++		VERIFY0(net_protocol_notify_unregister(ifs->ifs_ipf_viona,
++		    ipf_hook_protocol_notify));
++		VERIFY0(net_protocol_release(ifs->ifs_ipf_viona));
++		ifs->ifs_ipf_viona = NULL;
++		break;
++	}
++
++	return (ret);
++}
++
+ static	int	fr_setipfloopback(set, ifs)
+ int set;
+ ipf_stack_t *ifs;
+@@ -2167,6 +2382,128 @@ int ipf_hookvndl3v6_out(hook_event_token_t token, hook_data_t info, void *arg)
+ 	return ipf_hook6_out(token, info, arg);
+ }
+ 
++/* Static constants used by ipf_hook_ether */
++static uint8_t ipf_eth_bcast_addr[ETHERADDRL] = {
++	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
++};
++static uint8_t ipf_eth_ipv4_mcast[3] = { 0x01, 0x00, 0x5E };
++static uint8_t ipf_eth_ipv6_mcast[2] = { 0x33, 0x33 };
++
++/* ------------------------------------------------------------------------ */
++/* Function:	ipf_hook_ether                                              */
++/* Returns:	int - 0 == packet ok, else problem, free packet if not done */
++/* Parameters:	token(I)     - pointer to event                             */
++/*              info(I)      - pointer to hook information for firewalling  */
++/*                                                                          */
++/* The ipf_hook_ether hook is currently private to illumos.  It represents  */
++/* a layer 2 datapath generally used by virtual machines.  Currently the    */
++/* hook is only used by the viona driver to pass along L2 frames for        */
++/* inspection.  It requires that the L2 ethernet header is contained within */
++/* a single dblk_t (however layers above the L2 header have no restrctions  */
++/* in ipf).  ipf does not currently support filtering on L2 fields (e.g.    */
++/* filtering on a MAC address or ethertype), however virtual machines do    */
++/* not have native IP stack instances where ipf traditionally hooks in.     */
++/* Instead this entry point is used to determine if the packet is unicast,  */
++/* broadcast, or multicast. The IPv4 or IPv6 packet is then passed to the   */
++/* traditional ip hooks for filtering.  Non IPv4 or non IPv6 packets are    */
++/* not subject to examination.                                              */
++/* ------------------------------------------------------------------------ */
++int ipf_hook_ether(hook_event_token_t token, hook_data_t info, void *arg,
++    boolean_t out)
++{
++	struct ether_header *ethp;
++	hook_pkt_event_t *hpe = (hook_pkt_event_t *)info;
++	mblk_t *mp;
++	size_t offset, len;
++	uint16_t etype;
++	boolean_t v6;
++
++	/*
++	 * viona will only pass us mblks with the L2 header contained in a
++	 * single data block.
++	 *
++	 * XXX: I'm cheating here a bit -- this is only true after rpz's stuff
++	 * is integrated, but will re-verify (and hopefully remove this
++	 * sentence) after that has been done.
++	 */
++	mp = *hpe->hpe_mp;
++	len = MBLKL(mp);
++
++	VERIFY3S(len, >=, sizeof (struct ether_header));
++
++	ethp = (struct ether_header *)mp->b_rptr;
++	if ((etype = ntohs(ethp->ether_type)) == ETHERTYPE_VLAN) {
++		struct ether_vlan_header *evh =
++		    (struct ether_vlan_header *)ethp;
++
++		VERIFY3S(len, >=, sizeof (struct ether_vlan_header));
++
++		etype = ntohs(evh->ether_type);
++		offset = sizeof (*evh);
++	} else {
++		offset = sizeof (*ethp);
++	}
++
++	/*
++	 * ipf only support filtering IPv4 and IPv6.  Ignore other types.
++	 */
++	if (etype == ETHERTYPE_IP)
++		v6 = B_FALSE;
++	else if (etype == ETHERTYPE_IPV6)
++		v6 = B_TRUE;
++	else
++		return (0);
++
++	if (bcmp(ipf_eth_bcast_addr, ethp, ETHERADDRL) == 0)
++		hpe->hpe_flags |= HPE_BROADCAST;
++	else if (bcmp(ipf_eth_ipv4_mcast, ethp,
++	    sizeof (ipf_eth_ipv4_mcast)) == 0)
++		hpe->hpe_flags |= HPE_MULTICAST;
++	else if (bcmp(ipf_eth_ipv6_mcast, ethp,
++	    sizeof (ipf_eth_ipv6_mcast)) == 0)
++		hpe->hpe_flags |= HPE_MULTICAST;
++
++	/* Find the start of the IPv4 or IPv6 header */
++	for (; offset >= len; len = MBLKL(mp)) {
++		offset -= len;
++		mp = mp->b_cont;
++		if (mp == NULL) {
++			freemsg(*hpe->hpe_mp);
++			*hpe->hpe_mp = NULL;
++			return (-1);
++		}
++	}
++	hpe->hpe_mb = mp;
++	hpe->hpe_hdr = mp->b_rptr + offset;
++
++	return (v6 ? ipf_hook6(info, out, 0, arg) :
++	    ipf_hook(info, out, 0, arg));
++}
++
++/* ------------------------------------------------------------------------ */
++/* Function:    ipf_hookviona_{in,out}                                      */
++/* Returns:     int - 0 == packet ok, else problem, free packet if not done */
++/* Parameters:  event(I)     - pointer to event                             */
++/*              info(I)      - pointer to hook information for firewalling  */
++/*                                                                          */
++/* The viona hooks are private hooks to illumos. They represents a layer 2  */
++/* datapath generally used to implement virtual machines.                   */
++/* along L2 packets.                                                        */
++/*                                                                          */
++/* They end up calling the appropriate traditional ip hooks.                */
++/* ------------------------------------------------------------------------ */
++int
++ipf_hookviona_in(hook_event_token_t token, hook_data_t info, void *arg)
++{
++	return (ipf_hook_ether(token, info, arg, B_FALSE));
++}
++
++int
++ipf_hookviona_out(hook_event_token_t token, hook_data_t info, void *arg)
++{
++	return (ipf_hook_ether(token, info, arg, B_TRUE));
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* Function:    ipf_hook4_loop_in                                           */
+ /* Returns:     int - 0 == packet ok, else problem, free packet if not done */
+@@ -2510,7 +2847,7 @@ fr_info_t *fin;
+ #ifdef USE_INET6
+ 	struct in6_addr	tmp_src6;
+ #endif
+-	
++
+ 	ASSERT(fin->fin_p == IPPROTO_TCP);
+ 
+ 	/*
+@@ -2552,7 +2889,7 @@ fr_info_t *fin;
+ #endif
+ 
+ 	if (tcp != NULL) {
+-		/* 
++		/*
+ 		 * Adjust TCP header:
+ 		 *	swap ports,
+ 		 *	set flags,
+diff --git a/usr/src/uts/common/inet/ipf/netinet/ipf_stack.h b/usr/src/uts/common/inet/ipf/netinet/ipf_stack.h
+index 9aa2478c6a..5c156e9c44 100644
+--- a/usr/src/uts/common/inet/ipf/netinet/ipf_stack.h
++++ b/usr/src/uts/common/inet/ipf/netinet/ipf_stack.h
+@@ -6,7 +6,7 @@
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+  *
+- * Copyright 2014 Joyent, Inc.  All rights reserved.
++ * Copyright 2018 Joyent, Inc.  All rights reserved.
+  */
+ 
+ #ifndef	__IPF_STACK_H__
+@@ -87,8 +87,8 @@ struct ipf_stack {
+ #endif
+ 	int			ifs_ipf_locks_done;
+ 
+-	ipftoken_t 		*ifs_ipftokenhead;
+-	ipftoken_t 		**ifs_ipftokentail;
++	ipftoken_t		*ifs_ipftokenhead;
++	ipftoken_t		**ifs_ipftokentail;
+ 
+ 	ipfmutex_t	ifs_ipl_mutex;
+ 	ipfmutex_t	ifs_ipf_authmx;
+@@ -125,11 +125,15 @@ struct ipf_stack {
+ 	hook_t		*ifs_ipfhook6_loop_in;
+ 	hook_t		*ifs_ipfhook6_loop_out;
+ 	hook_t		*ifs_ipfhook6_nicevents;
++
+ 	hook_t		*ifs_ipfhookvndl3v4_in;
+ 	hook_t		*ifs_ipfhookvndl3v6_in;
+ 	hook_t		*ifs_ipfhookvndl3v4_out;
+ 	hook_t		*ifs_ipfhookvndl3v6_out;
+ 
++	hook_t		*ifs_ipfhookviona_in;
++	hook_t		*ifs_ipfhookviona_out;
++
+ 	/* flags to indicate whether hooks are registered. */
+ 	boolean_t	ifs_hook4_physical_in;
+ 	boolean_t	ifs_hook4_physical_out;
+@@ -145,12 +149,15 @@ struct ipf_stack {
+ 	boolean_t	ifs_hookvndl3v6_physical_in;
+ 	boolean_t	ifs_hookvndl3v4_physical_out;
+ 	boolean_t	ifs_hookvndl3v6_physical_out;
++	boolean_t	ifs_hookviona_physical_in;
++	boolean_t	ifs_hookviona_physical_out;
+ 
+ 	int		ifs_ipf_loopback;
+ 	net_handle_t	ifs_ipf_ipv4;
+ 	net_handle_t	ifs_ipf_ipv6;
+ 	net_handle_t	ifs_ipf_vndl3v4;
+ 	net_handle_t	ifs_ipf_vndl3v6;
++	net_handle_t	ifs_ipf_viona;
+ 
+ 	/* ip_auth.c */
+ 	int			ifs_fr_authsize;
+@@ -177,8 +184,8 @@ struct ipf_stack {
+ 	ipfr_t			**ifs_ipfr_nattail;
+ 	ipfr_t			**ifs_ipfr_nattab;
+ 
+-	ipfr_t  		*ifs_ipfr_ipidlist;
+-	ipfr_t  		**ifs_ipfr_ipidtail;
++	ipfr_t			*ifs_ipfr_ipidlist;
++	ipfr_t			**ifs_ipfr_ipidtail;
+ 	ipfr_t			**ifs_ipfr_ipidtab;
+ 
+ 	ipfrstat_t		ifs_ipfr_stats;
+diff --git a/usr/src/uts/common/io/hook.c b/usr/src/uts/common/io/hook.c
+index 2edbe752ce..b32da5a369 100644
+--- a/usr/src/uts/common/io/hook.c
++++ b/usr/src/uts/common/io/hook.c
+@@ -22,7 +22,7 @@
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+  *
+- * Copyright 2013 Joyent, Inc.  All rights reserved.
++ * Copyright 2018 Joyent, Inc.  All rights reserved.
+  * Copyright (c) 2016 by Delphix. All rights reserved.
+  */
+ #include <sys/param.h>
+@@ -1035,7 +1035,7 @@ hook_family_free(hook_family_int_t *hfi, hook_stack_t *hks)
+ 	/* Free container */
+ 	kmem_free(hfi, sizeof (*hfi));
+ 
+-	if (hks->hks_shutdown == 2)
++	if (hks != NULL && hks->hks_shutdown == 2)
+ 		hook_stack_remove(hks);
+ 
+ 	mutex_exit(&hook_stack_lock);
+@@ -1126,7 +1126,7 @@ hook_family_copy(hook_family_t *src)
+  * Parameters:	family(I) - family name string
+  *
+  * Search family list with family name
+- * 	A lock on hfi_lock must be held when called.
++ *	A lock on hfi_lock must be held when called.
+  */
+ static hook_family_int_t *
+ hook_family_find(char *family, hook_stack_t *hks)
+@@ -1651,7 +1651,7 @@ hook_event_copy(hook_event_t *src)
+  *		event(I) - event name string
+  *
+  * Search event list with event name
+- * 	A lock on hfi->hfi_lock must be held when called.
++ *	A lock on hfi->hfi_lock must be held when called.
+  */
+ static hook_event_int_t *
+ hook_event_find(hook_family_int_t *hfi, char *event)
+diff --git a/usr/src/uts/common/sys/hook_impl.h b/usr/src/uts/common/sys/hook_impl.h
+index d8a15f0fe5..f3337bbacf 100644
+--- a/usr/src/uts/common/sys/hook_impl.h
++++ b/usr/src/uts/common/sys/hook_impl.h
+@@ -21,6 +21,7 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -171,7 +172,7 @@ typedef struct hook_family_int {
+ 	cvwaitlock_t			hfi_lock;
+ 	SLIST_ENTRY(hook_family_int)	hfi_entry;
+ 	hook_event_int_head_t		hfi_head;
+-	hook_family_t 			hfi_family;
++	hook_family_t			hfi_family;
+ 	kstat_t				*hfi_kstat;
+ 	struct hook_stack		*hfi_stack;
+ 	hook_notify_head_t		hfi_nhead;
+@@ -209,6 +210,7 @@ typedef struct hook_stack_head hook_stack_head_t;
+ #define	Hn_ARP	"arp"
+ #define	Hn_IPV4	"inet"
+ #define	Hn_IPV6	"inet6"
++#define	Hn_VIONA "viona_inet"
+ 
+ extern int hook_run(hook_family_int_t *, hook_event_token_t, hook_data_t);
+ extern int hook_register(hook_family_int_t *, char *, hook_t *);
+diff --git a/usr/src/uts/common/sys/neti.h b/usr/src/uts/common/sys/neti.h
+index fe7746fc81..92bd5b897d 100644
+--- a/usr/src/uts/common/sys/neti.h
++++ b/usr/src/uts/common/sys/neti.h
+@@ -21,6 +21,8 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ *
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_NETI_H
+@@ -48,6 +50,7 @@ struct msgb;	/* avoiding sys/stream.h here */
+ #define	NHF_ARP		"NHF_ARP"
+ #define	NHF_VND_INET	"NHF_VND_INET"
+ #define	NHF_VND_INET6	"NHF_VND_INET6"
++#define	NHF_VIONA	"NHF_VIONA"
+ 
+ /*
+  * Event identification
+@@ -63,7 +66,7 @@ struct msgb;	/* avoiding sys/stream.h here */
+ /*
+  * Network NIC hardware checksum capability
+  */
+-#define	NET_HCK_NONE   	0x00
++#define	NET_HCK_NONE	0x00
+ #define	NET_HCK_L3_FULL	0x01
+ #define	NET_HCK_L3_PART	0x02
+ #define	NET_HCK_L4_FULL	0x10
+diff --git a/usr/src/uts/i86pc/io/viona/viona.c b/usr/src/uts/i86pc/io/viona/viona.c
+index 3c52457a0b..e680c092b7 100644
+--- a/usr/src/uts/i86pc/io/viona/viona.c
++++ b/usr/src/uts/i86pc/io/viona/viona.c
+@@ -207,6 +207,23 @@
+  * slow path for interrupts.  It will poll(2) the viona handle, receiving
+  * notification when ring events necessitate the assertion of an interrupt.
+  *
++ *
++ * ---------------
++ * Nethook Support
++ * ---------------
++ *
++ * Viona provides four nethook events that consumers (e.g. ipf) can hook into
++ * to intercept packets as they go up or down the stack.  Unfortunately,
++ * the nethook framework does not understand raw packets, so we can only
++ * generate events (in, out) for IPv4 and IPv6 packets.  At driver attach,
++ * we register callbacks with the neti (netinfo) module that will be invoked
++ * for each netstack already present, as well as for any additional netstack
++ * instances created as the system operates.  These callbacks will
++ * register/unregister the hooks with the nethook framework for each
++ * netstack instance.  This registration occurs prior to creating any
++ * viona instances for a given netstack, and the unregistration for a netstack
++ * instance occurs after all viona instances of the netstack instance have
++ * been deleted.
+  */
+ 
+ #include <sys/conf.h>
+@@ -225,12 +242,16 @@
+ #include <sys/pattr.h>
+ #include <sys/dls.h>
+ #include <sys/dlpi.h>
++#include <sys/hook.h>
++#include <sys/hook_event.h>
++#include <sys/list.h>
+ #include <sys/mac_client.h>
+ #include <sys/mac_provider.h>
+ #include <sys/mac_client_priv.h>
++#include <sys/neti.h>
+ #include <sys/vlan.h>
+ #include <inet/ip.h>
+-
++#include <inet/ip6.h>
+ #include <sys/vmm_drv.h>
+ #include <sys/viona_io.h>
+ 
+@@ -344,6 +365,8 @@ struct viona_link;
+ typedef struct viona_link viona_link_t;
+ struct viona_desb;
+ typedef struct viona_desb viona_desb_t;
++struct viona_net;
++typedef struct viona_neti viona_neti_t;
+ 
+ enum viona_ring_state {
+ 	VRS_RESET	= 0x0,	/* just allocated or reset */
+@@ -417,6 +440,9 @@ typedef struct viona_vring {
+ 		uint64_t	rs_rx_pad_short;
+ 		uint64_t	rs_too_short;
+ 		uint64_t	rs_tx_absent;
++
++		uint64_t	rs_rx_hookdrop;
++		uint64_t	rs_tx_hookdrop;
+ 	} vr_stats;
+ } viona_vring_t;
+ 
+@@ -438,6 +464,32 @@ struct viona_link {
+ 	mac_client_handle_t	l_mch;
+ 
+ 	pollhead_t		l_pollhead;
++
++	viona_neti_t		*l_neti;
++};
++
++typedef struct viona_nethook {
++	net_handle_t		vnh_neti;
++	hook_family_t		vnh_family;
++	hook_event_t		vnh_event_in;
++	hook_event_t		vnh_event_out;
++	hook_event_token_t	vnh_token_in;
++	hook_event_token_t	vnh_token_out;
++	boolean_t		vnh_hooked;
++} viona_nethook_t;
++
++struct viona_neti {
++	list_node_t		vni_node;
++
++	netid_t			vni_netid;
++	zoneid_t		vni_zid;
++
++	viona_nethook_t		vni_nethook;
++
++	kmutex_t		vni_lock;	/* Protects remaining members */
++	kcondvar_t		vni_ref_change; /* Protected by vni_lock */
++	u_int			vni_ref;	/* Protected by vni_lock */
++	list_t			vni_dev_list;	/* Protected by vni_lock */
+ };
+ 
+ struct viona_desb {
+@@ -451,6 +503,7 @@ struct viona_desb {
+ typedef struct viona_soft_state {
+ 	kmutex_t		ss_lock;
+ 	viona_link_t		*ss_link;
++	list_node_t		ss_node;
+ } viona_soft_state_t;
+ 
+ typedef struct used_elem {
+@@ -463,6 +516,18 @@ static dev_info_t		*viona_dip;
+ static id_space_t		*viona_minors;
+ static mblk_t			*viona_vlan_pad_mp;
+ 
++/*
++ * Global linked list of viona_neti_t's.  Access is protected by viona_neti_lock
++ */
++static kmutex_t			viona_neti_lock;
++static list_t			viona_neti_list;
++
++/*
++ * viona_neti is allocated and initialized during attach, and read-only
++ * until detach (where it's also freed)
++ */
++static net_instance_t		*viona_neti;
++
+ /*
+  * copy tx mbufs from virtio ring to avoid necessitating a wait for packet
+  * transmission to free resources.
+@@ -504,6 +569,15 @@ static void viona_desb_release(viona_desb_t *);
+ static void viona_rx(void *, mac_resource_handle_t, mblk_t *, boolean_t);
+ static void viona_tx(viona_link_t *, viona_vring_t *);
+ 
++static viona_neti_t *viona_neti_lookup_by_zid(zoneid_t);
++static void viona_neti_rele(viona_neti_t *);
++
++static void *viona_neti_create(const netid_t);
++static void viona_neti_shutdown(const netid_t, void *);
++static void viona_neti_destroy(const netid_t, void *);
++
++static int viona_hook(viona_link_t *, viona_vring_t *, mblk_t **, boolean_t);
++
+ static struct cb_ops viona_cb_ops = {
+ 	viona_open,
+ 	viona_close,
+@@ -652,6 +726,21 @@ viona_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	viona_dip = dip;
+ 	ddi_report_dev(viona_dip);
+ 
++	mutex_init(&viona_neti_lock, NULL, MUTEX_DRIVER, NULL);
++	list_create(&viona_neti_list, sizeof (viona_neti_t),
++	    offsetof(viona_neti_t, vni_node));
++
++	/* This can only fail if NETINFO_VERSION is wrong */
++	viona_neti = net_instance_alloc(NETINFO_VERSION);
++	VERIFY(viona_neti != NULL);
++
++	viona_neti->nin_name = "viona";
++	viona_neti->nin_create = viona_neti_create;
++	viona_neti->nin_shutdown = viona_neti_shutdown;
++	viona_neti->nin_destroy = viona_neti_destroy;
++	/* This can only failed if we've registered outselves multiple times */
++	VERIFY3S(net_instance_register(viona_neti), ==, DDI_SUCCESS);
++
+ 	return (DDI_SUCCESS);
+ }
+ 
+@@ -674,6 +763,14 @@ viona_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+ 	ddi_remove_minor_node(viona_dip, NULL);
+ 	viona_dip = NULL;
+ 
++	/* This can only fail if we've not registered previously */
++	VERIFY3S(net_instance_unregister(viona_neti), ==, DDI_SUCCESS);
++	net_instance_free(viona_neti);
++	viona_neti = NULL;
++
++	list_destroy(&viona_neti_list);
++	mutex_destroy(&viona_neti_lock);
++
+ 	return (DDI_SUCCESS);
+ }
+ 
+@@ -734,6 +831,7 @@ viona_close(dev_t dev, int flag, int otype, cred_t *credp)
+ 	}
+ 
+ 	VERIFY0(viona_ioc_delete(ss, B_TRUE));
++	VERIFY(!list_link_active(&ss->ss_node));
+ 	ddi_soft_state_free(viona_state, minor);
+ 	id_free(viona_minors, minor);
+ 
+@@ -877,6 +975,8 @@ viona_ioc_create(viona_soft_state_t *ss, void *dptr, int md, cred_t *cr)
+ 	int		err = 0;
+ 	file_t		*fp;
+ 	vmm_hold_t	*hold = NULL;
++	viona_neti_t	*nip = NULL;
++	zoneid_t	zid;
+ 
+ 	ASSERT(MUTEX_NOT_HELD(&ss->ss_lock));
+ 
+@@ -884,9 +984,21 @@ viona_ioc_create(viona_soft_state_t *ss, void *dptr, int md, cred_t *cr)
+ 		return (EFAULT);
+ 	}
+ 
++	zid = crgetzoneid(cr);
++	nip = viona_neti_lookup_by_zid(zid);
++	if (nip == NULL) {
++		return (EIO);
++	}
++
++	if (!nip->vni_nethook.vnh_hooked) {
++		viona_neti_rele(nip);
++		return (EIO);
++	}
++
+ 	mutex_enter(&ss->ss_lock);
+ 	if (ss->ss_link != NULL) {
+ 		mutex_exit(&ss->ss_lock);
++		viona_neti_rele(nip);
+ 		return (EEXIST);
+ 	}
+ 
+@@ -918,11 +1030,18 @@ viona_ioc_create(viona_soft_state_t *ss, void *dptr, int md, cred_t *cr)
+ 		goto bail;
+ 	}
+ 
++	link->l_neti = nip;
++
+ 	viona_ring_alloc(link, &link->l_vrings[VIONA_VQ_RX]);
+ 	viona_ring_alloc(link, &link->l_vrings[VIONA_VQ_TX]);
+ 	ss->ss_link = link;
+ 
+ 	mutex_exit(&ss->ss_lock);
++
++	mutex_enter(&nip->vni_lock);
++	list_insert_tail(&nip->vni_dev_list, ss);
++	mutex_exit(&nip->vni_lock);
++
+ 	return (0);
+ 
+ bail:
+@@ -938,6 +1057,7 @@ bail:
+ 	if (hold != NULL) {
+ 		vmm_drv_rele(hold);
+ 	}
++	viona_neti_rele(nip);
+ 
+ 	mutex_exit(&ss->ss_lock);
+ 	return (err);
+@@ -947,6 +1067,7 @@ static int
+ viona_ioc_delete(viona_soft_state_t *ss, boolean_t on_close)
+ {
+ 	viona_link_t *link;
++	viona_neti_t *nip = NULL;
+ 
+ 	mutex_enter(&ss->ss_lock);
+ 	if ((link = ss->ss_link) == NULL) {
+@@ -997,12 +1118,21 @@ viona_ioc_delete(viona_soft_state_t *ss, boolean_t on_close)
+ 		link->l_vm_hold = NULL;
+ 	}
+ 
++	nip = link->l_neti;
++	link->l_neti = NULL;
++
+ 	viona_ring_free(&link->l_vrings[VIONA_VQ_RX]);
+ 	viona_ring_free(&link->l_vrings[VIONA_VQ_TX]);
+ 	pollhead_clean(&link->l_pollhead);
+ 	ss->ss_link = NULL;
+ 	mutex_exit(&ss->ss_lock);
+ 
++	mutex_enter(&nip->vni_lock);
++	list_remove(&nip->vni_dev_list, ss);
++	mutex_exit(&nip->vni_lock);
++
++	viona_neti_rele(nip);
++
+ 	kmem_free(link, sizeof (viona_link_t));
+ 	return (0);
+ }
+@@ -2062,6 +2192,29 @@ viona_rx(void *arg, mac_resource_handle_t mrh, mblk_t *mp, boolean_t loopback)
+ 		mp->b_next = NULL;
+ 		size = msgsize(mp);
+ 
++		/*
++		 * We treat both a 'drop' response and errors the same here
++		 * and put the packet on the drop chain.  As packets may be
++		 * subject to different actions in ipf (which do not all
++		 * return the same set of error values), an error processing
++		 * one packet doesn't mean the next packet will also generate
++		 * an error.
++		 */
++		if (viona_hook(link, ring, &mp, B_FALSE) != 0) {
++			if (mp != NULL) {
++				*mdrop_prevp = mp;
++				mpdrop_prevp = &mp->b_next;
++			} else {
++				/*
++				 * If we're didn't defer freeing mp, update
++				 * the drop count now.
++				 */
++				ndrop++;
++			}
++			mp = next;
++			continue;
++		}
++
+ 		/*
+ 		 * Ethernet frames are expected to be padded out in order to
+ 		 * meet the minimum size.
+@@ -2120,7 +2273,15 @@ viona_rx(void *arg, mac_resource_handle_t mrh, mblk_t *mp, boolean_t loopback)
+ 		}
+ 
+ pad_drop:
+-		if (err != 0) {
++		/*
++		 * While an error during rx processing
++		 * (viona_recv_{merged,plain}) does not free mp on error,
++		 * hook processing might or might not free mp.  Handle either
++		 * scenario -- if mp is not yet free, it is queued up and
++		 * freed after the guest has been notified.  If mp is
++		 * already NULL, just proceed on.
++		 */
++		if (err != 0 && mp != NULL) {
+ 			*mpdrop_prevp = mp;
+ 			mpdrop_prevp = &mp->b_next;
+ 
+@@ -2133,7 +2294,7 @@ pad_drop:
+ 				mp->b_next = next;
+ 				break;
+ 			}
+-		} else {
++		} else if (mp != NULL) {
+ 			/* Chain successful mblks to be freed later */
+ 			*mprx_prevp = mp;
+ 			mprx_prevp = &mp->b_next;
+@@ -2206,6 +2367,10 @@ viona_desb_release(viona_desb_t *dp)
+ 	mutex_exit(&ring->vr_lock);
+ }
+ 
++/*
++ * Get the 8-bit value residing at the given offset and write it into *off.
++ * Returns 0 on success, 1 if offset is out of range.
++ */
+ static int
+ viona_mb_get_uint8(mblk_t *mp, off_t off, uint8_t *out)
+ {
+@@ -2383,6 +2548,7 @@ viona_tx(viona_link_t *link, viona_vring_t *ring)
+ 
+ 		len += iov[i].iov_len;
+ 		mp->b_wptr += iov[i].iov_len;
++
+ 		if (mp_head == NULL) {
+ 			ASSERT(mp_tail == NULL);
+ 			mp_head = mp;
+@@ -2393,6 +2559,27 @@ viona_tx(viona_link_t *link, viona_vring_t *ring)
+ 		mp_tail = mp;
+ 	}
+ 
++	/*
++	 * In case the hook tries to free the packet and set the mblk_t pointer
++	 * to NULL, take a ref on dp (if it's being used) to prevent the
++	 * cleanup from occuring during the call to viona_hook() so the
++	 * viona_desb_t can be reset and recycled.  Also set and pass &mp to
++	 * viona_hook so we don't lose track of mp_head if viona_hook()
++	 * tries to set mp to NULL.
++	 */
++	if (dp != NULL)
++		dp->d_ref++;
++
++	mp = mp_head;
++	if (viona_hook(link, ring, &mp, B_TRUE) != 0) {
++		if (mp != NULL)
++			freemsgchain(mp);
++		goto drop_hook;
++	}
++
++	if (dp != NULL)
++		dp->d_ref--;
++
+ 	/* Request hardware checksumming, if necessary */
+ 	if ((link->l_features & VIRTIO_NET_F_CSUM) != 0 &&
+ 	    (hdr->vrh_flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) != 0) {
+@@ -2446,6 +2633,8 @@ drop_fail:
+ 	 * dropped data to be released to the used ring.
+ 	 */
+ 	freemsgchain(mp_head);
++
++drop_hook:
+ 	len = 0;
+ 	for (uint_t i = 0; i < n; i++) {
+ 		len += iov[i].iov_len;
+@@ -2464,3 +2653,414 @@ drop_fail:
+ 	    uint16_t, cookie);
+ 	viona_tx_done(ring, len, cookie);
+ }
++
++/*
++ * Generate a hook event for the packet in *mpp headed in the direction
++ * indicated by 'out'.  If the packet is accepted, 0 is returned.  If the
++ * packet is rejected, an error is returned.  The hook function may or may not
++ * alter or even free *mpp.  The caller is expected to deal with either
++ * situation.
++ */
++static int
++viona_hook(viona_link_t *link, viona_vring_t *ring, mblk_t **mpp, boolean_t out)
++{
++	viona_neti_t *nip = link->l_neti;
++	viona_nethook_t *vnh = &nip->vni_nethook;
++	hook_pkt_event_t info;
++	hook_event_t he;
++	hook_event_token_t het;
++	int ret;
++
++	he = out ? vnh->vnh_event_out : vnh->vnh_event_in;
++	het = out ? vnh->vnh_token_out : vnh->vnh_token_in;
++
++	if (!he.he_interested)
++		return (0);
++
++	info.hpe_protocol = vnh->vnh_neti;
++	info.hpe_ifp = (phy_if_t)link;
++	info.hpe_ofp = (phy_if_t)link;
++	info.hpe_mp = mpp;
++	info.hpe_flags = 0;
++
++	ret = hook_run(vnh->vnh_neti->netd_hooks, het, (hook_data_t)&info);
++	if (ret == 0)
++		return (0);
++
++	if (out) {
++		VIONA_PROBE3(tx_hook_drop, viona_vring_t *, ring,
++		    mblk_t *, *mpp, int, ret);
++		VIONA_RING_STAT_INCR(ring, tx_hookdrop);
++	} else {
++		VIONA_PROBE3(rx_hook_drop, viona_vring_t *, ring,
++		    mblk_t *, *mpp, int, ret);
++		VIONA_RING_STAT_INCR(ring, rx_hookdrop);
++	}
++	return (ret);
++}
++
++/*
++ * netinfo stubs - required by the nethook framework, but otherwise unused
++ *
++ * Currently, all ipf rules are applied against all interfaces in a given
++ * netstack (e.g. all interfaces in a zone).  In the future if we want to
++ * support being able to apply different rules to different interfaces, I
++ * believe we would need to implement some of these stubs to map an interface
++ * name in a rule (e.g. 'net0', back to an index or viona_link_t);
++ */
++static int
++viona_neti_getifname(net_handle_t neti __unused, phy_if_t phy __unused,
++    char *buf __unused, const size_t len __unused)
++{
++	return (-1);
++}
++
++static int
++viona_neti_getmtu(net_handle_t neti __unused, phy_if_t phy __unused,
++    lif_if_t ifdata __unused)
++{
++	return (-1);
++}
++
++static int
++viona_neti_getptmue(net_handle_t neti __unused)
++{
++	return (-1);
++}
++
++static int
++viona_neti_getlifaddr(net_handle_t neti __unused, phy_if_t phy __unused,
++    lif_if_t ifdata __unused, size_t nelem __unused,
++    net_ifaddr_t type[] __unused, void *storage __unused)
++{
++	return (-1);
++}
++
++static int
++viona_neti_getlifzone(net_handle_t neti __unused, phy_if_t phy __unused,
++    lif_if_t ifdata __unused, zoneid_t *zid __unused)
++{
++	return (-1);
++}
++
++static int
++viona_neti_getlifflags(net_handle_t neti __unused, phy_if_t phy __unused,
++    lif_if_t ifdata __unused, uint64_t *flags __unused)
++{
++	return (-1);
++}
++
++static phy_if_t
++viona_neti_phygetnext(net_handle_t neti __unused, phy_if_t phy __unused)
++{
++	return ((phy_if_t)-1);
++}
++
++static phy_if_t
++viona_neti_phylookup(net_handle_t neti __unused, const char *name __unused)
++{
++	return ((phy_if_t)-1);
++}
++
++static lif_if_t
++viona_neti_lifgetnext(net_handle_t neti __unused, phy_if_t phy __unused,
++    lif_if_t ifdata __unused)
++{
++	return (-1);
++}
++
++static int
++viona_neti_inject(net_handle_t neti __unused, inject_t style __unused,
++    net_inject_t *packet __unused)
++{
++	return (-1);
++}
++
++static phy_if_t
++viona_neti_route(net_handle_t neti __unused, struct sockaddr *address __unused,
++    struct sockaddr *next __unused)
++{
++	return ((phy_if_t)-1);
++}
++
++static int
++viona_neti_ispchksum(net_handle_t neti __unused, mblk_t *mp __unused)
++{
++	return (-1);
++}
++
++static int
++viona_neti_isvchksum(net_handle_t neti __unused, mblk_t *mp __unused)
++{
++	return (-1);
++}
++
++static net_protocol_t viona_netinfo = {
++	NETINFO_VERSION,
++	NHF_VIONA,
++	viona_neti_getifname,
++	viona_neti_getmtu,
++	viona_neti_getptmue,
++	viona_neti_getlifaddr,
++	viona_neti_getlifzone,
++	viona_neti_getlifflags,
++	viona_neti_phygetnext,
++	viona_neti_phylookup,
++	viona_neti_lifgetnext,
++	viona_neti_inject,
++	viona_neti_route,
++	viona_neti_ispchksum,
++	viona_neti_isvchksum
++};
++
++/*
++ * Each entry corresponds to a step in the nethook setup (in order of setup).
++ * Used to track our progress in case we fail mid-setup.
++ */
++typedef enum viona_nh_init_progress {
++	VNH_INIT_NONE = 0,
++	VNH_INIT_PROTO,
++	VNH_INIT_FAMILY,
++	VNH_INIT_EVENT_IN,
++	VNH_INIT_EVENT_OUT,
++} viona_nh_init_progress_t;
++
++/*
++ * Create/register our nethooks
++ */
++static int
++viona_nethook_init(netid_t nid, viona_nethook_t *vnh, char *nh_name,
++    net_protocol_t *netip)
++{
++	/*
++	 * Track how far we get during setup, used if we fail mid-way to
++	 * reverse the order of operations and tear down cleanly.  Each
++	 * step is commented with its corresponding step number.
++	 */
++	viona_nh_init_progress_t progress = VNH_INIT_NONE;
++	int ret;
++
++	if ((vnh->vnh_neti = net_protocol_register(nid, netip)) == NULL) {
++		cmn_err(CE_NOTE, "%s: net_protocol_register failed "
++		    "(netid=%d name=%s)", __func__, nid, nh_name);
++		goto fail;
++	}
++	progress++;
++
++	HOOK_FAMILY_INIT(&vnh->vnh_family, nh_name);
++	if ((ret = net_family_register(vnh->vnh_neti, &vnh->vnh_family)) != 0) {
++		cmn_err(CE_NOTE, "%s: net_family_register failed "
++		    "(netid=%d name=%s err=%d)", __func__,
++		    nid, nh_name, ret);
++		goto fail;
++	}
++	progress++;
++
++	HOOK_EVENT_INIT(&vnh->vnh_event_in, NH_PHYSICAL_IN);
++	if ((vnh->vnh_token_in = net_event_register(vnh->vnh_neti,
++	    &vnh->vnh_event_in)) == NULL) {
++		cmn_err(CE_NOTE, "%s: net_event_register %s failed "
++		    "(netid=%d name=%s)", __func__, NH_PHYSICAL_IN, nid,
++		    nh_name);
++		goto fail;
++	}
++	progress++;
++
++	HOOK_EVENT_INIT(&vnh->vnh_event_out, NH_PHYSICAL_OUT);
++	if ((vnh->vnh_token_out = net_event_register(vnh->vnh_neti,
++	    &vnh->vnh_event_out)) == NULL) {
++		cmn_err(CE_NOTE, "%s: net_event_register %s failed "
++		    "(netid=%d name=%s)", __func__, NH_PHYSICAL_OUT, nid,
++		    nh_name);
++		goto fail;
++	}
++	return (0);
++
++fail:
++	switch (progress) {
++	default:
++		/*
++		 * If more netstack/nethook setup needs to happen, we should
++		 * add a corresponding error teardown case.  If it is missing,
++		 * it is a code error.
++		 */
++		cmn_err(CE_PANIC, "%s: Unhandled setup failure", __func__);
++		break;
++	case VNH_INIT_EVENT_OUT:
++		VERIFY0(net_event_shutdown(vnh->vnh_neti, &vnh->vnh_event_out));
++		VERIFY0(net_event_unregister(vnh->vnh_neti,
++		    &vnh->vnh_event_out));
++		vnh->vnh_token_out = NULL;
++		/* FALLTHRU */
++	case VNH_INIT_EVENT_IN:
++		VERIFY0(net_event_shutdown(vnh->vnh_neti, &vnh->vnh_event_in));
++		VERIFY0(net_event_unregister(vnh->vnh_neti,
++		    &vnh->vnh_event_in));
++		vnh->vnh_token_in = NULL;
++		/* FALLTHRU */
++	case VNH_INIT_FAMILY:
++		VERIFY0(net_family_shutdown(vnh->vnh_neti, &vnh->vnh_family));
++		VERIFY0(net_family_unregister(vnh->vnh_neti, &vnh->vnh_family));
++		/* FALLTHRU */
++	case VNH_INIT_PROTO:
++		VERIFY0(net_protocol_unregister(vnh->vnh_neti));
++		vnh->vnh_neti = NULL;
++		/* FALLTHRU */
++	case VNH_INIT_NONE:
++		break;
++	}
++	return (1);
++}
++
++/*
++ * Shutdown the nethooks for a protocol family.  This triggers notification
++ * callbacks to anything that has registered interest to allow hook consumers
++ * to unhook prior to the removal of the hooks as well as makes them unavailable
++ * to any future consumers as the first step of removal.
++ */
++static void
++viona_nethook_shutdown(viona_nethook_t *vnh)
++{
++	VERIFY0(net_event_shutdown(vnh->vnh_neti, &vnh->vnh_event_out));
++	VERIFY0(net_event_shutdown(vnh->vnh_neti, &vnh->vnh_event_in));
++	VERIFY0(net_family_shutdown(vnh->vnh_neti, &vnh->vnh_family));
++}
++
++/*
++ * Remove the nethooks for a protocol family.
++ */
++static void
++viona_nethook_fini(viona_nethook_t *vnh)
++{
++	VERIFY0(net_event_unregister(vnh->vnh_neti, &vnh->vnh_event_out));
++	VERIFY0(net_event_unregister(vnh->vnh_neti, &vnh->vnh_event_in));
++	VERIFY0(net_family_unregister(vnh->vnh_neti, &vnh->vnh_family));
++	VERIFY0(net_protocol_unregister(vnh->vnh_neti));
++	vnh->vnh_neti = NULL;
++}
++
++/*
++ * Callback invoked by the neti module.  This creates/registers our hooks
++ * {IPv4,IPv6}{in,out} with the nethook framework so they are available to
++ * interested consumers (e.g. ipf).
++ *
++ * During attach, viona_neti_create is called once for every netstack
++ * present on the system at the time of attach.  Thereafter, it is called
++ * during the creation of additional netstack instances (i.e. zone boot).  As a
++ * result, the viona_neti_t that is created during this call always occurs
++ * prior to any viona instances that will use it to send hook events.
++ *
++ * It should never return NULL.  If we cannot register our hooks, we do not
++ * set vnh_hooked of the respective protocol family, which will prevent the
++ * creation of any viona instances on this netstack (see viona_ioc_create).
++ * This can only occur if after a shutdown event (which means destruction is
++ * imminent) we are trying to create a new instance.
++ */
++static void *
++viona_neti_create(const netid_t netid)
++{
++	viona_neti_t *nip;
++
++	VERIFY(netid != -1);
++
++	nip = kmem_zalloc(sizeof (*nip), KM_SLEEP);
++	nip->vni_netid = netid;
++	nip->vni_zid = net_getzoneidbynetid(netid);
++	mutex_init(&nip->vni_lock, NULL, MUTEX_DRIVER, NULL);
++	list_create(&nip->vni_dev_list, sizeof (viona_soft_state_t),
++	    offsetof(viona_soft_state_t, ss_node));
++
++	if (viona_nethook_init(netid, &nip->vni_nethook, Hn_VIONA,
++	    &viona_netinfo) == 0)
++		nip->vni_nethook.vnh_hooked = B_TRUE;
++
++	mutex_enter(&viona_neti_lock);
++	list_insert_tail(&viona_neti_list, nip);
++	mutex_exit(&viona_neti_lock);
++
++	return (nip);
++}
++
++/*
++ * Called during netstack teardown by the neti module.  During teardown, all
++ * the shutdown callbacks are invoked, allowing consumers to release any holds
++ * and otherwise quiesce themselves prior to destruction, followed by the
++ * actual destruction callbacks.
++ */
++static void
++viona_neti_shutdown(netid_t nid, void *arg)
++{
++	viona_neti_t *nip = arg;
++
++	ASSERT(nip != NULL);
++	VERIFY(nid == nip->vni_netid);
++
++	mutex_enter(&viona_neti_lock);
++	list_remove(&viona_neti_list, nip);
++	mutex_exit(&viona_neti_lock);
++
++	if (nip->vni_nethook.vnh_hooked)
++		viona_nethook_shutdown(&nip->vni_nethook);
++}
++
++/*
++ * Called during netstack teardown by the neti module.  Destroys the viona
++ * netinst data.  This is invoked after all the netstack and neti shutdown
++ * callbacks have been invoked.
++ */
++static void
++viona_neti_destroy(netid_t nid, void *arg)
++{
++	viona_neti_t *nip = arg;
++
++	ASSERT(nip != NULL);
++	VERIFY(nid == nip->vni_netid);
++
++	mutex_enter(&nip->vni_lock);
++	while (nip->vni_ref != 0)
++		cv_wait(&nip->vni_ref_change, &nip->vni_lock);
++	mutex_exit(&nip->vni_lock);
++
++	VERIFY(!list_link_active(&nip->vni_node));
++
++	if (nip->vni_nethook.vnh_hooked)
++		viona_nethook_fini(&nip->vni_nethook);
++
++	mutex_destroy(&nip->vni_lock);
++	list_destroy(&nip->vni_dev_list);
++	kmem_free(nip, sizeof (*nip));
++}
++
++/*
++ * Find the viona netinst data by zone id.  This is only used during
++ * viona instance creation (and thus is only called by a zone is running).
++ */
++static viona_neti_t *
++viona_neti_lookup_by_zid(zoneid_t zid)
++{
++	viona_neti_t *nip;
++
++	mutex_enter(&viona_neti_lock);
++	for (nip = list_head(&viona_neti_list); nip != NULL;
++	    nip = list_next(&viona_neti_list, nip)) {
++		if (nip->vni_zid == zid) {
++			mutex_enter(&nip->vni_lock);
++			nip->vni_ref++;
++			mutex_exit(&nip->vni_lock);
++			mutex_exit(&viona_neti_lock);
++			return (nip);
++		}
++	}
++	mutex_exit(&viona_neti_lock);
++	return (NULL);
++}
++
++static void
++viona_neti_rele(viona_neti_t *nip)
++{
++	mutex_enter(&nip->vni_lock);
++	VERIFY3S(nip->vni_ref, >, 0);
++	nip->vni_ref--;
++	mutex_exit(&nip->vni_lock);
++	cv_broadcast(&nip->vni_ref_change);
++}
+diff --git a/usr/src/uts/i86pc/viona/Makefile b/usr/src/uts/i86pc/viona/Makefile
+index cbf0be9539..a1ebcd4f8b 100644
+--- a/usr/src/uts/i86pc/viona/Makefile
++++ b/usr/src/uts/i86pc/viona/Makefile
+@@ -53,7 +53,8 @@ ALL_BUILDS	= $(ALL_BUILDSONLY64)
+ DEF_BUILDS	= $(DEF_BUILDSONLY64)
+ 
+ CFLAGS		+= $(CCVERBOSE)
+-LDFLAGS		+= -dy -Ndrv/dld -Nmisc/mac -Nmisc/dls -Ndrv/vmm
++LDFLAGS		+= -dy -Ndrv/dld -Nmisc/mac -Nmisc/dls -Ndrv/vmm -Nmisc/neti
++LDFLAGS		+= -Nmisc/hook
+ 
+ #
+ #	Default build targets.
+diff --git a/usr/src/uts/intel/ipf/ipf.global-objs.debug64 b/usr/src/uts/intel/ipf/ipf.global-objs.debug64
+index 0af6da41fa..5ebc7eed2b 100644
+--- a/usr/src/uts/intel/ipf/ipf.global-objs.debug64
++++ b/usr/src/uts/intel/ipf/ipf.global-objs.debug64
+@@ -22,13 +22,17 @@
+ # Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+ # Use is subject to license terms.
+ #
+-# Copyright 2013 Joyent, Inc. All rights reserved
++# Copyright 2018 Joyent, Inc. All rights reserved
+ #
+ 
+ fr_availfuncs
+ fr_features
+ fr_objbytes
+ hdrsizes
++hook_viona_in
++hook_viona_in_gz
++hook_viona_out
++hook_viona_out_gz
+ hook4_in
+ hook4_in_gz
+ hook4_loop_in
+@@ -66,6 +70,9 @@ ip6exthdr
+ ipf_cb_ops
+ ipf_dev_info
+ ipf_devfiles
++ipf_eth_bcast_addr
++ipf_eth_ipv4_mcast
++ipf_eth_ipv6_mcast
+ ipf_kstat_tmp
+ ipf_minor
+ ipf_ops

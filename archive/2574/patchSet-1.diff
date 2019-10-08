@@ -1,0 +1,299 @@
+commit 6438ed65d606936c9793e9c6e75b160bdc4a0efd (refs/changes/74/2574/1)
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2017-09-14T22:23:39+00:00 (2 years, 1 month ago)
+    
+    OS-6344 elide squeue wake-ups when prudent
+
+diff --git a/usr/src/uts/common/inet/squeue.c b/usr/src/uts/common/inet/squeue.c
+index 9261c570ac..33bc43ca9a 100644
+--- a/usr/src/uts/common/inet/squeue.c
++++ b/usr/src/uts/common/inet/squeue.c
+@@ -140,6 +140,7 @@ static void squeue_drain(squeue_t *, uint_t, hrtime_t);
+ static void squeue_worker(squeue_t *sqp);
+ static void squeue_polling_thread(squeue_t *sqp);
+ static void squeue_worker_wakeup(squeue_t *sqp);
++static void squeue_try_drain_one(squeue_t *, conn_t *);
+ 
+ kmem_cache_t *squeue_cache;
+ 
+@@ -433,6 +434,15 @@ squeue_enter(squeue_t *sqp, mblk_t *mp, mblk_t *tail, uint32_t cnt,
+ 			sqp->sq_run = NULL;
+ 			if (sqp->sq_first == NULL ||
+ 			    process_flag == SQ_NODRAIN) {
++				/*
++				 * Even if SQ_NODRAIN was specified, it may
++				 * still be best to process a single queued
++				 * item if it matches the active connection.
++				 */
++				if (sqp->sq_first != NULL && sqp->sq_isip) {
++					squeue_try_drain_one(sqp, connp);
++				}
++
+ 				/*
+ 				 * If work or control actions are pending, wake
+ 				 * up the worker thread.
+@@ -1406,33 +1416,106 @@ again:
+ 	}
+ }
+ 
++/*
++ * If possible, attempt to immediately process a single queued request, should
++ * it match the supplied conn_t reference.  This is primarily intended to elide
++ * squeue worker thread wake-ups during local TCP connect() or close()
++ * operations where the response is placed on the squeue during processing.
++ */
++static void
++squeue_try_drain_one(squeue_t *sqp, conn_t *compare_conn)
++{
++	mblk_t *next, *mp = sqp->sq_first;
++	conn_t *connp;
++	sqproc_t proc = (sqproc_t)mp->b_queue;
++	ip_recv_attr_t iras, *ira = NULL;
++
++	ASSERT(MUTEX_HELD(&sqp->sq_lock));
++	ASSERT((sqp->sq_state & SQS_PROC) == 0);
++	ASSERT(sqp->sq_run == NULL);
++	ASSERT(sqp->sq_isip);
++	VERIFY(mp != NULL);
++
++	/*
++	 * There is no guarantee that compare_conn references a valid object at
++	 * this time, so under no circumstance may it be deferenced unless it
++	 * matches the squeue entry.
++	 */
++	connp = (conn_t *)mp->b_prev;
++	if (connp != compare_conn) {
++		return;
++	}
++
++	next = mp->b_next;
++	proc = (sqproc_t)mp->b_queue;
++
++	ASSERT(proc != NULL);
++	ASSERT(sqp->sq_count > 0);
++
++	/* Dequeue item from squeue */
++	if (next == NULL) {
++		sqp->sq_first = NULL;
++		sqp->sq_last = NULL;
++	} else {
++		sqp->sq_first = next;
++	}
++	sqp->sq_count--;
++
++	sqp->sq_state |= SQS_PROC;
++	sqp->sq_run = curthread;
++	mutex_exit(&sqp->sq_lock);
++
++	/* Prep mblk_t and retrieve ira if needed */
++	mp->b_prev = NULL;
++	mp->b_queue = NULL;
++	mp->b_next = NULL;
++	if (ip_recv_attr_is_mblk(mp)) {
++		mblk_t	*attrmp = mp;
++
++		ASSERT(attrmp->b_cont != NULL);
++
++		mp = attrmp->b_cont;
++		attrmp->b_cont = NULL;
++
++		ASSERT(mp->b_queue == NULL);
++		ASSERT(mp->b_prev == NULL);
++
++		if (!ip_recv_attr_from_mblk(attrmp, &iras)) {
++			/* ill_t or ip_stack_t disappeared */
++			ip_drop_input("ip_recv_attr_from_mblk", mp, NULL);
++			ira_cleanup(&iras, B_TRUE);
++			CONN_DEC_REF(connp);
++			goto done;
++		}
++		ira = &iras;
++	}
++
++	SQUEUE_DBG_SET(sqp, mp, proc, connp, mp->b_tag);
++	connp->conn_on_sqp = B_TRUE;
++	DTRACE_PROBE3(squeue__proc__start, squeue_t *, sqp, mblk_t *, mp,
++	    conn_t *, connp);
++	(*proc)(connp, mp, sqp, ira);
++	DTRACE_PROBE2(squeue__proc__end, squeue_t *, sqp, conn_t *, connp);
++	connp->conn_on_sqp = B_FALSE;
++	CONN_DEC_REF(connp);
++	SQUEUE_DBG_CLEAR(sqp);
++
++done:
++	mutex_enter(&sqp->sq_lock);
++	sqp->sq_state &= ~(SQS_PROC);
++	sqp->sq_run = NULL;
++}
++
+ void
+-squeue_synch_exit(conn_t *connp)
++squeue_synch_exit(conn_t *connp, int flag)
+ {
+ 	squeue_t *sqp = connp->conn_sqp;
++
+ 	VERIFY(sqp->sq_isip == B_TRUE);
++	ASSERT(flag == SQ_NODRAIN || flag == SQ_PROCESS);
+ 
+ 	mutex_enter(&sqp->sq_lock);
+-	if (sqp->sq_run == curthread) {
+-		ASSERT(sqp->sq_state & SQS_PROC);
+-
+-		sqp->sq_state &= ~SQS_PROC;
+-		sqp->sq_run = NULL;
+-		connp->conn_on_sqp = B_FALSE;
+-
+-		if (sqp->sq_first != NULL) {
+-			/*
+-			 * If this was a normal thread, then it would
+-			 * (most likely) continue processing the pending
+-			 * requests. Since the just completed operation
+-			 * was executed synchronously, the thread should
+-			 * not be delayed. To compensate, wake up the
+-			 * worker thread right away when there are outstanding
+-			 * requests.
+-			 */
+-			squeue_worker_wakeup(sqp);
+-		}
+-	} else {
++	if (sqp->sq_run != curthread) {
+ 		/*
+ 		 * The caller doesn't own the squeue, clear the SQS_PAUSE flag,
+ 		 * and wake up the squeue owner, such that owner can continue
+@@ -1443,6 +1526,24 @@ squeue_synch_exit(conn_t *connp)
+ 
+ 		/* There should be only one thread blocking on sq_synch_cv. */
+ 		cv_signal(&sqp->sq_synch_cv);
++		mutex_exit(&sqp->sq_lock);
++		return;
++	}
++
++	ASSERT(sqp->sq_state & SQS_PROC);
++
++	sqp->sq_state &= ~SQS_PROC;
++	sqp->sq_run = NULL;
++	connp->conn_on_sqp = B_FALSE;
++
++	/* If the caller opted in, attempt to process the head squeue item. */
++	if (flag == SQ_PROCESS && sqp->sq_first != NULL) {
++		squeue_try_drain_one(sqp, connp);
++	}
++
++	/* Wake up the worker if further requests are pending. */
++	if (sqp->sq_first != NULL) {
++		squeue_worker_wakeup(sqp);
+ 	}
+ 	mutex_exit(&sqp->sq_lock);
+ }
+diff --git a/usr/src/uts/common/inet/tcp/tcp_socket.c b/usr/src/uts/common/inet/tcp/tcp_socket.c
+index 8f535a5dd1..2de76ea060 100644
+--- a/usr/src/uts/common/inet/tcp/tcp_socket.c
++++ b/usr/src/uts/common/inet/tcp/tcp_socket.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /* This file contains all TCP kernel socket related functions. */
+@@ -222,7 +222,7 @@ tcp_bind(sock_lower_handle_t proto_handle, struct sockaddr *sa,
+ 		error = tcp_do_bind(connp, sa, len, cr, B_TRUE);
+ 	}
+ 
+-	squeue_synch_exit(connp);
++	squeue_synch_exit(connp, SQ_NODRAIN);
+ 
+ 	if (error < 0) {
+ 		if (error == -TOUTSTATE)
+@@ -269,7 +269,7 @@ tcp_listen(sock_lower_handle_t proto_handle, int backlog, cred_t *cr)
+ 		else
+ 			error = proto_tlitosyserr(-error);
+ 	}
+-	squeue_synch_exit(connp);
++	squeue_synch_exit(connp, SQ_NODRAIN);
+ 	return (error);
+ }
+ 
+@@ -333,7 +333,13 @@ tcp_connect(sock_lower_handle_t proto_handle, const struct sockaddr *sa,
+ 		    connp->conn_upper_handle, &sopp);
+ 	}
+ done:
+-	squeue_synch_exit(connp);
++	/*
++	 * Indicate (via SQ_PROCESS) that it is acceptable for the squeue to
++	 * attempt to drain a pending request relevant to this connection when
++	 * exiting the synchronous context.  This can improve the performance
++	 * and efficiency of TCP connect(2) operations to localhost.
++	 */
++	squeue_synch_exit(connp, SQ_PROCESS);
+ 
+ 	return ((error == 0) ? EINPROGRESS : error);
+ }
+@@ -402,7 +408,7 @@ tcp_getsockopt(sock_lower_handle_t proto_handle, int level, int option_name,
+ 	}
+ 
+ 	len = tcp_opt_get(connp, level, option_name, optvalp_buf);
+-	squeue_synch_exit(connp);
++	squeue_synch_exit(connp, SQ_NODRAIN);
+ 
+ 	if (len == -1) {
+ 		kmem_free(optvalp_buf, max_optbuf_len);
+@@ -463,14 +469,14 @@ tcp_setsockopt(sock_lower_handle_t proto_handle, int level, int option_name,
+ 		if (error < 0) {
+ 			error = proto_tlitosyserr(-error);
+ 		}
+-		squeue_synch_exit(connp);
++		squeue_synch_exit(connp, SQ_NODRAIN);
+ 		return (error);
+ 	}
+ 
+ 	error = tcp_opt_set(connp, SETFN_OPTCOM_NEGOTIATE, level, option_name,
+ 	    optlen, (uchar_t *)optvalp, (uint_t *)&optlen, (uchar_t *)optvalp,
+ 	    NULL, cr);
+-	squeue_synch_exit(connp);
++	squeue_synch_exit(connp, SQ_NODRAIN);
+ 
+ 	ASSERT(error >= 0);
+ 
+@@ -646,7 +652,7 @@ tcp_clr_flowctrl(sock_lower_handle_t proto_handle)
+ 		}
+ 	}
+ 
+-	squeue_synch_exit(connp);
++	squeue_synch_exit(connp, SQ_NODRAIN);
+ }
+ 
+ /* ARGSUSED */
+@@ -1028,7 +1034,7 @@ tcp_fallback(sock_lower_handle_t proto_handle, queue_t *q,
+ 	if (tcp->tcp_rg_bind != NULL) {
+ 		freeb(stropt_mp);
+ 		freeb(ordrel_mp);
+-		squeue_synch_exit(connp);
++		squeue_synch_exit(connp, SQ_NODRAIN);
+ 		return (EINVAL);
+ 	}
+ 
+@@ -1062,7 +1068,7 @@ tcp_fallback(sock_lower_handle_t proto_handle, queue_t *q,
+ 	 * There should be atleast two ref's (IP + TCP)
+ 	 */
+ 	ASSERT(connp->conn_ref >= 2);
+-	squeue_synch_exit(connp);
++	squeue_synch_exit(connp, SQ_NODRAIN);
+ 
+ 	return (0);
+ }
+diff --git a/usr/src/uts/common/sys/squeue.h b/usr/src/uts/common/sys/squeue.h
+index 2e391db3ea..89b355970e 100644
+--- a/usr/src/uts/common/sys/squeue.h
++++ b/usr/src/uts/common/sys/squeue.h
+@@ -98,7 +98,7 @@ extern void squeue_destroy(squeue_t *);
+ 
+ struct conn_s;
+ extern int squeue_synch_enter(struct conn_s *, mblk_t *);
+-extern void squeue_synch_exit(struct conn_s *);
++extern void squeue_synch_exit(struct conn_s *, int);
+ 
+ #ifdef	__cplusplus
+ }

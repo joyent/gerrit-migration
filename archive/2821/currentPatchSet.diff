@@ -1,0 +1,2546 @@
+commit 99e0ea6f8add1cf97455a780f409f34b33c9d6d0 (refs/changes/21/2821/4)
+Author: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date:   2017-10-27T14:57:29+00:00 (1 year, 11 months ago)
+    
+    OS-6355 in-kernel zone page invalidation
+    Reviewed by: Jason King <jason.king@joyent.com>
+    Reviewed by: Dan McDonald <danmcd@joyent.com>
+    Approved by: Jason King <jason.king@joyent.com>
+
+diff --git a/usr/src/cmd/truss/print.c b/usr/src/cmd/truss/print.c
+index 6175936df7..fad3a52ecd 100644
+--- a/usr/src/cmd/truss/print.c
++++ b/usr/src/cmd/truss/print.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1989, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2015, Joyent, Inc. All rights reserved.
++ * Copyright (c) 2017, Joyent, Inc. All rights reserved.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -2547,9 +2547,6 @@ prt_zga(private_t *pri, int raw, long val)
+ 		case ZONE_ATTR_BRAND:	s = "ZONE_ATTR_BRAND"; break;
+ 		case ZONE_ATTR_FLAGS:	s = "ZONE_ATTR_FLAGS"; break;
+ 		case ZONE_ATTR_DID:	s = "ZONE_ATTR_DID"; break;
+-		case ZONE_ATTR_PMCAP_NOVER: s = "ZONE_ATTR_PMCAP_NOVER"; break;
+-		case ZONE_ATTR_PMCAP_PAGEOUT: s = "ZONE_ATTR_PMCAP_PAGEOUT";
+-					break;
+ 		}
+ 	}
+ 
+diff --git a/usr/src/cmd/zoneadmd/Makefile.com b/usr/src/cmd/zoneadmd/Makefile.com
+index 0f81ce1539..bb96a96bc9 100644
+--- a/usr/src/cmd/zoneadmd/Makefile.com
++++ b/usr/src/cmd/zoneadmd/Makefile.com
+@@ -20,7 +20,7 @@
+ 
+ #
+ # Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+-# Copyright 2016 Joyent, Inc.
++# Copyright 2017 Joyent, Inc.
+ #
+ 
+ PROG= zoneadmd
+@@ -30,7 +30,7 @@ include ../../Makefile.ctf
+ 
+ ROOTCMDDIR=	$(ROOTLIB)/zones
+ 
+-OBJS= zoneadmd.o zcons.o zfd.o vplat.o mcap.o
++OBJS= zoneadmd.o zcons.o zfd.o vplat.o
+ 
+ CFLAGS += $(CCVERBOSE)
+ LDLIBS += -lsocket -lzonecfg -lnsl -ldevinfo -ldevice -lnvpair \
+diff --git a/usr/src/cmd/zoneadmd/mcap.c b/usr/src/cmd/zoneadmd/mcap.c
+deleted file mode 100644
+index d280c49b5b..0000000000
+--- a/usr/src/cmd/zoneadmd/mcap.c
++++ /dev/null
+@@ -1,997 +0,0 @@
+-/*
+- * CDDL HEADER START
+- *
+- * The contents of this file are subject to the terms of the
+- * Common Development and Distribution License (the "License").
+- * You may not use this file except in compliance with the License.
+- *
+- * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
+- * or http://www.opensolaris.org/os/licensing.
+- * See the License for the specific language governing permissions
+- * and limitations under the License.
+- *
+- * When distributing Covered Code, include this CDDL HEADER in each
+- * file and include the License file at usr/src/OPENSOLARIS.LICENSE.
+- * If applicable, add the following below this CDDL HEADER, with the
+- * fields enclosed by brackets "[]" replaced with your own identifying
+- * information: Portions Copyright [yyyy] [name of copyright owner]
+- *
+- * CDDL HEADER END
+- */
+-/*
+- * Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
+- * Copyright 2017 Joyent, Inc.
+- */
+-
+-/*
+- * This file implements the code which runs a thread inside zoneadmd to cap
+- * the associated zone's physical memory.  A thread to do this is started
+- * when the zone boots and is halted when the zone shuts down.
+- *
+- * The code obtains the accurate in-kernel RSS for the zone.
+- * It then checks the rss against the zone's zone.max-physical-memory rctl.
+- * Once the zone goes over its cap, then this thread will work through the
+- * zone's /proc process list, Pgrab-bing each process and stepping through the
+- * address space segments, using a private option (_RUSAGESYS_INVALMAP) to the
+- * private SYS_rusagesys syscall to attempt to unload page translations, until
+- * the zone is again under its cap.
+- *
+- * Although zone memory capping is implemented as a soft cap by this user-level
+- * thread, the interfaces around memory caps that are exposed to the user are
+- * the standard ones; an rctl and kstats.  This thread uses the rctl value
+- * to obtain the cap.
+- *
+- * The thread adaptively sleeps, periodically checking the state of the
+- * zone.  As the zone's rss gets closer to the cap, the thread will wake up
+- * more often to check the zone's status.  Once the zone is over the cap,
+- * the thread will work to pageout until the zone is under the cap, as shown
+- * by updated vm_usage data.
+- *
+- * NOTE: The pagedata page maps (at least on x86) are not useful.  Those flags
+- * are set by hrm_setbits() and on x86 that code path is only executed by
+- *     segvn_pagelock -> hat_setstat -> hrm_setbits
+- *     segvn_softunlock -^
+- * On SPARC there is an additional code path which may make this data
+- * useful (sfmmu_ttesync), but since it is not generic, we ignore the page
+- * maps.  If we ever fix this issue, then we could generalize this mcap code to
+- * do more with the data on active pages.
+- *
+- * For debugging, touch the file {zonepath}/mcap_debug.log.  This will
+- * cause the thread to start logging its actions into that file (it may take
+- * a minute or two if the thread is currently sleeping).  Removing that
+- * file will cause logging to stop.
+- */
+-
+-#include <sys/mman.h>
+-#include <sys/param.h>
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#include <assert.h>
+-#include <errno.h>
+-#include <fcntl.h>
+-#include <libproc.h>
+-#include <limits.h>
+-#include <procfs.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <strings.h>
+-#include <time.h>
+-#include <unistd.h>
+-#include <sys/priocntl.h>
+-#include <dirent.h>
+-#include <zone.h>
+-#include <libzonecfg.h>
+-#include <thread.h>
+-#include <values.h>
+-#include <sys/vm_usage.h>
+-#include <sys/resource.h>
+-#include <sys/debug.h>
+-#include <synch.h>
+-#include <wait.h>
+-#include <libcontract.h>
+-#include <libcontract_priv.h>
+-#include <sys/contract/process.h>
+-#include "zoneadmd.h"
+-
+-					/* round up to next y = 2^n */
+-#define	ROUNDUP(x, y)	(((x) + ((y) - 1)) & ~((y) - 1))
+-
+-#define	CAP_REFRESH	((uint64_t)300 * NANOSEC) /* every 5 minutes */
+-
+-/*
+- * zonecfg attribute tunables for memory capping.
+- *    phys-mcap-cmd
+- *	type: string
+- *	specifies a command that can be run when over the cap
+- *    phys-mcap-no-vmusage
+- *	type: boolean
+- *	true disables vm_getusage and just uses zone's proc. rss sum
+- *    phys-mcap-no-pageout
+- *	type: boolean
+- *	true disables pageout when over
+- *    phys-mcap-no-pf-throttle
+- *	type: boolean
+- *	true disables page fault throttling when over
+- */
+-#define	TUNE_CMD	"phys-mcap-cmd"
+-#define	TUNE_NVMU	"phys-mcap-no-vmusage"
+-#define	TUNE_NPAGE	"phys-mcap-no-pageout"
+-#define	TUNE_NPFTHROT	"phys-mcap-no-pf-throttle"
+-
+-uint64_t	accurate_rss = 0;
+-
+-/*
+- * Tunable for chunk size when breaking up large segment page-out ops.
+- * The initial value has been set at 64MB, trying to strike a balance between
+- * responsiveness and the load placed on locks.
+- */
+-static size_t	pageout_chunk_size = 0x4000000;
+-
+-static char	zoneproc[MAXPATHLEN];
+-static char	debug_log[MAXPATHLEN];
+-static zoneid_t	zid;
+-static mutex_t	shutdown_mx;
+-static cond_t	shutdown_cv;
+-static int	shutting_down = 0;
+-static thread_t mcap_tid;
+-static FILE	*debug_log_fp = NULL;
+-static uint64_t zone_rss_cap;		/* RSS cap(KB) */
+-static char	over_cmd[2 * BUFSIZ];	/* same size as zone_attr_value */
+-static boolean_t skip_vmusage = B_FALSE;
+-static boolean_t skip_pageout = B_FALSE;
+-static boolean_t skip_pf_throttle = B_FALSE;
+-
+-static int64_t check_suspend();
+-static void get_mcap_tunables();
+-
+-/*
+- * Structure to hold current state about a process address space that we're
+- * working on.
+- */
+-typedef struct {
+-	int pr_curr;		/* the # of the mapping we're working on */
+-	int pr_nmap;		/* number of mappings in address space */
+-	prmap_t *pr_mapp;	/* process's map array */
+-} proc_map_t;
+-
+-typedef struct zsd_vmusage64 {
+-	id_t vmu_zoneid;
+-	uint_t vmu_type;
+-	id_t vmu_id;
+-	/*
+-	 * An amd64 kernel will align the following uint64_t members, but a
+-	 * 32bit i386 process will not without help.
+-	 */
+-	int vmu_align_next_members_on_8_bytes;
+-	uint64_t vmu_rss_all;
+-	uint64_t vmu_rss_private;
+-	uint64_t vmu_rss_shared;
+-	uint64_t vmu_swap_all;
+-	uint64_t vmu_swap_private;
+-	uint64_t vmu_swap_shared;
+-} zsd_vmusage64_t;
+-
+-/*
+- * Output a debug log message.
+- */
+-/*PRINTFLIKE1*/
+-static void
+-debug(char *fmt, ...)
+-{
+-	va_list ap;
+-
+-	if (debug_log_fp == NULL)
+-		return;
+-
+-	va_start(ap, fmt);
+-	(void) vfprintf(debug_log_fp, fmt, ap);
+-	va_end(ap);
+-	(void) fflush(debug_log_fp);
+-}
+-
+-/*
+- * Like sleep(3C) but can be interupted by cond_signal which is posted when
+- * we're shutting down the mcap thread.
+- */
+-static void
+-sleep_shutdown(int secs)
+-{
+-	timestruc_t to;
+-
+-	to.tv_sec = secs;
+-	to.tv_nsec = 0;
+-
+-	(void) mutex_lock(&shutdown_mx);
+-	if (!shutting_down)
+-		(void) cond_reltimedwait(&shutdown_cv, &shutdown_mx, &to);
+-	(void) mutex_unlock(&shutdown_mx);
+-}
+-
+-static boolean_t
+-proc_issystem(pid_t pid)
+-{
+-	char pc_clname[PC_CLNMSZ];
+-
+-	if (priocntl(P_PID, pid, PC_GETXPARMS, NULL, PC_KY_CLNAME, pc_clname,
+-	    PC_KY_NULL) != -1)
+-		return (strcmp(pc_clname, "SYS") == 0);
+-
+-	return (B_TRUE);
+-}
+-
+-/*
+- * Fork a child that enters the zone and runs the "phys-mcap-cmd" command.
+- */
+-static void
+-run_over_cmd()
+-{
+-	int		ctfd;
+-	int		err;
+-	pid_t		childpid;
+-	siginfo_t	info;
+-	ctid_t		ct;
+-
+-	/*
+-	 * Before we enter the zone, we need to create a new process contract
+-	 * for the child, as required by zone_enter().
+-	 */
+-	if ((ctfd = open64("/system/contract/process/template", O_RDWR)) == -1)
+-		return;
+-	if (ct_tmpl_set_critical(ctfd, 0) != 0 ||
+-	    ct_tmpl_set_informative(ctfd, 0) != 0 ||
+-	    ct_pr_tmpl_set_fatal(ctfd, CT_PR_EV_HWERR) != 0 ||
+-	    ct_pr_tmpl_set_param(ctfd, CT_PR_PGRPONLY) != 0 ||
+-	    ct_tmpl_activate(ctfd) != 0) {
+-		(void) close(ctfd);
+-		return;
+-	}
+-
+-	childpid = fork();
+-	switch (childpid) {
+-	case -1:
+-		(void) ct_tmpl_clear(ctfd);
+-		(void) close(ctfd);
+-		break;
+-	case 0:	/* Child */
+-		(void) ct_tmpl_clear(ctfd);
+-		(void) close(ctfd);
+-		if (zone_enter(zid) == -1)
+-			_exit(errno);
+-		err = system(over_cmd);
+-		_exit(err);
+-		break;
+-	default:	/* Parent */
+-		if (contract_latest(&ct) == -1)
+-			ct = -1;
+-		(void) ct_tmpl_clear(ctfd);
+-		(void) close(ctfd);
+-		err = waitid(P_PID, childpid, &info, WEXITED);
+-		(void) contract_abandon_id(ct);
+-		if (err == -1 || info.si_status != 0)
+-			debug("over_cmd failed");
+-		break;
+-	}
+-}
+-
+-/*
+- * Get the next mapping.
+- */
+-static prmap_t *
+-nextmapping(proc_map_t *pmp)
+-{
+-	if (pmp->pr_mapp == NULL || pmp->pr_curr >= pmp->pr_nmap)
+-		return (NULL);
+-
+-	return (&pmp->pr_mapp[pmp->pr_curr++]);
+-}
+-
+-/*
+- * Initialize the proc_map_t to access the first mapping of an address space.
+- */
+-static prmap_t *
+-init_map(proc_map_t *pmp, pid_t pid)
+-{
+-	int fd;
+-	int res;
+-	struct stat st;
+-	char pathbuf[MAXPATHLEN];
+-
+-	bzero(pmp, sizeof (proc_map_t));
+-	pmp->pr_nmap = -1;
+-
+-	(void) snprintf(pathbuf, sizeof (pathbuf), "%s/%d/map", zoneproc, pid);
+-	if ((fd = open(pathbuf, O_RDONLY, 0)) < 0)
+-		return (NULL);
+-
+-redo:
+-	errno = 0;
+-	if (fstat(fd, &st) != 0)
+-		goto done;
+-
+-	if ((pmp->pr_mapp = malloc(st.st_size)) == NULL) {
+-		debug("cannot malloc() %ld bytes for xmap", st.st_size);
+-		goto done;
+-	}
+-	(void) bzero(pmp->pr_mapp, st.st_size);
+-
+-	errno = 0;
+-	if ((res = pread(fd, pmp->pr_mapp, st.st_size, 0)) != st.st_size) {
+-		free(pmp->pr_mapp);
+-		pmp->pr_mapp = NULL;
+-		if (res > 0 || errno == E2BIG) {
+-			goto redo;
+-		} else {
+-			debug("pid %ld cannot read xmap\n", pid);
+-			goto done;
+-		}
+-	}
+-
+-	pmp->pr_nmap = st.st_size / sizeof (prmap_t);
+-
+-done:
+-	(void) close(fd);
+-	return (nextmapping(pmp));
+-}
+-
+-/*
+- * Attempt to invalidate the entire mapping from within the given process's
+- * address space.
+- */
+-static void
+-pageout_mapping(pid_t pid, prmap_t *pmp)
+-{
+-	uintptr_t base;
+-	size_t remain;
+-
+-	if (pmp->pr_mflags & MA_ISM || pmp->pr_mflags & MA_SHM)
+-		return;
+-
+-	errno = 0;
+-	base = pmp->pr_vaddr;
+-	remain = pmp->pr_size;
+-	while (remain > 0 && !shutting_down) {
+-		size_t chunk;
+-
+-		/*
+-		 * The rusagesys(INVALMAP) call is split up into smaller chunks
+-		 * when applied to large mappings.  This is meant to avoid the
+-		 * situation where large writable segments take an extrememly
+-		 * long time to page out, keeping locks held in the process.
+-		 */
+-		if (remain > pageout_chunk_size) {
+-			chunk = pageout_chunk_size;
+-		} else {
+-			chunk = remain;
+-		}
+-
+-		if (syscall(SYS_rusagesys, _RUSAGESYS_INVALMAP, pid, base,
+-		    chunk) != 0) {
+-			debug("pid %ld: mapping 0x%p %ldkb unpageable (%d)\n",
+-			    pid, (void *)base, (long)chunk / 1024L, errno);
+-			return;
+-		}
+-
+-		base += chunk;
+-		remain -= chunk;
+-	}
+-}
+-
+-/*
+- * Work through a process paging out mappings until the whole address space was
+- * examined or the excess is < 0.  Return our estimate of the updated excess.
+- */
+-static int64_t
+-pageout_process(pid_t pid, int64_t excess)
+-{
+-	int			psfd;
+-	prmap_t			*pmap;
+-	proc_map_t		cur;
+-	int64_t			sum_d_rss, d_rss;
+-	int64_t			old_rss;
+-	int			map_cnt;
+-	psinfo_t		psinfo;
+-	char			pathbuf[MAXPATHLEN];
+-
+-	(void) snprintf(pathbuf, sizeof (pathbuf), "%s/%d/psinfo", zoneproc,
+-	    pid);
+-	if ((psfd = open(pathbuf, O_RDONLY, 0000)) < 0)
+-		return (excess);
+-
+-	cur.pr_mapp = NULL;
+-
+-	if (pread(psfd, &psinfo, sizeof (psinfo), 0) != sizeof (psinfo))
+-		goto done;
+-
+-	old_rss = (int64_t)psinfo.pr_rssize;
+-	map_cnt = 0;
+-
+-	/* If unscannable, skip it. */
+-	if (psinfo.pr_nlwp == 0 || proc_issystem(pid)) {
+-		debug("pid %ld: system process, skipping %s\n",
+-		    pid, psinfo.pr_psargs);
+-		goto done;
+-	}
+-
+-	/* If tiny RSS (16KB), skip it. */
+-	if (old_rss <= 16) {
+-		debug("pid %ld: skipping, RSS %lldKB %s\n",
+-		    pid, old_rss, psinfo.pr_psargs);
+-		goto done;
+-	}
+-
+-	/* Get segment residency information. */
+-	pmap = init_map(&cur, pid);
+-
+-	/* Skip process if it has no mappings. */
+-	if (pmap == NULL) {
+-		debug("pid %ld: map unreadable; ignoring\n", pid);
+-		goto done;
+-	}
+-
+-	debug("pid %ld: nmap %d sz %dKB rss %lldKB %s\n",
+-	    pid, cur.pr_nmap, psinfo.pr_size, old_rss, psinfo.pr_psargs);
+-
+-	/*
+-	 * Within the process's address space, attempt to page out mappings.
+-	 */
+-	sum_d_rss = 0;
+-	while (excess > 0 && pmap != NULL && !shutting_down) {
+-		/* invalidate the entire mapping */
+-		pageout_mapping(pid, pmap);
+-
+-		map_cnt++;
+-
+-		/*
+-		 * Re-check the process rss and get the delta.
+-		 */
+-		if (pread(psfd, &psinfo, sizeof (psinfo), 0)
+-		    != sizeof (psinfo)) {
+-			excess -= old_rss;
+-			goto done;
+-		}
+-
+-		d_rss = (int64_t)psinfo.pr_rssize - old_rss;
+-		old_rss = (int64_t)psinfo.pr_rssize;
+-		sum_d_rss += d_rss;
+-
+-		/*
+-		 * d_rss hopefully should be negative (or 0 if nothing
+-		 * invalidated) but can be positive if more got paged in.
+-		 */
+-		excess += d_rss;
+-
+-		if (excess <= 0) {
+-			debug("pid %ld: (part.) nmap %d delta_rss %lldKB "
+-			    "excess %lldKB\n", pid, map_cnt,
+-			    (unsigned long long)sum_d_rss, (long long)excess);
+-			map_cnt = 0;
+-
+-			/*
+-			 * If we're actually under, this will suspend checking
+-			 * in the middle of this process's address space.
+-			 */
+-			excess = check_suspend();
+-			if (shutting_down)
+-				goto done;
+-
+-			/*
+-			 * since we might have suspended, re-read process's rss
+-			 */
+-			if (pread(psfd, &psinfo, sizeof (psinfo), 0)
+-			    != sizeof (psinfo)) {
+-				excess -= old_rss;
+-				goto done;
+-			}
+-
+-			old_rss = (int64_t)psinfo.pr_rssize;
+-
+-			debug("pid %ld: resume pageout; excess %lld\n", pid,
+-			    (long long)excess);
+-			sum_d_rss = 0;
+-		}
+-
+-		pmap = nextmapping(&cur);
+-	}
+-
+-	debug("pid %ld: nmap %d delta_rss %lldKB excess %lldKB\n",
+-	    pid, map_cnt, (unsigned long long)sum_d_rss, (long long)excess);
+-
+-done:
+-	if (cur.pr_mapp != NULL)
+-		free(cur.pr_mapp);
+-
+-	(void) close(psfd);
+-
+-	if (shutting_down)
+-		return (0);
+-
+-	return (excess);
+-}
+-
+-/*
+- * Get the zone's RSS data.
+- */
+-static uint64_t
+-get_mem_info()
+-{
+-	if (shutting_down)
+-		return (0);
+-
+-	(void) zone_getattr(zid, ZONE_ATTR_RSS, &accurate_rss,
+-	    sizeof (accurate_rss));
+-	accurate_rss /= 1024;
+-	return (accurate_rss);
+-}
+-
+-/*
+- * Needed to read the zones physical-memory-cap rctl.
+- */
+-static struct ps_prochandle *
+-grab_zone_proc()
+-{
+-	DIR *dirp;
+-	struct dirent *dentp;
+-	struct ps_prochandle *ph = NULL;
+-	int tmp;
+-
+-	if ((dirp = opendir(zoneproc)) == NULL)
+-		return (NULL);
+-
+-	while (!shutting_down && (dentp = readdir(dirp))) {
+-		int pid;
+-
+-		if (strcmp(".", dentp->d_name) == 0 ||
+-		    strcmp("..", dentp->d_name) == 0)
+-			continue;
+-
+-		pid = atoi(dentp->d_name);
+-		/* attempt to grab process */
+-		if ((ph = Pgrab(pid, 0, &tmp)) != NULL) {
+-			if (Psetflags(ph, PR_RLC) == 0) {
+-				if (Pcreate_agent(ph) == 0) {
+-					(void) closedir(dirp);
+-					return (ph);
+-				}
+-			}
+-			Prelease(ph, 0);
+-		}
+-	}
+-
+-	(void) closedir(dirp);
+-	return (NULL);
+-}
+-
+-static uint64_t
+-get_zone_cap()
+-{
+-	rctlblk_t *rblk;
+-	uint64_t mcap;
+-	struct ps_prochandle *ph;
+-
+-	if ((rblk = (rctlblk_t *)malloc(rctlblk_size())) == NULL)
+-		return (UINT64_MAX);
+-
+-	if ((ph = grab_zone_proc()) == NULL) {
+-		free(rblk);
+-		return (UINT64_MAX);
+-	}
+-
+-	if (pr_getrctl(ph, "zone.max-physical-memory", NULL, rblk,
+-	    RCTL_FIRST)) {
+-		Pdestroy_agent(ph);
+-		Prelease(ph, 0);
+-		free(rblk);
+-		return (UINT64_MAX);
+-	}
+-
+-	Pdestroy_agent(ph);
+-	Prelease(ph, 0);
+-
+-	mcap = rctlblk_get_value(rblk);
+-	free(rblk);
+-	return (mcap);
+-}
+-
+-/*
+- * check_suspend is invoked at the beginning of every pass through the process
+- * list or after we've paged out enough so that we think the excess is under
+- * the cap.  The purpose is to periodically check the zone's rss and return
+- * the excess when the zone is over the cap.  The rest of the time this
+- * function will sleep, periodically waking up to check the current rss.
+- *
+- * Depending on the percentage of penetration of the zone's rss into the
+- * cap we sleep for longer or shorter amounts. This reduces the impact of this
+- * work on the system, which is important considering that each zone will be
+- * monitoring its rss.
+- */
+-static int64_t
+-check_suspend()
+-{
+-	static hrtime_t last_cap_read = 0;
+-	static uint64_t addon;
+-	static uint64_t lo_thresh;	/* Thresholds for how long to  sleep */
+-	static uint64_t hi_thresh;	/* when under the cap (80% & 90%). */
+-	static uint64_t prev_zone_rss = 0;
+-	static uint32_t pfdelay = 0;	/* usec page fault delay when over */
+-
+-	/* Wait a second to give the async pageout a chance to catch up. */
+-	(void) sleep_shutdown(1);
+-
+-	while (!shutting_down) {
+-		int64_t new_excess;
+-		int sleep_time;
+-		hrtime_t now;
+-		struct stat st;
+-		uint64_t zone_rss;		/* total RSS(KB) */
+-
+-		/*
+-		 * Check if the debug log files exists and enable or disable
+-		 * debug.
+-		 */
+-		if (debug_log_fp == NULL) {
+-			if (stat(debug_log, &st) == 0)
+-				debug_log_fp = fopen(debug_log, "w");
+-		} else {
+-			if (stat(debug_log, &st) == -1) {
+-				(void) fclose(debug_log_fp);
+-				debug_log_fp = NULL;
+-			}
+-		}
+-
+-		/*
+-		 * If the CAP_REFRESH interval has passed, re-get the current
+-		 * cap in case it has been dynamically updated.
+-		 */
+-		now = gethrtime();
+-		if (now - last_cap_read > CAP_REFRESH) {
+-			uint64_t mcap;
+-
+-			last_cap_read = now;
+-
+-			mcap = get_zone_cap();
+-			if (mcap != 0 && mcap != UINT64_MAX)
+-				zone_rss_cap = ROUNDUP(mcap, 1024) / 1024;
+-			else
+-				zone_rss_cap = UINT64_MAX;
+-
+-			lo_thresh = (uint64_t)(zone_rss_cap * .8);
+-			hi_thresh = (uint64_t)(zone_rss_cap * .9);
+-			addon = (uint64_t)(zone_rss_cap * 0.05);
+-
+-			/*
+-			 * We allow the memory cap tunables to be changed on
+-			 * the fly.
+-			 */
+-			get_mcap_tunables();
+-
+-			debug("%s: %s\n", TUNE_CMD, over_cmd);
+-			debug("%s: %d\n", TUNE_NVMU, skip_vmusage);
+-			debug("%s: %d\n", TUNE_NPAGE, skip_pageout);
+-			debug("%s: %d\n", TUNE_NPFTHROT, skip_pf_throttle);
+-			debug("current cap %lluKB lo %lluKB hi %lluKB\n",
+-			    zone_rss_cap, lo_thresh, hi_thresh);
+-		}
+-
+-		/* No cap, nothing to do. */
+-		if (zone_rss_cap == 0 || zone_rss_cap == UINT64_MAX) {
+-			debug("no cap, sleep 120 seconds\n");
+-			(void) sleep_shutdown(120);
+-			continue;
+-		}
+-
+-		zone_rss = get_mem_info();
+-
+-		/* calculate excess */
+-		new_excess = zone_rss - zone_rss_cap;
+-
+-		debug("rss %lluKB, cap %lluKB, excess %lldKB\n",
+-		    zone_rss, zone_rss_cap, new_excess);
+-
+-		/*
+-		 * If necessary, updates stats.
+-		 */
+-
+-		/*
+-		 * If it looks like we did some paging out since last over the
+-		 * cap then update the kstat so we can approximate how much was
+-		 * paged out.
+-		 */
+-		if (prev_zone_rss > zone_rss_cap && zone_rss < prev_zone_rss) {
+-			uint64_t diff;
+-
+-			/* assume diff is num bytes we paged out */
+-			diff = (prev_zone_rss - zone_rss) * 1024;
+-
+-			(void) zone_setattr(zid, ZONE_ATTR_PMCAP_PAGEOUT,
+-			    &diff, 0);
+-		}
+-		prev_zone_rss = zone_rss;
+-
+-		if (new_excess > 0) {
+-			uint64_t n = 1;
+-
+-			/* Increment "nover" kstat. */
+-			(void) zone_setattr(zid, ZONE_ATTR_PMCAP_NOVER, &n, 0);
+-
+-			if (!skip_pf_throttle) {
+-				/*
+-				 * Tell the kernel to start throttling page
+-				 * faults by some number of usecs to help us
+-				 * catch up. If we are persistently over the
+-				 * cap the delay ramps up to a max of 2000usecs.
+-				 * Note that for delays less than 1 tick
+-				 * (i.e. all of these) we busy-wait in as_fault.
+-				 *	delay	faults/sec
+-				 *	 125	8000
+-				 *	 250	4000
+-				 *	 500	2000
+-				 *	1000	1000
+-				 *	2000	 500
+-				 */
+-				if (pfdelay == 0)
+-					pfdelay = 125;
+-				else if (pfdelay < 2000)
+-					pfdelay *= 2;
+-
+-				(void) zone_setattr(zid, ZONE_ATTR_PG_FLT_DELAY,
+-				    &pfdelay, 0);
+-			}
+-
+-			/*
+-			 * Once we go over the cap, then we want to
+-			 * page out a little extra instead of stopping
+-			 * right at the cap. To do this we add 5% to
+-			 * the excess so that pageout_proces will work
+-			 * a little longer before stopping.
+-			 */
+-			return ((int64_t)(new_excess + addon));
+-		}
+-
+-		/*
+-		 * At this point we are under the cap.
+-		 *
+-		 * Tell the kernel to stop throttling page faults.
+-		 *
+-		 * Scale the amount of time we sleep before rechecking the
+-		 * zone's memory usage.  Also, scale the accpetable age of
+-		 * cached results from vm_getusage.  We do this based on the
+-		 * penetration into the capped limit.
+-		 */
+-		if (pfdelay > 0) {
+-			pfdelay = 0;
+-			(void) zone_setattr(zid, ZONE_ATTR_PG_FLT_DELAY,
+-			    &pfdelay, 0);
+-		}
+-
+-		if (zone_rss <= lo_thresh) {
+-			sleep_time = 120;
+-		} else if (zone_rss <= hi_thresh) {
+-			sleep_time = 60;
+-		} else {
+-			sleep_time = 30;
+-		}
+-
+-		debug("sleep %d seconds\n", sleep_time);
+-		(void) sleep_shutdown(sleep_time);
+-	}
+-
+-	/* Shutting down, tell the kernel so it doesn't throttle */
+-	if (pfdelay > 0) {
+-		pfdelay = 0;
+-		(void) zone_setattr(zid, ZONE_ATTR_PG_FLT_DELAY, &pfdelay, 0);
+-	}
+-
+-	return (0);
+-}
+-
+-static void
+-get_mcap_tunables()
+-{
+-	zone_dochandle_t handle;
+-	struct zone_attrtab attr;
+-
+-	over_cmd[0] = '\0';
+-	if ((handle = zonecfg_init_handle()) == NULL)
+-		return;
+-
+-	if (zonecfg_get_handle(zone_name, handle) != Z_OK)
+-		goto done;
+-
+-	/* Reset to defaults in case rebooting and settings have changed */
+-	over_cmd[0] = '\0';
+-	skip_vmusage = B_FALSE;
+-	skip_pageout = B_FALSE;
+-	skip_pf_throttle = B_FALSE;
+-
+-	if (zonecfg_setattrent(handle) != Z_OK)
+-		goto done;
+-	while (zonecfg_getattrent(handle, &attr) == Z_OK) {
+-		if (strcmp(TUNE_CMD, attr.zone_attr_name) == 0) {
+-			(void) strlcpy(over_cmd, attr.zone_attr_value,
+-			    sizeof (over_cmd));
+-		} else if (strcmp(TUNE_NVMU, attr.zone_attr_name) == 0) {
+-			if (strcmp("true", attr.zone_attr_value) == 0)
+-				skip_vmusage = B_TRUE;
+-		} else if (strcmp(TUNE_NPAGE, attr.zone_attr_name) == 0) {
+-			if (strcmp("true", attr.zone_attr_value) == 0)
+-				skip_pageout = B_TRUE;
+-		} else if (strcmp(TUNE_NPFTHROT, attr.zone_attr_name) == 0) {
+-			if (strcmp("true", attr.zone_attr_value) == 0)
+-				skip_pf_throttle = B_TRUE;
+-		}
+-	}
+-	(void) zonecfg_endattrent(handle);
+-
+-done:
+-	zonecfg_fini_handle(handle);
+-}
+-
+-/* ARGSUSED */
+-static int
+-chk_proc_fs(void *data, const char *spec, const char *dir,
+-    const char *fstype, const char *opt)
+-{
+-	if (fstype != NULL && strcmp(fstype, "proc") == 0)
+-		*((boolean_t *)data) = B_TRUE;
+-
+-	return (0);
+-}
+-
+-static boolean_t
+-has_proc()
+-{
+-	brand_handle_t bh;
+-	boolean_t fnd = B_FALSE;
+-
+-	if ((bh = brand_open(brand_name)) != NULL) {
+-		(void) brand_platform_iter_mounts(bh, chk_proc_fs, &fnd);
+-	}
+-
+-	brand_close(bh);
+-	return (fnd);
+-}
+-
+-/*
+- * Thread that checks zone's memory usage and when over the cap, goes through
+- * the zone's process list trying to pageout processes to get under the cap.
+- */
+-static void
+-mcap_zone()
+-{
+-	DIR *pdir = NULL;
+-	int64_t excess;
+-
+-	/*
+-	 * If the zone has no /proc filesystem (e.g. KVM), we can't pageout any
+-	 * processes. Terminate this thread.
+-	 */
+-	if (!has_proc()) {
+-		return;
+-	}
+-
+-	debug("thread startup\n");
+-	get_mcap_tunables();
+-
+-	/*
+-	 * When first starting it is likely lots of other zones are starting
+-	 * too because the system is booting.  Since we just started the zone
+-	 * we're not worried about being over the cap right away, so we let
+-	 * things settle a bit and tolerate some older data here to minimize
+-	 * the load on the system.
+-	 */
+-	(void) sleep_shutdown(15); /* wait 15 secs. so the zone can get going */
+-
+-	/* Wait until zone's /proc is mounted */
+-	while (!shutting_down) {
+-		struct stat st;
+-
+-		if (stat(zoneproc, &st) == 0 &&
+-		    strcmp(st.st_fstype, "proc") == 0)
+-			break;
+-		sleep_shutdown(5);
+-	}
+-
+-	/* Open zone's /proc and walk entries. */
+-	while (!shutting_down) {
+-		if ((pdir = opendir(zoneproc)) != NULL)
+-			break;
+-		sleep_shutdown(5);
+-	}
+-
+-	while (!shutting_down) {
+-		struct dirent *dirent;
+-
+-		/* Wait until we've gone over the cap. */
+-		excess = check_suspend();
+-
+-		debug("starting to scan, excess %lldk\n", (long long)excess);
+-
+-		if (over_cmd[0] != '\0') {
+-			uint64_t zone_rss;	/* total RSS(KB) */
+-
+-			debug("run phys_mcap_cmd: %s\n", over_cmd);
+-			run_over_cmd();
+-
+-			zone_rss = get_mem_info();
+-			excess = zone_rss - zone_rss_cap;
+-			debug("rss %lluKB, cap %lluKB, excess %lldKB\n",
+-			    zone_rss, zone_rss_cap, excess);
+-			if (excess <= 0)
+-				continue;
+-		}
+-
+-		while (!shutting_down && (dirent = readdir(pdir)) != NULL) {
+-			pid_t pid;
+-
+-			if (strcmp(".", dirent->d_name) == 0 ||
+-			    strcmp("..", dirent->d_name) == 0)
+-				continue;
+-
+-			pid = atoi(dirent->d_name);
+-			if (pid == 0 || pid == 1)
+-				continue;
+-
+-			if (skip_pageout)
+-				(void) sleep_shutdown(2);
+-			else
+-				excess = pageout_process(pid, excess);
+-
+-			if (excess <= 0) {
+-				debug("apparently under; excess %lld\n",
+-				    (long long)excess);
+-				/* Double check the current excess */
+-				excess = check_suspend();
+-			}
+-		}
+-
+-		debug("process pass done; excess %lld\n", (long long)excess);
+-		rewinddir(pdir);
+-
+-		if (skip_pageout)
+-			(void) sleep_shutdown(120);
+-	}
+-
+-	if (pdir != NULL)
+-		(void) closedir(pdir);
+-	debug("thread shutdown\n");
+-}
+-
+-void
+-create_mcap_thread(zlog_t *zlogp, zoneid_t id)
+-{
+-	int		res;
+-
+-	shutting_down = 0;
+-	zid = id;
+-
+-	/* all but the lx brand currently use /proc */
+-	if (strcmp(brand_name, "lx") == 0) {
+-		(void) snprintf(zoneproc, sizeof (zoneproc),
+-		    "%s/root/native/proc", zonepath);
+-	} else {
+-		(void) snprintf(zoneproc, sizeof (zoneproc), "%s/root/proc",
+-		    zonepath);
+-	}
+-
+-	(void) snprintf(debug_log, sizeof (debug_log), "%s/mcap_debug.log",
+-	    zonepath);
+-
+-	res = thr_create(NULL, NULL, (void *(*)(void *))mcap_zone, NULL, NULL,
+-	    &mcap_tid);
+-	if (res != 0) {
+-		zerror(zlogp, B_FALSE, "error %d creating memory cap thread",
+-		    res);
+-		mcap_tid = 0;
+-	}
+-}
+-
+-void
+-destroy_mcap_thread()
+-{
+-	if (mcap_tid != 0) {
+-		shutting_down = 1;
+-		(void) cond_signal(&shutdown_cv);
+-		(void) thr_join(mcap_tid, NULL, NULL);
+-		mcap_tid = 0;
+-	}
+-}
+diff --git a/usr/src/cmd/zoneadmd/zoneadmd.c b/usr/src/cmd/zoneadmd/zoneadmd.c
+index 13a9777f81..5d3adcebc6 100644
+--- a/usr/src/cmd/zoneadmd/zoneadmd.c
++++ b/usr/src/cmd/zoneadmd/zoneadmd.c
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright 2014 Nexenta Systems, Inc. All rights reserved.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  * Copyright (c) 2016 by Delphix. All rights reserved.
+  */
+ 
+@@ -1230,9 +1230,6 @@ zone_bootup(zlog_t *zlogp, const char *bootargs, int zstate, boolean_t debug)
+ 	/* Startup a thread to perform zfd logging/tty svc for the zone. */
+ 	create_log_thread(zlogp, zone_id);
+ 
+-	/* Startup a thread to perform memory capping for the zone. */
+-	create_mcap_thread(zlogp, zone_id);
+-
+ 	return (0);
+ 
+ bad:
+@@ -1259,9 +1256,6 @@ zone_halt(zlog_t *zlogp, boolean_t unmount_cmd, boolean_t rebooting, int zstate,
+ 	    brand_prestatechg(zlogp, zstate, Z_HALT, debug) != 0)
+ 		return (-1);
+ 
+-	/* Shutting down, stop the memcap thread */
+-	destroy_mcap_thread();
+-
+ 	if (vplat_teardown(zlogp, unmount_cmd, rebooting, debug) != 0) {
+ 		if (!bringup_failure_recovery)
+ 			zerror(zlogp, B_FALSE, "unable to destroy zone");
+@@ -2101,13 +2095,11 @@ top:
+ 
+ 			/*
+ 			 * Startup a thread to perform the zfd logging/tty svc
+-			 * and a thread to perform memory capping for the
+-			 * zone. zlogp won't be valid for much longer so use
+-			 * logsys.
++			 * for the zone. zlogp won't be valid for much longer
++			 * so use logsys.
+ 			 */
+ 			if ((zid = getzoneidbyname(zone_name)) != -1) {
+ 				create_log_thread(&logsys, zid);
+-				create_mcap_thread(&logsys, zid);
+ 			}
+ 
+ 			/* recover the global configuration snapshot */
+diff --git a/usr/src/cmd/zoneadmd/zoneadmd.h b/usr/src/cmd/zoneadmd/zoneadmd.h
+index 864c8ea8da..0a347e9b82 100644
+--- a/usr/src/cmd/zoneadmd/zoneadmd.h
++++ b/usr/src/cmd/zoneadmd/zoneadmd.h
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright 2014 Nexenta Systems, Inc. All rights reserved.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef	_ZONEADMD_H
+@@ -159,12 +159,6 @@ extern int init_console(zlog_t *);
+ extern void serve_console(zlog_t *);
+ extern void zcons_statechanged();
+ 
+-/*
+- * Memory capping thread creation.
+- */
+-extern void create_mcap_thread(zlog_t *, zoneid_t);
+-extern void destroy_mcap_thread();
+-
+ /*
+  * Zone FD log thread creation.
+  */
+diff --git a/usr/src/uts/common/os/kstat_fr.c b/usr/src/uts/common/os/kstat_fr.c
+index 93c04cff8d..1171376ba5 100644
+--- a/usr/src/uts/common/os/kstat_fr.c
++++ b/usr/src/uts/common/os/kstat_fr.c
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1992, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2014, Joyent, Inc. All rights reserved.
++ * Copyright 2017, Joyent, Inc. All rights reserved.
+  * Copyright 2015 Nexenta Systems, Inc. All rights reserved.
+  */
+ 
+@@ -198,6 +198,7 @@ struct {
+ 	kstat_named_t pagesfree;
+ 	kstat_named_t pageslocked;
+ 	kstat_named_t pagestotal;
++	kstat_named_t zonecapscan;
+ } system_pages_kstat = {
+ 	{ "physmem",		KSTAT_DATA_ULONG },
+ 	{ "nalloc",		KSTAT_DATA_ULONG },
+@@ -219,6 +220,7 @@ struct {
+ 	{ "pagesfree", 		KSTAT_DATA_ULONG },
+ 	{ "pageslocked", 	KSTAT_DATA_ULONG },
+ 	{ "pagestotal",		KSTAT_DATA_ULONG },
++	{ "zone_cap_scan",	KSTAT_DATA_ULONG },
+ };
+ 
+ static int header_kstat_update(kstat_t *, int);
+@@ -912,6 +914,7 @@ system_pages_kstat_update(kstat_t *ksp, int rw)
+ 	system_pages_kstat.pageslocked.value.ul	= (ulong_t)(availrmem_initial -
+ 	    availrmem);
+ 	system_pages_kstat.pagestotal.value.ul	= (ulong_t)total_pages;
++	system_pages_kstat.zonecapscan.value.ul	= (ulong_t)zone_cap_scan;
+ 	/*
+ 	 * pp_kernel represents total pages used by the kernel since the
+ 	 * startup. This formula takes into account the boottime kernel
+diff --git a/usr/src/uts/common/os/vm_pageout.c b/usr/src/uts/common/os/vm_pageout.c
+index 608208bbca..85fed26b7c 100644
+--- a/usr/src/uts/common/os/vm_pageout.c
++++ b/usr/src/uts/common/os/vm_pageout.c
+@@ -21,6 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -58,6 +59,7 @@
+ #include <sys/tnf_probe.h>
+ #include <sys/mem_cage.h>
+ #include <sys/time.h>
++#include <sys/zone.h>
+ 
+ #include <vm/hat.h>
+ #include <vm/as.h>
+@@ -73,7 +75,7 @@ static int checkpage(page_t *, int);
+  * algorithm.  They are initialized to 0, and then computed at boot time
+  * based on the size of the system.  If they are patched non-zero in
+  * a loaded vmunix they are left alone and may thus be changed per system
+- * using adb on the loaded system.
++ * using mdb on the loaded system.
+  */
+ pgcnt_t		slowscan = 0;
+ pgcnt_t		fastscan = 0;
+@@ -81,6 +83,7 @@ pgcnt_t		fastscan = 0;
+ static pgcnt_t	handspreadpages = 0;
+ static int	loopfraction = 2;
+ static pgcnt_t	looppages;
++/* See comment below describing 4% and 80% */
+ static int	min_percent_cpu = 4;
+ static int	max_percent_cpu = 80;
+ static pgcnt_t	maxfastscan = 0;
+@@ -98,14 +101,30 @@ pgcnt_t	deficit;
+ pgcnt_t	nscan;
+ pgcnt_t	desscan;
+ 
++uint64_t zone_cap_scan;
++clock_t	zone_pageout_ticks;	/* tunable to change zone pagescan ticks */
++
+ /*
+  * Values for min_pageout_ticks, max_pageout_ticks and pageout_ticks
+  * are the number of ticks in each wakeup cycle that gives the
+  * equivalent of some underlying %CPU duty cycle.
+- * When RATETOSCHEDPAGING is 4,  and hz is 100, pageout_scanner is
+- * awakened every 25 clock ticks.  So, converting from %CPU to ticks
+- * per wakeup cycle would be x% of 25, that is (x * 100) / 25.
+- * So, for example, 4% == 1 tick and 80% == 20 ticks.
++ *
++ * For example, when RATETOSCHEDPAGING is 4 (the default), then schedpaging()
++ * will run 4 times/sec to update pageout scanning parameters and kickoff
++ * the pageout_scanner() thread if necessary.
++ *
++ * Given hz is 100, min_pageout_ticks will be set to 1 (1% of a CPU). When
++ * pageout_ticks is set to min_pageout_ticks, then the total CPU time consumed
++ * by the scanner in a 1 second interval is 4% of a CPU (RATETOSCHEDPAGING * 1).
++ *
++ * Given hz is 100, max_pageout_ticks will be set to 20 (20% of a CPU). When
++ * pageout_ticks is set to max_pageout_ticks, then the total CPU time consumed
++ * by the scanner in a 1 second interval is 80% of a CPU
++ * (RATETOSCHEDPAGING * 20). There is no point making max_pageout_ticks >25
++ * since schedpaging() runs RATETOSCHEDPAGING (4) times/sec.
++ *
++ * If hz is 1000, then min_pageout_ticks will be 10 and max_pageout_ticks
++ * will be 200, so the CPU percentages are the same as when hz is 100.
+  *
+  * min_pageout_ticks:
+  *     ticks/wakeup equivalent of min_percent_cpu.
+@@ -117,7 +136,7 @@ pgcnt_t	desscan;
+  *     Number of clock ticks budgeted for each wakeup cycle.
+  *     Computed each time around by schedpaging().
+  *     Varies between min_pageout_ticks .. max_pageout_ticks,
+- *     depending on memory pressure.
++ *     depending on memory pressure or zones over their cap.
+  *
+  * pageout_lbolt:
+  *     Timestamp of the last time pageout_scanner woke up and started
+@@ -145,21 +164,23 @@ static uint_t	reset_hands;
+  * pageout_sample_pages:
+  *     The accumulated number of pages scanned during sampling.
+  *
+- * pageout_sample_ticks:
+- *     The accumulated clock ticks for the sample.
++ * pageout_sample_etime:
++ *     The accumulated number of nanoseconds for the sample.
+  *
+  * pageout_rate:
+- *     Rate in pages/nanosecond, computed at the end of sampling.
++ *     Rate in pages/second, computed at the end of sampling.
+  *
+  * pageout_new_spread:
+- *     The new value to use for fastscan and handspreadpages.
+- *     Calculated after enough samples have been taken.
++ *     The new value to use for maxfastscan and (perhaps) handspreadpages.
++ *     Intended to be the number pages that can be scanned per sec using ~10%
++ *     of a CPU. Calculated after enough samples have been taken.
++ *     pageout_rate / 10
+  */
+ 
+ typedef hrtime_t hrrate_t;
+ 
+-static uint64_t	pageout_sample_lim = 4;
+-static uint64_t	pageout_sample_cnt = 0;
++static uint_t	pageout_sample_lim = 4;
++static uint_t	pageout_sample_cnt = 0;
+ static pgcnt_t	pageout_sample_pages = 0;
+ static hrrate_t	pageout_rate = 0;
+ static pgcnt_t	pageout_new_spread = 0;
+@@ -168,10 +189,14 @@ static clock_t	pageout_cycle_ticks;
+ static hrtime_t	sample_start, sample_end;
+ static hrtime_t	pageout_sample_etime = 0;
+ 
++/* True if page scanner is first starting up */
++#define	PAGE_SCAN_STARTUP	(pageout_sample_cnt < pageout_sample_lim)
++
+ /*
+  * Record number of times a pageout_scanner wakeup cycle finished because it
+  * timed out (exceeded its CPU budget), rather than because it visited
+- * its budgeted number of pages.
++ * its budgeted number of pages. This is only done when scanning under low
++ * free memory conditions, not when scanning for zones over their cap.
+  */
+ uint64_t pageout_timeouts = 0;
+ 
+@@ -194,21 +219,27 @@ kcondvar_t	memavail_cv;
+ #define	LOOPPAGES	total_pages
+ 
+ /*
+- * Set up the paging constants for the clock algorithm.
+- * Called after the system is initialized and the amount of memory
+- * and number of paging devices is known.
++ * Local boolean to control scanning when zones are over their cap. Avoids
++ * accessing the zone_num_over_cap variable except within schedpaging(), which
++ * only runs periodically. This is here only to reduce our access to
++ * zone_num_over_cap, since it is already accessed a lot during paging, and
++ * the page scanner accesses the zones_over variable on each page during a
++ * scan. There is no lock needed for zone_num_over_cap since schedpaging()
++ * doesn't modify the variable, it only cares if the variable is 0 or non-0.
++ */
++static boolean_t zones_over = B_FALSE;
++
++/*
++ * Set up the paging constants for the page scanner clock-hand algorithm.
++ * Called at startup after the system is initialized and the amount of memory
++ * and number of paging devices is known. Called again once PAGE_SCAN_STARTUP
++ * is true after the scanner has collected enough samples.
++ *
++ * Will also be called after a memory dynamic reconfiguration operation.
+  *
+- * lotsfree is 1/64 of memory, but at least 512K.
++ * lotsfree is 1/64 of memory, but at least 512K (ha!).
+  * desfree is 1/2 of lotsfree.
+  * minfree is 1/2 of desfree.
+- *
+- * Note: to revert to the paging algorithm of Solaris 2.4/2.5, set:
+- *
+- *	lotsfree = btop(512K)
+- *	desfree = btop(200K)
+- *	minfree = btop(100K)
+- *	throttlefree = INT_MIN
+- *	max_percent_cpu = 4
+  */
+ void
+ setupclock(int recalc)
+@@ -221,8 +252,8 @@ setupclock(int recalc)
+ 	looppages = LOOPPAGES;
+ 
+ 	/*
+-	 * setupclock can now be called to recalculate the paging
+-	 * parameters in the case of dynamic addition of memory.
++	 * setupclock can be called to recalculate the paging
++	 * parameters in the case of dynamic reconfiguration of memory.
+ 	 * So to make sure we make the proper calculations, if such a
+ 	 * situation should arise, we save away the initial values
+ 	 * of each parameter so we can recall them when needed. This
+@@ -311,105 +342,98 @@ setupclock(int recalc)
+ 		maxpgio = init_mpgio;
+ 
+ 	/*
+-	 * The clock scan rate varies between fastscan and slowscan
+-	 * based on the amount of free memory available.  Fastscan
+-	 * rate should be set based on the number pages that can be
+-	 * scanned per sec using ~10% of processor time.  Since this
+-	 * value depends on the processor, MMU, Mhz etc., it is
+-	 * difficult to determine it in a generic manner for all
+-	 * architectures.
++	 * When the system is in a low memory state, the page scan rate varies
++	 * between fastscan and slowscan based on the amount of free memory
++	 * available. When only zones are over their memory cap, the scan rate
++	 * is always fastscan.
++	 *
++	 * The fastscan rate should be set based on the number pages that can
++	 * be scanned per sec using ~10% of a CPU. Since this value depends on
++	 * the processor, MMU, Ghz etc., it must be determined dynamically.
++	 *
++	 * When the scanner first starts up, fastscan will be set to 0 and
++	 * maxfastscan will be set to MAXHANDSPREADPAGES (64MB, in pages).
++	 * However, once the scanner has collected enough samples, then fastscan
++	 * is set to be the smaller of 1/2 of memory (looppages / loopfraction)
++	 * or maxfastscan (which is set from pageout_new_spread). Thus,
++	 * MAXHANDSPREADPAGES is irrelevant after the scanner is fully
++	 * initialized.
++	 *
++	 * pageout_new_spread is calculated when the scanner first starts
++	 * running. During this initial sampling period the nscan_limit
++	 * is set to the total_pages of system memory. Thus, the scanner could
++	 * theoretically scan all of memory in one pass. However, each sample
++	 * is also limited by the %CPU budget. This is controlled by
++	 * pageout_ticks which is set in schedpaging(). During the sampling
++	 * period, pageout_ticks is set to max_pageout_ticks. This tick value
++	 * is derived from the max_percent_cpu (80%) described above. On a
++	 * system with more than a small amount of memory (~8GB), the scanner's
++	 * %CPU will be the limiting factor in calculating pageout_new_spread.
+ 	 *
+-	 * Instead of trying to determine the number of pages scanned
+-	 * per sec for every processor, fastscan is set to be the smaller
+-	 * of 1/2 of memory or MAXHANDSPREADPAGES and the sampling
+-	 * time is limited to ~4% of processor time.
++	 * At the end of the sampling period, the pageout_rate indicates how
++	 * many pages could be scanned per second. The pageout_new_spread is
++	 * then set to be 1/10th of that (i.e. approximating 10% of a CPU).
++	 * Of course, this value could still be more than the physical memory
++	 * on the system. If so, fastscan is set to 1/2 of memory, as
++	 * mentioned above.
+ 	 *
+-	 * Setting fastscan to be 1/2 of memory allows pageout to scan
+-	 * all of memory in ~2 secs.  This implies that user pages not
+-	 * accessed within 1 sec (assuming, handspreadpages == fastscan)
+-	 * can be reclaimed when free memory is very low.  Stealing pages
+-	 * not accessed within 1 sec seems reasonable and ensures that
+-	 * active user processes don't thrash.
++	 * All of this leads up to the setting of handspreadpages, which is
++	 * set to fastscan. This is the distance, in pages, between the front
++	 * and back hands during scanning. It will dictate which pages will
++	 * be considered "hot" on the backhand and which pages will be "cold"
++	 * and reclaimed
+ 	 *
+-	 * Smaller values of fastscan result in scanning fewer pages
+-	 * every second and consequently pageout may not be able to free
+-	 * sufficient memory to maintain the minimum threshold.  Larger
+-	 * values of fastscan result in scanning a lot more pages which
+-	 * could lead to thrashing and higher CPU usage.
++	 * If the scanner is limited by desscan, then at the highest rate it
++	 * will scan up to fastscan/RATETOSCHEDPAGING pages per cycle. If the
++	 * scanner is limited by the %CPU, then at the highest rate (20% of a
++	 * CPU per cycle) the number of pages scanned could be much less.
+ 	 *
+-	 * Fastscan needs to be limited to a maximum value and should not
+-	 * scale with memory to prevent pageout from consuming too much
+-	 * time for scanning on slow CPU's and avoid thrashing, as a
+-	 * result of scanning too many pages, on faster CPU's.
+-	 * The value of 64 Meg was chosen for MAXHANDSPREADPAGES
+-	 * (the upper bound for fastscan) based on the average number
+-	 * of pages that can potentially be scanned in ~1 sec (using ~4%
+-	 * of the CPU) on some of the following machines that currently
+-	 * run Solaris 2.x:
++	 * Thus, if the scanner is limited by desscan, then the handspreadpages
++	 * setting means 1sec between the front and back hands, but if the
++	 * scanner is limited by %CPU, it could be several seconds between the
++	 * two hands.
+ 	 *
+-	 *			average memory scanned in ~1 sec
++	 * The basic assumption is that at the worst case, stealing pages
++	 * not accessed within 1 sec seems reasonable and ensures that active
++	 * user processes don't thrash. This is especially true when the system
++	 * is in a low memory state.
+ 	 *
+-	 *	25 Mhz SS1+:		23 Meg
+-	 *	LX:			37 Meg
+-	 *	50 Mhz SC2000:		68 Meg
++	 * There are some additional factors to consider for the case of
++	 * scanning when zones are over their cap. In this situation it is
++	 * also likely that the machine will have a large physical memory which
++	 * will take many seconds to fully scan (due to the %CPU and desscan
++	 * limits per cycle). It is probable that there will be few (or 0)
++	 * pages attributed to these zones in any single scanning cycle. The
++	 * result is that reclaiming enough pages for these zones might take
++	 * several additional seconds (this is generally not a problem since
++	 * the zone physical cap is just a soft cap).
+ 	 *
+-	 *	40 Mhz 486:		26 Meg
+-	 *	66 Mhz 486:		42 Meg
++	 * This is similar to the typical multi-processor situation in which
++	 * pageout is often unable to maintain the minimum paging thresholds
++	 * under heavy load due to the fact that user processes running on
++	 * other CPU's can be dirtying memory at a much faster pace than
++	 * pageout can find pages to free.
+ 	 *
+-	 * When free memory falls just below lotsfree, the scan rate
+-	 * goes from 0 to slowscan (i.e., pageout starts running).  This
++	 * One potential approach to address both of these cases is to enable
++	 * more than one CPU to run the page scanner, in such a manner that the
++	 * various clock hands don't overlap. However, this also makes it more
++	 * difficult to determine the values for fastscan, slowscan and
++	 * handspreadpages. This is left as a future enhancement, if necessary.
++	 *
++	 * When free memory falls just below lotsfree, the scan rate goes from
++	 * 0 to slowscan (i.e., the page scanner starts running).  This
+ 	 * transition needs to be smooth and is achieved by ensuring that
+ 	 * pageout scans a small number of pages to satisfy the transient
+ 	 * memory demand.  This is set to not exceed 100 pages/sec (25 per
+ 	 * wakeup) since scanning that many pages has no noticible impact
+ 	 * on system performance.
+ 	 *
+-	 * In addition to setting fastscan and slowscan, pageout is
+-	 * limited to using ~4% of the CPU.  This results in increasing
+-	 * the time taken to scan all of memory, which in turn means that
+-	 * user processes have a better opportunity of preventing their
+-	 * pages from being stolen.  This has a positive effect on
+-	 * interactive and overall system performance when memory demand
+-	 * is high.
+-	 *
+-	 * Thus, the rate at which pages are scanned for replacement will
+-	 * vary linearly between slowscan and the number of pages that
+-	 * can be scanned using ~4% of processor time instead of varying
+-	 * linearly between slowscan and fastscan.
+-	 *
+-	 * Also, the processor time used by pageout will vary from ~1%
+-	 * at slowscan to ~4% at fastscan instead of varying between
+-	 * ~1% at slowscan and ~10% at fastscan.
+-	 *
+-	 * The values chosen for the various VM parameters (fastscan,
+-	 * handspreadpages, etc) are not universally true for all machines,
+-	 * but appear to be a good rule of thumb for the machines we've
+-	 * tested.  They have the following ranges:
+-	 *
+-	 *	cpu speed:	20 to 70 Mhz
+-	 *	page size:	4K to 8K
+-	 *	memory size:	16M to 5G
+-	 *	page scan rate:	4000 - 17400 4K pages per sec
+-	 *
+-	 * The values need to be re-examined for machines which don't
+-	 * fall into the various ranges (e.g., slower or faster CPUs,
+-	 * smaller or larger pagesizes etc) shown above.
+-	 *
+-	 * On an MP machine, pageout is often unable to maintain the
+-	 * minimum paging thresholds under heavy load.  This is due to
+-	 * the fact that user processes running on other CPU's can be
+-	 * dirtying memory at a much faster pace than pageout can find
+-	 * pages to free.  The memory demands could be met by enabling
+-	 * more than one CPU to run the clock algorithm in such a manner
+-	 * that the various clock hands don't overlap.  This also makes
+-	 * it more difficult to determine the values for fastscan, slowscan
+-	 * and handspreadpages.
+-	 *
+-	 * The swapper is currently used to free up memory when pageout
+-	 * is unable to meet memory demands by swapping out processes.
+-	 * In addition to freeing up memory, swapping also reduces the
+-	 * demand for memory by preventing user processes from running
+-	 * and thereby consuming memory.
++	 * The swapper is currently used to free up memory when pageout is
++	 * unable to meet memory demands. It does this by swapping out entire
++	 * processes. In addition to freeing up memory, swapping also reduces
++	 * the demand for memory because the swapped out processes cannot
++	 * run, and thereby consume memory. However, this is a pathological
++	 * state and performance will generally be considered unacceptable.
+ 	 */
+ 	if (init_mfscan == 0) {
+ 		if (pageout_new_spread != 0)
+@@ -419,12 +443,13 @@ setupclock(int recalc)
+ 	} else {
+ 		maxfastscan = init_mfscan;
+ 	}
+-	if (init_fscan == 0)
++	if (init_fscan == 0) {
+ 		fastscan = MIN(looppages / loopfraction, maxfastscan);
+-	else
++	} else {
+ 		fastscan = init_fscan;
+-	if (fastscan > looppages / loopfraction)
+-		fastscan = looppages / loopfraction;
++		if (fastscan > looppages / loopfraction)
++			fastscan = looppages / loopfraction;
++	}
+ 
+ 	/*
+ 	 * Set slow scan time to 1/10 the fast scan time, but
+@@ -444,12 +469,10 @@ setupclock(int recalc)
+ 	 * decreases as the scan rate rises. It must be < the amount
+ 	 * of pageable memory.
+ 	 *
+-	 * Since pageout is limited to ~4% of the CPU, setting handspreadpages
+-	 * to be "fastscan" results in the front hand being a few secs
+-	 * (varies based on the processor speed) ahead of the back hand
+-	 * at fastscan rates.  This distance can be further reduced, if
+-	 * necessary, by increasing the processor time used by pageout
+-	 * to be more than ~4% and preferrably not more than ~10%.
++	 * Since pageout is limited to the %CPU per cycle, setting
++	 * handspreadpages to be "fastscan" results in the front hand being
++	 * a few secs (varies based on the processor speed) ahead of the back
++	 * hand at fastscan rates.
+ 	 *
+ 	 * As a result, user processes have a much better chance of
+ 	 * referencing their pages before the back hand examines them.
+@@ -491,9 +514,10 @@ setupclock(int recalc)
+  * currently available memory.
+  */
+ 
+-#define	RATETOSCHEDPAGING	4		/* hz that is */
++#define	RATETOSCHEDPAGING	4		/* times/second */
+ 
+-static kmutex_t	pageout_mutex;	/* held while pageout or schedpaging running */
++/* held while pageout_scanner or schedpaging running */
++static kmutex_t	pageout_mutex;
+ 
+ /*
+  * Pool of available async pageout putpage requests.
+@@ -536,7 +560,7 @@ schedpaging(void *arg)
+ 		kcage_cageout_wakeup();
+ 
+ 	if (mutex_tryenter(&pageout_mutex)) {
+-		/* pageout() not running */
++		/* pageout_scanner() is not currently running */
+ 		nscan = 0;
+ 		vavail = freemem - deficit;
+ 		if (pageout_new_spread != 0)
+@@ -557,8 +581,11 @@ schedpaging(void *arg)
+ 		if ((needfree) && (pageout_new_spread == 0)) {
+ 			/*
+ 			 * If we've not yet collected enough samples to
+-			 * calculate a spread, use the old logic of kicking
+-			 * into high gear anytime needfree is non-zero.
++			 * calculate a spread, kick into high gear anytime
++			 * needfree is non-zero. Note that desscan will not be
++			 * the limiting factor for systems with larger memory;
++			 * the %CPU will limit the scan. That will also be
++			 * maxed out below.
+ 			 */
+ 			desscan = fastscan / RATETOSCHEDPAGING;
+ 		} else {
+@@ -576,14 +603,45 @@ schedpaging(void *arg)
+ 			desscan = (pgcnt_t)result;
+ 		}
+ 
+-		pageout_ticks = min_pageout_ticks + (lotsfree - vavail) *
+-		    (max_pageout_ticks - min_pageout_ticks) / nz(lotsfree);
++		/*
++		 * If we've not yet collected enough samples to calculate a
++		 * spread, also kick %CPU to the max.
++		 */
++		if (pageout_new_spread == 0) {
++			pageout_ticks = max_pageout_ticks;
++		} else {
++			pageout_ticks = min_pageout_ticks +
++			    (lotsfree - vavail) *
++			    (max_pageout_ticks - min_pageout_ticks) /
++			    nz(lotsfree);
++		}
++		zones_over = B_FALSE;
++
++		if (freemem < lotsfree + needfree || PAGE_SCAN_STARTUP) {
++			DTRACE_PROBE(schedpage__wake__low);
++			cv_signal(&proc_pageout->p_cv);
++
++		} else if (zone_num_over_cap > 0) {
++			/* One or more zones are over their cap. */
++
++			/* No page limit */
++			desscan = total_pages;
++
++			/*
++			 * Increase the scanning CPU% to the max. This implies
++			 * 80% of one CPU/sec if the scanner can run each
++			 * opportunity. Can also be tuned via setting
++			 * zone_pageout_ticks in /etc/system or with mdb.
++			 */
++			pageout_ticks = (zone_pageout_ticks != 0) ?
++			    zone_pageout_ticks : max_pageout_ticks;
++
++			zones_over = B_TRUE;
++			zone_cap_scan++;
+ 
+-		if (freemem < lotsfree + needfree ||
+-		    pageout_sample_cnt < pageout_sample_lim) {
+-			TRACE_1(TR_FAC_VM, TR_PAGEOUT_CV_SIGNAL,
+-			    "pageout_cv_signal:freemem %ld", freemem);
++			DTRACE_PROBE(schedpage__wake__zone);
+ 			cv_signal(&proc_pageout->p_cv);
++
+ 		} else {
+ 			/*
+ 			 * There are enough free pages, no need to
+@@ -617,23 +675,26 @@ ulong_t		push_list_size;		/* # of requests on pageout queue */
+ #define	FRONT	1
+ #define	BACK	2
+ 
+-int dopageout = 1;	/* must be non-zero to turn page stealing on */
++int dopageout = 1;	/* /etc/system tunable to disable page reclamation */
+ 
+ /*
+  * The page out daemon, which runs as process 2.
+  *
+- * As long as there are at least lotsfree pages,
+- * this process is not run.  When the number of free
+- * pages stays in the range desfree to lotsfree,
+- * this daemon runs through the pages in the loop
+- * at a rate determined in schedpaging().  Pageout manages
+- * two hands on the clock.  The front hand moves through
+- * memory, clearing the reference bit,
+- * and stealing pages from procs that are over maxrss.
+- * The back hand travels a distance behind the front hand,
+- * freeing the pages that have not been referenced in the time
+- * since the front hand passed.  If modified, they are pushed to
+- * swap before being freed.
++ * Page out occurs when either:
++ * a) there is less than lotsfree pages,
++ * b) there are one or more zones over their physical memory cap.
++ *
++ * The daemon treats physical memory as a circular array of pages and scans the
++ * pages using a 'two-handed clock' algorithm. The front hand moves through
++ * the pages, clearing the reference bit. The back hand travels a distance
++ * (handspreadpages) behind the front hand, freeing the pages that have not
++ * been referenced in the time since the front hand passed. If modified, they
++ * are first written to their backing store before being freed.
++ *
++ * As long as there are at least lotsfree pages, or no zones over their cap,
++ * then this process is not run. When the scanner is running for case (a),
++ * all pages are considered for pageout. For case (b), only pages belonging to
++ * a zone over its cap will be considered for pageout.
+  *
+  * There are 2 threads that act on behalf of the pageout process.
+  * One thread scans pages (pageout_scanner) and frees them up if
+@@ -646,7 +707,7 @@ int dopageout = 1;	/* must be non-zero to turn page stealing on */
+  * thread, but the scanner thread can still operate. There is still
+  * no guarantee that memory deadlocks cannot occur.
+  *
+- * For now, this thing is in very rough form.
++ * The pageout_scanner parameters are determined in schedpaging().
+  */
+ void
+ pageout()
+@@ -720,6 +781,7 @@ pageout()
+ 		arg->a_next = NULL;
+ 		mutex_exit(&push_lock);
+ 
++		DTRACE_PROBE(pageout__push);
+ 		if (VOP_PUTPAGE(arg->a_vp, (offset_t)arg->a_off,
+ 		    arg->a_len, arg->a_flags, arg->a_cred, NULL) == 0) {
+ 			pushes++;
+@@ -795,36 +857,37 @@ loop:
+ 	CPU_STATS_ADDQ(CPU, vm, pgrrun, 1);
+ 	count = 0;
+ 
+-	TRACE_4(TR_FAC_VM, TR_PAGEOUT_START,
+-	    "pageout_start:freemem %ld lotsfree %ld nscan %ld desscan %ld",
+-	    freemem, lotsfree, nscan, desscan);
+-
+ 	/* Kernel probe */
+ 	TNF_PROBE_2(pageout_scan_start, "vm pagedaemon", /* CSTYLED */,
+ 	    tnf_ulong, pages_free, freemem, tnf_ulong, pages_needed, needfree);
+ 
+ 	pcount = 0;
+-	if (pageout_sample_cnt < pageout_sample_lim) {
++	if (PAGE_SCAN_STARTUP) {
+ 		nscan_limit = total_pages;
+ 	} else {
+ 		nscan_limit = desscan;
+ 	}
++
++	DTRACE_PROBE1(pageout__start, pgcnt_t, nscan_limit);
++
+ 	pageout_lbolt = ddi_get_lbolt();
+ 	sample_start = gethrtime();
+ 
+ 	/*
+ 	 * Scan the appropriate number of pages for a single duty cycle.
+-	 * However, stop scanning as soon as there is enough free memory.
+-	 * For a short while, we will be sampling the performance of the
+-	 * scanner and need to keep running just to get sample data, in
+-	 * which case we keep going and don't pay attention to whether
+-	 * or not there is enough free memory.
++	 * Only scan while at least one of these is true:
++	 * 1) one or more zones is over its cap
++	 * 2) there is not enough free memory
++	 * 3) during page scan startup when determining sample data
+ 	 */
+-
+-	while (nscan < nscan_limit && (freemem < lotsfree + needfree ||
+-	    pageout_sample_cnt < pageout_sample_lim)) {
++	while (nscan < nscan_limit &&
++	    (zones_over ||
++	    freemem < lotsfree + needfree ||
++	    PAGE_SCAN_STARTUP)) {
+ 		int rvfront, rvback;
+ 
++		DTRACE_PROBE1(pageout__loop, pgcnt_t, pcount);
++
+ 		/*
+ 		 * Check to see if we have exceeded our %CPU budget
+ 		 * for this wakeup, but not on every single page visited,
+@@ -833,14 +896,21 @@ loop:
+ 		if ((pcount & PAGES_POLL_MASK) == PAGES_POLL_MASK) {
+ 			pageout_cycle_ticks = ddi_get_lbolt() - pageout_lbolt;
+ 			if (pageout_cycle_ticks >= pageout_ticks) {
+-				++pageout_timeouts;
++				/*
++				 * This is where we normally break out of the
++				 * loop when scanning zones or sampling.
++				 */
++				if (!zones_over) {
++					++pageout_timeouts;
++				}
++				DTRACE_PROBE(pageout__timeout);
+ 				break;
+ 			}
+ 		}
+ 
+ 		/*
+ 		 * If checkpage manages to add a page to the free list,
+-		 * we give ourselves another couple of trips around the loop.
++		 * we give ourselves another couple of trips around memory.
+ 		 */
+ 		if ((rvfront = checkpage(fronthand, FRONT)) == 1)
+ 			count = 0;
+@@ -868,19 +938,26 @@ loop:
+ 		 */
+ 
+ 		if ((fronthand = page_next(fronthand)) == page_first())	{
+-			TRACE_2(TR_FAC_VM, TR_PAGEOUT_HAND_WRAP,
+-			    "pageout_hand_wrap:freemem %ld whichhand %d",
+-			    freemem, FRONT);
++			DTRACE_PROBE(pageout__wrap__front);
+ 
+ 			/*
+ 			 * protected by pageout_mutex instead of cpu_stat_lock
+ 			 */
+ 			CPU_STATS_ADDQ(CPU, vm, rev, 1);
+-			if (++count > 1) {
++
++			/*
++			 * If scanning because the system is low on memory,
++			 * then when we wraparound memory we want to try to
++			 * reclaim more pages.
++			 * If scanning only because zones are over their cap,
++			 * then wrapping is common and we simply keep going.
++			 */
++			if (freemem < lotsfree + needfree && ++count > 1) {
+ 				/*
++				 * The system is low on memory.
+ 				 * Extremely unlikely, but it happens.
+-				 * We went around the loop at least once
+-				 * and didn't get far enough.
++				 * We went around memory at least once
++				 * and didn't reclaim enough.
+ 				 * If we are still skipping `highly shared'
+ 				 * pages, skip fewer of them.  Otherwise,
+ 				 * give up till the next clock tick.
+@@ -889,11 +966,9 @@ loop:
+ 					po_share <<= 1;
+ 				} else {
+ 					/*
+-					 * Really a "goto loop", but
+-					 * if someone is TRACing or
+-					 * TNF_PROBE_ing, at least
+-					 * make records to show
+-					 * where we are.
++					 * Really a "goto loop", but if someone
++					 * is tracing or TNF_PROBE_ing, hit
++					 * those probes first.
+ 					 */
+ 					break;
+ 				}
+@@ -903,21 +978,26 @@ loop:
+ 
+ 	sample_end = gethrtime();
+ 
+-	TRACE_5(TR_FAC_VM, TR_PAGEOUT_END,
+-	    "pageout_end:freemem %ld lots %ld nscan %ld des %ld count %u",
+-	    freemem, lotsfree, nscan, desscan, count);
++	DTRACE_PROBE2(pageout__loop__end, pgcnt_t, pcount, uint_t, count);
+ 
+ 	/* Kernel probe */
+ 	TNF_PROBE_2(pageout_scan_end, "vm pagedaemon", /* CSTYLED */,
+ 	    tnf_ulong, pages_scanned, nscan, tnf_ulong, pages_free, freemem);
+ 
+-	if (pageout_sample_cnt < pageout_sample_lim) {
++	/*
++	 * The following two blocks are only relevant when the scanner is
++	 * first started up. After the scanner runs for a while, neither of
++	 * the conditions will ever be true again.
++	 */
++	if (PAGE_SCAN_STARTUP) {
+ 		pageout_sample_pages += pcount;
+ 		pageout_sample_etime += sample_end - sample_start;
+ 		++pageout_sample_cnt;
+-	}
+-	if (pageout_sample_cnt >= pageout_sample_lim &&
+-	    pageout_new_spread == 0) {
++
++	} else if (pageout_new_spread == 0) {
++		/*
++		 * We have run enough samples, set the spread.
++		 */
+ 		pageout_rate = (hrrate_t)pageout_sample_pages *
+ 		    (hrrate_t)(NANOSEC) / pageout_sample_etime;
+ 		pageout_new_spread = pageout_rate / 10;
+@@ -931,9 +1011,8 @@ loop:
+  * Look at the page at hand.  If it is locked (e.g., for physical i/o),
+  * system (u., page table) or free, then leave it alone.  Otherwise,
+  * if we are running the front hand, turn off the page's reference bit.
+- * If the proc is over maxrss, we take it.  If running the back hand,
+- * check whether the page has been reclaimed.  If not, free the page,
+- * pushing it to disk first if necessary.
++ * If running the back hand, check whether the page has been reclaimed.
++ * If not, free the page, pushing it to disk first if necessary.
+  *
+  * Return values:
+  *	-1 if the page is not a candidate at all,
+@@ -947,6 +1026,7 @@ checkpage(struct page *pp, int whichhand)
+ 	int isfs = 0;
+ 	int isexec = 0;
+ 	int pagesync_flag;
++	zoneid_t zid = ALL_ZONES;
+ 
+ 	/*
+ 	 * Skip pages:
+@@ -989,6 +1069,21 @@ checkpage(struct page *pp, int whichhand)
+ 		return (-1);
+ 	}
+ 
++	if (zones_over) {
++		ASSERT(pp->p_zoneid == ALL_ZONES ||
++		    pp->p_zoneid >= 0 && pp->p_zoneid <= MAX_ZONEID);
++		if (pp->p_zoneid == ALL_ZONES ||
++		    zone_pcap_data[pp->p_zoneid].zpcap_over == 0) {
++			/*
++			 * Cross-zone shared page, or zone not over it's cap.
++			 * Leave the page alone.
++			 */
++			page_unlock(pp);
++			return (-1);
++		}
++		zid = pp->p_zoneid;
++	}
++
+ 	/*
+ 	 * Maintain statistics for what we are freeing
+ 	 */
+@@ -1016,31 +1111,24 @@ checkpage(struct page *pp, int whichhand)
+ 
+ recheck:
+ 	/*
+-	 * If page is referenced; make unreferenced but reclaimable.
+-	 * If this page is not referenced, then it must be reclaimable
+-	 * and we can add it to the free list.
++	 * If page is referenced; fronthand makes unreferenced and reclaimable.
++	 * For the backhand, a process referenced the page since the front hand
++	 * went by, so it's not a candidate for freeing up.
+ 	 */
+ 	if (ppattr & P_REF) {
+-		TRACE_2(TR_FAC_VM, TR_PAGEOUT_ISREF,
+-		    "pageout_isref:pp %p whichhand %d", pp, whichhand);
++		DTRACE_PROBE2(pageout__isref, page_t *, pp, int, whichhand);
+ 		if (whichhand == FRONT) {
+-			/*
+-			 * Checking of rss or madvise flags needed here...
+-			 *
+-			 * If not "well-behaved", fall through into the code
+-			 * for not referenced.
+-			 */
+ 			hat_clrref(pp);
+ 		}
+-		/*
+-		 * Somebody referenced the page since the front
+-		 * hand went by, so it's not a candidate for
+-		 * freeing up.
+-		 */
+ 		page_unlock(pp);
+ 		return (0);
+ 	}
+ 
++	/*
++	 * This page is not referenced, so it must be reclaimable and we can
++	 * add it to the free list. This can be done by either hand.
++	 */
++
+ 	VM_STAT_ADD(pageoutvmstats.checkpage[0]);
+ 
+ 	/*
+@@ -1073,8 +1161,9 @@ recheck:
+ 		u_offset_t offset = pp->p_offset;
+ 
+ 		/*
+-		 * XXX - Test for process being swapped out or about to exit?
+-		 * [Can't get back to process(es) using the page.]
++		 * Note: There is no possibility to test for process being
++		 * swapped out or about to exit since we can't get back to
++		 * process(es) from the page.
+ 		 */
+ 
+ 		/*
+@@ -1092,6 +1181,11 @@ recheck:
+ 			VN_RELE(vp);
+ 			return (0);
+ 		}
++		if (isfs) {
++			zone_pageout_stat(zid, ZPO_DIRTY);
++		} else {
++			zone_pageout_stat(zid, ZPO_ANONDIRTY);
++		}
+ 		return (1);
+ 	}
+ 
+@@ -1102,8 +1196,7 @@ recheck:
+ 	 * the pagesync but before it was unloaded we catch it
+ 	 * and handle the page properly.
+ 	 */
+-	TRACE_2(TR_FAC_VM, TR_PAGEOUT_FREE,
+-	    "pageout_free:pp %p whichhand %d", pp, whichhand);
++	DTRACE_PROBE2(pageout__free, page_t *, pp, int, whichhand);
+ 	(void) hat_pageunload(pp, HAT_FORCE_PGUNLOAD);
+ 	ppattr = hat_page_getattr(pp, P_MOD | P_REF);
+ 	if ((ppattr & P_REF) || ((ppattr & P_MOD) && pp->p_vnode))
+@@ -1120,8 +1213,10 @@ recheck:
+ 		} else {
+ 			CPU_STATS_ADD_K(vm, fsfree, 1);
+ 		}
++		zone_pageout_stat(zid, ZPO_FS);
+ 	} else {
+ 		CPU_STATS_ADD_K(vm, anonfree, 1);
++		zone_pageout_stat(zid, ZPO_ANON);
+ 	}
+ 
+ 	return (1);		/* freed a page! */
+diff --git a/usr/src/uts/common/os/zone.c b/usr/src/uts/common/os/zone.c
+index 9c1ee8d750..843adc1ee0 100644
+--- a/usr/src/uts/common/os/zone.c
++++ b/usr/src/uts/common/os/zone.c
+@@ -461,7 +461,7 @@ static const int ZONE_SYSCALL_API_VERSION = 7;
+  * take care to ensure that we only take the zone_physcap_lock mutex when a
+  * zone is transitioning over/under its physical memory cap.
+  *
+- * The "zone_incr_capped" and "zone_decr_capped" functions are used manage
++ * The "zone_incr_capped" and "zone_decr_capped" functions are used to manage
+  * the "zone_pcap_data" array and associated counter.
+  *
+  * The zone_pcap_t structure tracks the zone's physical cap and phyiscal usage
+@@ -471,7 +471,7 @@ static const int ZONE_SYSCALL_API_VERSION = 7;
+  * zone's maximum RSS is limited to 17.5 TB and twice that with an 8k page size.
+  * In the future we may need to expand these counters to 64-bit, but for now
+  * we're using 32-bit to conserve memory, since this array is statically
+- * allocatd within the kernel based on the maximum number of zones supported.
++ * allocated within the kernel based on the maximum number of zones supported.
+  */
+ uint_t zone_num_over_cap;
+ zone_pcap_t zone_pcap_data[MAX_ZONES];
+@@ -2263,8 +2263,6 @@ zone_mcap_kstat_update(kstat_t *ksp, int rw)
+ 	zmp->zm_execpgin.value.ui64 = zone->zone_execpgin;
+ 	zmp->zm_fspgin.value.ui64 = zone->zone_fspgin;
+ 	zmp->zm_anon_alloc_fail.value.ui64 = zone->zone_anon_alloc_fail;
+-	zmp->zm_pf_throttle.value.ui64 = zone->zone_pf_throttle;
+-	zmp->zm_pf_throttle_usec.value.ui64 = zone->zone_pf_throttle_usec;
+ 
+ 	return (0);
+ }
+@@ -2304,10 +2302,6 @@ zone_mcap_kstat_create(zone_t *zone)
+ 	kstat_named_init(&zmp->zm_fspgin, "fspgin", KSTAT_DATA_UINT64);
+ 	kstat_named_init(&zmp->zm_anon_alloc_fail, "anon_alloc_fail",
+ 	    KSTAT_DATA_UINT64);
+-	kstat_named_init(&zmp->zm_pf_throttle, "n_pf_throttle",
+-	    KSTAT_DATA_UINT64);
+-	kstat_named_init(&zmp->zm_pf_throttle_usec, "n_pf_throttle_usec",
+-	    KSTAT_DATA_UINT64);
+ 
+ 	ksp->ks_update = zone_mcap_kstat_update;
+ 	ksp->ks_private = zone;
+@@ -3093,60 +3087,6 @@ zone_set_initname(zone_t *zone, const char *zone_initname)
+ 	return (0);
+ }
+ 
+-/*
+- * The zone_set_mcap_nover and zone_set_mcap_pageout functions are used
+- * to provide the physical memory capping kstats.  Since physical memory
+- * capping is currently implemented in userland, that code uses the setattr
+- * entry point to increment the kstats.  We ignore nover when that setattr is
+- * called and we always add in the input value to zone_mcap_pagedout every
+- * time that is called.
+- */
+-/*ARGSUSED*/
+-static int
+-zone_set_mcap_nover(zone_t *zone, const uint64_t *zone_nover)
+-{
+-	return (0);
+-}
+-
+-static int
+-zone_set_mcap_pageout(zone_t *zone, const uint64_t *zone_pageout)
+-{
+-	uint64_t pageout;
+-	int err;
+-
+-	if ((err = copyin(zone_pageout, &pageout, sizeof (uint64_t))) == 0) {
+-		zone_pcap_t *zp = &zone_pcap_data[zone->zone_id];
+-		uint64_t pages;
+-
+-		pages = btop(pageout);
+-#ifndef DEBUG
+-		atomic_add_64(&zp->zpcap_pg_out, pages);
+-#else
+-		atomic_add_64(&zp->zpcap_pg_fs, pages);
+-#endif
+-	}
+-
+-	return (err);
+-}
+-
+-/*
+- * The zone_set_page_fault_delay function is used to set the number of usecs
+- * to throttle page faults.  This is normally 0 but can be set to a non-0 value
+- * by the user-land memory capping code when the zone is over its physcial
+- * memory cap.
+- */
+-static int
+-zone_set_page_fault_delay(zone_t *zone, const uint32_t *pfdelay)
+-{
+-	uint32_t dusec;
+-	int err;
+-
+-	if ((err = copyin(pfdelay, &dusec, sizeof (uint32_t))) == 0)
+-		zone->zone_pg_flt_delay = dusec;
+-
+-	return (err);
+-}
+-
+ static int
+ zone_set_sched_class(zone_t *zone, const char *new_class)
+ {
+@@ -6301,19 +6241,6 @@ zone_getattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 		    bufsize) != 0)
+ 			error = EFAULT;
+ 		break;
+-	case ZONE_ATTR_RSS: {
+-		zone_pcap_t *zp = &zone_pcap_data[zone->zone_id];
+-		uint64_t phys_mem;
+-
+-		phys_mem = ptob(zp->zpcap_pg_cnt);
+-		size = sizeof (phys_mem);
+-		if (bufsize > size)
+-			bufsize = size;
+-		if (buf != NULL &&
+-		    copyout(&phys_mem, buf, bufsize) != 0)
+-			error = EFAULT;
+-		}
+-		break;
+ 	default:
+ 		if ((attr >= ZONE_ATTR_BRAND_ATTRS) && ZONE_IS_BRANDED(zone)) {
+ 			size = bufsize;
+@@ -6345,11 +6272,9 @@ zone_setattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 		return (set_errno(EPERM));
+ 
+ 	/*
+-	 * Only the ZONE_ATTR_PMCAP_NOVER and ZONE_ATTR_PMCAP_PAGEOUT
+-	 * attributes can be set on the global zone.
++	 * No attributes can be set on the global zone.
+ 	 */
+-	if (zoneid == GLOBAL_ZONEID &&
+-	    attr != ZONE_ATTR_PMCAP_NOVER && attr != ZONE_ATTR_PMCAP_PAGEOUT) {
++	if (zoneid == GLOBAL_ZONEID) {
+ 		return (set_errno(EINVAL));
+ 	}
+ 
+@@ -6362,12 +6287,11 @@ zone_setattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 	mutex_exit(&zonehash_lock);
+ 
+ 	/*
+-	 * At present most attributes can only be set on non-running,
++	 * At present attributes can only be set on non-running,
+ 	 * non-global zones.
+ 	 */
+ 	zone_status = zone_status_get(zone);
+-	if (attr != ZONE_ATTR_PMCAP_NOVER && attr != ZONE_ATTR_PMCAP_PAGEOUT &&
+-	    attr != ZONE_ATTR_PG_FLT_DELAY && zone_status > ZONE_IS_READY) {
++	if (zone_status > ZONE_IS_READY) {
+ 		err = EINVAL;
+ 		goto done;
+ 	}
+@@ -6389,15 +6313,6 @@ zone_setattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 	case ZONE_ATTR_FS_ALLOWED:
+ 		err = zone_set_fs_allowed(zone, (const char *)buf);
+ 		break;
+-	case ZONE_ATTR_PMCAP_NOVER:
+-		err = zone_set_mcap_nover(zone, (const uint64_t *)buf);
+-		break;
+-	case ZONE_ATTR_PMCAP_PAGEOUT:
+-		err = zone_set_mcap_pageout(zone, (const uint64_t *)buf);
+-		break;
+-	case ZONE_ATTR_PG_FLT_DELAY:
+-		err = zone_set_page_fault_delay(zone, (const uint32_t *)buf);
+-		break;
+ 	case ZONE_ATTR_SECFLAGS:
+ 		err = zone_set_secflags(zone, (psecflags_t *)buf);
+ 		break;
+diff --git a/usr/src/uts/common/sys/resource.h b/usr/src/uts/common/sys/resource.h
+index 6f936bc5aa..d65ca00f69 100644
+--- a/usr/src/uts/common/sys/resource.h
++++ b/usr/src/uts/common/sys/resource.h
+@@ -23,7 +23,7 @@
+  *
+  * Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2014 Joyent, Inc.  All rights reserved.
++ * Copyright 2017 Joyent, Inc.  All rights reserved.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -192,7 +192,6 @@ struct	rusage {
+ #define	_RUSAGESYS_GETRUSAGE_CHLD	1	/* rusage child process */
+ #define	_RUSAGESYS_GETRUSAGE_LWP	2	/* rusage lwp */
+ #define	_RUSAGESYS_GETVMUSAGE		3	/* getvmusage */
+-#define	_RUSAGESYS_INVALMAP		4	/* vm_map_inval */
+ 
+ #if defined(_SYSCALL32)
+ 
+diff --git a/usr/src/uts/common/sys/vm_usage.h b/usr/src/uts/common/sys/vm_usage.h
+index 067bd01714..afbf438eff 100644
+--- a/usr/src/uts/common/sys/vm_usage.h
++++ b/usr/src/uts/common/sys/vm_usage.h
+@@ -113,7 +113,6 @@ extern int getvmusage(uint_t flags, time_t age, vmusage_t *buf, size_t *nres);
+ 
+ int vm_getusage(uint_t, time_t, vmusage_t *, size_t *, int);
+ void vm_usage_init();
+-int vm_map_inval(pid_t, caddr_t, size_t);
+ 
+ #endif	/* _KERNEL */
+ 
+diff --git a/usr/src/uts/common/sys/vmsystm.h b/usr/src/uts/common/sys/vmsystm.h
+index e28b36b2bf..3f908e01fc 100644
+--- a/usr/src/uts/common/sys/vmsystm.h
++++ b/usr/src/uts/common/sys/vmsystm.h
+@@ -19,7 +19,7 @@
+  * CDDL HEADER END
+  */
+ /*
+- * Copyright (c) 2014, Joyent, Inc. All rights reserved.
++ * Copyright (c) 2017, Joyent, Inc. All rights reserved.
+  */
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+@@ -61,6 +61,7 @@ extern pgcnt_t	desscan;	/* desired pages scanned per second */
+ extern pgcnt_t	slowscan;
+ extern pgcnt_t	fastscan;
+ extern pgcnt_t	pushes;		/* number of pages pushed to swap device */
++extern uint64_t	zone_cap_scan;	/* num times page scan due to zone cap */;
+ 
+ /* writable copies of tunables */
+ extern pgcnt_t	maxpgio;	/* max paging i/o per sec before start swaps */
+diff --git a/usr/src/uts/common/sys/zone.h b/usr/src/uts/common/sys/zone.h
+index a08ef59959..1cca1e7555 100644
+--- a/usr/src/uts/common/sys/zone.h
++++ b/usr/src/uts/common/sys/zone.h
+@@ -110,20 +110,16 @@ extern "C" {
+ #define	ZONE_ATTR_INITNAME	9
+ #define	ZONE_ATTR_BOOTARGS	10
+ #define	ZONE_ATTR_BRAND		11
+-#define	ZONE_ATTR_PMCAP_NOVER	12
+-#define	ZONE_ATTR_SCHED_CLASS	13
+-#define	ZONE_ATTR_FLAGS		14
+-#define	ZONE_ATTR_HOSTID	15
+-#define	ZONE_ATTR_FS_ALLOWED	16
+-#define	ZONE_ATTR_NETWORK	17
+-#define	ZONE_ATTR_DID		18
+-#define	ZONE_ATTR_PMCAP_PAGEOUT	19
+-#define	ZONE_ATTR_INITNORESTART	20
+-#define	ZONE_ATTR_PG_FLT_DELAY	21
+-#define	ZONE_ATTR_RSS		22
+-#define	ZONE_ATTR_APP_SVC_CT	23
+-#define	ZONE_ATTR_SCHED_FIXEDHI	24
+-#define	ZONE_ATTR_SECFLAGS	25
++#define	ZONE_ATTR_SCHED_CLASS	12
++#define	ZONE_ATTR_FLAGS		13
++#define	ZONE_ATTR_HOSTID	14
++#define	ZONE_ATTR_FS_ALLOWED	15
++#define	ZONE_ATTR_NETWORK	16
++#define	ZONE_ATTR_DID		17
++#define	ZONE_ATTR_INITNORESTART	18
++#define	ZONE_ATTR_APP_SVC_CT	19
++#define	ZONE_ATTR_SCHED_FIXEDHI	20
++#define	ZONE_ATTR_SECFLAGS	21
+ 
+ /* Start of the brand-specific attribute namespace */
+ #define	ZONE_ATTR_BRAND_ATTRS	32768
+@@ -687,11 +683,6 @@ typedef struct zone {
+ 	uint64_t	zone_execpgin;		/* exec pages paged in */
+ 	uint64_t	zone_fspgin;		/* fs pages paged in */
+ 	uint64_t	zone_anon_alloc_fail;	/* cnt of anon alloc fails */
+-	uint64_t	zone_pf_throttle;	/* cnt of page flt throttles */
+-	uint64_t	zone_pf_throttle_usec;	/* time of page flt throttles */
+-
+-	/* Num usecs to throttle page fault when zone is over phys. mem cap */
+-	uint32_t	zone_pg_flt_delay;
+ 
+ 	psecflags_t	zone_secflags; /* default zone security-flags */
+ 
+diff --git a/usr/src/uts/common/syscall/rusagesys.c b/usr/src/uts/common/syscall/rusagesys.c
+index 417c629168..09f3266ab4 100644
+--- a/usr/src/uts/common/syscall/rusagesys.c
++++ b/usr/src/uts/common/syscall/rusagesys.c
+@@ -21,7 +21,7 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2014 Joyent, Inc.  All rights reserved.
++ * Copyright 2017 Joyent, Inc.  All rights reserved.
+  */
+ 
+ /*
+@@ -258,19 +258,6 @@ rusagesys(int code, void *arg1, void *arg2, void *arg3, void *arg4)
+ 	case _RUSAGESYS_GETVMUSAGE:
+ 		return (vm_getusage((uint_t)(uintptr_t)arg1, (time_t)arg2,
+ 		    (vmusage_t *)arg3, (size_t *)arg4, 0));
+-	case _RUSAGESYS_INVALMAP:
+-		/*
+-		 * SPARC sfmmu hat does not support HAT_CURPROC_PGUNLOAD
+-		 * handling so callers on SPARC should get simple sync
+-		 * handling with invalidation to all processes.
+-		 */
+-#if defined(__sparc)
+-		return (memcntl((caddr_t)arg2, (size_t)arg3, MC_SYNC,
+-		    (caddr_t)(MS_ASYNC | MS_INVALIDATE), 0, 0));
+-#else
+-		return (vm_map_inval((pid_t)(uintptr_t)arg1, (caddr_t)arg2,
+-		    (size_t)arg3));
+-#endif
+ 	default:
+ 		return (set_errno(EINVAL));
+ 	}
+diff --git a/usr/src/uts/common/vm/vm_as.c b/usr/src/uts/common/vm/vm_as.c
+index a9e4cc917b..b09d9b4bae 100644
+--- a/usr/src/uts/common/vm/vm_as.c
++++ b/usr/src/uts/common/vm/vm_as.c
+@@ -856,7 +856,6 @@ as_fault(struct hat *hat, struct as *as, caddr_t addr, size_t size,
+ 	struct seg *segsav;
+ 	int as_lock_held;
+ 	klwp_t *lwp = ttolwp(curthread);
+-	zone_t *zonep = curzone;
+ 
+ retry:
+ 	/*
+@@ -892,22 +891,6 @@ retry:
+ 		if (as == &kas)
+ 			CPU_STATS_ADDQ(CPU, vm, kernel_asflt, 1);
+ 		CPU_STATS_EXIT_K();
+-		if (zonep->zone_pg_flt_delay != 0) {
+-			/*
+-			 * The zone in which this process is running is
+-			 * currently over it's physical memory cap. Throttle
+-			 * page faults to help the user-land memory capper
+-			 * catch up. Note that drv_usectohz() rounds up.
+-			 */
+-			atomic_add_64(&zonep->zone_pf_throttle, 1);
+-			atomic_add_64(&zonep->zone_pf_throttle_usec,
+-			    zonep->zone_pg_flt_delay);
+-			if (zonep->zone_pg_flt_delay < TICK_TO_USEC(1)) {
+-				drv_usecwait(zonep->zone_pg_flt_delay);
+-			} else {
+-				delay(drv_usectohz(zonep->zone_pg_flt_delay));
+-			}
+-		}
+ 		break;
+ 	}
+ 
+diff --git a/usr/src/uts/common/vm/vm_usage.c b/usr/src/uts/common/vm/vm_usage.c
+index cfc762ec05..10017d27ef 100644
+--- a/usr/src/uts/common/vm/vm_usage.c
++++ b/usr/src/uts/common/vm/vm_usage.c
+@@ -2173,185 +2173,3 @@ start:
+ 	vmu_data.vmu_pending_waiters--;
+ 	goto start;
+ }
+-
+-#if defined(__x86)
+-/*
+- * Attempt to invalidate all of the pages in the mapping for the given process.
+- */
+-static void
+-map_inval(proc_t *p, struct seg *seg, caddr_t addr, size_t size)
+-{
+-	page_t		*pp;
+-	size_t		psize;
+-	u_offset_t	off;
+-	caddr_t		eaddr;
+-	struct vnode	*vp;
+-	struct segvn_data *svd;
+-	struct hat	*victim_hat;
+-
+-	ASSERT((addr + size) <= (seg->s_base + seg->s_size));
+-
+-	victim_hat = p->p_as->a_hat;
+-	svd = (struct segvn_data *)seg->s_data;
+-	vp = svd->vp;
+-	psize = page_get_pagesize(seg->s_szc);
+-
+-	off = svd->offset + (uintptr_t)(addr - seg->s_base);
+-
+-	for (eaddr = addr + size; addr < eaddr; addr += psize, off += psize) {
+-		pp = page_lookup_nowait(vp, off, SE_SHARED);
+-
+-		if (pp != NULL) {
+-			/* following logic based on pvn_getdirty() */
+-
+-			if (pp->p_lckcnt != 0 || pp->p_cowcnt != 0) {
+-				page_unlock(pp);
+-				continue;
+-			}
+-
+-			page_io_lock(pp);
+-			hat_page_inval(pp, 0, victim_hat);
+-			page_io_unlock(pp);
+-
+-			/*
+-			 * For B_INVALCURONLY-style handling we let
+-			 * page_release call VN_DISPOSE if no one else is using
+-			 * the page.
+-			 *
+-			 * A hat_ismod() check would be useless because:
+-			 * (1) we are not be holding SE_EXCL lock
+-			 * (2) we've not unloaded _all_ translations
+-			 *
+-			 * Let page_release() do the heavy-lifting.
+-			 */
+-			(void) page_release(pp, 1);
+-		}
+-	}
+-}
+-
+-/*
+- * vm_map_inval()
+- *
+- * Invalidate as many pages as possible within the given mapping for the given
+- * process. addr is expected to be the base address of the mapping and size is
+- * the length of the mapping. In some cases a mapping will encompass an
+- * entire segment, but at least for anon or stack mappings, these will be
+- * regions within a single large segment. Thus, the invalidation is oriented
+- * around a single mapping and not an entire segment.
+- *
+- * SPARC sfmmu hat does not support HAT_CURPROC_PGUNLOAD-style handling so
+- * this code is only applicable to x86.
+- */
+-int
+-vm_map_inval(pid_t pid, caddr_t addr, size_t size)
+-{
+-	int ret;
+-	int error = 0;
+-	proc_t *p;		/* target proc */
+-	struct as *as;		/* target proc's address space */
+-	struct seg *seg;	/* working segment */
+-
+-	if (curproc->p_zone != global_zone || crgetruid(curproc->p_cred) != 0)
+-		return (set_errno(EPERM));
+-
+-	/* If not a valid mapping address, return an error */
+-	if ((caddr_t)((uintptr_t)addr & (uintptr_t)PAGEMASK) != addr)
+-		return (set_errno(EINVAL));
+-
+-again:
+-	mutex_enter(&pidlock);
+-	p = prfind(pid);
+-	if (p == NULL) {
+-		mutex_exit(&pidlock);
+-		return (set_errno(ESRCH));
+-	}
+-
+-	mutex_enter(&p->p_lock);
+-	mutex_exit(&pidlock);
+-
+-	if (panicstr != NULL) {
+-		mutex_exit(&p->p_lock);
+-		return (0);
+-	}
+-
+-	as = p->p_as;
+-
+-	/*
+-	 * Try to set P_PR_LOCK - prevents process "changing shape"
+-	 * - blocks fork
+-	 * - blocks sigkill
+-	 * - cannot be a system proc
+-	 * - must be fully created proc
+-	 */
+-	ret = sprtrylock_proc(p);
+-	if (ret == -1) {
+-		/* Process in invalid state */
+-		mutex_exit(&p->p_lock);
+-		return (set_errno(ESRCH));
+-	}
+-
+-	if (ret == 1) {
+-		/*
+-		 * P_PR_LOCK is already set. Wait and try again. This also
+-		 * drops p_lock so p may no longer be valid since the proc may
+-		 * have exited.
+-		 */
+-		sprwaitlock_proc(p);
+-		goto again;
+-	}
+-
+-	/* P_PR_LOCK is now set */
+-	mutex_exit(&p->p_lock);
+-
+-	AS_LOCK_ENTER(as, RW_READER);
+-	if ((seg = as_segat(as, addr)) == NULL) {
+-		AS_LOCK_EXIT(as);
+-		mutex_enter(&p->p_lock);
+-		sprunlock(p);
+-		return (set_errno(ENOMEM));
+-	}
+-
+-	/*
+-	 * The invalidation behavior only makes sense for vnode-backed segments.
+-	 */
+-	if (seg->s_ops != &segvn_ops) {
+-		AS_LOCK_EXIT(as);
+-		mutex_enter(&p->p_lock);
+-		sprunlock(p);
+-		return (0);
+-	}
+-
+-	/*
+-	 * If the mapping is out of bounds of the segement return an error.
+-	 */
+-	if ((addr + size) > (seg->s_base + seg->s_size)) {
+-		AS_LOCK_EXIT(as);
+-		mutex_enter(&p->p_lock);
+-		sprunlock(p);
+-		return (set_errno(EINVAL));
+-	}
+-
+-	/*
+-	 * Don't use MS_INVALCURPROC flag here since that would eventually
+-	 * initiate hat invalidation based on curthread. Since we're doing this
+-	 * on behalf of a different process, that would erroneously invalidate
+-	 * our own process mappings.
+-	 */
+-	error = SEGOP_SYNC(seg, addr, size, 0, (uint_t)MS_ASYNC);
+-	if (error == 0) {
+-		/*
+-		 * Since we didn't invalidate during the sync above, we now
+-		 * try to invalidate all of the pages in the mapping.
+-		 */
+-		map_inval(p, seg, addr, size);
+-	}
+-	AS_LOCK_EXIT(as);
+-
+-	mutex_enter(&p->p_lock);
+-	sprunlock(p);
+-
+-	if (error)
+-		(void) set_errno(error);
+-	return (error);
+-}
+-#endif
+diff --git a/usr/src/uts/i86pc/sys/vm_machparam.h b/usr/src/uts/i86pc/sys/vm_machparam.h
+index 90a5245217..fde81e59ed 100644
+--- a/usr/src/uts/i86pc/sys/vm_machparam.h
++++ b/usr/src/uts/i86pc/sys/vm_machparam.h
+@@ -23,6 +23,7 @@
+ /*
+  * Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_VM_MACHPARAM_H
+@@ -133,7 +134,8 @@ extern "C" {
+ 
+ /*
+  * The maximum value for handspreadpages which is the the distance
+- * between the two clock hands in pages.
++ * between the two clock hands in pages. This is only used when the page
++ * scanner is first started.
+  */
+ #define	MAXHANDSPREADPAGES	((64 * 1024 * 1024) / PAGESIZE)
+ 

@@ -1,0 +1,111 @@
+commit 1e916a827b0966b03c15ee18915a5043f3228e32 (refs/changes/44/4244/2)
+Author: Mike Gerdts <mike.gerdts@joyent.com>
+Date:   2018-06-18T21:45:52+00:00 (1 year, 4 months ago)
+    
+    OS-7030 lx audit may consume all kernel memory
+
+diff --git a/usr/src/uts/common/brand/lx/io/lx_netlink.c b/usr/src/uts/common/brand/lx/io/lx_netlink.c
+index 2635d1cae5..974192aebb 100644
+--- a/usr/src/uts/common/brand/lx/io/lx_netlink.c
++++ b/usr/src/uts/common/brand/lx/io/lx_netlink.c
+@@ -416,6 +416,7 @@ typedef struct lx_netlink_sock {
+ 	uint32_t lxns_groups;			/* group subscriptions */
+ 	uint32_t lxns_bufsize;			/* buffer size */
+ 	uint32_t lxns_flags;			/* socket flags */
++	int lxns_sock_error;			/* last socket error */
+ } lx_netlink_sock_t;
+ 
+ typedef struct lx_netlink_reply {
+@@ -1786,6 +1787,18 @@ lx_netlink_au_emit_cb(void *s, uint_t type, const char *msg, uint_t size)
+ 	int error;
+ 	uint32_t len;
+ 
++	/*
++	 * Enforce flow control, except for when sending LX_NETLINK_NLMSG_DONE.
++	 *
++	 * lxns_sock_error is only modified by sockfs while holding so_lock.
++	 * That is, it is modified by su_recv() in this function and by
++	 * lx_netlink_clr_flowctrl.  If anyone else modifies it, races can lead
++	 * to deadlock.
++	 */
++	if (lxsock->lxns_sock_error == ENOSPC && msg != NULL) {
++		return (ENOSPC);
++	}
++
+ 	len = LXNLMSG_ALIGN(sizeof (lx_netlink_hdr_t));
+ 	if (msg != NULL) {
+ 		len += LXNLMSG_ALIGN(size);
+@@ -1812,16 +1825,33 @@ lx_netlink_au_emit_cb(void *s, uint_t type, const char *msg, uint_t size)
+ 		mp->b_wptr += LXNLMSG_ALIGN(size);
+ 	}
+ 
++	/* As in lx_netlink_reply_sendup, send as T_UNITDATA_IND message. */
+ 	if ((mp1 = lx_netlink_alloc_mp1(lxsock)) == NULL) {
+ 		freeb(mp);
+ 		return (ENOMEM);
+ 	}
+-	/* As in lx_netlink_reply_sendup, send as T_UNITDATA_IND message. */
+ 	mp1->b_cont = mp;
++
+ 	lxsock->lxns_upcalls->su_recv(lxsock->lxns_uphandle, mp1,
+-	    msgdsize(mp1), 0, &error, NULL);
++	    msgdsize(mp1), 0, &lxsock->lxns_sock_error, NULL);
++	/*
++	 * There is a tiny race here.  su_recv() (really so_queue_msg()) set
++	 * lxns_sock_error while holding so_lock.  We read it without holding
++	 * that lock, which could result in returning an exit value from another
++	 * thread in this same function or from lx_netlink_clr_flowctrl() being
++	 * called to clear lxns_sock_error.  The first case is not possible, as
++	 * there is only one caller of this function per lxsock.  The second
++	 * case is possible, but will only have an effect if the so_queue_msg()
++	 * returns an error other than ENOSPC.  The only other error returned by
++	 * so_queue_msg() is EOPPNOTSUP - an error we should never hit.
++	 *
++	 * The alternative is to pass &error to su_recv().  That opens up a race
++	 * condition that can lead to deadlock.  It's clear which is the lesser
++	 * of the two evils.
++	 */
++	error = lxsock->lxns_sock_error;
+ 
+-	return (error);
++	return (error == ENOSPC ? 0 : error);
+ }
+ 
+ static int
+@@ -1989,6 +2019,14 @@ lx_netlink_send(sock_lower_handle_t handle, mblk_t *mp,
+ 	return (rval);
+ }
+ 
++static void
++lx_netlink_clr_flowctrl(sock_lower_handle_t handle)
++{
++	lx_netlink_sock_t *lxsock = (lx_netlink_sock_t *)handle;
++
++	lxsock->lxns_sock_error = 0;
++}
++
+ /*ARGSUSED*/
+ static int
+ lx_netlink_close(sock_lower_handle_t handle, int flags, cred_t *cr)
+@@ -2031,7 +2069,7 @@ static sock_downcalls_t sock_lx_netlink_downcalls = {
+ 	NULL,				/* sd_recv_uio */
+ 	NULL,				/* sd_poll */
+ 	sock_shutdown_notsupp,		/* sd_shutdown */
+-	sock_clr_flowctrl_notsupp,	/* sd_setflowctrl */
++	lx_netlink_clr_flowctrl,	/* sd_clr_flowctrl */
+ 	sock_ioctl_notsupp,		/* sd_ioctl */
+ 	lx_netlink_close		/* sd_close */
+ };
+diff --git a/usr/src/uts/common/brand/lx/os/lx_audit.c b/usr/src/uts/common/brand/lx/os/lx_audit.c
+index b940a0527d..0e2d6be02c 100644
+--- a/usr/src/uts/common/brand/lx/os/lx_audit.c
++++ b/usr/src/uts/common/brand/lx/os/lx_audit.c
+@@ -401,7 +401,7 @@ lx_audit_worker(void *a)
+ 
+ 		err = lx_audit_emit_syscall_event(rp->lxar_type,
+ 		    asp->lxast_sock, rp->lxar_msg);
+-		if (err != ENOMEM) {
++		if (err != ENOMEM && err != ENOSPC) {
+ 			kmem_free(rp->lxar_msg, LX_AUDIT_MESSAGE_TEXT_MAX);
+ 			kmem_free(rp, sizeof (lx_audit_record_t));
+ 		} else {

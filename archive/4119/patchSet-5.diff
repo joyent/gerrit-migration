@@ -1,0 +1,423 @@
+commit a0b5dfc6419f43efd13b6a002c56891ba318554f (refs/changes/19/4119/5)
+Author: Dan McDonald <danmcd@joyent.com>
+Date:   2018-06-05T15:21:53-04:00 (1 year, 4 months ago)
+    
+    Version bump SVP to 2
+
+diff --git a/usr/src/lib/varpd/svp/common/libvarpd_svp.h b/usr/src/lib/varpd/svp/common/libvarpd_svp.h
+index e44f720468..c824e11f38 100644
+--- a/usr/src/lib/varpd/svp/common/libvarpd_svp.h
++++ b/usr/src/lib/varpd/svp/common/libvarpd_svp.h
+@@ -125,7 +125,8 @@ typedef enum svp_conn_error {
+ 	SVP_CE_NONE		= 0x00,
+ 	SVP_CE_ASSOCIATE	= 0x01,
+ 	SVP_CE_NOPOLLOUT	= 0x02,
+-	SVP_CE_SOCKET		= 0x03
++	SVP_CE_SOCKET		= 0x03,
++	SVP_CE_VERSION_PONG	= 0x04
+ } svp_conn_error_t;
+ 
+ typedef enum svp_conn_flags {
+@@ -166,6 +167,7 @@ struct svp_conn {
+ 	list_t			sc_queries;
+ 	svp_conn_out_t		sc_output;
+ 	svp_conn_in_t		sc_input;
++	uint_t			sc_version;
+ };
+ 
+ typedef enum svp_remote_state {
+diff --git a/usr/src/lib/varpd/svp/common/libvarpd_svp_conn.c b/usr/src/lib/varpd/svp/common/libvarpd_svp_conn.c
+index 5d19f8a388..b556c10450 100644
+--- a/usr/src/lib/varpd/svp/common/libvarpd_svp_conn.c
++++ b/usr/src/lib/varpd/svp/common/libvarpd_svp_conn.c
+@@ -43,6 +43,8 @@ typedef enum svp_conn_act {
+ 	SVP_RA_CLEANUP	= 0x04
+ } svp_conn_act_t;
+ 
++static svp_conn_act_t svp_conn_poll_connect(port_event_t *, svp_conn_t *);
++
+ static void
+ svp_conn_inject(svp_conn_t *scp)
+ {
+@@ -167,6 +169,73 @@ svp_conn_backoff(svp_conn_t *scp)
+ 	return (SVP_RA_NONE);
+ }
+ 
++/*
++ * Think of this as an extension to the connect() call in svp_conn_connect().
++ * Send a message, receive it, and set the version here.  If the response is
++ * too slow or the socket throws an error, indicate a socket error, which
++ * will cause the caller to backoff (i.e. close the socket and try again).
++ *
++ * Version mismatch (corrupt SVP server or too-advanced SVP server) is its
++ * own error type.
++ */
++static svp_conn_error_t
++svp_conn_version_set(svp_conn_t *scp)
++{
++	svp_req_t ping;
++	ssize_t ret;
++	uint32_t save_crc;
++	uint16_t peer_version;
++	int ntries = 3;	/* One second between tries. 3secs should be enough. */
++
++	ping.svp_ver = htons(SVP_CURRENT_VERSION);
++	ping.svp_op = htons(SVP_R_PING);
++	ping.svp_size = 0;	/* Header-only... */
++	ping.svp_id = 0;
++	/* 0-length data... just use the req buffer for the pointer. */
++	svp_query_crc32(&ping, &ping, 0);
++
++	ret = write(scp->sc_socket, &ping, sizeof (ping));
++	if (ret == -1) {
++		/*
++		 * A failed write() call right after connect probably
++		 * indicates a larger connection failure.  Restart the
++		 * connection from scratch.
++		 */
++		return (SVP_CE_SOCKET);
++	}
++	assert(ret == sizeof (ping));
++	do {
++		/*
++		 * Asynch read.  We may loop here once or twice.
++		 * Wait a bit, but don't loop too many times...
++		 */
++		(void) sleep(1);
++		ret = read(scp->sc_socket, &ping, sizeof (ping));
++	} while (--ntries > 0 &&
++	    ret == -1 && (errno == EINTR || errno == EAGAIN));
++	if (ret == -1) {
++		/*
++		 * This is actually a failed read() call.  Restart the
++		 * connection from scratch.
++		 */
++		return (SVP_CE_SOCKET);
++	}
++
++	save_crc = ping.svp_crc32;
++	svp_query_crc32(&ping, &ping, 0);
++	peer_version = htons(ping.svp_ver);
++	if (ping.svp_op != htons(SVP_R_PONG) ||
++	    ping.svp_size != 0 || ping.svp_id != 0 ||
++	    ping.svp_crc32 != save_crc ||
++	    peer_version == 0 || peer_version > SVP_CURRENT_VERSION) {
++		return (SVP_CE_VERSION_PONG);
++	}
++
++	/* This connection now has a version! */
++	scp->sc_version = peer_version;
++	return (SVP_CE_NONE);
++}
++
+ static svp_conn_act_t
+ svp_conn_connect(svp_conn_t *scp)
+ {
+@@ -180,6 +249,9 @@ svp_conn_connect(svp_conn_t *scp)
+ 	if (scp->sc_cstate == SVP_CS_INITIAL)
+ 		scp->sc_nbackoff = 0;
+ 
++	/* New connect means we need to know the version. */
++	scp->sc_version = 0;
++
+ 	scp->sc_socket = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+ 	if (scp->sc_socket == -1) {
+ 		scp->sc_error = SVP_CE_SOCKET;
+@@ -252,46 +324,67 @@ svp_conn_connect(svp_conn_t *scp)
+ 		}
+ 	}
+ 
+-	/*
+-	 * We've connected. Successfully move ourselves to the bound
+-	 * state and start polling.
+-	 */
+-	scp->sc_cstate = SVP_CS_ACTIVE;
+-	scp->sc_event.se_events = POLLIN | POLLRDNORM | POLLHUP;
+-	ret = svp_event_associate(&scp->sc_event, scp->sc_socket);
+-	if (ret == 0)
+-		return (SVP_RA_RESTORE);
+-	scp->sc_error = SVP_CE_ASSOCIATE;
+-	scp->sc_cstate = SVP_CS_ERROR;
+-
+-	return (SVP_RA_DEGRADE);
++	return (svp_conn_poll_connect(NULL, scp));
+ }
+ 
+ /*
+- * This should be the first call we get after a connect. If we have successfully
+- * connected, we should see a writeable event. We may also see an error or a
+- * hang up. In either of these cases, we transition to error mode. If there is
+- * also a readable event, we ignore it at the moment and just let a
+- * reassociation pick it up so we can simplify the set of state transitions that
+- * we have.
++ * This should be the first call we get after a successful synchronous
++ * connect, or a completed (failed or successful) asynchronous connect.  A
++ * non-NULL port-event indicates asynchronous completion, a NULL port-event
++ * indicates a successful synchronous connect.
++ * 
++ * If we have successfully connected, we should see a writeable event.  In the
++ * asynchronous case, we may also see an error or a hang up. For either hang
++ * up or error, we transition to error mode. If there is also a readable event
++ * (i.e. incoming data), we ignore it at the moment and just let a
++ * reassociation pick it up so we can simplify the set of state transitions
++ * that we have.
+  */
+ static svp_conn_act_t
+ svp_conn_poll_connect(port_event_t *pe, svp_conn_t *scp)
+ {
+-	int ret, err;
+-	socklen_t sl = sizeof (err);
+-	if (!(pe->portev_events & POLLOUT)) {
+-		scp->sc_errno = 0;
+-		scp->sc_error = SVP_CE_NOPOLLOUT;
+-		scp->sc_cstate = SVP_CS_ERROR;
+-		return (SVP_RA_DEGRADE);
++	int ret;
++	svp_conn_error_t version_error;
++
++	if (pe != NULL) {
++		int err;
++		socklen_t sl = sizeof (err);
++
++		/*
++		 * These bits only matter if we're notified of an
++		 * asynchronous connection completion.
++		 */
++		if (!(pe->portev_events & POLLOUT)) {
++			scp->sc_errno = 0;
++			scp->sc_error = SVP_CE_NOPOLLOUT;
++			scp->sc_cstate = SVP_CS_ERROR;
++			return (SVP_RA_DEGRADE);
++		}
++
++		ret = getsockopt(scp->sc_socket, SOL_SOCKET, SO_ERROR, &err,
++		    &sl);
++		if (ret != 0)
++			libvarpd_panic("unanticipated getsockopt error");
++		if (err != 0) {
++			return (svp_conn_backoff(scp));
++		}
+ 	}
+ 
+-	ret = getsockopt(scp->sc_socket, SOL_SOCKET, SO_ERROR, &err, &sl);
+-	if (ret != 0)
+-		libvarpd_panic("unanticipated getsockopt error");
+-	if (err != 0) {
++	/* Use a single SVP_R_PING to determine the version. */
++	version_error = svp_conn_version_set(scp);
++	switch (version_error) {
++	case SVP_CE_SOCKET:
++		/* Use this to signal read/write errors... */
+ 		return (svp_conn_backoff(scp));
++	case SVP_CE_NONE:
++		assert(scp->sc_version > 0 &&
++		    scp->sc_version <= SVP_CURRENT_VERSION);
++		break;
++	default:
++		scp->sc_error = version_error;
++		scp->sc_cstate = SVP_CS_ERROR;
++		scp->sc_errno = EPROTONOSUPPORT;	/* Protocol error... */
++		return (SVP_RA_DEGRADE);
+ 	}
+ 
+ 	scp->sc_cstate = SVP_CS_ACTIVE;
+@@ -357,7 +450,7 @@ svp_conn_pollout(svp_conn_t *scp)
+ 
+ 	do {
+ 		ret = writev(scp->sc_socket, iov, nvecs);
+-	} while (ret == -1 && errno == EAGAIN);
++	} while (ret == -1 && errno == EINTR);
+ 	if (ret == -1) {
+ 		switch (errno) {
+ 		case EAGAIN:
+@@ -397,11 +490,16 @@ svp_conn_pollin_validate(svp_conn_t *scp)
+ 	nop = ntohs(resp->svp_op);
+ 	nsize = ntohl(resp->svp_size);
+ 
+-	if (nvers != SVP_CURRENT_VERSION) {
+-		(void) bunyan_warn(svp_bunyan, "unsupported version",
++	/*
++	 * A peer that's messing with post-connection version changes is
++	 * likely a broken peer.
++	 */
++	if (nvers != scp->sc_version) {
++		(void) bunyan_warn(svp_bunyan, "version mismatch",
+ 		    BUNYAN_T_IP, "remote_ip", &scp->sc_addr,
+ 		    BUNYAN_T_INT32, "remote_port", scp->sc_remote->sr_rport,
+-		    BUNYAN_T_INT32, "version", nvers,
++		    BUNYAN_T_INT32, "peer version", nvers,
++		    BUNYAN_T_INT32, "our version", scp->sc_version,
+ 		    BUNYAN_T_INT32, "operation", nop,
+ 		    BUNYAN_T_INT32, "response_id", resp->svp_id,
+ 		    BUNYAN_T_END);
+diff --git a/usr/src/lib/varpd/svp/common/libvarpd_svp_prot.h b/usr/src/lib/varpd/svp/common/libvarpd_svp_prot.h
+index ca16c21886..8dc2411dc3 100644
+--- a/usr/src/lib/varpd/svp/common/libvarpd_svp_prot.h
++++ b/usr/src/lib/varpd/svp/common/libvarpd_svp_prot.h
+@@ -35,8 +35,12 @@ extern "C" {
+ 
+ #define	SVP_VERSION_ONE	1
+ #define	SVP_VERSION_TWO	2
+-/* XXX KEBE SAYS -- we are not yet ready to bump this. */
+-#define	SVP_CURRENT_VERSION	SVP_VERSION_ONE
++/*
++ * Bump this to 2.  Version 1 SVP is a subset of version 2, and can be
++ * determined using an SVP_R_PING as part of connection establishment.
++ * Version-2 specific changes will be highlighed (look for "v2").
++ */
++#define	SVP_CURRENT_VERSION	SVP_VERSION_TWO
+ 
+ typedef struct svp_req {
+ 	uint16_t	svp_ver;
+@@ -46,6 +50,10 @@ typedef struct svp_req {
+ 	uint32_t	svp_crc32;
+ } svp_req_t;
+ 
++/*
++ * Unless specified, all message types function identically between v1 and v2
++ * of SVP.
++ */
+ typedef enum svp_op {
+ 	SVP_R_UNKNOWN		= 0x00,
+ 	SVP_R_PING		= 0x01,
+@@ -58,11 +66,11 @@ typedef enum svp_op {
+ 	SVP_R_BULK_ACK		= 0x08,
+ 	SVP_R_LOG_REQ		= 0x09,
+ 	SVP_R_LOG_ACK		= 0x0A,
+-	SVP_R_LOG_RM		= 0x0B,
+-	SVP_R_LOG_RM_ACK	= 0x0C,
++	SVP_R_LOG_RM		= 0x0B,	/* v2 introduces new log type */
++	SVP_R_LOG_RM_ACK	= 0x0C, /* See svp_log_route_t */
+ 	SVP_R_SHOOTDOWN		= 0x0D,
+-	SVP_R_ROUTE_REQ		= 0x0E,
+-	SVP_R_ROUTE_ACK		= 0x0F
++	SVP_R_ROUTE_REQ		= 0x0E,	/* v2 only */
++	SVP_R_ROUTE_ACK		= 0x0F	/* v2 only */
+ } svp_op_t;
+ 
+ typedef enum svp_status {
+@@ -174,7 +182,7 @@ typedef struct svp_log_req {
+ typedef enum svp_log_type {
+ 	SVP_LOG_VL2	= 0x01,
+ 	SVP_LOG_VL3	= 0x02,
+-	SVP_LOG_ROUTE	= 0x03
++	SVP_LOG_ROUTE	= 0x03	/* v2 only */
+ } svp_log_type_t;
+ 
+ typedef struct svp_log_vl2 {
+@@ -194,6 +202,9 @@ typedef struct svp_log_vl3 {
+ 	uint32_t	svl3_vnetid;
+ } svp_log_vl3_t;
+ 
++/*
++ * This log entry only appears on v2 connections.
++ */
+ typedef struct svp_log_route {
+ 	uint32_t	svlr_type;	/* Should be SVP_LOG_ROUTE */
+ 	uint8_t		svlr_id[16];	/* 16-byte UUID */
+@@ -255,6 +266,8 @@ typedef struct svp_shootdown {
+  * far-remote networks.  Modern overlay modules will request IP destinations
+  * for remote-Triton networks, but they must know how to reach the
+  * remote-Triton SVP server.
++ *
++ * NOTE: SVP_R_ROUTE_{REQ,ACK} are only present in SVP v2.
+  */
+ typedef struct svp_route_req {
+ 	uint32_t	srr_vnetid;	/* Requester's vnet ID. */
+diff --git a/usr/src/lib/varpd/svp/common/libvarpd_svp_remote.c b/usr/src/lib/varpd/svp/common/libvarpd_svp_remote.c
+index 50e31b6e97..8820fbec39 100644
+--- a/usr/src/lib/varpd/svp/common/libvarpd_svp_remote.c
++++ b/usr/src/lib/varpd/svp/common/libvarpd_svp_remote.c
+@@ -279,8 +279,40 @@ svp_remote_detach(svp_t *svp)
+ }
+ 
+ /*
+- * Walk the list of connections and find the first one that's available, the
+- * move it to the back of the list so it's less likely to be used again.
++ * See if the request can be sent over the connection's supported version.
++ * Scribble the version in the request itself.  NOTE that we do not check the
++ * version that already exists in sqp->sq_header.svp_ver, as we may be called
++ * from svp_remote_reassign() (and change versions when arriving at a new
++ * connection).
++ */
++static boolean_t
++svp_outbound_version_check(int version, svp_query_t *sqp)
++{
++	uint16_t op = htons(sqp->sq_header.svp_op);
++
++	/*
++	 * As of v1 -> v2, we really only need to restrict SVP_R_ROUTE_REQ
++	 * as v2-only.  Reflect that here.
++	 *
++	 * NOTE that if any message semantics change between future versions,
++	 * (e.g. "in v3 SVP_R_VL2_REQ takes on additional work"), we'll
++	 * need to more-deeply inspect the query.  It's possible that the
++	 * svp_op space is big enough to just continue op-only inspections.
++	 */
++
++	assert(version > 0 && version <= SVP_CURRENT_VERSION);
++
++	if (op != SVP_R_ROUTE_REQ || version >= SVP_VERSION_TWO) {
++		sqp->sq_header.svp_ver = htons(version);
++		return (B_TRUE);
++	}
++	return (B_FALSE);
++}
++
++/*
++ * Walk the list of connections and find the first one that's available AND
++ * version-appropriate for the message, then move the matched connection to
++ * the back of the list so it's less likely to be used again.
+  */
+ static boolean_t
+ svp_remote_conn_queue(svp_remote_t *srp, svp_query_t *sqp)
+@@ -291,7 +323,8 @@ svp_remote_conn_queue(svp_remote_t *srp, svp_query_t *sqp)
+ 	for (scp = list_head(&srp->sr_conns); scp != NULL;
+ 	    scp = list_next(&srp->sr_conns, scp)) {
+ 		mutex_enter(&scp->sc_lock);
+-		if (scp->sc_cstate != SVP_CS_ACTIVE) {
++		if (scp->sc_cstate != SVP_CS_ACTIVE ||
++		    !svp_outbound_version_check(scp->sc_version, sqp)) {
+ 			mutex_exit(&scp->sc_lock);
+ 			continue;
+ 		}
+@@ -331,7 +364,6 @@ svp_remote_vl2_lookup(svp_t *svp, svp_query_t *sqp, const uint8_t *mac,
+ 	sqp->sq_arg = arg;
+ 	sqp->sq_svp = svp;
+ 	sqp->sq_state = SVP_QUERY_INIT;
+-	sqp->sq_header.svp_ver = htons(SVP_CURRENT_VERSION);
+ 	sqp->sq_header.svp_op = htons(SVP_R_VL2_REQ);
+ 	sqp->sq_header.svp_size = htonl(sizeof (svp_vl2_req_t));
+ 	sqp->sq_header.svp_id = id_alloc(svp_idspace);
+@@ -383,7 +415,6 @@ svp_remote_route_lookup(svp_t *svp, svp_query_t *sqp,
+ 	sqp->sq_arg = arg;
+ 	sqp->sq_svp = svp;
+ 	sqp->sq_state = SVP_QUERY_INIT;
+-	sqp->sq_header.svp_ver = htons(SVP_CURRENT_VERSION);
+ 	sqp->sq_header.svp_op = htons(SVP_R_ROUTE_REQ);
+ 	sqp->sq_header.svp_size = htonl(sizeof (svp_route_req_t));
+ 	sqp->sq_header.svp_id = id_alloc(svp_idspace);
+@@ -435,7 +466,6 @@ svp_remote_vl3_common(svp_remote_t *srp, svp_query_t *sqp,
+ 	sqp->sq_func = func;
+ 	sqp->sq_arg = arg;
+ 	sqp->sq_state = SVP_QUERY_INIT;
+-	sqp->sq_header.svp_ver = htons(SVP_CURRENT_VERSION);
+ 	sqp->sq_header.svp_op = htons(SVP_R_VL3_REQ);
+ 	sqp->sq_header.svp_size = htonl(sizeof (svp_vl3_req_t));
+ 	sqp->sq_header.svp_id = id_alloc(svp_idspace);
+@@ -517,7 +547,6 @@ svp_remote_log_request(svp_remote_t *srp, svp_query_t *sqp, void *buf,
+ 	sqp->sq_func = svp_remote_log_request_cb;
+ 	sqp->sq_state = SVP_QUERY_INIT;
+ 	sqp->sq_arg = srp;
+-	sqp->sq_header.svp_ver = htons(SVP_CURRENT_VERSION);
+ 	sqp->sq_header.svp_op = htons(SVP_R_LOG_REQ);
+ 	sqp->sq_header.svp_size = htonl(sizeof (svp_log_req_t));
+ 	sqp->sq_header.svp_id = id_alloc(svp_idspace);
+@@ -563,7 +592,6 @@ svp_remote_lrm_request(svp_remote_t *srp, svp_query_t *sqp, void *buf,
+ 	sqp->sq_func = svp_remote_lrm_request_cb;
+ 	sqp->sq_state = SVP_QUERY_INIT;
+ 	sqp->sq_arg = srp;
+-	sqp->sq_header.svp_ver = htons(SVP_CURRENT_VERSION);
+ 	sqp->sq_header.svp_op = htons(SVP_R_LOG_RM);
+ 	sqp->sq_header.svp_size = htonl(buflen);
+ 	sqp->sq_header.svp_id = id_alloc(svp_idspace);

@@ -1,0 +1,3508 @@
+commit 49f74c2243256a40cc4d7b49c59d62f3ad9dc5d3 (refs/changes/42/3542/5)
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2018-03-06T06:11:09+00:00 (1 year, 7 months ago)
+    
+    OS-6685 bhyve ppt should facilitate PCI access
+    
+    OS-XXXX update ppt to use sdev and fix bugs
+    OS-XXXX fix DEBUG compile errors in ppt
+    
+    - don't assert we hold pptdev_mtx, we haven't fixed the locking yet
+    - fix ppt sdev
+
+diff --git a/usr/src/cmd/bhyve/Makefile.com b/usr/src/cmd/bhyve/Makefile.com
+index bbfc56e063..1f7e87e074 100644
+--- a/usr/src/cmd/bhyve/Makefile.com
++++ b/usr/src/cmd/bhyve/Makefile.com
+@@ -84,7 +84,7 @@ CPPFLAGS =	-I$(COMPAT)/freebsd -I$(CONTRIB)/freebsd \
+ 		-I$(SRC)/uts/i86pc \
+ 		-I$(SRC)/lib/libdladm/common \
+ 		-DWITHOUT_CAPSICUM
+-LDLIBS +=	-lsocket -lnsl -ldlpi -ldladm -lmd -luuid -lvmmapi -lz -lnvpair -ldevinfo
++LDLIBS +=	-lsocket -lnsl -ldlpi -ldladm -lmd -luuid -lvmmapi -lz -lnvpair
+ 
+ POST_PROCESS += ; $(GENSETDEFS) $@
+ 
+diff --git a/usr/src/cmd/bhyve/pci_passthru.c b/usr/src/cmd/bhyve/pci_passthru.c
+index e5e9064926..65257e9618 100644
+--- a/usr/src/cmd/bhyve/pci_passthru.c
++++ b/usr/src/cmd/bhyve/pci_passthru.c
+@@ -39,8 +39,6 @@ __FBSDID("$FreeBSD$");
+ #include <sys/ioctl.h>
+ 
+ #include <sys/pci.h>
+-#include <sys/pci_tools.h>
+-#include <libdevinfo.h>
+ 
+ #include <dev/io/iodev.h>
+ #include <dev/pci/pcireg.h>
+@@ -58,19 +56,10 @@ __FBSDID("$FreeBSD$");
+ 
+ #include <machine/vmm.h>
+ #include <vmmapi.h>
++#include <sys/ppt_dev.h>
+ #include "pci_emul.h"
+ #include "mem.h"
+ 
+-#ifdef __FreeBSD__
+-#ifndef _PATH_DEVPCI
+-#define	_PATH_DEVPCI	"/dev/pci"
+-#endif
+-
+-#ifndef	_PATH_DEVIO
+-#define	_PATH_DEVIO	"/dev/io"
+-#endif
+-#endif
+-
+ #ifndef _PATH_MEM
+ #define	_PATH_MEM	"/dev/mem"
+ #endif
+@@ -80,10 +69,6 @@ __FBSDID("$FreeBSD$");
+ #define MSIX_TABLE_COUNT(ctrl) (((ctrl) & PCIM_MSIXCTRL_TABLE_SIZE) + 1)
+ #define MSIX_CAPLEN 12
+ 
+-#ifdef __FreeBSD__
+-static int pcifd = -1;
+-static int iofd = -1;
+-#endif
+ static int memfd = -1;
+ 
+ struct passthru_softc {
+@@ -97,9 +82,7 @@ struct passthru_softc {
+ 	struct {
+ 		int		capoff;
+ 	} psc_msix;
+-	struct pcisel psc_sel;
+-	di_node_t devnode;
+-	int nexfd;
++	int pptfd;
+ 	int msi_limit;
+ 	int msix_limit;
+ };
+@@ -108,7 +91,7 @@ static int
+ msi_caplen(int msgctrl)
+ {
+ 	int len;
+-	
++
+ 	len = 10;		/* minimum length of msi capability */
+ 
+ 	if (msgctrl & PCIM_MSICTRL_64BIT)
+@@ -127,81 +110,76 @@ msi_caplen(int msgctrl)
+ }
+ 
+ static uint32_t
+-pcitool_reg_rw(const struct passthru_softc *sc, int bar, uint64_t reg, int width,
+-    uint64_t data, int req)
++read_config(const struct passthru_softc *sc, long reg, int width)
+ {
+-	struct pcitool_reg pr = { 0 };
+-
+-	pr.user_version = PCITOOL_VERSION;
+-	pr.acc_attr = PCITOOL_ACC_ATTR_ENDN_LTL;
+-	pr.barnum = bar;
+-	pr.bus_no = sc->psc_sel.pc_bus;
+-	pr.dev_no = sc->psc_sel.pc_dev;
+-	pr.func_no = sc->psc_sel.pc_func;
+-	pr.offset = reg;
+-	pr.data = data;
+-
+-	switch (width) {
+-	case 1:
+-		pr.acc_attr += PCITOOL_ACC_ATTR_SIZE_1;
+-		break;
+-	case 2:
+-		pr.acc_attr += PCITOOL_ACC_ATTR_SIZE_2;
+-		break;
+-	case 4:
+-		pr.acc_attr += PCITOOL_ACC_ATTR_SIZE_4;
+-		break;
+-	case 8:
+-		pr.acc_attr += PCITOOL_ACC_ATTR_SIZE_8;
+-		break;
+-	default:
++	struct ppt_cfg_io pi;
++
++	pi.pci_off = reg;
++	pi.pci_width = width;
++
++	if (ioctl(sc->pptfd, PPT_CFG_READ, &pi) != 0) {
+ 		return (0);
+ 	}
++	return (pi.pci_data);
++}
+ 
+-	if (ioctl(sc->nexfd, req, &pr) != 0)
+-		return (0);
+-	else
+-		return (pr.data);
++static void
++write_config(const struct passthru_softc *sc, long reg, int width,
++    uint32_t data)
++{
++	struct ppt_cfg_io pi;
++
++	pi.pci_off = reg;
++	pi.pci_width = width;
++	pi.pci_data = data;
++
++	(void) ioctl(sc->pptfd, PPT_CFG_WRITE, &pi);
+ }
+ 
+-static uint32_t
+-read_config(const struct passthru_softc *sc, long reg, int width)
++static int
++passthru_get_bar(struct passthru_softc *sc, int bar, enum pcibar_type *type,
++    uint64_t *base, uint64_t *size)
+ {
+-#ifdef __FreeBSD__
+-	struct pci_io pi;
++	struct ppt_bar_query pb;
+ 
+-	bzero(&pi, sizeof(pi));
+-	pi.pi_sel = sc->sel;
+-	pi.pi_reg = reg;
+-	pi.pi_width = width;
++	pb.pbq_baridx = bar;
+ 
+-	if (ioctl(pcifd, PCIOCREAD, &pi) < 0)
+-		return (0);				/* XXX */
+-	else
+-		return (pi.pi_data);
+-#else
+-	return (pcitool_reg_rw(sc, PCITOOL_CONFIG, reg, width, 0,
+-	    PCITOOL_DEVICE_GET_REG));
+-#endif
++	if (ioctl(sc->pptfd, PPT_BAR_QUERY, &pb) != 0) {
++		return (-1);
++	}
++
++	switch (pb.pbq_type) {
++	case PCI_ADDR_IO:
++		*type = PCIBAR_IO;
++		break;
++	case PCI_ADDR_MEM32:
++		*type = PCIBAR_MEM32;
++		break;
++	case PCI_ADDR_MEM64:
++		*type = PCIBAR_MEM64;
++		break;
++	default:
++		err(1, "unrecognized BAR type: %u\n", pb.pbq_type);
++		break;
++	}
++
++	*base = pb.pbq_base;
++	*size = pb.pbq_size;
++	return (0);
+ }
+ 
+-static void
+-write_config(const struct passthru_softc *sc, long reg, int width, uint32_t data)
++static int
++passthru_dev_open(const char *path, int *pptfdp)
+ {
+-#ifdef __FreeBSD__
+-	struct pci_io pi;
+-
+-	bzero(&pi, sizeof(pi));
+-	pi.pi_sel = sc->sel;
+-	pi.pi_reg = reg;
+-	pi.pi_width = width;
+-	pi.pi_data = data;
+-
+-	(void)ioctl(pcifd, PCIOCWRITE, &pi);		/* XXX */
+-#else
+-	(void) pcitool_reg_rw(sc, PCITOOL_CONFIG, reg, width, data,
+-	    PCITOOL_DEVICE_SET_REG);
+-#endif
++	int pptfd;
++
++	if ((pptfd = open(path, O_RDWR)) < 0) {
++		return (errno);
++	}
++
++	/* XXX: verify fd with ioctl? */
++	*pptfdp = pptfd;
++	return (0);
+ }
+ 
+ #ifdef LEGACY_SUPPORT
+@@ -229,19 +207,50 @@ passthru_add_msicap(struct pci_devinst *pi, int msgnum, int nextptr)
+ }
+ #endif	/* LEGACY_SUPPORT */
+ 
++static void
++passthru_intr_limit(struct passthru_softc *sc, struct msixcap *msixcap)
++{
++	struct pci_devinst *pi = sc->psc_pi;
++	int off;
++
++	/* Reduce the number of MSI vectors if higher than OS limit */
++	if ((off = sc->psc_msi.capoff) != 0 && sc->msi_limit != -1) {
++		int msi_limit, mmc;
++
++		msi_limit =
++		    sc->msi_limit > 16 ? PCIM_MSICTRL_MMC_32 :
++		    sc->msi_limit > 8 ? PCIM_MSICTRL_MMC_16 :
++		    sc->msi_limit > 4 ? PCIM_MSICTRL_MMC_8 :
++		    sc->msi_limit > 2 ? PCIM_MSICTRL_MMC_4 :
++		    sc->msi_limit > 1 ? PCIM_MSICTRL_MMC_2 :
++		    PCIM_MSICTRL_MMC_1;
++		mmc = sc->psc_msi.msgctrl & PCIM_MSICTRL_MMC_MASK;
++
++		if (mmc > msi_limit) {
++			sc->psc_msi.msgctrl &= ~PCIM_MSICTRL_MMC_MASK;
++			sc->psc_msi.msgctrl |= msi_limit;
++			pci_set_cfgdata16(pi, off + 2, sc->psc_msi.msgctrl);
++		}
++	}
++
++	/* Reduce the number of MSI-X vectors if higher than OS limit */
++	if ((off = sc->psc_msix.capoff) != 0 && sc->msix_limit != -1) {
++		if (MSIX_TABLE_COUNT(msixcap->msgctrl) > sc->msix_limit) {
++			msixcap->msgctrl &= ~PCIM_MSIXCTRL_TABLE_SIZE;
++			msixcap->msgctrl |= sc->msix_limit - 1;
++			pci_set_cfgdata16(pi, off + 2, msixcap->msgctrl);
++		}
++	}
++}
++
+ static int
+ cfginitmsi(struct passthru_softc *sc)
+ {
+-	int i, ptr, capptr, cap, sts, caplen, table_size, mmc;
++	int i, ptr, capptr, cap, sts, caplen, table_size;
+ 	uint32_t u32;
+-	struct pcisel sel;
+-	struct pci_devinst *pi;
++	struct pci_devinst *pi = sc->psc_pi;
+ 	struct msixcap msixcap;
+ 	uint32_t *msixcap_ptr;
+-	int msi_limit;
+-
+-	pi = sc->psc_pi;
+-	sel = sc->psc_sel;
+ 
+ 	/*
+ 	 * Parse the capabilities and cache the location of the MSI
+@@ -259,7 +268,7 @@ cfginitmsi(struct passthru_softc *sc)
+ 				 */
+ 				sc->psc_msi.capoff = ptr;
+ 				sc->psc_msi.msgctrl = read_config(sc,
+-								  ptr + 2, 2);
++				    ptr + 2, 2);
+ 				sc->psc_msi.emulated = 0;
+ 				caplen = msi_caplen(sc->psc_msi.msgctrl);
+ 				capptr = ptr;
+@@ -269,31 +278,9 @@ cfginitmsi(struct passthru_softc *sc)
+ 					caplen -= 4;
+ 					capptr += 4;
+ 				}
+-
+-				/*
+-				 * Reduce the number of MSI vectors if higher
+-				 * than the limit imposed by the OS.
+-				 */
+-				msi_limit =
+-				    sc->msi_limit > 16 ? PCIM_MSICTRL_MMC_32 :
+-				    sc->msi_limit > 8 ? PCIM_MSICTRL_MMC_16 :
+-				    sc->msi_limit > 4 ? PCIM_MSICTRL_MMC_8 :
+-				    sc->msi_limit > 2 ? PCIM_MSICTRL_MMC_4 :
+-				    sc->msi_limit > 1 ? PCIM_MSICTRL_MMC_2 :
+-				    PCIM_MSICTRL_MMC_1;
+-
+-				mmc = sc->psc_msi.msgctrl &
+-				    PCIM_MSICTRL_MMC_MASK;
+-				if (sc->msi_limit != -1 && mmc > msi_limit) {
+-					sc->psc_msi.msgctrl &=
+-					    ~PCIM_MSICTRL_MMC_MASK;
+-					sc->psc_msi.msgctrl |= msi_limit;
+-					pci_set_cfgdata16(pi, ptr + 2,
+-					    sc->psc_msi.msgctrl);
+-				}
+ 			} else if (cap == PCIY_MSIX) {
+ 				/*
+-				 * Copy the MSI-X capability 
++				 * Copy the MSI-X capability
+ 				 */
+ 				sc->psc_msix.capoff = ptr;
+ 				caplen = 12;
+@@ -307,25 +294,13 @@ cfginitmsi(struct passthru_softc *sc)
+ 					capptr += 4;
+ 					msixcap_ptr++;
+ 				}
+-
+-				/*
+-				 * Reduce the number of MSI vectors if higher
+-				 * than the limit imposed by the OS.
+-				 */
+-				if (sc->msix_limit != -1 &&
+-				    MSIX_TABLE_COUNT(msixcap.msgctrl) >
+-				    sc->msix_limit) {
+-					msixcap.msgctrl &=
+-					    ~PCIM_MSIXCTRL_TABLE_SIZE;
+-					msixcap.msgctrl |= sc->msix_limit - 1;
+-					pci_set_cfgdata16(pi, ptr + 2,
+-					    msixcap.msgctrl);
+-				}
+ 			}
+ 			ptr = read_config(sc, ptr + PCICAP_NEXTPTR, 1);
+ 		}
+ 	}
+ 
++	passthru_intr_limit(sc, &msixcap);
++
+ 	if (sc->psc_msix.capoff != 0) {
+ 		pi->pi_msix.pba_bar =
+ 		    msixcap.pba_info & PCIM_MSIX_BIR_MASK;
+@@ -367,14 +342,15 @@ cfginitmsi(struct passthru_softc *sc)
+ #endif
+ 
+ 	/* Make sure one of the capabilities is present */
+-	if (sc->psc_msi.capoff == 0 && sc->psc_msix.capoff == 0) 
++	if (sc->psc_msi.capoff == 0 && sc->psc_msix.capoff == 0) {
+ 		return (-1);
+-	else
++	} else {
+ 		return (0);
++	}
+ }
+ 
+ static uint64_t
+-msix_table_read(struct passthru_softc *sc, uint64_t offset, int size)
++passthru_msix_table_read(struct passthru_softc *sc, uint64_t offset, int size)
+ {
+ 	struct pci_devinst *pi;
+ 	struct msix_table_entry *entry;
+@@ -452,8 +428,8 @@ msix_table_read(struct passthru_softc *sc, uint64_t offset, int size)
+ }
+ 
+ static void
+-msix_table_write(struct vmctx *ctx, int vcpu, struct passthru_softc *sc,
+-		 uint64_t offset, int size, uint64_t data)
++passthru_msix_table_write(struct vmctx *ctx, int vcpu,
++    struct passthru_softc *sc, uint64_t offset, int size, uint64_t data)
+ {
+ 	struct pci_devinst *pi;
+ 	struct msix_table_entry *entry;
+@@ -518,10 +494,9 @@ msix_table_write(struct vmctx *ctx, int vcpu, struct passthru_softc *sc,
+ 		/* If the entry is masked, don't set it up */
+ 		if ((entry->vector_control & PCIM_MSIX_VCTRL_MASK) == 0 ||
+ 		    (vector_control & PCIM_MSIX_VCTRL_MASK) == 0) {
+-			(void)vm_setup_pptdev_msix(ctx, vcpu,
+-			    sc->psc_sel.pc_bus, sc->psc_sel.pc_dev,
+-			    sc->psc_sel.pc_func, index, entry->addr,
+-			    entry->msg_data, entry->vector_control);
++			(void) vm_setup_pptdev_msix(ctx, vcpu, sc->pptfd,
++			    index, entry->addr, entry->msg_data,
++			    entry->vector_control);
+ 		}
+ 	}
+ }
+@@ -529,7 +504,6 @@ msix_table_write(struct vmctx *ctx, int vcpu, struct passthru_softc *sc,
+ static int
+ init_msix_table(struct vmctx *ctx, struct passthru_softc *sc, uint64_t base)
+ {
+-	int b, s, f;
+ 	int error, idx;
+ 	size_t len, remaining;
+ 	uint32_t table_size, table_offset;
+@@ -539,14 +513,10 @@ init_msix_table(struct vmctx *ctx, struct passthru_softc *sc, uint64_t base)
+ 
+ 	assert(pci_msix_table_bar(pi) >= 0 && pci_msix_pba_bar(pi) >= 0);
+ 
+-	b = sc->psc_sel.pc_bus;
+-	s = sc->psc_sel.pc_dev;
+-	f = sc->psc_sel.pc_func;
+-
+-	/* 
++	/*
+ 	 * If the MSI-X table BAR maps memory intended for
+-	 * other uses, it is at least assured that the table 
+-	 * either resides in its own page within the region, 
++	 * other uses, it is at least assured that the table
++	 * either resides in its own page within the region,
+ 	 * or it resides in a page shared with only the PBA.
+ 	 */
+ 	table_offset = rounddown2(pi->pi_msix.table_offset, 4096);
+@@ -585,9 +555,8 @@ init_msix_table(struct vmctx *ctx, struct passthru_softc *sc, uint64_t base)
+ 			    PROT_WRITE, MAP_SHARED, memfd, start +
+ 			    pi->pi_msix.pba_page_offset);
+ 			if (pi->pi_msix.pba_page == MAP_FAILED) {
+-				warn(
+-			    "Failed to map PBA page for MSI-X on %d/%d/%d",
+-				    b, s, f);
++				warn("Failed to map PBA page for MSI-X on %d",
++				    sc->pptfd);
+ 				return (-1);
+ 			}
+ 		}
+@@ -596,7 +565,7 @@ init_msix_table(struct vmctx *ctx, struct passthru_softc *sc, uint64_t base)
+ 	/* Map everything before the MSI-X table */
+ 	if (table_offset > 0) {
+ 		len = table_offset;
+-		error = vm_map_pptdev_mmio(ctx, b, s, f, start, len, base);
++		error = vm_map_pptdev_mmio(ctx, sc->pptfd, start, len, base);
+ 		if (error)
+ 			return (error);
+ 
+@@ -613,7 +582,7 @@ init_msix_table(struct vmctx *ctx, struct passthru_softc *sc, uint64_t base)
+ 	/* Map everything beyond the end of the MSI-X table */
+ 	if (remaining > 0) {
+ 		len = remaining;
+-		error = vm_map_pptdev_mmio(ctx, b, s, f, start, len, base);
++		error = vm_map_pptdev_mmio(ctx, sc->pptfd, start, len, base);
+ 		if (error)
+ 			return (error);
+ 	}
+@@ -621,99 +590,29 @@ init_msix_table(struct vmctx *ctx, struct passthru_softc *sc, uint64_t base)
+ 	return (0);
+ }
+ 
+-static int
+-devinfo_getbar(di_node_t node, int bar, enum pcibar_type *type, uint64_t *base,
+-    uint64_t *size)
+-{
+-	int len, i;
+-	int *regbuf;
+-	int num;
+-
+-	len = di_prop_lookup_ints(DDI_DEV_T_ANY, node,
+-	    "assigned-addresses", &regbuf);
+-
+-	for (i = 0; i < len;
+-	     i += sizeof (pci_regspec_t) / sizeof (uint_t)) {
+-		pci_regspec_t *reg = (pci_regspec_t *)&regbuf[i];
+-
+-		if (PCI_REG_REG_G(reg->pci_phys_hi) < PCI_CONF_BASE0 ||
+-		    PCI_REG_REG_G(reg->pci_phys_hi) > PCI_CONF_BASE5)
+-			continue;
+-		num = (PCI_REG_REG_G(reg->pci_phys_hi) - PCI_CONF_BASE0) >> 2;
+-		if (num != bar)
+-			continue;
+-
+-		*base = ((uint64_t)reg->pci_phys_mid << 32) | reg->pci_phys_low;
+-		*size = ((uint64_t)reg->pci_size_hi << 32) | reg->pci_size_low;
+-		switch (reg->pci_phys_hi & PCI_REG_ADDR_M) {
+-		case PCI_ADDR_IO:
+-			*type = PCIBAR_IO;
+-			break;
+-		case PCI_ADDR_MEM32:
+-			*type = PCIBAR_MEM32;
+-			break;
+-		case PCI_ADDR_MEM64:
+-			*type = PCIBAR_MEM64;
+-			break;
+-		}
+-
+-		return (0);
+-	}
+-
+-	return (-1);
+-}
+-
+ static int
+ cfginitbar(struct vmctx *ctx, struct passthru_softc *sc)
+ {
+-	int i, error;
+-	struct pci_devinst *pi;
+-#ifdef __FreeBSD__
+-	struct pci_bar_io bar;
+-#endif
+-	enum pcibar_type bartype;
+-	uint64_t base, size;
+-
+-	pi = sc->psc_pi;
++	struct pci_devinst *pi = sc->psc_pi;
++	uint_t i;
+ 
+ 	/*
+ 	 * Initialize BAR registers
+ 	 */
+ 	for (i = 0; i <= PCI_BARMAX; i++) {
+-#ifdef __FreeBSD__
+-		bzero(&bar, sizeof(bar));
+-		bar.pbi_sel = sc->psc_sel;
+-		bar.pbi_reg = PCIR_BAR(i);
++		enum pcibar_type bartype;
++		uint64_t base, size;
++		int error;
+ 
+-		if (ioctl(pcifd, PCIOCGETBAR, &bar) < 0)
++		if (passthru_get_bar(sc, i, &bartype, &base, &size) != 0) {
+ 			continue;
+-
+-		if (PCI_BAR_IO(bar.pbi_base)) {
+-			bartype = PCIBAR_IO;
+-			base = bar.pbi_base & PCIM_BAR_IO_BASE;
+-		} else {
+-			switch (bar.pbi_base & PCIM_BAR_MEM_TYPE) {
+-			case PCIM_BAR_MEM_64:
+-				bartype = PCIBAR_MEM64;
+-				break;
+-			default:
+-				bartype = PCIBAR_MEM32;
+-				break;
+-			}
+-			base = bar.pbi_base & PCIM_BAR_MEM_BASE;
+ 		}
+-		size = bar.pbi_length;
+-#else
+-		if (devinfo_getbar(sc->devnode, i, &bartype, &base, &size) != 0)
+-			continue;
+-#endif
+ 
+ 		if (bartype != PCIBAR_IO) {
+ 			if (((base | size) & PAGE_MASK) != 0) {
+-				warnx("passthru device %d/%d/%d BAR %d: "
++				warnx("passthru device %d BAR %d: "
+ 				    "base %#lx or size %#lx not page aligned\n",
+-				    sc->psc_sel.pc_bus, sc->psc_sel.pc_dev,
+-				    sc->psc_sel.pc_func, i, base, size);
++				    sc->pptfd, i, base, size);
+ 				return (-1);
+ 			}
+ 		}
+@@ -731,13 +630,12 @@ cfginitbar(struct vmctx *ctx, struct passthru_softc *sc)
+ 		/* The MSI-X table needs special handling */
+ 		if (i == pci_msix_table_bar(pi)) {
+ 			error = init_msix_table(ctx, sc, base);
+-			if (error) 
++			if (error)
+ 				return (-1);
+ 		} else if (bartype != PCIBAR_IO) {
+ 			/* Map the physical BAR in the guest MMIO space */
+-			error = vm_map_pptdev_mmio(ctx, sc->psc_sel.pc_bus,
+-				sc->psc_sel.pc_dev, sc->psc_sel.pc_func,
+-				pi->pi_bar[i].addr, pi->pi_bar[i].size, base);
++			error = vm_map_pptdev_mmio(ctx, sc->pptfd,
++			    pi->pi_bar[i].addr, pi->pi_bar[i].size, base);
+ 			if (error)
+ 				return (-1);
+ 		}
+@@ -755,150 +653,36 @@ cfginitbar(struct vmctx *ctx, struct passthru_softc *sc)
+ }
+ 
+ static int
+-cfginit(struct vmctx *ctx, struct pci_devinst *pi, int bus, int slot, int func)
++cfginit(struct vmctx *ctx, struct passthru_softc *sc)
+ {
+-	int error;
+-	struct passthru_softc *sc;
+-
+-	error = 1;
+-	sc = pi->pi_arg;
+-
+-	bzero(&sc->psc_sel, sizeof(struct pcisel));
+-	sc->psc_sel.pc_bus = bus;
+-	sc->psc_sel.pc_dev = slot;
+-	sc->psc_sel.pc_func = func;
+-
+ 	if (cfginitmsi(sc) != 0) {
+-		warnx("failed to initialize MSI for PCI %d/%d/%d",
+-		    bus, slot, func);
+-		goto done;
++		warnx("failed to initialize MSI for PCI %d", sc->pptfd);
++		return (-1);
+ 	}
+ 
+ 	if (cfginitbar(ctx, sc) != 0) {
+-		warnx("failed to initialize BARs for PCI %d/%d/%d",
+-		    bus, slot, func);
+-		goto done;
+-	}
+-
+-	error = 0;				/* success */
+-done:
+-	return (error);
+-}
+-
+-static int
+-devinfo_open(char *path, di_node_t *devnode, int *bus, int *slot, int *func)
+-{
+-	di_node_t rootnode, nexnode, node;
+-	char *devfspath, *tmp;
+-	int nexfd;
+-	int len, *regbuf;
+-	pci_regspec_t *reg;
+-
+-	nexnode = rootnode = di_init("/", DINFOCPYALL);
+-
+-	if (rootnode == DI_NODE_NIL)
++		warnx("failed to initialize BARs for PCI %d", sc->pptfd);
+ 		return (-1);
+-
+-	for (*devnode = di_drv_first_node("ppt", rootnode);
+-	     *devnode != DI_NODE_NIL;
+-	     *devnode = di_drv_next_node(*devnode)) {
+-		devfspath = di_devfs_path(*devnode);
+-		if (strcmp(devfspath, path) == 0) {
+-			/*
+-			 * Walk up device path. Last node before the root node
+-			 * is the nexus node.
+-			 */
+-			node = di_parent_node(*devnode);
+-			while (node != rootnode) {
+-				nexnode = node;
+-				node = di_parent_node(node);
+-			}
+-
+-			di_devfs_path_free(devfspath);
+-			break;
+-		}
+-		di_devfs_path_free(devfspath);
+ 	}
+ 
+-	if (*devnode == DI_NODE_NIL || nexnode == rootnode)
+-		return (-1);
+-
+-	devfspath = di_devfs_path(nexnode);
+-	(void) asprintf(&tmp, "/devices%s:reg", devfspath);
+-	nexfd = open(tmp, O_RDWR);
+-	free(tmp);
+-	di_devfs_path_free(devfspath);
+-
+-	len = di_prop_lookup_ints(DDI_DEV_T_ANY, *devnode, "reg", &regbuf);
+-	reg = (pci_regspec_t *)regbuf;
+-
+-	*bus = (uchar_t)PCI_REG_BUS_G(reg->pci_phys_hi);
+-	*slot = (uchar_t)PCI_REG_DEV_G(reg->pci_phys_hi);
+-	*func = (uchar_t)PCI_REG_FUNC_G(reg->pci_phys_hi);
+-
+-	return (nexfd);
++	return (0);
+ }
+ 
+ static int
+ passthru_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+ {
+-	int bus, slot, func, error, memflags;
++	int error, memflags, pptfd;
+ 	struct passthru_softc *sc;
+-#ifndef WITHOUT_CAPSICUM
+-	cap_rights_t rights;
+-	cap_ioctl_t pci_ioctls[] = { PCIOCREAD, PCIOCWRITE, PCIOCGETBAR };
+-	cap_ioctl_t io_ioctls[] = { IODEV_PIO };
+-#endif
+-	di_node_t devnode;
+-	int nexfd;
+ 
+ 	sc = NULL;
+ 	error = 1;
+ 
+-#ifndef WITHOUT_CAPSICUM
+-	cap_rights_init(&rights, CAP_IOCTL, CAP_READ, CAP_WRITE);
+-#endif
+-
+ 	memflags = vm_get_memflags(ctx);
+ 	if (!(memflags & VM_MEM_F_WIRED)) {
+ 		warnx("passthru requires guest memory to be wired");
+ 		goto done;
+ 	}
+ 
+-#ifdef __FreeBSD__
+-	if (pcifd < 0) {
+-		pcifd = open(_PATH_DEVPCI, O_RDWR, 0);
+-		if (pcifd < 0) {
+-			warn("failed to open %s", _PATH_DEVPCI);
+-			goto done;
+-		}
+-	}
+-#endif
+-
+-#ifndef WITHOUT_CAPSICUM
+-	if (cap_rights_limit(pcifd, &rights) == -1 && errno != ENOSYS)
+-		errx(EX_OSERR, "Unable to apply rights for sandbox");
+-	if (cap_ioctls_limit(pcifd, pci_ioctls, nitems(pci_ioctls)) == -1 && errno != ENOSYS)
+-		errx(EX_OSERR, "Unable to apply rights for sandbox");
+-#endif
+-
+-#ifdef __FreeBSD__
+-	if (iofd < 0) {
+-		iofd = open(_PATH_DEVIO, O_RDWR, 0);
+-		if (iofd < 0) {
+-			warn("failed to open %s", _PATH_DEVIO);
+-			goto done;
+-		}
+-	}
+-#endif
+-
+-#ifndef WITHOUT_CAPSICUM
+-	if (cap_rights_limit(iofd, &rights) == -1 && errno != ENOSYS)
+-		errx(EX_OSERR, "Unable to apply rights for sandbox");
+-	if (cap_ioctls_limit(iofd, io_ioctls, nitems(io_ioctls)) == -1 && errno != ENOSYS)
+-		errx(EX_OSERR, "Unable to apply rights for sandbox");
+-#endif
+-
+ 	if (memfd < 0) {
+ 		memfd = open(_PATH_MEM, O_RDWR, 0);
+ 		if (memfd < 0) {
+@@ -907,30 +691,13 @@ passthru_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+ 		}
+ 	}
+ 
+-#ifndef WITHOUT_CAPSICUM
+-	cap_rights_clear(&rights, CAP_IOCTL);
+-	cap_rights_set(&rights, CAP_MMAP_RW);
+-	if (cap_rights_limit(memfd, &rights) == -1 && errno != ENOSYS)
+-		errx(EX_OSERR, "Unable to apply rights for sandbox");
+-#endif
+-
+-#ifdef __FreeBSD__
+-	if (opts == NULL ||
+-	    sscanf(opts, "%d/%d/%d", &bus, &slot, &func) != 3) {
+-		warnx("invalid passthru options");
+-		goto done;
+-	}
+-#else
+-	if (opts == NULL ||
+-	    (nexfd = devinfo_open(opts, &devnode, &bus, &slot, &func)) == -1) {
++	if (opts == NULL || passthru_dev_open(opts, &pptfd) != 0) {
+ 		warnx("invalid passthru options");
+ 		goto done;
+ 	}
+-#endif
+ 
+-	if (vm_assign_pptdev(ctx, bus, slot, func) != 0) {
+-		warnx("PCI device at %d/%d/%d is not using the ppt(4) driver",
+-		    bus, slot, func);
++	if (vm_assign_pptdev(ctx, pptfd) != 0) {
++		warnx("PCI device at %d is not using the ppt driver", pptfd);
+ 		goto done;
+ 	}
+ 
+@@ -938,22 +705,21 @@ passthru_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
+ 
+ 	pi->pi_arg = sc;
+ 	sc->psc_pi = pi;
+-	sc->devnode = devnode;
+-	sc->nexfd = nexfd;
++	sc->pptfd = pptfd;
+ 
+-	if ((error = vm_get_pptdev_limits(ctx, bus, slot, func, &sc->msi_limit,
++	if ((error = vm_get_pptdev_limits(ctx, pptfd, &sc->msi_limit,
+ 	    &sc->msix_limit)) != 0)
+ 		goto done;
+ 
+ 	/* initialize config space */
+-	if ((error = cfginit(ctx, pi, bus, slot, func)) != 0)
++	if ((error = cfginit(ctx, sc)) != 0)
+ 		goto done;
+-	
++
+ 	error = 0;		/* success */
+ done:
+ 	if (error) {
+ 		free(sc);
+-		vm_unassign_pptdev(ctx, bus, slot, func);
++		vm_unassign_pptdev(ctx, pptfd);
+ 	}
+ 	return (error);
+ }
+@@ -983,7 +749,7 @@ msicap_access(struct passthru_softc *sc, int coff)
+ 		return (0);
+ }
+ 
+-static int 
++static int
+ msixcap_access(struct passthru_softc *sc, int coff)
+ {
+ 	if (sc->psc_msix.capoff == 0) 
+@@ -995,7 +761,7 @@ msixcap_access(struct passthru_softc *sc, int coff)
+ 
+ static int
+ passthru_cfgread(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
+-		 int coff, int bytes, uint32_t *rv)
++    int coff, int bytes, uint32_t *rv)
+ {
+ 	struct passthru_softc *sc;
+ 
+@@ -1007,6 +773,13 @@ passthru_cfgread(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
+ 	if (bar_access(coff) || msicap_access(sc, coff))
+ 		return (-1);
+ 
++	/*
++	 * MSI-X is also emulated since a limit on interrupts may be imposed by
++	 * the OS, altering the perceived register state.
++	 */
++	if (msixcap_access(sc, coff))
++		return (-1);
++
+ #ifdef LEGACY_SUPPORT
+ 	/*
+ 	 * Emulate PCIR_CAP_PTR if this device does not support MSI capability
+@@ -1026,7 +799,7 @@ passthru_cfgread(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
+ 
+ static int
+ passthru_cfgwrite(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
+-		  int coff, int bytes, uint32_t val)
++    int coff, int bytes, uint32_t val)
+ {
+ 	int error, msix_table_entries, i;
+ 	struct passthru_softc *sc;
+@@ -1045,10 +818,8 @@ passthru_cfgwrite(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
+ 	if (msicap_access(sc, coff)) {
+ 		msicap_cfgwrite(pi, sc->psc_msi.capoff, coff, bytes, val);
+ 
+-		error = vm_setup_pptdev_msi(ctx, vcpu, sc->psc_sel.pc_bus,
+-			sc->psc_sel.pc_dev, sc->psc_sel.pc_func,
+-			pi->pi_msi.addr, pi->pi_msi.msg_data,
+-			pi->pi_msi.maxmsgnum);
++		error = vm_setup_pptdev_msi(ctx, vcpu, sc->pptfd,
++		    pi->pi_msi.addr, pi->pi_msi.msg_data, pi->pi_msi.maxmsgnum);
+ 		if (error != 0)
+ 			err(1, "vm_setup_pptdev_msi");
+ 		return (0);
+@@ -1060,12 +831,11 @@ passthru_cfgwrite(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
+ 			msix_table_entries = pi->pi_msix.table_count;
+ 			for (i = 0; i < msix_table_entries; i++) {
+ 				error = vm_setup_pptdev_msix(ctx, vcpu,
+-				    sc->psc_sel.pc_bus, sc->psc_sel.pc_dev, 
+-				    sc->psc_sel.pc_func, i, 
++				    sc->pptfd, i,
+ 				    pi->pi_msix.table[i].addr,
+ 				    pi->pi_msix.table[i].msg_data,
+ 				    pi->pi_msix.table[i].vector_control);
+-		
++
+ 				if (error)
+ 					err(1, "vm_setup_pptdev_msix");
+ 			}
+@@ -1092,64 +862,47 @@ passthru_cfgwrite(struct vmctx *ctx, int vcpu, struct pci_devinst *pi,
+ 
+ static void
+ passthru_write(struct vmctx *ctx, int vcpu, struct pci_devinst *pi, int baridx,
+-	       uint64_t offset, int size, uint64_t value)
++    uint64_t offset, int size, uint64_t value)
+ {
+-	struct passthru_softc *sc;
+-#ifdef __FreeBSD__
+-	struct iodev_pio_req pio;
+-#endif
+-
+-	sc = pi->pi_arg;
++	struct passthru_softc *sc = pi->pi_arg;
+ 
+ 	if (baridx == pci_msix_table_bar(pi)) {
+-		msix_table_write(ctx, vcpu, sc, offset, size, value);
++		passthru_msix_table_write(ctx, vcpu, sc, offset, size, value);
+ 	} else {
++		struct ppt_bar_io pbi;
++
+ 		assert(pi->pi_bar[baridx].type == PCIBAR_IO);
+-#ifdef __FreeBSD__
+-		bzero(&pio, sizeof(struct iodev_pio_req));
+-		pio.access = IODEV_PIO_WRITE;
+-		pio.port = sc->psc_bar[baridx].addr + offset;
+-		pio.width = size;
+-		pio.val = value;
+-		
+-		(void)ioctl(iofd, IODEV_PIO, &pio);
+-#else
+-		(void) pcitool_reg_rw(sc, baridx, offset, size, value,
+-		    PCITOOL_DEVICE_SET_REG);
+-#endif
++
++		pbi.pbi_bar = baridx;
++		pbi.pbi_width = size;
++		pbi.pbi_off = offset;
++		pbi.pbi_data = value;
++		(void) ioctl(sc->pptfd, PPT_BAR_WRITE, &pbi);
+ 	}
+ }
+ 
+ static uint64_t
+ passthru_read(struct vmctx *ctx, int vcpu, struct pci_devinst *pi, int baridx,
+-	      uint64_t offset, int size)
++    uint64_t offset, int size)
+ {
+-	struct passthru_softc *sc;
+-#ifdef __FreeBSD__
+-	struct iodev_pio_req pio;
+-#endif
++	struct passthru_softc *sc = pi->pi_arg;
+ 	uint64_t val;
+ 
+-	sc = pi->pi_arg;
+-
+ 	if (baridx == pci_msix_table_bar(pi)) {
+-		val = msix_table_read(sc, offset, size);
++		val = passthru_msix_table_read(sc, offset, size);
+ 	} else {
++		struct ppt_bar_io pbi;
++
+ 		assert(pi->pi_bar[baridx].type == PCIBAR_IO);
+-#ifdef __FreeBSD__
+-		bzero(&pio, sizeof(struct iodev_pio_req));
+-		pio.access = IODEV_PIO_READ;
+-		pio.port = sc->psc_bar[baridx].addr + offset;
+-		pio.width = size;
+-		pio.val = 0;
+-
+-		(void)ioctl(iofd, IODEV_PIO, &pio);
+-
+-		val = pio.val;
+-#else
+-		val = pcitool_reg_rw(sc, baridx, offset, size, 0,
+-		    PCITOOL_DEVICE_GET_REG);
+-#endif
++
++		pbi.pbi_bar = baridx;
++		pbi.pbi_width = size;
++		pbi.pbi_off = offset;
++		if (ioctl(sc->pptfd, PPT_BAR_READ, &pbi) == 0) {
++			val = pbi.pbi_data;
++		} else {
++			val = 0;
++		}
+ 	}
+ 
+ 	return (val);
+diff --git a/usr/src/cmd/bhyvectl/bhyvectl.c b/usr/src/cmd/bhyvectl/bhyvectl.c
+index f1657a00aa..c0d4d00ee5 100644
+--- a/usr/src/cmd/bhyvectl/bhyvectl.c
++++ b/usr/src/cmd/bhyvectl/bhyvectl.c
+@@ -166,7 +166,9 @@ usage(bool cpu_intel)
+ 	"       [--get-ldtr]\n"
+ 	"       [--set-x2apic-state=<state>]\n"
+ 	"       [--get-x2apic-state]\n"
++#ifdef __FreeBSD__
+ 	"       [--unassign-pptdev=<bus/slot/func>]\n"
++#endif
+ 	"       [--set-mem=<memory in units of MB>]\n"
+ 	"       [--get-lowmem]\n"
+ 	"       [--get-highmem]\n"
+@@ -278,7 +280,9 @@ static int set_cs, set_ds, set_es, set_fs, set_gs, set_ss, set_tr, set_ldtr;
+ static int get_cs, get_ds, get_es, get_fs, get_gs, get_ss, get_tr, get_ldtr;
+ static int set_x2apic_state, get_x2apic_state;
+ enum x2apic_state x2apic_state;
++#ifdef __FreeBSD__
+ static int unassign_pptdev, bus, slot, func;
++#endif
+ static int run;
+ 
+ /*
+@@ -1763,11 +1767,13 @@ main(int argc, char *argv[])
+ 		case CAPNAME:
+ 			capname = optarg;
+ 			break;
++#ifdef __FreeBSD__
+ 		case UNASSIGN_PPTDEV:
+ 			unassign_pptdev = 1;
+ 			if (sscanf(optarg, "%d/%d/%d", &bus, &slot, &func) != 3)
+ 				usage(cpu_intel);
+ 			break;
++#endif
+ 		case ASSERT_LAPIC_LVT:
+ 			assert_lapic_lvt = atoi(optarg);
+ 			break;
+@@ -1903,8 +1909,10 @@ main(int argc, char *argv[])
+ 	if (!error && set_x2apic_state)
+ 		error = vm_set_x2apic_state(ctx, vcpu, x2apic_state);
+ 
++#ifdef __FreeBSD__
+ 	if (!error && unassign_pptdev)
+ 		error = vm_unassign_pptdev(ctx, bus, slot, func);
++#endif /* __FreeBSD__ */
+ 
+ 	if (!error && set_exception_bitmap) {
+ 		if (cpu_intel)
+diff --git a/usr/src/cmd/devfsadm/i386/misc_link_i386.c b/usr/src/cmd/devfsadm/i386/misc_link_i386.c
+index 492e03ff6e..fbb344cdf6 100644
+--- a/usr/src/cmd/devfsadm/i386/misc_link_i386.c
++++ b/usr/src/cmd/devfsadm/i386/misc_link_i386.c
+@@ -90,6 +90,9 @@ static devfsadm_create_t misc_cbt[] = {
+ 	},
+ 	{ "pseudo", "ddi_pseudo", "vmm",
+ 	    TYPE_EXACT | DRV_EXACT, ILEVEL_0, vmmctl,
++	},
++	{ "pseudo", "ddi_pseudo", "ppt",
++	    TYPE_EXACT | DRV_EXACT, ILEVEL_0, ln_minor_name,
+ 	}
+ };
+ 
+@@ -122,6 +125,9 @@ static devfsadm_remove_t misc_remove_cbt[] = {
+ 	},
+ 	{ "pseudo", "^vmmctl$", RM_ALWAYS | RM_PRE | RM_HOT,
+ 		ILEVEL_0, devfsadm_rm_all
++	},
++	{ "pseudo", "^ppt$", RM_ALWAYS | RM_PRE | RM_HOT,
++		ILEVEL_0, devfsadm_rm_all
+ 	}
+ };
+ 
+diff --git a/usr/src/compat/freebsd/dev/pci/pcivar.h b/usr/src/compat/freebsd/dev/pci/pcivar.h
+index d4d0352156..064d983117 100644
+--- a/usr/src/compat/freebsd/dev/pci/pcivar.h
++++ b/usr/src/compat/freebsd/dev/pci/pcivar.h
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2017 Joyent, Inc.
++ * Copyright 2018 Joyent, Inc.
+  */
+ 
+ #ifndef _COMPAT_FREEBSD_DEV_PCI_PCIVAR_H
+@@ -33,19 +33,6 @@ pci_get_bdf(device_t dev)
+ 	return (bdf);
+ }
+ 
+-#define PCIE_REQ_ID(val, what)	(((val) & PCIE_REQ_ID_##what##_MASK) >>\
+-    PCIE_REQ_ID_##what##_SHIFT)
+-
+-#define	pci_get_bus(dev)	(PCIE_REQ_ID(pci_get_bdf(dev), BUS))
+-#define	pci_get_slot(dev)	(PCIE_REQ_ID(pci_get_bdf(dev), DEV))
+-#define	pci_get_function(dev)	(PCIE_REQ_ID(pci_get_bdf(dev), FUNC))
+ #define	pci_get_rid(dev)	(pci_get_bdf(dev))
+ 
+-#define	pci_save_state(dev)	pci_save_config_regs(dev)
+-#define	pci_restore_state(dev)	pci_restore_config_regs(dev)
+-
+-bool pcie_flr(device_t, u_int, bool);
+-int pcie_get_max_completion_timeout(device_t);
+-
+-
+ #endif /* _COMPAT_FREEBSD_DEV_PCI_PCIVAR_H */
+diff --git a/usr/src/lib/libvmmapi/common/vmmapi.c b/usr/src/lib/libvmmapi/common/vmmapi.c
+index a40a93578a..6a19b4d12e 100644
+--- a/usr/src/lib/libvmmapi/common/vmmapi.c
++++ b/usr/src/lib/libvmmapi/common/vmmapi.c
+@@ -917,6 +917,7 @@ vm_set_capability(struct vmctx *ctx, int vcpu, enum vm_cap_type cap, int val)
+ 	return (ioctl(ctx->fd, VM_SET_CAPABILITY, &vmcap));
+ }
+ 
++#ifdef __FreeBSD__
+ int
+ vm_assign_pptdev(struct vmctx *ctx, int bus, int slot, int func)
+ {
+@@ -978,7 +979,7 @@ vm_setup_pptdev_msi(struct vmctx *ctx, int vcpu, int bus, int slot, int func,
+ 	return (ioctl(ctx->fd, VM_PPTDEV_MSI, &pptmsi));
+ }
+ 
+-int	
++int
+ vm_setup_pptdev_msix(struct vmctx *ctx, int vcpu, int bus, int slot, int func,
+     int idx, uint64_t addr, uint64_t msg, uint32_t vector_control)
+ {
+@@ -1016,6 +1017,83 @@ vm_get_pptdev_limits(struct vmctx *ctx, int bus, int slot, int func,
+ 
+ 	return (error);
+ }
++#else /* __FreeBSD__ */
++int
++vm_assign_pptdev(struct vmctx *ctx, int pptfd)
++{
++	struct vm_pptdev pptdev;
++
++	pptdev.pptfd = pptfd;
++	return (ioctl(ctx->fd, VM_BIND_PPTDEV, &pptdev));
++}
++
++int
++vm_unassign_pptdev(struct vmctx *ctx, int pptfd)
++{
++	struct vm_pptdev pptdev;
++
++	pptdev.pptfd = pptfd;
++	return (ioctl(ctx->fd, VM_UNBIND_PPTDEV, &pptdev));
++}
++
++int
++vm_map_pptdev_mmio(struct vmctx *ctx, int pptfd, vm_paddr_t gpa, size_t len,
++    vm_paddr_t hpa)
++{
++	struct vm_pptdev_mmio pptmmio;
++
++	pptmmio.pptfd = pptfd;
++	pptmmio.gpa = gpa;
++	pptmmio.len = len;
++	pptmmio.hpa = hpa;
++	return (ioctl(ctx->fd, VM_MAP_PPTDEV_MMIO, &pptmmio));
++}
++
++int
++vm_setup_pptdev_msi(struct vmctx *ctx, int vcpu, int pptfd, uint64_t addr,
++    uint64_t msg, int numvec)
++{
++	struct vm_pptdev_msi pptmsi;
++
++	pptmsi.vcpu = vcpu;
++	pptmsi.pptfd = pptfd;
++	pptmsi.msg = msg;
++	pptmsi.addr = addr;
++	pptmsi.numvec = numvec;
++	return (ioctl(ctx->fd, VM_PPTDEV_MSI, &pptmsi));
++}
++
++int
++vm_setup_pptdev_msix(struct vmctx *ctx, int vcpu, int pptfd, int idx,
++    uint64_t addr, uint64_t msg, uint32_t vector_control)
++{
++	struct vm_pptdev_msix pptmsix;
++
++	pptmsix.vcpu = vcpu;
++	pptmsix.pptfd = pptfd;
++	pptmsix.idx = idx;
++	pptmsix.msg = msg;
++	pptmsix.addr = addr;
++	pptmsix.vector_control = vector_control;
++	return ioctl(ctx->fd, VM_PPTDEV_MSIX, &pptmsix);
++}
++
++int
++vm_get_pptdev_limits(struct vmctx *ctx, int pptfd, int *msi_limit,
++    int *msix_limit)
++{
++	struct vm_pptdev_limits pptlimits;
++	int error;
++
++	bzero(&pptlimits, sizeof (pptlimits));
++	pptlimits.pptfd = pptfd;
++	error = ioctl(ctx->fd, VM_GET_PPTDEV_LIMITS, &pptlimits);
++
++	*msi_limit = pptlimits.msi_limit;
++	*msix_limit = pptlimits.msix_limit;
++	return (error);
++}
++#endif /* __FreeBSD__ */
+ 
+ uint64_t *
+ vm_get_stats(struct vmctx *ctx, int vcpu, struct timeval *ret_tv,
+diff --git a/usr/src/lib/libvmmapi/common/vmmapi.h b/usr/src/lib/libvmmapi/common/vmmapi.h
+index 77ab2bc935..5fc9988b24 100644
+--- a/usr/src/lib/libvmmapi/common/vmmapi.h
++++ b/usr/src/lib/libvmmapi/common/vmmapi.h
+@@ -162,6 +162,7 @@ int	vm_get_capability(struct vmctx *ctx, int vcpu, enum vm_cap_type cap,
+ 			  int *retval);
+ int	vm_set_capability(struct vmctx *ctx, int vcpu, enum vm_cap_type cap,
+ 			  int val);
++#ifdef __FreeBSD__
+ int	vm_assign_pptdev(struct vmctx *ctx, int bus, int slot, int func);
+ int	vm_unassign_pptdev(struct vmctx *ctx, int bus, int slot, int func);
+ int	vm_map_pptdev_mmio(struct vmctx *ctx, int bus, int slot, int func,
+@@ -173,6 +174,18 @@ int	vm_setup_pptdev_msix(struct vmctx *ctx, int vcpu, int bus, int slot,
+ 	    uint32_t vector_control);
+ int	vm_get_pptdev_limits(struct vmctx *ctx, int bus, int slot, int func,
+     int *msi_limit, int *msix_limit);
++#else /* __FreeBSD__ */
++int	vm_assign_pptdev(struct vmctx *ctx, int pptfd);
++int	vm_unassign_pptdev(struct vmctx *ctx, int pptfd);
++int	vm_map_pptdev_mmio(struct vmctx *ctx, int pptfd, vm_paddr_t gpa,
++    size_t len, vm_paddr_t hpa);
++int	vm_setup_pptdev_msi(struct vmctx *ctx, int vcpu, int pptfd,
++    uint64_t addr, uint64_t msg, int numvec);
++int	vm_setup_pptdev_msix(struct vmctx *ctx, int vcpu, int pptfd,
++    int idx, uint64_t addr, uint64_t msg, uint32_t vector_control);
++int	vm_get_pptdev_limits(struct vmctx *ctx, int pptfd, int *msi_limit,
++    int *msix_limit);
++#endif /* __FreeBSD__ */
+ 
+ int	vm_get_intinfo(struct vmctx *ctx, int vcpu, uint64_t *i1, uint64_t *i2);
+ int	vm_set_intinfo(struct vmctx *ctx, int vcpu, uint64_t exit_intinfo);
+diff --git a/usr/src/uts/i86pc/Makefile.files b/usr/src/uts/i86pc/Makefile.files
+index ccabea7e4a..34db892539 100644
+--- a/usr/src/uts/i86pc/Makefile.files
++++ b/usr/src/uts/i86pc/Makefile.files
+@@ -274,7 +274,7 @@ VMM_OBJS += vmm.o \
+ 
+ VIONA_OBJS += viona.o
+ 
+-PPT_OBJS += ppt.o ppt_sol_glue.o
++PPT_OBJS += ppt.o
+ 
+ #
+ #	Build up defines and paths.
+diff --git a/usr/src/uts/i86pc/io/vmm/io/ppt.c b/usr/src/uts/i86pc/io/vmm/io/ppt.c
+index f2e6677ced..b7e0514d1e 100644
+--- a/usr/src/uts/i86pc/io/vmm/io/ppt.c
++++ b/usr/src/uts/i86pc/io/vmm/io/ppt.c
+@@ -26,6 +26,10 @@
+  * $FreeBSD$
+  */
+ 
++/*
++ * Copyright 2018 Joyent, Inc
++ */
++
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
+@@ -36,25 +40,24 @@ __FBSDID("$FreeBSD$");
+ #include <sys/module.h>
+ #include <sys/bus.h>
+ #include <sys/pciio.h>
+-#ifdef __FreeBSD__
+-#include <sys/rman.h>
+-#endif
+ #include <sys/smp.h>
+ #include <sys/sysctl.h>
+ 
+ #include <dev/pci/pcivar.h>
+ #include <dev/pci/pcireg.h>
+ 
+-#ifdef __FreeBSD__
+-#include <machine/resource.h>
+-#endif
+-
+ #include <machine/vmm.h>
+ #include <machine/vmm_dev.h>
+ 
+ #include <sys/conf.h>
+ #include <sys/ddi.h>
++#include <sys/stat.h>
+ #include <sys/sunddi.h>
++#include <sys/pci.h>
++#include <sys/pci_cap.h>
++#include <sys/ppt_dev.h>
++#include <sys/mkdev.h>
++#include <sys/id_space.h>
+ 
+ #include "vmm_lapic.h"
+ #include "vmm_ktr.h"
+@@ -62,8 +65,6 @@ __FBSDID("$FreeBSD$");
+ #include "iommu.h"
+ #include "ppt.h"
+ 
+-/* XXX locking */
+-
+ #define	MAX_MSIMSGS	32
+ 
+ /*
+@@ -76,9 +77,7 @@ __FBSDID("$FreeBSD$");
+  */
+ #define	MAX_MMIOSEGS	((PCIR_MAX_BAR_0 + 1) + 1)
+ 
+-MALLOC_DEFINE(M_PPTMSIX, "pptmsix", "Passthru MSI-X resources");
+-
+-struct pptintr_arg {				/* pptintr(pptintr_arg) */
++struct pptintr_arg {
+ 	struct pptdev	*pptdev;
+ 	uint64_t	addr;
+ 	uint64_t	msg_data;
+@@ -90,175 +89,410 @@ struct pptseg {
+ 	int		wired;
+ };
+ 
++struct pptbar {
++	uint64_t base;
++	uint64_t size;
++	uint_t type;
++	ddi_acc_handle_t io_handle;
++	caddr_t io_ptr;
++};
++
+ struct pptdev {
+-	device_t	dev;
+-	struct vm	*vm;			/* owner of this device */
+-	TAILQ_ENTRY(pptdev)	next;
++	dev_info_t		*pptd_dip;
++	list_node_t		pptd_node;
++	ddi_acc_handle_t	pptd_cfg;
++	dev_t			pptd_dev;
++	struct pptbar		pptd_bars[PCI_BASE_NUM];
++	struct vm		*vm;
+ 	struct pptseg mmio[MAX_MMIOSEGS];
+ 	struct {
+ 		int	num_msgs;		/* guest state */
+-#ifdef __FreeBSD__
+-		int	startrid;		/* host state */
+-		struct resource *res[MAX_MSIMSGS];
+-		void	*cookie[MAX_MSIMSGS];
+-#else
+ 		boolean_t is_fixed;
+ 		size_t	inth_sz;
+ 		ddi_intr_handle_t *inth;
+-#endif
+ 		struct pptintr_arg arg[MAX_MSIMSGS];
+ 	} msi;
+ 
+ 	struct {
+ 		int num_msgs;
+-#ifdef __FreeBSD__
+-		int startrid;
+-		int msix_table_rid;
+-		struct resource *msix_table_res;
+-		struct resource **res;
+-		void **cookie;
+-#else
+ 		size_t inth_sz;
+ 		size_t arg_sz;
+ 		ddi_intr_handle_t *inth;
+-#endif
+ 		struct pptintr_arg *arg;
+ 	} msix;
+ };
+ 
+-SYSCTL_DECL(_hw_vmm);
+-SYSCTL_NODE(_hw_vmm, OID_AUTO, ppt, CTLFLAG_RW, 0, "bhyve passthru devices");
+ 
+-static int num_pptdevs;
+-SYSCTL_INT(_hw_vmm_ppt, OID_AUTO, devices, CTLFLAG_RD, &num_pptdevs, 0,
+-    "number of pci passthru devices");
++static void		*ppt_state;
++static kmutex_t		pptdev_mtx;
++static list_t		pptdev_list;
++static id_space_t	*pptdev_minors = NULL;
+ 
+-static TAILQ_HEAD(, pptdev) pptdev_list = TAILQ_HEAD_INITIALIZER(pptdev_list);
++static ddi_device_acc_attr_t ppt_attr = {
++	DDI_DEVICE_ATTR_V0,
++	DDI_NEVERSWAP_ACC,
++	DDI_STORECACHING_OK_ACC,
++	DDI_DEFAULT_ACC
++};
+ 
+-#ifdef __FreeBSD__
+ static int
+-ppt_probe(device_t dev)
++ppt_open(dev_t *devp, int flag, int otyp, cred_t *cr)
+ {
+-	int bus, slot, func;
+-	struct pci_devinfo *dinfo;
+-
+-	dinfo = (struct pci_devinfo *)device_get_ivars(dev);
+-
+-	bus = pci_get_bus(dev);
+-	slot = pci_get_slot(dev);
+-	func = pci_get_function(dev);
+-
+-	/*
+-	 * To qualify as a pci passthrough device a device must:
+-	 * - be allowed by administrator to be used in this role
+-	 * - be an endpoint device
+-	 */
+-	if ((dinfo->cfg.hdrtype & PCIM_HDRTYPE) != PCIM_HDRTYPE_NORMAL)
+-		return (ENXIO);
+-	else if (vmm_is_pptdev(bus, slot, func))
+-		return (0);
+-	else
+-		/*
+-		 * Returning BUS_PROBE_NOWILDCARD here matches devices that the
+-		 * SR-IOV infrastructure specified as "ppt" passthrough devices.
+-		 * All normal devices that did not have "ppt" specified as their
+-		 * driver will not be matched by this.
+-		 */
+-		return (BUS_PROBE_NOWILDCARD);
++	/* XXX: require extra privs? */
++	return (0);
+ }
+-#endif
++
++#define	BAR_TO_IDX(bar)	(((bar) - PCI_CONF_BASE0) / PCI_BAR_SZ_32)
++#define	BAR_VALID(b)	(			\
++		(b) >= PCI_CONF_BASE0 &&	\
++		(b) <= PCI_CONF_BASE5 &&	\
++		((b) & (PCI_BAR_SZ_32-1)) == 0)
+ 
+ static int
+-ppt_attach(device_t dev)
++ppt_ioctl(dev_t dev, int cmd, intptr_t arg, int md, cred_t *cr, int *rv)
+ {
++	minor_t minor = getminor(dev);
+ 	struct pptdev *ppt;
++	void *data = (void *)arg;
++
++	if ((ppt = ddi_get_soft_state(ppt_state, minor)) == NULL) {
++		return (ENOENT);
++	}
++
++	switch (cmd) {
++	case PPT_CFG_READ: {
++		struct ppt_cfg_io cio;
++		ddi_acc_handle_t cfg = ppt->pptd_cfg;
++
++		if (ddi_copyin(data, &cio, sizeof (cio), md) != 0) {
++			return (EFAULT);
++		}
++		switch (cio.pci_width) {
++		case 4:
++			cio.pci_data = pci_config_get32(cfg, cio.pci_off);
++			break;
++		case 2:
++			cio.pci_data = pci_config_get16(cfg, cio.pci_off);
++			break;
++		case 1:
++			cio.pci_data = pci_config_get8(cfg, cio.pci_off);
++			break;
++		default:
++			return (EINVAL);
++		}
++
++		if (ddi_copyout(&cio, data, sizeof (cio), md) != 0) {
++			return (EFAULT);
++		}
++		return (0);
++	}
++	case PPT_CFG_WRITE: {
++		struct ppt_cfg_io cio;
++		ddi_acc_handle_t cfg = ppt->pptd_cfg;
++
++		if (ddi_copyin(data, &cio, sizeof (cio), md) != 0) {
++			return (EFAULT);
++		}
++		switch (cio.pci_width) {
++		case 4:
++			pci_config_put32(cfg, cio.pci_off, cio.pci_data);
++			break;
++		case 2:
++			pci_config_put16(cfg, cio.pci_off, cio.pci_data);
++			break;
++		case 1:
++			pci_config_put8(cfg, cio.pci_off, cio.pci_data);
++			break;
++		default:
++			return (EINVAL);
++		}
++
++		return (0);
++	}
++	case PPT_BAR_QUERY: {
++		struct ppt_bar_query barg;
++		struct pptbar *pbar;
++
++		if (ddi_copyin(data, &barg, sizeof (barg), md) != 0) {
++			return (EFAULT);
++		}
++		if (barg.pbq_baridx >= PCI_BASE_NUM) {
++			return (EINVAL);
++		}
++		pbar = &ppt->pptd_bars[barg.pbq_baridx];
+ 
+-	ppt = device_get_softc(dev);
++		if (pbar->base == 0 || pbar->size == 0) {
++			return (ENOENT);
++		}
++		barg.pbq_type = pbar->type;
++		barg.pbq_base = pbar->base;
++		barg.pbq_size = pbar->size;
+ 
+-	num_pptdevs++;
+-	TAILQ_INSERT_TAIL(&pptdev_list, ppt, next);
+-	ppt->dev = dev;
++		if (ddi_copyout(&barg, data, sizeof (barg), md) != 0) {
++			return (EFAULT);
++		}
++		return (0);
++	}
++	case PPT_BAR_READ: {
++		struct ppt_bar_io bio;
++		struct pptbar *pbar;
++		void *addr;
++		uint_t rnum;
++		ddi_acc_handle_t cfg;
++
++		if (ddi_copyin(data, &bio, sizeof (bio), md) != 0) {
++			return (EFAULT);
++		}
++		rnum = bio.pbi_bar;
++		if (rnum >= PCI_BASE_NUM) {
++			return (EINVAL);
++		}
++		pbar = &ppt->pptd_bars[rnum];
++		if (pbar->type != PCI_ADDR_IO || pbar->io_handle == NULL) {
++			return (EINVAL);
++		}
++		addr = pbar->io_ptr + bio.pbi_off;
+ 
+-#ifdef __FreeBSD__
+-	if (bootverbose)
+-		device_printf(dev, "attached\n");
+-#endif
++		switch (bio.pbi_width) {
++		case 4:
++			bio.pbi_data = ddi_get32(pbar->io_handle, addr);
++			break;
++		case 2:
++			bio.pbi_data = ddi_get16(pbar->io_handle, addr);
++			break;
++		case 1:
++			bio.pbi_data = ddi_get8(pbar->io_handle, addr);
++			break;
++		default:
++			return (EINVAL);
++		}
++
++		if (ddi_copyout(&bio, data, sizeof (bio), md) != 0) {
++			return (EFAULT);
++		}
++		return (0);
++	}
++	case PPT_BAR_WRITE: {
++		struct ppt_bar_io bio;
++		struct pptbar *pbar;
++		void *addr;
++		uint_t rnum;
++		ddi_acc_handle_t cfg;
++
++		if (ddi_copyin(data, &bio, sizeof (bio), md) != 0) {
++			return (EFAULT);
++		}
++		rnum = bio.pbi_bar;
++		if (rnum >= PCI_BASE_NUM) {
++			return (EINVAL);
++		}
++		pbar = &ppt->pptd_bars[rnum];
++		if (pbar->type != PCI_ADDR_IO || pbar->io_handle == NULL) {
++			return (EINVAL);
++		}
++		addr = pbar->io_ptr + bio.pbi_off;
++
++		switch (bio.pbi_width) {
++		case 4:
++			ddi_put32(pbar->io_handle, addr, bio.pbi_data);
++			break;
++		case 2:
++			ddi_put16(pbar->io_handle, addr, bio.pbi_data);
++			break;
++		case 1:
++			ddi_put8(pbar->io_handle, addr, bio.pbi_data);
++			break;
++		default:
++			return (EINVAL);
++		}
++
++		return (0);
++	}
++
++	default:
++		return (ENOTTY);
++	}
+ 
+ 	return (0);
+ }
+ 
++
++static void
++ppt_bar_wipe(struct pptdev *ppt)
++{
++	uint_t i;
++
++	for (i = 0; i < PCI_BASE_NUM; i++) {
++		struct pptbar *pbar = &ppt->pptd_bars[i];
++		if (pbar->type == PCI_ADDR_IO && pbar->io_handle != NULL) {
++			ddi_regs_map_free(&pbar->io_handle);
++		}
++	}
++	bzero(&ppt->pptd_bars, sizeof (ppt->pptd_bars));
++}
++
+ static int
+-ppt_detach(device_t dev)
++ppt_bar_crawl(struct pptdev *ppt)
+ {
+-	struct pptdev *ppt;
++	pci_regspec_t *regs;
++	uint_t rcount, i;
++	int err = 0, rlen;
+ 
+-	ppt = device_get_softc(dev);
++	if (ddi_getlongprop(DDI_DEV_T_ANY, ppt->pptd_dip, DDI_PROP_DONTPASS,
++	    "assigned-addresses", (caddr_t)&regs, &rlen) != DDI_PROP_SUCCESS) {
++		return (EIO);
++	}
+ 
+-	if (ppt->vm != NULL)
+-		return (EBUSY);
+-	num_pptdevs--;
+-	TAILQ_REMOVE(&pptdev_list, ppt, next);
++	VERIFY3S(rlen, >, 0);
++	rcount = (rlen * sizeof (int)) / sizeof (pci_regspec_t);
++	for (i = 0; i < rcount; i++) {
++		pci_regspec_t *reg = &regs[i];
++		struct pptbar *pbar;
++		uint_t bar, rnum;
+ 
+-	return (0);
+-}
++		DTRACE_PROBE1(ppt__crawl__reg, pci_regspec_t *, reg);
++		bar = PCI_REG_REG_G(reg->pci_phys_hi);
++		if (!BAR_VALID(bar)) {
++			continue;
++		}
+ 
+-#ifdef __FreeBSD__
+-static device_method_t ppt_methods[] = {
+-	/* Device interface */
+-	DEVMETHOD(device_probe,		ppt_probe),
+-	DEVMETHOD(device_attach,	ppt_attach),
+-	DEVMETHOD(device_detach,	ppt_detach),
+-	{0, 0}
+-};
++		rnum = BAR_TO_IDX(bar);
++		pbar = &ppt->pptd_bars[rnum];
++		/* is this somehow already populated? */
++		if (pbar->base != 0 || pbar->size != 0) {
++			err = EEXIST;
++			break;
++		}
+ 
+-static devclass_t ppt_devclass;
+-DEFINE_CLASS_0(ppt, ppt_driver, ppt_methods, sizeof(struct pptdev));
+-DRIVER_MODULE(ppt, pci, ppt_driver, ppt_devclass, NULL, NULL);
+-#endif
++		pbar->type = reg->pci_phys_hi & PCI_ADDR_MASK;
++		pbar->base = ((uint64_t)reg->pci_phys_mid << 32) |
++		    (uint64_t)reg->pci_phys_low;
++		pbar->size = ((uint64_t)reg->pci_size_hi << 32) |
++		    (uint64_t)reg->pci_size_low;
++		if (pbar->type == PCI_ADDR_IO) {
++			err = ddi_regs_map_setup(ppt->pptd_dip, rnum,
++			    &pbar->io_ptr, 0, 0, &ppt_attr, &pbar->io_handle);
++			if (err != 0) {
++				break;
++			}
++		}
++	}
++	kmem_free(regs, rlen);
+ 
+-static void *ppt_state;
++	if (err != 0) {
++		ppt_bar_wipe(ppt);
++	}
++	return (err);
++}
+ 
+ static int
+ ppt_ddi_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ {
+-	struct pptdev *ppt;
++	struct pptdev *ppt = NULL;
++	char name[PPT_MAXNAMELEN];
++	minor_t minor;
+ 
+ 	if (cmd != DDI_ATTACH)
+ 		return (DDI_FAILURE);
+ 
+-	ddi_soft_state_zalloc(ppt_state, ddi_get_instance(dip));
+-
+-	ppt = ddi_get_soft_state(ppt_state, ddi_get_instance(dip));
+-	ppt->dev = dip;
++	minor = id_alloc_nosleep(pptdev_minors);
++	if (minor == -1) {
++		return (DDI_FAILURE);
++	}
+ 
++	if (ddi_soft_state_zalloc(ppt_state, minor) != DDI_SUCCESS) {
++		goto fail;
++	}
++	VERIFY(ppt = ddi_get_soft_state(ppt_state, minor));
++	ppt->pptd_dip = dip;
+ 	ddi_set_driver_private(dip, ppt);
+ 
+-	if (ppt_attach(dip) == 0)
+-			return (DDI_SUCCESS);
++	if (pci_config_setup(dip, &ppt->pptd_cfg) != DDI_SUCCESS) {
++		goto fail;
++	}
++	if (ppt_bar_crawl(ppt) != 0) {
++		goto fail;
++	}
+ 
+-	ddi_set_driver_private(dip, NULL);
++	if (snprintf(name, sizeof (name), "ppt%u", minor)
++	    >= PPT_MAXNAMELEN - 1) {
++		goto fail;
++	}
++	if (ddi_create_minor_node(dip, name, S_IFCHR, minor,
++	    DDI_PSEUDO, 0) != DDI_SUCCESS) {
++		goto fail;
++	}
+ 
+-	ddi_soft_state_free(ppt_state, ddi_get_instance(dip));
++	ppt->pptd_dev = makedevice(ddi_driver_major(dip), minor);
++	mutex_enter(&pptdev_mtx);
++	list_insert_tail(&pptdev_list, ppt);
++	mutex_exit(&pptdev_mtx);
+ 
++	return (DDI_SUCCESS);
++
++fail:
++	if (ppt != NULL) {
++		ddi_remove_minor_node(dip, NULL);
++		if (ppt->pptd_cfg != NULL) {
++			pci_config_teardown(&ppt->pptd_cfg);
++		}
++		ppt_bar_wipe(ppt);
++		ddi_soft_state_free(ppt_state, minor);
++	}
++	id_free(pptdev_minors, minor);
+ 	return (DDI_FAILURE);
+ }
+ 
+ static int
+ ppt_ddi_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+ {
++	struct pptdev *ppt;
++	minor_t minor;
++
+ 	if (cmd != DDI_DETACH)
+ 		return (DDI_FAILURE);
+ 
+-	if (ppt_detach(dip) != 0)
+-			return (DDI_FAILURE);
++	ppt = ddi_get_driver_private(dip);
++	minor = getminor(ppt->pptd_dev);
+ 
+-	ddi_set_driver_private(dip, NULL);
++	ASSERT3P(ddi_get_soft_state(ppt_state, minor), ==, ppt);
++
++	mutex_enter(&pptdev_mtx);
++	if (ppt->vm != NULL) {
++		mutex_exit(&pptdev_mtx);
++		return (DDI_FAILURE);
++	}
++	list_remove(&pptdev_list, ppt);
++	mutex_exit(&pptdev_mtx);
+ 
+-	ddi_soft_state_free(ppt_state, ddi_get_instance(dip));
++	ddi_remove_minor_node(dip, NULL);
++	ppt_bar_wipe(ppt);
++	pci_config_teardown(&ppt->pptd_cfg);
++	ddi_set_driver_private(dip, NULL);
++	ddi_soft_state_free(ppt_state, minor);
++	id_free(pptdev_minors, minor);
+ 
+ 	return (DDI_SUCCESS);
+ }
+ 
++static struct cb_ops ppt_cb_ops = {
++	ppt_open,
++	nulldev,	/* close */
++	nodev,		/* strategy */
++	nodev,		/* print */
++	nodev,		/* dump */
++	nodev,		/* read */
++	nodev,		/* write */
++	ppt_ioctl,
++	nodev,		/* devmap */
++	nodev,		/* mmap */
++	nodev,		/* segmap */
++	nochpoll,	/* poll */
++	ddi_prop_op,
++	NULL,
++	D_NEW | D_MP | D_DEVMAP
++};
++
+ static struct dev_ops ppt_ops = {
+ 	DEVO_REV,
+ 	0,
+@@ -268,7 +502,7 @@ static struct dev_ops ppt_ops = {
+ 	ppt_ddi_attach,
+ 	ppt_ddi_detach,
+ 	nodev,		/* reset */
+-	(struct cb_ops *)NULL,
++	&ppt_cb_ops,
+ 	(struct bus_ops *)NULL
+ };
+ 
+@@ -287,28 +521,40 @@ static struct modlinkage modlinkage = {
+ int
+ _init(void)
+ {
+-	int	error;
++	int error;
++
++	mutex_init(&pptdev_mtx, NULL, MUTEX_DRIVER, NULL);
++	list_create(&pptdev_list, sizeof (struct pptdev),
++	    offsetof(struct pptdev, pptd_node));
++	pptdev_minors = id_space_create("ppt_minors", 0, MAXMIN32);
+ 
+ 	error = ddi_soft_state_init(&ppt_state, sizeof (struct pptdev), 0);
+-	if (error)
+-		return (error);
++	if (error) {
++		goto fail;
++	}
+ 
+ 	error = mod_install(&modlinkage);
+-	if (error)
+-		ddi_soft_state_fini(&ppt_state);
+ 
++fail:
++	if (error) {
++		ddi_soft_state_fini(&ppt_state);
++		id_space_destroy(pptdev_minors);
++		pptdev_minors = NULL;
++	}
+ 	return (error);
+ }
+ 
+ int
+ _fini(void)
+ {
+-	int	error;
++	int error;
+ 
+ 	error = mod_remove(&modlinkage);
+ 	if (error)
+ 		return (error);
+ 
++	id_space_destroy(pptdev_minors);
++	pptdev_minors = NULL;
+ 	ddi_soft_state_fini(&ppt_state);
+ 
+ 	return (0);
+@@ -320,23 +566,178 @@ _info(struct modinfo *modinfop)
+ 	return (mod_info(&modlinkage, modinfop));
+ }
+ 
++static boolean_t
++ppt_wait_for_pending_txn(dev_info_t *dip, uint_t max_delay_us)
++{
++	uint16_t cap_ptr, devsts;
++	ddi_acc_handle_t hdl;
++
++	if (pci_config_setup(dip, &hdl) != DDI_SUCCESS)
++		return (B_FALSE);
++
++	if (PCI_CAP_LOCATE(hdl, PCI_CAP_ID_PCI_E, &cap_ptr) != DDI_SUCCESS) {
++		pci_config_teardown(&hdl);
++		return (B_FALSE);
++	}
++
++	devsts = PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVSTS);
++	while ((devsts & PCIE_DEVSTS_TRANS_PENDING) != 0) {
++		if (max_delay_us == 0) {
++			pci_config_teardown(&hdl);
++			return (B_FALSE);
++		}
++
++		/* Poll once every 100 milliseconds up to the timeout. */
++		if (max_delay_us > 100000) {
++			delay(drv_usectohz(100000));
++			max_delay_us -= 100000;
++		} else {
++			delay(drv_usectohz(max_delay_us));
++			max_delay_us = 0;
++		}
++		devsts = PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVSTS);
++	}
++
++	pci_config_teardown(&hdl);
++	return (B_TRUE);
++}
++
++static uint_t
++ppt_max_completion_tmo_us(dev_info_t *dip)
++{
++	uint_t timo = 0;
++	uint16_t cap_ptr;
++	ddi_acc_handle_t hdl;
++	uint_t timo_ranges[] = {	/* timeout ranges */
++		50000,		/* 50ms */
++		100,		/* 100us */
++		10000,		/* 10ms */
++		0,
++		0,
++		55000,		/* 55ms */
++		210000,		/* 210ms */
++		0,
++		0,
++		900000,		/* 900ms */
++		3500000,	/* 3.5s */
++		0,
++		0,
++		13000000,	/* 13s */
++		64000000,	/* 64s */
++		0
++	};
++
++	if (pci_config_setup(dip, &hdl) != DDI_SUCCESS)
++		return (50000); /* default 50ms */
++
++	if (PCI_CAP_LOCATE(hdl, PCI_CAP_ID_PCI_E, &cap_ptr) != DDI_SUCCESS)
++		goto out;
++
++	if ((PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_PCIECAP) &
++	    PCIE_PCIECAP_VER_MASK) < PCIE_PCIECAP_VER_2_0)
++		goto out;
++
++	if ((PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCAP2) &
++	    PCIE_DEVCTL2_COM_TO_RANGE_MASK) == 0)
++		goto out;
++
++	timo = timo_ranges[PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCTL2) &
++	    PCIE_DEVCAP2_COM_TO_RANGE_MASK];
++
++out:
++	if (timo == 0)
++		timo = 50000; /* default 50ms */
++
++	pci_config_teardown(&hdl);
++	return (timo);
++}
++
++static boolean_t
++ppt_flr(dev_info_t *dip, boolean_t force)
++{
++	uint16_t cap_ptr, ctl, cmd;
++	ddi_acc_handle_t hdl;
++	uint_t compl_delay = 0, max_delay_us;
++
++	if (pci_config_setup(dip, &hdl) != DDI_SUCCESS)
++		return (B_FALSE);
++
++	if (PCI_CAP_LOCATE(hdl, PCI_CAP_ID_PCI_E, &cap_ptr) != DDI_SUCCESS)
++		goto fail;
++
++	if ((PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCAP) & PCIE_DEVCAP_FLR)
++	    == 0)
++		goto fail;
++
++	max_delay_us = MAX(ppt_max_completion_tmo_us(dip), 10000);
++
++	/*
++	 * Disable busmastering to prevent generation of new transactions while
++	 * waiting for the device to go idle.  If the idle timeout fails, the
++	 * command register is restored which will re-enable busmastering.
++	 */
++	cmd = pci_config_get16(hdl, PCI_CONF_COMM);
++	pci_config_put16(hdl, PCI_CONF_COMM, cmd & ~PCI_COMM_ME);
++	if (!ppt_wait_for_pending_txn(dip, max_delay_us)) {
++		if (!force) {
++			pci_config_put16(hdl, PCI_CONF_COMM, cmd);
++			goto fail;
++		}
++		dev_err(dip, CE_WARN,
++		    "?Resetting with transactions pending after %u us\n",
++		    max_delay_us);
++
++		/*
++		 * Extend the post-FLR delay to cover the maximum Completion
++		 * Timeout delay of anything in flight during the FLR delay.
++		 * Enforce a minimum delay of at least 10ms.
++		 */
++		compl_delay = MAX(10, (ppt_max_completion_tmo_us(dip) / 1000));
++	}
++
++	/* Initiate the reset. */
++	ctl = PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCTL);
++	(void) PCI_CAP_PUT16(hdl, NULL, cap_ptr, PCIE_DEVCTL,
++	    ctl | PCIE_DEVCTL_INITIATE_FLR);
++
++	/* Wait for at least 100ms */
++	delay(drv_usectohz((100 + compl_delay) * 1000));
++
++	pci_config_teardown(&hdl);
++	return (B_TRUE);
++
++fail:
++	pci_config_teardown(&hdl);
++	return (B_FALSE);
++}
+ 
+ static struct pptdev *
+-ppt_find(int bus, int slot, int func)
++ppt_findf(const int fd)
+ {
+-	device_t dev;
+-	struct pptdev *ppt;
+-	int b, s, f;
++	struct pptdev *ppt = NULL;
++	file_t *fp;
++	vattr_t va;
+ 
+-	TAILQ_FOREACH(ppt, &pptdev_list, next) {
+-		dev = ppt->dev;
+-		b = pci_get_bus(dev);
+-		s = pci_get_slot(dev);
+-		f = pci_get_function(dev);
+-		if (bus == b && slot == s && func == f)
+-			return (ppt);
++	ASSERT(MUTEX_HELD(&pptdev_mtx));
++
++	if ((fp = getf(fd)) == NULL) {
++		return (NULL);
++	}
++
++	va.va_mask = AT_RDEV;
++	if (VOP_GETATTR(fp->f_vnode, &va, NO_FOLLOW, fp->f_cred, NULL) == 0) {
++		for (ppt = list_head(&pptdev_list); ppt != NULL;
++		    ppt = list_next(&pptdev_list, ppt)) {
++			if (ppt->pptd_dev == va.va_rdev) {
++				break;
++			}
++		}
+ 	}
+-	return (NULL);
++
++	if (ppt == NULL) {
++		releasef(fd);
++	}
++	return (ppt);
+ }
+ 
+ static void
+@@ -357,31 +758,14 @@ ppt_unmap_mmio(struct vm *vm, struct pptdev *ppt)
+ static void
+ ppt_teardown_msi(struct pptdev *ppt)
+ {
+-	int i, rid;
+-#ifdef __FreeBSD__
+-	void *cookie;
+-	struct resource *res;
+-#endif
+-	int intr_cap = 0;
++	int i;
+ 
+ 	if (ppt->msi.num_msgs == 0)
+ 		return;
+ 
+ 	for (i = 0; i < ppt->msi.num_msgs; i++) {
+-#ifdef __FreeBSD__
+-		rid = ppt->msi.startrid + i;
+-		res = ppt->msi.res[i];
+-		cookie = ppt->msi.cookie[i];
+-
+-		if (cookie != NULL)
+-			bus_teardown_intr(ppt->dev, res, cookie);
+-
+-		if (res != NULL)
+-			bus_release_resource(ppt->dev, SYS_RES_IRQ, rid, res);
+-		
+-		ppt->msi.res[i] = NULL;
+-		ppt->msi.cookie[i] = NULL;
+-#else
++		int intr_cap;
++
+ 		(void) ddi_intr_get_cap(ppt->msi.inth[i], &intr_cap);
+ 		if (intr_cap & DDI_INTR_FLAG_BLOCK)
+ 			ddi_intr_block_disable(&ppt->msi.inth[i], 1);
+@@ -392,43 +776,19 @@ ppt_teardown_msi(struct pptdev *ppt)
+ 		ddi_intr_free(ppt->msi.inth[i]);
+ 
+ 		ppt->msi.inth[i] = NULL;
+-#endif
+ 	}
+ 
+-#ifdef __FreeBSD__
+-	if (ppt->msi.startrid == 1)
+-		pci_release_msi(ppt->dev);
+-#else
+ 	kmem_free(ppt->msi.inth, ppt->msi.inth_sz);
+ 	ppt->msi.inth = NULL;
+ 	ppt->msi.inth_sz = 0;
+ 	ppt->msi.is_fixed = B_FALSE;
+-#endif
+ 
+ 	ppt->msi.num_msgs = 0;
+ }
+ 
+-static void 
++static void
+ ppt_teardown_msix_intr(struct pptdev *ppt, int idx)
+ {
+-#ifdef __FreeBSD__
+-	int rid;
+-	struct resource *res;
+-	void *cookie;
+-
+-	rid = ppt->msix.startrid + idx;
+-	res = ppt->msix.res[idx];
+-	cookie = ppt->msix.cookie[idx];
+-
+-	if (cookie != NULL) 
+-		bus_teardown_intr(ppt->dev, res, cookie);
+-
+-	if (res != NULL) 
+-		bus_release_resource(ppt->dev, SYS_RES_IRQ, rid, res);
+-
+-	ppt->msix.res[idx] = NULL;
+-	ppt->msix.cookie[idx] = NULL;
+-#else
+ 	if (ppt->msix.inth != NULL && ppt->msix.inth[idx] != NULL) {
+ 		int intr_cap;
+ 
+@@ -440,35 +800,19 @@ ppt_teardown_msix_intr(struct pptdev *ppt, int idx)
+ 
+ 		ddi_intr_remove_handler(ppt->msix.inth[idx]);
+ 	}
+-#endif
+ }
+ 
+-static void 
++static void
+ ppt_teardown_msix(struct pptdev *ppt)
+ {
+-	int i;
++	uint_t i;
+ 
+-	if (ppt->msix.num_msgs == 0) 
++	if (ppt->msix.num_msgs == 0)
+ 		return;
+ 
+ 	for (i = 0; i < ppt->msix.num_msgs; i++)
+ 		ppt_teardown_msix_intr(ppt, i);
+ 
+-#ifdef __FreeBSD__
+-	if (ppt->msix.msix_table_res) {
+-		bus_release_resource(ppt->dev, SYS_RES_MEMORY, 
+-				     ppt->msix.msix_table_rid,
+-				     ppt->msix.msix_table_res);
+-		ppt->msix.msix_table_res = NULL;
+-		ppt->msix.msix_table_rid = 0;
+-	}
+-
+-	free(ppt->msix.res, M_PPTMSIX);
+-	free(ppt->msix.cookie, M_PPTMSIX);
+-	free(ppt->msix.arg, M_PPTMSIX);
+-
+-	pci_release_msi(ppt->dev);
+-#else
+ 	if (ppt->msix.inth) {
+ 		for (i = 0; i < ppt->msix.num_msgs; i++)
+ 			ddi_intr_free(ppt->msix.inth[i]);
+@@ -479,177 +823,242 @@ ppt_teardown_msix(struct pptdev *ppt)
+ 		ppt->msix.arg = NULL;
+ 		ppt->msix.arg_sz = 0;
+ 	}
+-#endif
+ 
+ 	ppt->msix.num_msgs = 0;
+ }
+ 
+-int
+-ppt_avail_devices(void)
+-{
+-
+-	return (num_pptdevs);
+-}
+-
+ int
+ ppt_assigned_devices(struct vm *vm)
+ {
+ 	struct pptdev *ppt;
+-	int num;
++	uint_t num = 0;
+ 
+-	num = 0;
+-	TAILQ_FOREACH(ppt, &pptdev_list, next) {
+-		if (ppt->vm == vm)
++	mutex_enter(&pptdev_mtx);
++	for (ppt = list_head(&pptdev_list); ppt != NULL;
++	    ppt = list_next(&pptdev_list, ppt)) {
++		if (ppt->vm == vm) {
+ 			num++;
++		}
+ 	}
++	mutex_exit(&pptdev_mtx);
+ 	return (num);
+ }
+ 
+ boolean_t
+ ppt_is_mmio(struct vm *vm, vm_paddr_t gpa)
+ {
+-	int i;
+-	struct pptdev *ppt;
+-	struct pptseg *seg;
++	struct pptdev *ppt = list_head(&pptdev_list);
+ 
+-	TAILQ_FOREACH(ppt, &pptdev_list, next) {
+-		if (ppt->vm != vm)
++	/* XXX: this should probably be restructured to avoid the lock */
++	mutex_enter(&pptdev_mtx);
++	for (ppt = list_head(&pptdev_list); ppt != NULL;
++	    ppt = list_next(&pptdev_list, ppt)) {
++		if (ppt->vm != vm) {
+ 			continue;
++		}
++
++		for (uint_t i = 0; i < MAX_MMIOSEGS; i++) {
++			struct pptseg *seg = &ppt->mmio[i];
+ 
+-		for (i = 0; i < MAX_MMIOSEGS; i++) {
+-			seg = &ppt->mmio[i];
+ 			if (seg->len == 0)
+ 				continue;
+-			if (gpa >= seg->gpa && gpa < seg->gpa + seg->len)
+-				return (TRUE);
++			if (gpa >= seg->gpa && gpa < seg->gpa + seg->len) {
++				mutex_exit(&pptdev_mtx);
++				return (B_TRUE);
++			}
+ 		}
+ 	}
+ 
+-	return (FALSE);
++	mutex_exit(&pptdev_mtx);
++	return (B_FALSE);
+ }
+ 
+ int
+-ppt_assign_device(struct vm *vm, int bus, int slot, int func)
++ppt_assign_device(struct vm *vm, int pptfd)
+ {
+ 	struct pptdev *ppt;
++	int err = 0;
+ 
+-	ppt = ppt_find(bus, slot, func);
+-	if (ppt != NULL) {
+-		/*
+-		 * If this device is owned by a different VM then we
+-		 * cannot change its owner.
+-		 */
+-		if (ppt->vm != NULL && ppt->vm != vm)
+-			return (EBUSY);
+-
+-		pci_save_state(ppt->dev);
+-		pcie_flr(ppt->dev,
+-		    max(pcie_get_max_completion_timeout(ppt->dev) / 1000, 10),
+-		    true);
+-		pci_restore_state(ppt->dev);
+-		ppt->vm = vm;
+-		iommu_remove_device(iommu_host_domain(), pci_get_rid(ppt->dev));
+-		iommu_add_device(vm_iommu_domain(vm), pci_get_rid(ppt->dev));
+-		return (0);
++	mutex_enter(&pptdev_mtx);
++	ppt = ppt_findf(pptfd);
++	if (ppt == NULL) {
++		mutex_exit(&pptdev_mtx);
++		return (EBADF);
++	}
++
++	/* Only one VM may own a device at any given time */
++	if (ppt->vm != NULL && ppt->vm != vm) {
++		err = EBUSY;
++		goto done;
++	}
++
++	if (pci_save_config_regs(ppt->pptd_dip) != DDI_SUCCESS) {
++		err = EIO;
++		goto done;
++	}
++	ppt_flr(ppt->pptd_dip, B_TRUE);
++
++	/*
++	 * Restore the device state after reset and then perform another save
++	 * so the "pristine" state can be restored when the device is removed
++	 * from the guest.
++	 */
++	if (pci_restore_config_regs(ppt->pptd_dip) != DDI_SUCCESS ||
++	    pci_save_config_regs(ppt->pptd_dip) != DDI_SUCCESS) {
++		err = EIO;
++		goto done;
++	}
++
++	ppt->vm = vm;
++	iommu_remove_device(iommu_host_domain(), pci_get_bdf(ppt->pptd_dip));
++	iommu_add_device(vm_iommu_domain(vm), pci_get_bdf(ppt->pptd_dip));
++
++done:
++	releasef(pptfd);
++	mutex_exit(&pptdev_mtx);
++	return (err);
++}
++
++static void
++ppt_reset_pci_power_state(dev_info_t *dip)
++{
++	ddi_acc_handle_t cfg;
++	uint16_t cap_ptr;
++
++	if (pci_config_setup(dip, &cfg) != DDI_SUCCESS)
++		return;
++
++	if (PCI_CAP_LOCATE(cfg, PCI_CAP_ID_PM, &cap_ptr) == DDI_SUCCESS) {
++		uint16_t val;
++
++		val = PCI_CAP_GET16(cfg, NULL, cap_ptr, PCI_PMCSR);
++		if ((val & PCI_PMCSR_STATE_MASK) != PCI_PMCSR_D0) {
++			val = (val & ~PCI_PMCSR_STATE_MASK) | PCI_PMCSR_D0;
++			(void) PCI_CAP_PUT16(cfg, NULL, cap_ptr, PCI_PMCSR,
++			    val);
++		}
+ 	}
+-	return (ENOENT);
++
++	pci_config_teardown(&cfg);
++}
++
++static void
++ppt_do_unassign(struct pptdev *ppt)
++{
++	struct vm *vm = ppt->vm;
++
++	ASSERT3P(vm, !=, NULL);
++	ASSERT(MUTEX_HELD(&pptdev_mtx));
++
++
++	ppt_flr(ppt->pptd_dip, B_TRUE);
++
++	/*
++	 * Restore from the state saved during device assignment.
++	 * If the device power state has been altered, that must be remedied
++	 * first, as it will reset register state during the transition.
++	 */
++	ppt_reset_pci_power_state(ppt->pptd_dip);
++	(void) pci_restore_config_regs(ppt->pptd_dip);
++
++	ppt_unmap_mmio(vm, ppt);
++	ppt_teardown_msi(ppt);
++	ppt_teardown_msix(ppt);
++	iommu_remove_device(vm_iommu_domain(vm), pci_get_bdf(ppt->pptd_dip));
++	iommu_add_device(iommu_host_domain(), pci_get_bdf(ppt->pptd_dip));
++	ppt->vm = NULL;
+ }
+ 
+ int
+-ppt_unassign_device(struct vm *vm, int bus, int slot, int func)
++ppt_unassign_device(struct vm *vm, int pptfd)
+ {
+ 	struct pptdev *ppt;
++	int err = 0;
+ 
+-	ppt = ppt_find(bus, slot, func);
+-	if (ppt != NULL) {
+-		/*
+-		 * If this device is not owned by this 'vm' then bail out.
+-		 */
+-		if (ppt->vm != vm)
+-			return (EBUSY);
+-
+-		pci_save_state(ppt->dev);
+-		pcie_flr(ppt->dev,
+-		    max(pcie_get_max_completion_timeout(ppt->dev) / 1000, 10),
+-		    true);
+-		pci_restore_state(ppt->dev);
+-		ppt_unmap_mmio(vm, ppt);
+-		ppt_teardown_msi(ppt);
+-		ppt_teardown_msix(ppt);
+-		iommu_remove_device(vm_iommu_domain(vm), pci_get_rid(ppt->dev));
+-		iommu_add_device(iommu_host_domain(), pci_get_rid(ppt->dev));
+-		ppt->vm = NULL;
+-		return (0);
++	mutex_enter(&pptdev_mtx);
++	ppt = ppt_findf(pptfd);
++	if (ppt == NULL) {
++		mutex_exit(&pptdev_mtx);
++		return (ENOENT);
+ 	}
+-	return (ENOENT);
++
++	/* If this device is not owned by this 'vm' then bail out. */
++	if (ppt->vm != vm) {
++		err = EBUSY;
++		goto done;
++	}
++	ppt_do_unassign(ppt);
++
++done:
++	releasef(pptfd);
++	mutex_exit(&pptdev_mtx);
++	return (err);
+ }
+ 
+ int
+ ppt_unassign_all(struct vm *vm)
+ {
+ 	struct pptdev *ppt;
+-	int bus, slot, func;
+-	device_t dev;
+ 
+-	TAILQ_FOREACH(ppt, &pptdev_list, next) {
++	mutex_enter(&pptdev_mtx);
++	for (ppt = list_head(&pptdev_list); ppt != NULL;
++	    ppt = list_next(&pptdev_list, ppt)) {
+ 		if (ppt->vm == vm) {
+-			dev = ppt->dev;
+-			bus = pci_get_bus(dev);
+-			slot = pci_get_slot(dev);
+-			func = pci_get_function(dev);
+-			vm_unassign_pptdev(vm, bus, slot, func);
++			ppt_do_unassign(ppt);
+ 		}
+ 	}
++	mutex_exit(&pptdev_mtx);
+ 
+ 	return (0);
+ }
+ 
+ int
+-ppt_map_mmio(struct vm *vm, int bus, int slot, int func,
+-	     vm_paddr_t gpa, size_t len, vm_paddr_t hpa)
++ppt_map_mmio(struct vm *vm, int pptfd, vm_paddr_t gpa, size_t len,
++    vm_paddr_t hpa)
+ {
+-	int i, error;
+-	struct pptseg *seg;
+ 	struct pptdev *ppt;
++	int err = 0;
+ 
+-	ppt = ppt_find(bus, slot, func);
+-	if (ppt != NULL) {
+-		if (ppt->vm != vm)
+-			return (EBUSY);
+-
+-		for (i = 0; i < MAX_MMIOSEGS; i++) {
+-			seg = &ppt->mmio[i];
+-			if (seg->len == 0) {
+-				error = vm_map_mmio(vm, gpa, len, hpa);
+-				if (error == 0) {
+-					seg->gpa = gpa;
+-					seg->len = len;
+-				}
+-				return (error);
++	mutex_enter(&pptdev_mtx);
++	ppt = ppt_findf(pptfd);
++	if (ppt == NULL) {
++		mutex_exit(&pptdev_mtx);
++		return (EBADF);
++	}
++	if (ppt->vm != vm) {
++		err = EBUSY;
++		goto done;
++	}
++
++	for (uint_t i = 0; i < MAX_MMIOSEGS; i++) {
++		struct pptseg *seg = &ppt->mmio[i];
++
++		if (seg->len == 0) {
++			err = vm_map_mmio(vm, gpa, len, hpa);
++			if (err == 0) {
++				seg->gpa = gpa;
++				seg->len = len;
+ 			}
++			goto done;
+ 		}
+-		return (ENOSPC);
+ 	}
+-	return (ENOENT);
++	err = ENOSPC;
++
++done:
++	releasef(pptfd);
++	mutex_exit(&pptdev_mtx);
++	return (err);
+ }
+ 
+-#ifdef __FreeBSD__
+-static int
+-pptintr(void *arg)
+-#else
+ static uint_t
+-pptintr(char *arg, char *unused)
+-#endif
++pptintr(caddr_t arg, caddr_t unused)
+ {
+-	struct pptdev *ppt;
+-	struct pptintr_arg *pptarg;
+-	
+-	pptarg = (struct pptintr_arg *)arg;
+-	ppt = pptarg->pptdev;
++	struct pptintr_arg *pptarg = (struct pptintr_arg *)arg;
++	struct pptdev *ppt = pptarg->pptdev;
+ 
+-	if (ppt->vm != NULL)
++	if (ppt->vm != NULL) {
+ 		lapic_intr_msi(ppt->vm, pptarg->addr, pptarg->msg_data);
+-	else {
++	} else {
+ 		/*
+ 		 * XXX
+ 		 * This is not expected to happen - panic?
+@@ -660,106 +1069,47 @@ pptintr(char *arg, char *unused)
+ 	 * For legacy interrupts give other filters a chance in case
+ 	 * the interrupt was not generated by the passthrough device.
+ 	 */
+-#ifdef __FreeBSD__
+-	if (ppt->msi.startrid == 0)
+-		return (FILTER_STRAY);
+-	else
+-		return (FILTER_HANDLED);
+-#else
+ 	return (ppt->msi.is_fixed ? DDI_INTR_UNCLAIMED : DDI_INTR_CLAIMED);
+-#endif
+ }
+ 
+ int
+-ppt_setup_msi(struct vm *vm, int vcpu, int bus, int slot, int func,
+-	      uint64_t addr, uint64_t msg, int numvec)
++ppt_setup_msi(struct vm *vm, int vcpu, int pptfd, uint64_t addr, uint64_t msg,
++    int numvec)
+ {
+-	int i, rid, flags;
+-	int msi_count, startrid, error, tmp;
+-	int intr_type, intr_cap = 0;
++	int i, msi_count, intr_type;
+ 	struct pptdev *ppt;
++	int err = 0;
+ 
+ 	if (numvec < 0 || numvec > MAX_MSIMSGS)
+ 		return (EINVAL);
+ 
+-	ppt = ppt_find(bus, slot, func);
+-	if (ppt == NULL)
+-		return (ENOENT);
+-	if (ppt->vm != vm)		/* Make sure we own this device */
+-		return (EBUSY);
++	mutex_enter(&pptdev_mtx);
++	ppt = ppt_findf(pptfd);
++	if (ppt == NULL) {
++		mutex_exit(&pptdev_mtx);
++		return (EBADF);
++	}
++	if (ppt->vm != vm) {
++		/* Make sure we own this device */
++		err = EBUSY;
++		goto done;
++	}
+ 
+ 	/* Free any allocated resources */
+ 	ppt_teardown_msi(ppt);
+ 
+-	if (numvec == 0)		/* nothing more to do */
+-		return (0);
+-
+-#ifdef __FreeBSD__
+-	flags = RF_ACTIVE;
+-	msi_count = pci_msi_count(ppt->dev);
+-	if (msi_count == 0) {
+-		startrid = 0;		/* legacy interrupt */
+-		msi_count = 1;
+-		flags |= RF_SHAREABLE;
+-	} else
+-		startrid = 1;		/* MSI */
+-
+-	/*
+-	 * The device must be capable of supporting the number of vectors
+-	 * the guest wants to allocate.
+-	 */
+-	if (numvec > msi_count)
+-		return (EINVAL);
+-
+-	/*
+-	 * Make sure that we can allocate all the MSI vectors that are needed
+-	 * by the guest.
+-	 */
+-	if (startrid == 1) {
+-		tmp = numvec;
+-		error = pci_alloc_msi(ppt->dev, &tmp);
+-		if (error)
+-			return (error);
+-		else if (tmp != numvec) {
+-			pci_release_msi(ppt->dev);
+-			return (ENOSPC);
+-		} else {
+-			/* success */
+-		}
++	if (numvec == 0) {
++		/* nothing more to do */
++		goto done;
+ 	}
+-	
+-	ppt->msi.startrid = startrid;
+ 
+-	/*
+-	 * Allocate the irq resource and attach it to the interrupt handler.
+-	 */
+-	for (i = 0; i < numvec; i++) {
+-		ppt->msi.num_msgs = i + 1;
+-		ppt->msi.cookie[i] = NULL;
+-
+-		rid = startrid + i;
+-		ppt->msi.res[i] = bus_alloc_resource_any(ppt->dev, SYS_RES_IRQ,
+-							 &rid, flags);
+-		if (ppt->msi.res[i] == NULL)
+-			break;
+-
+-		ppt->msi.arg[i].pptdev = ppt;
+-		ppt->msi.arg[i].addr = addr;
+-		ppt->msi.arg[i].msg_data = msg + i;
+-
+-		error = bus_setup_intr(ppt->dev, ppt->msi.res[i],
+-				       INTR_TYPE_NET | INTR_MPSAFE,
+-				       pptintr, NULL, &ppt->msi.arg[i],
+-				       &ppt->msi.cookie[i]);
+-		if (error != 0)
+-			break;
+-	}
+-#else
+-	if (ddi_intr_get_navail(ppt->dev, DDI_INTR_TYPE_MSI, &msi_count) !=
+-	    DDI_SUCCESS) {
+-		if (ddi_intr_get_navail(ppt->dev, DDI_INTR_TYPE_FIXED,
+-		    &msi_count) != DDI_SUCCESS)
+-			return (EINVAL);
++	if (ddi_intr_get_navail(ppt->pptd_dip, DDI_INTR_TYPE_MSI,
++	    &msi_count) != DDI_SUCCESS) {
++		if (ddi_intr_get_navail(ppt->pptd_dip, DDI_INTR_TYPE_FIXED,
++		    &msi_count) != DDI_SUCCESS) {
++			err = EINVAL;
++			goto done;
++		}
+ 
+ 		intr_type = DDI_INTR_TYPE_FIXED;
+ 		ppt->msi.is_fixed = B_TRUE;
+@@ -771,29 +1121,31 @@ ppt_setup_msi(struct vm *vm, int vcpu, int bus, int slot, int func,
+ 	 * The device must be capable of supporting the number of vectors
+ 	 * the guest wants to allocate.
+ 	 */
+-	if (numvec > msi_count)
+-		return (EINVAL);
++	if (numvec > msi_count) {
++		err = EINVAL;
++		goto done;
++	}
+ 
+ 	ppt->msi.inth_sz = numvec * sizeof (ddi_intr_handle_t);
+ 	ppt->msi.inth = kmem_zalloc(ppt->msi.inth_sz, KM_SLEEP);
+-	if (ddi_intr_alloc(ppt->dev, ppt->msi.inth, intr_type, 0,
++	if (ddi_intr_alloc(ppt->pptd_dip, ppt->msi.inth, intr_type, 0,
+ 	    numvec, &msi_count, 0) != DDI_SUCCESS) {
+ 		kmem_free(ppt->msi.inth, ppt->msi.inth_sz);
+-		return (EINVAL);
++		err = EINVAL;
++		goto done;
+ 	}
+ 
+-	/*
+-	 * Again, make sure we actually got as many vectors as the guest wanted
+-	 * to allocate.
+-	 */
++	/* Verify that we got as many vectors as the guest requested */
+ 	if (numvec != msi_count) {
+ 		ppt_teardown_msi(ppt);
+-		return (EINVAL);
++		err = EINVAL;
++		goto done;
+ 	}
+-	/*
+-	 * Set up & enable interrupt handler for each vector.
+-	 */
++
++	/* Set up & enable interrupt handler for each vector. */
+ 	for (i = 0; i < numvec; i++) {
++		int res, intr_cap = 0;
++
+ 		ppt->msi.num_msgs = i + 1;
+ 		ppt->msi.arg[i].pptdev = ppt;
+ 		ppt->msi.arg[i].addr = addr;
+@@ -805,95 +1157,58 @@ ppt_setup_msi(struct vm *vm, int vcpu, int bus, int slot, int func,
+ 
+ 		(void) ddi_intr_get_cap(ppt->msi.inth[i], &intr_cap);
+ 		if (intr_cap & DDI_INTR_FLAG_BLOCK)
+-			error = ddi_intr_block_enable(&ppt->msi.inth[i], 1);
++			res = ddi_intr_block_enable(&ppt->msi.inth[i], 1);
+ 		else
+-			error = ddi_intr_enable(ppt->msi.inth[i]);
++			res = ddi_intr_enable(ppt->msi.inth[i]);
+ 
+-		if (error != DDI_SUCCESS)
++		if (res != DDI_SUCCESS)
+ 			break;
+ 	}
+-#endif
+-	
+ 	if (i < numvec) {
+ 		ppt_teardown_msi(ppt);
+-		return (ENXIO);
++		err = ENXIO;
+ 	}
+ 
+-	return (0);
++done:
++	releasef(pptfd);
++	mutex_exit(&pptdev_mtx);
++	return (err);
+ }
+ 
+ int
+-ppt_setup_msix(struct vm *vm, int vcpu, int bus, int slot, int func,
+-	       int idx, uint64_t addr, uint64_t msg, uint32_t vector_control)
++ppt_setup_msix(struct vm *vm, int vcpu, int pptfd, int idx, uint64_t addr,
++    uint64_t msg, uint32_t vector_control)
+ {
+ 	struct pptdev *ppt;
+-	struct pci_devinfo *dinfo;
+-	int numvec, alloced, rid, error;
+-	size_t res_size, cookie_size, arg_size;
+-	int intr_cap;
+-
+-	ppt = ppt_find(bus, slot, func);
+-	if (ppt == NULL)
+-		return (ENOENT);
+-	if (ppt->vm != vm)		/* Make sure we own this device */
+-		return (EBUSY);
+-
+-#ifdef __FreeBSD__
+-	dinfo = device_get_ivars(ppt->dev);
+-	if (!dinfo) 
+-		return (ENXIO);
++	int numvec, alloced;
++	int err = 0;
++
++	mutex_enter(&pptdev_mtx);
++	ppt = ppt_findf(pptfd);
++	if (ppt == NULL) {
++		mutex_exit(&pptdev_mtx);
++		return (EBADF);
++	}
++	/* Make sure we own this device */
++	if (ppt->vm != vm) {
++		err = EBUSY;
++		goto done;
++	}
+ 
+-	/* 
++	/*
+ 	 * First-time configuration:
+ 	 * 	Allocate the MSI-X table
+ 	 *	Allocate the IRQ resources
+ 	 *	Set up some variables in ppt->msix
+ 	 */
+ 	if (ppt->msix.num_msgs == 0) {
+-		numvec = pci_msix_count(ppt->dev);
+-		if (numvec <= 0)
+-			return (EINVAL);
+-
+-		ppt->msix.startrid = 1;
+-		ppt->msix.num_msgs = numvec;
++		dev_info_t *dip = ppt->pptd_dip;
+ 
+-		res_size = numvec * sizeof(ppt->msix.res[0]);
+-		cookie_size = numvec * sizeof(ppt->msix.cookie[0]);
+-		arg_size = numvec * sizeof(ppt->msix.arg[0]);
+-
+-		ppt->msix.res = malloc(res_size, M_PPTMSIX, M_WAITOK | M_ZERO);
+-		ppt->msix.cookie = malloc(cookie_size, M_PPTMSIX,
+-					  M_WAITOK | M_ZERO);
+-		ppt->msix.arg = malloc(arg_size, M_PPTMSIX, M_WAITOK | M_ZERO);
+-
+-		rid = dinfo->cfg.msix.msix_table_bar;
+-		ppt->msix.msix_table_res = bus_alloc_resource_any(ppt->dev,
+-					       SYS_RES_MEMORY, &rid, RF_ACTIVE);
+-
+-		if (ppt->msix.msix_table_res == NULL) {
+-			ppt_teardown_msix(ppt);
+-			return (ENOSPC);
++		if (ddi_intr_get_navail(dip, DDI_INTR_TYPE_MSIX,
++		    &numvec) != DDI_SUCCESS) {
++			err = EINVAL;
++			goto done;
+ 		}
+-		ppt->msix.msix_table_rid = rid;
+-
+-		alloced = numvec;
+-		error = pci_alloc_msix(ppt->dev, &alloced);
+-		if (error || alloced != numvec) {
+-			ppt_teardown_msix(ppt);
+-			return (error == 0 ? ENOSPC: error);
+-		}
+-	}
+-#else
+-	/*
+-	 * First-time configuration:
+-	 * 	Allocate the MSI-X table
+-	 *	Allocate the IRQ resources
+-	 *	Set up some variables in ppt->msix
+-	 */
+-	if (ppt->msix.num_msgs == 0) {
+-		if (ddi_intr_get_navail(ppt->dev, DDI_INTR_TYPE_MSIX, &numvec) !=
+-		    DDI_SUCCESS)
+-			return (EINVAL);
+ 
+ 		ppt->msix.num_msgs = numvec;
+ 
+@@ -902,99 +1217,96 @@ ppt_setup_msix(struct vm *vm, int vcpu, int bus, int slot, int func,
+ 		ppt->msix.inth_sz = numvec * sizeof(ddi_intr_handle_t);
+ 		ppt->msix.inth = kmem_zalloc(ppt->msix.inth_sz, KM_SLEEP);
+ 
+-		if (ddi_intr_alloc(ppt->dev, ppt->msix.inth, DDI_INTR_TYPE_MSIX,
+-		    0, numvec, &alloced, 0) != DDI_SUCCESS) {
++		if (ddi_intr_alloc(dip, ppt->msix.inth, DDI_INTR_TYPE_MSIX, 0,
++		    numvec, &alloced, 0) != DDI_SUCCESS) {
+ 			kmem_free(ppt->msix.arg, ppt->msix.arg_sz);
+ 			kmem_free(ppt->msix.inth, ppt->msix.inth_sz);
+ 			ppt->msix.arg = NULL;
+ 			ppt->msix.inth = NULL;
+ 			ppt->msix.arg_sz = ppt->msix.inth_sz = 0;
+-			return (EINVAL);
++			err = EINVAL;
++			goto done;
+ 		}
+ 
+ 		if (numvec != alloced) {
+ 			ppt_teardown_msix(ppt);
+-			return (EINVAL);
++			err = EINVAL;
++			goto done;
+ 		}
+ 	}
+-#endif
+-	if (idx >= ppt->msix.num_msgs)
+-		return (EINVAL);
++
++	if (idx >= ppt->msix.num_msgs) {
++		err = EINVAL;
++		goto done;
++	}
+ 
+ 	if ((vector_control & PCIM_MSIX_VCTRL_MASK) == 0) {
++		int intr_cap, res;
++
+ 		/* Tear down the IRQ if it's already set up */
+ 		ppt_teardown_msix_intr(ppt, idx);
+ 
+-#ifdef __FreeBSD__
+-		/* Allocate the IRQ resource */
+-		ppt->msix.cookie[idx] = NULL;
+-		rid = ppt->msix.startrid + idx;
+-		ppt->msix.res[idx] = bus_alloc_resource_any(ppt->dev, SYS_RES_IRQ,
+-							    &rid, RF_ACTIVE);
+-		if (ppt->msix.res[idx] == NULL)
+-			return (ENXIO);
+-#endif
+ 		ppt->msix.arg[idx].pptdev = ppt;
+ 		ppt->msix.arg[idx].addr = addr;
+ 		ppt->msix.arg[idx].msg_data = msg;
+-	
++
+ 		/* Setup the MSI-X interrupt */
+-#ifdef __FreeBSD__
+-		error = bus_setup_intr(ppt->dev, ppt->msix.res[idx],
+-				       INTR_TYPE_NET | INTR_MPSAFE,
+-				       pptintr, NULL, &ppt->msix.arg[idx],
+-				       &ppt->msix.cookie[idx]);
+-	
+-		if (error != 0) {
+-			bus_teardown_intr(ppt->dev, ppt->msix.res[idx], ppt->msix.cookie[idx]);
+-			bus_release_resource(ppt->dev, SYS_RES_IRQ, rid, ppt->msix.res[idx]);
+-			ppt->msix.cookie[idx] = NULL;
+-			ppt->msix.res[idx] = NULL;
+-			return (ENXIO);
+-		}
+-#else
+ 		if (ddi_intr_add_handler(ppt->msix.inth[idx], pptintr,
+-		    &ppt->msix.arg[idx], NULL) != DDI_SUCCESS)
+-			return (ENXIO);
++		    &ppt->msix.arg[idx], NULL) != DDI_SUCCESS) {
++			err = ENXIO;
++			goto done;
++		}
+ 
+ 		(void) ddi_intr_get_cap(ppt->msix.inth[idx], &intr_cap);
+ 		if (intr_cap & DDI_INTR_FLAG_BLOCK)
+-			error = ddi_intr_block_enable(&ppt->msix.inth[idx], 1);
++			res = ddi_intr_block_enable(&ppt->msix.inth[idx], 1);
+ 		else
+-			error = ddi_intr_enable(ppt->msix.inth[idx]);
++			res = ddi_intr_enable(ppt->msix.inth[idx]);
+ 
+-		if (error != DDI_SUCCESS) {
++		if (res != DDI_SUCCESS) {
+ 			ddi_intr_remove_handler(ppt->msix.inth[idx]);
+-			return (ENXIO);
++			err = ENXIO;
++			goto done;
+ 		}
+-#endif
+ 	} else {
+ 		/* Masked, tear it down if it's already been set up */
+ 		ppt_teardown_msix_intr(ppt, idx);
+ 	}
+ 
+-	return (0);
++done:
++	releasef(pptfd);
++	mutex_enter(&pptdev_mtx);
++	return (err);
+ }
+ 
+ int
+-ppt_get_limits(struct vm *vm, int bus, int slot, int func, int *msilimit,
+-    int *msixlimit)
++ppt_get_limits(struct vm *vm, int pptfd, int *msilimit, int *msixlimit)
+ {
+ 	struct pptdev *ppt;
++	int err = 0;
+ 
+-	ppt = ppt_find(bus, slot, func);
+-	if (ppt == NULL)
+-		return (ENOENT);
+-	if (ppt->vm != vm)		/* Make sure we own this device */
+-		return (EBUSY);
++	mutex_enter(&pptdev_mtx);
++	ppt = ppt_findf(pptfd);
++	if (ppt == NULL) {
++		mutex_exit(&pptdev_mtx);
++		return (EBADF);
++	}
++	if (ppt->vm != vm) {
++		err = EBUSY;
++		goto done;
++	}
+ 
+-	if (ddi_intr_get_navail(ppt->dev, DDI_INTR_TYPE_MSI, msilimit) !=
+-	    DDI_SUCCESS)
++	if (ddi_intr_get_navail(ppt->pptd_dip, DDI_INTR_TYPE_MSI,
++	    msilimit) != DDI_SUCCESS) {
+ 		*msilimit = -1;
+-
+-	if (ddi_intr_get_navail(ppt->dev, DDI_INTR_TYPE_MSIX, msixlimit) !=
+-	    DDI_SUCCESS)
++	}
++	if (ddi_intr_get_navail(ppt->pptd_dip, DDI_INTR_TYPE_MSIX,
++	    msixlimit) != DDI_SUCCESS) {
+ 		*msixlimit = -1;
++	}
+ 
+-	return (0);
++done:
++	releasef(pptfd);
++	mutex_exit(&pptdev_mtx);
++	return (err);
+ }
+diff --git a/usr/src/uts/i86pc/io/vmm/io/ppt.h b/usr/src/uts/i86pc/io/vmm/io/ppt.h
+index 9d3bdab2db..59e070857d 100644
+--- a/usr/src/uts/i86pc/io/vmm/io/ppt.h
++++ b/usr/src/uts/i86pc/io/vmm/io/ppt.h
+@@ -29,28 +29,21 @@
+ #ifndef _IO_PPT_H_
+ #define	_IO_PPT_H_
+ 
+-int	ppt_unassign_all(struct vm *vm);
+-int	ppt_map_mmio(struct vm *vm, int bus, int slot, int func,
+-		     vm_paddr_t gpa, size_t len, vm_paddr_t hpa);
+-int	ppt_setup_msi(struct vm *vm, int vcpu, int bus, int slot, int func,
+-		      uint64_t addr, uint64_t msg, int numvec);
+-int	ppt_setup_msix(struct vm *vm, int vcpu, int bus, int slot, int func,
+-		int idx, uint64_t addr, uint64_t msg, uint32_t vector_control);
+-int	ppt_assigned_devices(struct vm *vm);
++int ppt_unassign_all(struct vm *vm);
++int ppt_map_mmio(struct vm *vm, int pptfd, vm_paddr_t gpa, size_t len,
++    vm_paddr_t hpa);
++int ppt_setup_msi(struct vm *vm, int vcpu, int pptfd, uint64_t addr,
++    uint64_t msg, int numvec);
++int ppt_setup_msix(struct vm *vm, int vcpu, int pptfd, int idx, uint64_t addr,
++    uint64_t msg, uint32_t vector_control);
++int ppt_assigned_devices(struct vm *vm);
+ boolean_t ppt_is_mmio(struct vm *vm, vm_paddr_t gpa);
+-int	ppt_get_limits(struct vm *vm, int bus, int slot, int func, int *msilimit,
+-    int *msixlimit);
+-
+-/*
+- * Returns the number of devices sequestered by the ppt driver for assignment
+- * to virtual machines.
+- */
+-int	ppt_avail_devices(void);
++int ppt_get_limits(struct vm *vm, int pptfd, int *msilimit, int *msixlimit);
+ 
+ /*
+  * The following functions should never be called directly.
+  * Use 'vm_assign_pptdev()' and 'vm_unassign_pptdev()' instead.
+  */
+-int	ppt_assign_device(struct vm *vm, int bus, int slot, int func);
+-int	ppt_unassign_device(struct vm *vm, int bus, int slot, int func);
++int ppt_assign_device(struct vm *vm, int pptfd);
++int ppt_unassign_device(struct vm *vm, int pptfd);
+ #endif
+diff --git a/usr/src/uts/i86pc/io/vmm/io/ppt_sol_glue.c b/usr/src/uts/i86pc/io/vmm/io/ppt_sol_glue.c
+deleted file mode 100644
+index 3fa38d209f..0000000000
+--- a/usr/src/uts/i86pc/io/vmm/io/ppt_sol_glue.c
++++ /dev/null
+@@ -1,177 +0,0 @@
+-/*
+- * This file and its contents are supplied under the terms of the
+- * Common Development and Distribution License ("CDDL"), version 1.0.
+- * You may only use this file in accordance with the terms of version
+- * 1.0 of the CDDL.
+- *
+- * A full copy of the text of the CDDL should have accompanied this
+- * source.  A copy of the CDDL is also available via the Internet at
+- * http://www.illumos.org/license/CDDL.
+- */
+-
+-/*
+- * Copyright 2017 Joyent, Inc.
+- */
+-
+-/*
+- * PCI/PCIe interfaces needed by ppt
+- */
+-
+-#include <sys/ddi.h>
+-#include <sys/sunddi.h>
+-#include <sys/pcie.h>
+-#include <sys/pci_cap.h>
+-
+-#include <sys/bus.h>
+-#include <dev/pci/pcivar.h>
+-
+-static bool
+-pcie_wait_for_pending_transactions(dev_info_t *dip, u_int max_delay)
+-{
+-	uint16_t cap_ptr, devsts;
+-	ddi_acc_handle_t hdl;
+-
+-	if (pci_config_setup(dip, &hdl) != DDI_SUCCESS)
+-		return (false);
+-
+-	if (PCI_CAP_LOCATE(hdl, PCI_CAP_ID_PCI_E, &cap_ptr) != DDI_SUCCESS) {
+-		pci_config_teardown(&hdl);
+-		return (false);
+-	}
+-
+-	devsts = PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVSTS);
+-	while ((devsts & PCIE_DEVSTS_TRANS_PENDING) != 0) {
+-		if (max_delay == 0) {
+-			pci_config_teardown(&hdl);
+-			return (false);
+-		}
+-
+-		/* Poll once every 100 milliseconds up to the timeout. */
+-		if (max_delay > 100) {
+-			delay(drv_usectohz(100 * 1000));
+-			max_delay -= 100;
+-		} else {
+-			delay(drv_usectohz(max_delay * 1000));
+-			max_delay = 0;
+-		}
+-		devsts = PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVSTS);
+-	}
+-
+-	pci_config_teardown(&hdl);
+-	return (true);
+-}
+-
+-int
+-pcie_get_max_completion_timeout(device_t dev)
+-{
+-	dev_info_t *dip = dev;
+-	int timo = 0;
+-	uint16_t cap_ptr;
+-	ddi_acc_handle_t hdl;
+-	int timo_ranges[] = {	/* timeout ranges */
+-		50000,		/* 50ms */
+-		100,		/* 100us */
+-		10000,		/* 10ms */
+-		0,
+-		0,
+-		55000,		/* 55ms */
+-		210000,		/* 210ms */
+-		0,
+-		0,
+-		900000,		/* 900ms */
+-		3500000,	/* 3.5s */
+-		0,
+-		0,
+-		13000000,	/* 13s */
+-		64000000,	/* 64s */
+-		0
+-	};
+-
+-	if (pci_config_setup(dip, &hdl) != DDI_SUCCESS)
+-		return (50000); /* default 50ms */
+-
+-	if (PCI_CAP_LOCATE(hdl, PCI_CAP_ID_PCI_E, &cap_ptr) != DDI_SUCCESS)
+-		goto out;
+-
+-	if ((PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_PCIECAP) &
+-	    PCIE_PCIECAP_VER_MASK) < PCIE_PCIECAP_VER_2_0)
+-		goto out;
+-
+-	if ((PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCAP2) &
+-	    PCIE_DEVCTL2_COM_TO_RANGE_MASK) == 0)
+-		goto out;
+-
+-	timo = timo_ranges[PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCTL2) &
+-	    PCIE_DEVCAP2_COM_TO_RANGE_MASK];
+-
+-out:
+-	if (timo == 0)
+-		timo = 50000; /* default 50ms */
+-
+-	pci_config_teardown(&hdl);
+-	return (timo);
+-}
+-
+-bool
+-pcie_flr(device_t dev, u_int max_delay, bool force)
+-{
+-	dev_info_t *dip = dev;
+-	bool ret = false;
+-	uint16_t cap_ptr, ctl, cmd;
+-	ddi_acc_handle_t hdl;
+-	int compl_delay;
+-
+-	if (pci_config_setup(dip, &hdl) != DDI_SUCCESS)
+-		return (false);
+-
+-	if (PCI_CAP_LOCATE(hdl, PCI_CAP_ID_PCI_E, &cap_ptr) != DDI_SUCCESS)
+-		goto fail;
+-
+-	if ((PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCAP) & PCIE_DEVCAP_FLR)
+-	    == 0)
+-		goto fail;
+-
+-	/*
+-	 * Disable busmastering to prevent generation of new
+-	 * transactions while waiting for the device to go idle.  If
+-	 * the idle timeout fails, the command register is restored
+-	 * which will re-enable busmastering.
+-	 */
+-	cmd = pci_config_get16(hdl, PCI_CONF_COMM);
+-	pci_config_put16(hdl, PCI_CONF_COMM, cmd & ~PCI_COMM_ME);
+-	if (!pcie_wait_for_pending_transactions(dev, max_delay)) {
+-		if (!force) {
+-			pci_config_put16(hdl, PCI_CONF_COMM, cmd);
+-			goto fail;
+-		}
+-		dev_err(dip, CE_WARN,
+-		    "?Resetting with transactions pending after %d ms\n",
+-		    max_delay);
+-
+-		/*
+-		 * Extend the post-FLR delay to cover the maximum
+-		 * Completion Timeout delay of anything in flight
+-		 * during the FLR delay.  Enforce a minimum delay of
+-		 * at least 10ms.
+-		 */
+-		compl_delay = pcie_get_max_completion_timeout(dev) / 1000;
+-		if (compl_delay < 10)
+-			compl_delay = 10;
+-	} else
+-		compl_delay = 0;
+-
+-	/* Initiate the reset. */
+-	ctl = PCI_CAP_GET16(hdl, NULL, cap_ptr, PCIE_DEVCTL);
+-	(void) PCI_CAP_PUT16(hdl, NULL, cap_ptr, PCIE_DEVCTL,
+-	    ctl | PCIE_DEVCTL_INITIATE_FLR);
+-
+-	/* Wait for at least 100ms */
+-	delay(drv_usectohz((100 + compl_delay) * 1000));
+-
+-	pci_config_teardown(&hdl);
+-	return (true);
+-
+-fail:
+-	pci_config_teardown(&hdl);
+-	return (ret);
+-}
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm.c b/usr/src/uts/i86pc/io/vmm/vmm.c
+index 0cd82a9309..bad3ac6317 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm.c
+@@ -922,10 +922,14 @@ vm_iommu_modify(struct vm *vm, boolean_t map)
+ 			hpa = DMAP_TO_PHYS((uintptr_t)vp);
+ 			if (map) {
+ 				iommu_create_mapping(vm->iommu, gpa, hpa, sz);
++#ifdef __FreeBSD__
+ 				iommu_remove_mapping(host_domain, hpa, sz);
++#endif
+ 			} else {
+ 				iommu_remove_mapping(vm->iommu, gpa, sz);
++#ifdef __FreeBSD__
+ 				iommu_create_mapping(host_domain, hpa, hpa, sz);
++#endif
+ 			}
+ 
+ 			gpa += PAGE_SIZE;
+@@ -936,21 +940,34 @@ vm_iommu_modify(struct vm *vm, boolean_t map)
+ 	 * Invalidate the cached translations associated with the domain
+ 	 * from which pages were removed.
+ 	 */
++#ifdef __FreeBSD__
+ 	if (map)
+ 		iommu_invalidate_tlb(host_domain);
+ 	else
+ 		iommu_invalidate_tlb(vm->iommu);
++#else
++	iommu_invalidate_tlb(vm->iommu);
++#endif
+ }
+ 
+ #define	vm_iommu_unmap(vm)	vm_iommu_modify((vm), FALSE)
+ #define	vm_iommu_map(vm)	vm_iommu_modify((vm), TRUE)
+ 
++#ifdef __FreeBSD__
+ int
+ vm_unassign_pptdev(struct vm *vm, int bus, int slot, int func)
++#else
++int
++vm_unassign_pptdev(struct vm *vm, int pptfd)
++#endif /* __FreeBSD__ */
+ {
+ 	int error;
+ 
++#ifdef __FreeBSD__
+ 	error = ppt_unassign_device(vm, bus, slot, func);
++#else
++	error = ppt_unassign_device(vm, pptfd);
++#endif /* __FreeBSD__ */
+ 	if (error)
+ 		return (error);
+ 
+@@ -960,8 +977,13 @@ vm_unassign_pptdev(struct vm *vm, int bus, int slot, int func)
+ 	return (0);
+ }
+ 
++#ifdef __FreeBSD__
+ int
+ vm_assign_pptdev(struct vm *vm, int bus, int slot, int func)
++#else
++int
++vm_assign_pptdev(struct vm *vm, int pptfd)
++#endif /* __FreeBSD__ */
+ {
+ 	int error;
+ 	vm_paddr_t maxaddr;
+@@ -977,7 +999,11 @@ vm_assign_pptdev(struct vm *vm, int bus, int slot, int func)
+ 		vm_iommu_map(vm);
+ 	}
+ 
++#ifdef __FreeBSD__
+ 	error = ppt_assign_device(vm, bus, slot, func);
++#else
++	error = ppt_assign_device(vm, pptfd);
++#endif /* __FreeBSD__ */
+ 	return (error);
+ }
+ 
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c b/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c
+index 9cb7aef035..f83ee78c31 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c
+@@ -609,65 +609,67 @@ vmmdev_do_ioctl(vmm_softc_t *sc, int cmd, intptr_t arg, int md,
+ 
+ 	case VM_PPTDEV_MSI: {
+ 		struct vm_pptdev_msi pptmsi;
++
+ 		if (ddi_copyin(datap, &pptmsi, sizeof (pptmsi), md)) {
+ 			error = EFAULT;
+ 			break;
+ 		}
+-		error = ppt_setup_msi(sc->vmm_vm, pptmsi.vcpu, pptmsi.bus,
+-		    pptmsi.slot, pptmsi.func, pptmsi.addr, pptmsi.msg,
+-		    pptmsi.numvec);
++		error = ppt_setup_msi(sc->vmm_vm, pptmsi.vcpu, pptmsi.pptfd,
++		    pptmsi.addr, pptmsi.msg, pptmsi.numvec);
+ 		break;
+ 	}
+ 	case VM_PPTDEV_MSIX: {
+ 		struct vm_pptdev_msix pptmsix;
++
+ 		if (ddi_copyin(datap, &pptmsix, sizeof (pptmsix), md)) {
+ 			error = EFAULT;
+ 			break;
+ 		}
+-		error = ppt_setup_msix(sc->vmm_vm, pptmsix.vcpu, pptmsix.bus,
+-		    pptmsix.slot, pptmsix.func, pptmsix.idx, pptmsix.addr,
+-		    pptmsix.msg, pptmsix.vector_control);
++		error = ppt_setup_msix(sc->vmm_vm, pptmsix.vcpu, pptmsix.pptfd,
++		    pptmsix.idx, pptmsix.addr, pptmsix.msg,
++		    pptmsix.vector_control);
+ 		break;
+ 	}
+ 	case VM_MAP_PPTDEV_MMIO: {
+ 		struct vm_pptdev_mmio pptmmio;
++
+ 		if (ddi_copyin(datap, &pptmmio, sizeof (pptmmio), md)) {
+ 			error = EFAULT;
+ 			break;
+ 		}
+-		error = ppt_map_mmio(sc->vmm_vm, pptmmio.bus, pptmmio.slot,
+-		    pptmmio.func, pptmmio.gpa, pptmmio.len, pptmmio.hpa);
++		error = ppt_map_mmio(sc->vmm_vm, pptmmio.pptfd, pptmmio.gpa,
++		    pptmmio.len, pptmmio.hpa);
+ 		break;
+ 	}
+ 	case VM_BIND_PPTDEV: {
+ 		struct vm_pptdev pptdev;
++
+ 		if (ddi_copyin(datap, &pptdev, sizeof (pptdev), md)) {
+ 			error = EFAULT;
+ 			break;
+ 		}
+-		error = vm_assign_pptdev(sc->vmm_vm, pptdev.bus, pptdev.slot,
+-		    pptdev.func);
++		error = vm_assign_pptdev(sc->vmm_vm, pptdev.pptfd);
+ 		break;
+ 	}
+ 	case VM_UNBIND_PPTDEV: {
+ 		struct vm_pptdev pptdev;
++
+ 		if (ddi_copyin(datap, &pptdev, sizeof (pptdev), md)) {
+ 			error = EFAULT;
+ 			break;
+ 		}
+-		error = vm_unassign_pptdev(sc->vmm_vm, pptdev.bus, pptdev.slot,
+-		    pptdev.func);
++		error = vm_unassign_pptdev(sc->vmm_vm, pptdev.pptfd);
+ 		break;
+ 	}
+ 	case VM_GET_PPTDEV_LIMITS: {
+ 		struct vm_pptdev_limits pptlimits;
++
+ 		if (ddi_copyin(datap, &pptlimits, sizeof (pptlimits), md)) {
+ 			error = EFAULT;
+ 			break;
+ 		}
+-		error = ppt_get_limits(sc->vmm_vm, pptlimits.bus,
+-		    pptlimits.slot, pptlimits.func, &pptlimits.msi_limit,
+-		    &pptlimits.msix_limit);
++		error = ppt_get_limits(sc->vmm_vm, pptlimits.pptfd,
++		    &pptlimits.msi_limit, &pptlimits.msix_limit);
+ 		if (error == 0 &&
+ 		    ddi_copyout(&pptlimits, datap, sizeof (pptlimits), md)) {
+ 			error = EFAULT;
+diff --git a/usr/src/uts/i86pc/ppt/Makefile b/usr/src/uts/i86pc/ppt/Makefile
+index 8e8fa9bb57..34661bd3f3 100644
+--- a/usr/src/uts/i86pc/ppt/Makefile
++++ b/usr/src/uts/i86pc/ppt/Makefile
+@@ -25,7 +25,7 @@ UTSBASE	= ../..
+ MODULE		= ppt
+ OBJECTS		= $(PPT_OBJS:%=$(OBJS_DIR)/%)
+ LINTS		= $(PPT_OBJS:%.o=$(LINTS_DIR)/%.ln)
+-ROOTMODULE	= $(ROOT_DRV_DIR)/$(MODULE)
++ROOTMODULE	= $(USR_DRV_DIR)/$(MODULE)
+ CONF_SRCDIR	= $(UTSBASE)/i86pc/io/vmm/io
+ 
+ #
+diff --git a/usr/src/uts/i86pc/sys/ppt_dev.h b/usr/src/uts/i86pc/sys/ppt_dev.h
+new file mode 100644
+index 0000000000..e25f941f14
+--- /dev/null
++++ b/usr/src/uts/i86pc/sys/ppt_dev.h
+@@ -0,0 +1,56 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright 2018 Joyent, Inc
++ */
++
++#ifndef _PPT_DEV_H
++#define	_PPT_DEV_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define	PPT_IOC			(('P' << 16)|('T' << 8))
++
++#define	PPT_CFG_READ		(PPT_IOC | 0x01)
++#define	PPT_CFG_WRITE		(PPT_IOC | 0x02)
++#define	PPT_BAR_QUERY		(PPT_IOC | 0x03)
++#define	PPT_BAR_READ		(PPT_IOC | 0x04)
++#define	PPT_BAR_WRITE		(PPT_IOC | 0x05)
++
++#define	PPT_MAXNAMELEN	32
++
++struct ppt_cfg_io {
++	uint64_t pci_off;
++	uint32_t pci_width;
++	uint32_t pci_data;
++};
++struct ppt_bar_io {
++	uint32_t pbi_bar;
++	uint32_t pbi_off;
++	uint32_t pbi_width;
++	uint32_t pbi_data;
++};
++
++struct ppt_bar_query {
++	uint32_t pbq_baridx;
++	uint32_t pbq_type;
++	uint64_t pbq_base;
++	uint64_t pbq_size;
++};
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _PPT_DEV_H */
+diff --git a/usr/src/uts/i86pc/sys/vmm.h b/usr/src/uts/i86pc/sys/vmm.h
+index d013f4f70a..ded10a79df 100644
+--- a/usr/src/uts/i86pc/sys/vmm.h
++++ b/usr/src/uts/i86pc/sys/vmm.h
+@@ -198,8 +198,13 @@ int vm_alloc_memseg(struct vm *vm, int ident, size_t len, bool sysmem);
+ void vm_free_memseg(struct vm *vm, int ident);
+ int vm_map_mmio(struct vm *vm, vm_paddr_t gpa, size_t len, vm_paddr_t hpa);
+ int vm_unmap_mmio(struct vm *vm, vm_paddr_t gpa, size_t len);
++#ifdef __FreeBSD__
+ int vm_assign_pptdev(struct vm *vm, int bus, int slot, int func);
+ int vm_unassign_pptdev(struct vm *vm, int bus, int slot, int func);
++#else
++int vm_assign_pptdev(struct vm *vm, int pptfd);
++int vm_unassign_pptdev(struct vm *vm, int pptfd);
++#endif /* __FreeBSD__ */
+ 
+ /*
+  * APIs that inspect the guest memory map require only a *single* vcpu to
+diff --git a/usr/src/uts/i86pc/sys/vmm_dev.h b/usr/src/uts/i86pc/sys/vmm_dev.h
+index b8e3f39f01..d2c77b77c2 100644
+--- a/usr/src/uts/i86pc/sys/vmm_dev.h
++++ b/usr/src/uts/i86pc/sys/vmm_dev.h
+@@ -121,6 +121,7 @@ struct vm_capability {
+ 	int		allcpus;
+ };
+ 
++#ifdef __FreeBSD__
+ struct vm_pptdev {
+ 	int		bus;
+ 	int		slot;
+@@ -164,6 +165,41 @@ struct vm_pptdev_limits {
+ 	int		msi_limit;
+ 	int		msix_limit;
+ };
++#else /* __FreeBSD__ */
++struct vm_pptdev {
++	int		pptfd;
++};
++
++struct vm_pptdev_mmio {
++	int		pptfd;
++	vm_paddr_t	gpa;
++	vm_paddr_t	hpa;
++	size_t		len;
++};
++
++struct vm_pptdev_msi {
++	int		vcpu;
++	int		pptfd;
++	int		numvec;		/* 0 means disabled */
++	uint64_t	msg;
++	uint64_t	addr;
++};
++
++struct vm_pptdev_msix {
++	int		vcpu;
++	int		pptfd;
++	int		idx;
++	uint64_t	msg;
++	uint32_t	vector_control;
++	uint64_t	addr;
++};
++
++struct vm_pptdev_limits {
++	int		pptfd;
++	int		msi_limit;
++	int		msix_limit;
++};
++#endif /* __FreeBSD__ */
+ 
+ struct vm_nmi {
+ 	int		cpuid;
+diff --git a/usr/src/uts/intel/ia32/ml/modstubs.s b/usr/src/uts/intel/ia32/ml/modstubs.s
+index 6ead53dd73..040c5f0ea5 100644
+--- a/usr/src/uts/intel/ia32/ml/modstubs.s
++++ b/usr/src/uts/intel/ia32/ml/modstubs.s
+@@ -1440,7 +1440,6 @@ fcnname/**/_info:							\
+ 	WSTUB(ppt, ppt_setup_msix,		nomod_einval);
+ 	WSTUB(ppt, ppt_assigned_devices,	nomod_zero);
+ 	WSTUB(ppt, ppt_is_mmio,			nomod_zero);
+-	WSTUB(ppt, ppt_avail_devices,		nomod_zero);
+ 	WSTUB(ppt, ppt_assign_device,		nomod_einval);
+ 	WSTUB(ppt, ppt_unassign_device,		nomod_einval);
+ 	WSTUB(ppt, ppt_get_limits,		nomod_einval);

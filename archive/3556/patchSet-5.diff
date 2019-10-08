@@ -1,0 +1,216 @@
+commit 51fb399e0d228a24ffced11038f72e1fcc123159 (refs/changes/56/3556/5)
+Author: Hans Rosenfeld <hans.rosenfeld@joyent.com>
+Date:   2018-03-14T14:22:54+01:00 (1 year, 7 months ago)
+    
+    OS-6740 bhyve vtd leaks mapping resources
+
+diff --git a/usr/src/uts/i86pc/io/vmm/intel/vtd.c b/usr/src/uts/i86pc/io/vmm/intel/vtd.c
+index 73779733d0..cfd928d18a 100644
+--- a/usr/src/uts/i86pc/io/vmm/intel/vtd.c
++++ b/usr/src/uts/i86pc/io/vmm/intel/vtd.c
+@@ -120,6 +120,9 @@ static int		drhd_num;
+ static struct vtdmap	*vtdmaps[DRHD_MAX_UNITS];
+ static int		max_domains;
+ typedef int		(*drhd_ident_func_t)(void);
++#ifndef __FreeBSD__
++static dev_info_t	*vtddips[DRHD_MAX_UNITS];
++#endif
+ 
+ static uint64_t root_table[PAGE_SIZE / sizeof(uint64_t)] __aligned(4096);
+ static uint64_t ctx_tables[256][PAGE_SIZE / sizeof(uint64_t)] __aligned(4096);
+@@ -238,11 +241,8 @@ vtd_translation_disable(struct vtdmap *vtdmap)
+ }
+ 
+ static void *
+-vtd_map(ACPI_DMAR_HARDWARE_UNIT *drhd, int unit)
++vtd_map(dev_info_t *dip)
+ {
+-	struct ddi_parent_private_data *pdptr;
+-	struct regspec reg;
+-	dev_info_t *dip;
+ 	caddr_t regs;
+ 	ddi_acc_handle_t hdl;
+ 	int error;
+@@ -253,13 +253,44 @@ vtd_map(ACPI_DMAR_HARDWARE_UNIT *drhd, int unit)
+ 		DDI_STRICTORDER_ACC,
+ 	};
+ 
++	error = ddi_regs_map_setup(dip, 0, &regs, 0, PAGE_SIZE, &regs_attr,
++	    &hdl);
++
++	if (error != DDI_SUCCESS)
++		return (NULL);
++
++	ddi_set_driver_private(dip, hdl);
++
++	return (regs);
++}
++
++static void
++vtd_unmap(dev_info_t *dip)
++{
++	ddi_acc_handle_t hdl = ddi_get_driver_private(dip);
++
++	if (hdl != NULL)
++		ddi_regs_map_free(&hdl);
++}
++
++static dev_info_t *
++vtd_get_dip(ACPI_DMAR_HARDWARE_UNIT *drhd, int unit)
++{
++	dev_info_t *dip;
++	struct ddi_parent_private_data *pdptr;
++	struct regspec reg;
++	int circ;
++
++	ndi_devi_enter(ddi_root_node(), &circ);
++	dip = ddi_find_devinfo("vtd", unit, 0);
++	ndi_devi_exit(ddi_root_node(), circ);
++
++	if (dip != NULL)
++		return (dip);
++
+ 	dip = ddi_add_child(ddi_root_node(), "vtd",
+ 	    DEVI_SID_NODEID, unit);
+ 
+-#if 0
+-	drhd->dr_dip = dip;
+-#endif
+-
+ 	reg.regspec_bustype = 0;
+ 	reg.regspec_addr = drhd->Address;
+ 	reg.regspec_size = PAGE_SIZE;
+@@ -299,13 +330,7 @@ vtd_map(ACPI_DMAR_HARDWARE_UNIT *drhd, int unit)
+ 	pdptr->par_reg->regspec_size = PAGE_SIZE;
+ 	ddi_set_parent_data(dip, pdptr);
+ 
+-	error = ddi_regs_map_setup(dip, 0, &regs, 0, PAGE_SIZE, &regs_attr,
+-	    &hdl);
+-
+-	if (error != DDI_SUCCESS)
+-		return (NULL);
+-
+-	return (regs);
++	return (dip);
+ }
+ 
+ static int
+@@ -371,7 +396,10 @@ vtd_init(void)
+ #ifdef __FreeBSD__
+ 		vtdmaps[units++] = (struct vtdmap *)PHYS_TO_DMAP(drhd->Address);
+ #else
+-		vtdmaps[units] = (struct vtdmap *)vtd_map(drhd, units);
++		vtddips[units] = vtd_get_dip(drhd, units);
++		vtdmaps[units] = (struct vtdmap *)vtd_map(vtddips[units]);
++		if (vtdmaps[units] == NULL)
++			goto fail;
+ 		units++;
+ #endif
+ 		if (units >= DRHD_MAX_UNITS)
+@@ -405,11 +433,29 @@ skip_dmar:
+ 	}
+ 
+ 	return (0);
++
++#ifndef __FreeBSD__
++fail:
++	for (i = 0; i <= units; i++)
++		vtd_unmap(vtddips[i]);
++	return (ENXIO);
++#endif
+ }
+ 
+ static void
+ vtd_cleanup(void)
+ {
++	int i;
++
++	KASSERT(SLIST_EMPTY(&domhead), ("domain list not empty"));
++
++	bzero(root_table, sizeof (root_table));
++
++	for (i = 0; i <= drhd_num; i++) {
++		vtdmaps[i] = NULL;
++		if (vtddips[i] != NULL)
++			vtd_unmap(vtddips[i]);
++	}
+ }
+ 
+ static void
+diff --git a/usr/src/uts/i86pc/io/vmm/io/iommu.c b/usr/src/uts/i86pc/io/vmm/io/iommu.c
+index 11ad6ebabd..96eb8936d4 100644
+--- a/usr/src/uts/i86pc/io/vmm/io/iommu.c
++++ b/usr/src/uts/i86pc/io/vmm/io/iommu.c
+@@ -66,6 +66,8 @@ static void *host_domain;
+ static eventhandler_tag add_tag, delete_tag;
+ #endif
+ 
++static volatile u_int iommu_initted;
++
+ static __inline int
+ IOMMU_INIT(void)
+ {
+@@ -177,14 +179,19 @@ iommu_pci_delete(void *arg, device_t dev)
+ }
+ #endif
+ 
++#ifndef __FreeBSD__
+ static int
+-iommu_find_device(dev_info_t *dip, void *unused)
++iommu_find_device(dev_info_t *dip, void *arg)
+ {
++	boolean_t add = (boolean_t)arg;
++
+ 	if (pcie_is_pci_device(dip))
+-		iommu_add_device(host_domain, pci_get_rid(dip));
++		(add ? iommu_add_device : iommu_remove_device)
++		    (host_domain, pci_get_rid(dip));
+ 
+ 	return (DDI_WALK_CONTINUE);
+ }
++#endif
+ 
+ static void
+ iommu_init(void)
+@@ -246,7 +253,7 @@ iommu_init(void)
+ 		}
+ 	}
+ #else
+-	ddi_walk_devs(ddi_root_node(), iommu_find_device, NULL);
++	ddi_walk_devs(ddi_root_node(), iommu_find_device, (void *)B_TRUE);
+ #endif
+ 	IOMMU_ENABLE();
+ 
+@@ -265,7 +272,11 @@ iommu_cleanup(void)
+ 		delete_tag = NULL;
+ 	}
+ #endif
++	atomic_store_rel_int(&iommu_initted, 0);
+ 	IOMMU_DISABLE();
++#ifndef __FreeBSD__
++	ddi_walk_devs(ddi_root_node(), iommu_find_device, (void *)B_FALSE);
++#endif
+ 	IOMMU_DESTROY_DOMAIN(host_domain);
+ 	IOMMU_CLEANUP();
+ }
+@@ -273,8 +284,6 @@ iommu_cleanup(void)
+ void *
+ iommu_create_domain(vm_paddr_t maxaddr)
+ {
+-	static volatile u_int iommu_initted;
+-
+ 	if (iommu_initted < 2) {
+ 		if (atomic_cmpset_int(&iommu_initted, 0, 1)) {
+ 			iommu_init();
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm.c b/usr/src/uts/i86pc/io/vmm/vmm.c
+index bad3ac6317..5dc87453d2 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm.c
+@@ -465,6 +465,7 @@ vmm_mod_unload()
+ 	int	error;
+ 
+ 	vmmdev_cleanup();
++	iommu_cleanup();
+ 	error = VMM_CLEANUP();
+ 	if (error)
+ 		return (error);

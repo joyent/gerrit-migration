@@ -1,0 +1,864 @@
+commit 53530b55291038343c45f77f1916b357c76d8f37 (refs/changes/77/4777/3)
+Author: Robert Mustacchi <rm@joyent.com>
+Date:   2018-09-05T22:19:48+00:00 (1 year, 1 month ago)
+    
+    OS-7206 Multi-TRB xhci transfers should use event data
+    OS-7207 xhci needs to always set slot context
+    OS-7208 increase xhci bulk transfer sgl count
+    OS-7210 xhci_transfer_get_tdsize can return values that are too large
+
+diff --git a/usr/src/uts/common/io/usb/hcd/xhci/xhci_dma.c b/usr/src/uts/common/io/usb/hcd/xhci/xhci_dma.c
+index 03f752c7ff..e7d028a384 100644
+--- a/usr/src/uts/common/io/usb/hcd/xhci/xhci_dma.c
++++ b/usr/src/uts/common/io/usb/hcd/xhci/xhci_dma.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -268,22 +268,27 @@ xhci_transfer_free(xhci_t *xhcip, xhci_transfer_t *xt)
+ 	VERIFY(xhcip != NULL);
+ 	xhci_dma_free(&xt->xt_buffer);
+ 	if (xt->xt_isoc != NULL) {
+-		ASSERT(xt->xt_ntrbs > 0);
++		ASSERT3U(xt->xt_ntrbs, >, 0);
+ 		kmem_free(xt->xt_isoc, sizeof (usb_isoc_pkt_descr_t) *
+ 		    xt->xt_ntrbs);
+ 		xt->xt_isoc = NULL;
+ 	}
+ 	if (xt->xt_trbs != NULL) {
+-		ASSERT(xt->xt_ntrbs > 0);
++		ASSERT3U(xt->xt_ntrbs, >, 0);
+ 		kmem_free(xt->xt_trbs, sizeof (xhci_trb_t) * xt->xt_ntrbs);
+ 		xt->xt_trbs = NULL;
+ 	}
++	if (xt->xt_trbs_pa != NULL) {
++		ASSERT3U(xt->xt_ntrbs, >, 0);
++		kmem_free(xt->xt_trbs_pa, sizeof (uint64_t) * xt->xt_ntrbs);
++		xt->xt_trbs_pa = NULL;
++	}
+ 	kmem_free(xt, sizeof (xhci_transfer_t));
+ }
+ 
+ xhci_transfer_t *
+-xhci_transfer_alloc(xhci_t *xhcip, xhci_endpoint_t *xep, size_t size, int trbs,
+-    int usb_flags)
++xhci_transfer_alloc(xhci_t *xhcip, xhci_endpoint_t *xep, size_t size,
++    uint_t trbs, int usb_flags)
+ {
+ 	int kmflags;
+ 	boolean_t dmawait;
+@@ -319,9 +324,17 @@ xhci_transfer_alloc(xhci_t *xhcip, xhci_endpoint_t *xep, size_t size, int trbs,
+ 		 * off from what ehci and co. have done before. If this becomes
+ 		 * a technical issue, it's certainly possible to increase the
+ 		 * SGL entry count.
++		 *
++		 * When we use the larger SGL count, we change our strategy for
++		 * being notified. In such a case we will opt to use an event
++		 * data packet. This helps deal with cases where some
++		 * controllers don't properly generate events for the last entry
++		 * in a TD with IOC when IOSP is set.
+ 		 */
+-		if (xep->xep_type == USB_EP_ATTR_BULK)
++		if (xep->xep_type == USB_EP_ATTR_BULK) {
+ 			sgl = XHCI_TRANSFER_DMA_SGL;
++			trbs++;
++		}
+ 
+ 		xhci_dma_acc_attr(xhcip, &acc);
+ 		xhci_dma_transfer_attr(xhcip, &attr, sgl);
+@@ -346,6 +359,14 @@ xhci_transfer_alloc(xhci_t *xhcip, xhci_endpoint_t *xep, size_t size, int trbs,
+ 		return (NULL);
+ 	}
+ 
++	xt->xt_trbs_pa = kmem_zalloc(sizeof (uint64_t) * trbs, kmflags);
++	if (xt->xt_trbs_pa == NULL) {
++		kmem_free(xt->xt_trbs, sizeof (xhci_trb_t) * trbs);
++		xhci_dma_free(&xt->xt_buffer);
++		kmem_free(xt, sizeof (xhci_transfer_t));
++		return (NULL);
++	}
++
+ 	/*
+ 	 * For ISOCH transfers, we need to also allocate the results data.
+ 	 */
+@@ -353,6 +374,7 @@ xhci_transfer_alloc(xhci_t *xhcip, xhci_endpoint_t *xep, size_t size, int trbs,
+ 		xt->xt_isoc = kmem_zalloc(sizeof (usb_isoc_pkt_descr_t) * trbs,
+ 		    kmflags);
+ 		if (xt->xt_isoc == NULL) {
++			kmem_free(xt->xt_trbs_pa, sizeof (uint64_t) * trbs);
+ 			kmem_free(xt->xt_trbs, sizeof (xhci_trb_t) * trbs);
+ 			xhci_dma_free(&xt->xt_buffer);
+ 			kmem_free(xt, sizeof (xhci_transfer_t));
+@@ -402,12 +424,12 @@ xhci_transfer_sync(xhci_t *xhcip, xhci_transfer_t *xt, uint_t type)
+  * Remain	4608	512	256	0
+  * Bytes	4096	4096	256	256
+  * Naive TD	9	1	1	0
+- * Act TD 	10	2	1	0
++ * Act TD	10	2	1	0
+  *
+  * This means that the only safe way forward here is to work backwards and see
+  * how many we need to work up to this point.
+  */
+-static int
++static uint_t
+ xhci_transfer_get_tdsize(xhci_transfer_t *xt, uint_t off, uint_t mps)
+ {
+ 	int i;
+@@ -418,19 +440,17 @@ xhci_transfer_get_tdsize(xhci_transfer_t *xt, uint_t off, uint_t mps)
+ 	 */
+ 	ASSERT(xt->xt_buffer.xdb_ncookies > 0);
+ 	for (i = xt->xt_buffer.xdb_ncookies - 1; i > off; i--) {
+-		size_t len;
+-
+-		/*
+-		 * The maximum value we can return is 31 packets. So, in that
+-		 * case we short-circuit and return.
+-		 */
+-		if (npkt >= 31)
+-			return (31);
+-
+-		len = roundup(xt->xt_buffer.xdb_cookies[i].dmac_size, mps);
++		size_t len = roundup(xt->xt_buffer.xdb_cookies[i].dmac_size,
++		    mps);
+ 		npkt += len / mps;
+ 	}
+ 
++	/*
++	 * Make sure to clamp this value otherwise we risk truncation.
++	 */
++	if (npkt >= XHCI_MAX_TDSIZE)
++		return (XHCI_MAX_TDSIZE);
++
+ 	return (npkt);
+ }
+ 
+@@ -446,6 +466,19 @@ xhci_transfer_trb_fill_data(xhci_endpoint_t *xep, xhci_transfer_t *xt, int off,
+ 	VERIFY(off + xt->xt_buffer.xdb_ncookies <= xt->xt_ntrbs);
+ 	mps = xep->xep_pipe->p_ep.wMaxPacketSize;
+ 
++	if (in == B_TRUE) {
++		xt->xt_data_tohost = B_TRUE;
++	}
++
++	/*
++	 * We assume that if we have a non-bulk endpoint, then we should only
++	 * have a single cookie. This falls out from the default SGL length that
++	 * we use for these other device types.
++	 */
++	if (xep->xep_type != USB_EP_ATTR_BULK) {
++		VERIFY3U(xt->xt_buffer.xdb_ncookies, ==, 1);
++	}
++
+ 	for (i = 0; i < xt->xt_buffer.xdb_ncookies; i++) {
+ 		uint64_t pa, dmasz;
+ 
+@@ -462,34 +495,45 @@ xhci_transfer_trb_fill_data(xhci_endpoint_t *xep, xhci_transfer_t *xt, int off,
+ 		}
+ 
+ 		/*
+-		 * When reading data in (from the device), we may get shorter
+-		 * transfers than the buffer allowed for. To make sure we get
+-		 * notified about that and handle that, we need to set the ISP
+-		 * flag.
+-		 */
+-		if (in == B_TRUE) {
+-			flags |= XHCI_TRB_ISP;
+-			xt->xt_data_tohost = B_TRUE;
+-		}
+-
+-		/*
+-		 * When we have more than one cookie, we are technically
+-		 * chaining together things according to the controllers view,
+-		 * hence why we need to set the chain flag.
++		 * If we have more than one cookie, then we need to set chaining
++		 * on every TRB and the last TRB will turn into an event data
++		 * TRB. If we only have a single TRB, then we just set interrupt
++		 * on completion (IOC). There's no need to specifically set
++		 * interrupt on short packet (IOSP) in that case, as we'll
++		 * always get the event notification. We still need the chain
++		 * bit set on the last packet, so we can chain into the event
++		 * data. Even if all the data on a bulk endpoint (the only
++		 * endpoint type that uses chaining today) has only one cookie,
++		 * then we'll still schedule an event data block.
+ 		 */
+-		if (xt->xt_buffer.xdb_ncookies > 1 &&
+-		    i != (xt->xt_buffer.xdb_ncookies - 1)) {
++		if (xep->xep_type == USB_EP_ATTR_BULK ||
++		    xt->xt_buffer.xdb_ncookies > 1) {
+ 			flags |= XHCI_TRB_CHAIN;
+ 		}
+ 
+ 		/*
+-		 * If we have a non-control transfer, then we need to make sure
+-		 * that we set ourselves up to be interrupted, which we set for
+-		 * the last entry.
++		 * What we set for the last TRB depends on the type of the
++		 * endpoint. If it's a bulk endpoint, then we have to set
++		 * evaluate next trb (ENT) so we successfully process the event
++		 * data TRB we'll set up. Otherwise, we need to make sure that
++		 * we set interrupt on completion, so we get the event. However,
++		 * we don't set the event on control endpoints, as the status
++		 * stage TD will be the one where we get the event. But, we do
++		 * still need an interrupt on short packet, because technically
++		 * the status stage is in its own TD.
+ 		 */
+-		if (i + 1 == xt->xt_buffer.xdb_ncookies &&
+-		    xep->xep_type != USB_EP_ATTR_CONTROL) {
+-			flags |= XHCI_TRB_IOC;
++		if (i + 1 == xt->xt_buffer.xdb_ncookies) {
++			switch (xep->xep_type) {
++			case USB_EP_ATTR_BULK:
++				flags |= XHCI_TRB_ENT;
++				break;
++			case USB_EP_ATTR_CONTROL:
++				flags |= XHCI_TRB_ISP;
++				break;
++			default:
++				flags |= XHCI_TRB_IOC;
++				break;
++			}
+ 		}
+ 
+ 		xt->xt_trbs[off + i].trb_addr = LE_64(pa);
+@@ -497,6 +541,17 @@ xhci_transfer_trb_fill_data(xhci_endpoint_t *xep, xhci_transfer_t *xt, int off,
+ 		    XHCI_TRB_TDREM(tdsize) | XHCI_TRB_INTR(0));
+ 		xt->xt_trbs[off + i].trb_flags = LE_32(flags);
+ 	}
++
++	/*
++	 * The last TRB in any bulk transfer is the Event Data TRB.
++	 */
++	if (xep->xep_type == USB_EP_ATTR_BULK) {
++		VERIFY(off + xt->xt_buffer.xdb_ncookies + 1 <= xt->xt_ntrbs);
++		xt->xt_trbs[off + i].trb_addr = LE_64((uintptr_t)xt);
++		xt->xt_trbs[off + i].trb_status = LE_32(XHCI_TRB_INTR(0));
++		xt->xt_trbs[off + i].trb_flags = LE_32(XHCI_TRB_TYPE_EVENT |
++		    XHCI_TRB_IOC);
++	}
+ }
+ 
+ /*
+diff --git a/usr/src/uts/common/io/usb/hcd/xhci/xhci_endpoint.c b/usr/src/uts/common/io/usb/hcd/xhci/xhci_endpoint.c
+index 9500fa634b..e44fe6d452 100644
+--- a/usr/src/uts/common/io/usb/hcd/xhci/xhci_endpoint.c
++++ b/usr/src/uts/common/io/usb/hcd/xhci/xhci_endpoint.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -299,29 +299,29 @@ xhci_endpoint_exponential_interval(usb_ep_descr_t *ep)
+  * basically the six different cases we have to consider:
+  *
+  * Case 1: Non-High Speed Bulk and Control Endpoints
+- * 	Always return 0.
++ *	Always return 0.
+  *
+  * Case 2: Super Speed and High Speed Isoch and Intr endpoints
+- * 	Convert from a 2^(x-1) range to a 2^x range.
++ *	Convert from a 2^(x-1) range to a 2^x range.
+  *
+  * Case 3: Full Speed Isochronous Endpoints
+- * 	As case 2, but add 3 as its values are in frames and we need to convert
+- * 	to microframes. Adding three to the result is the same as multiplying
+- * 	the initial value by 8.
++ *	As case 2, but add 3 as its values are in frames and we need to convert
++ *	to microframes. Adding three to the result is the same as multiplying
++ *	the initial value by 8.
+  *
+  * Case 4: Full speed and Low Speed Interrupt Endpoints
+- * 	These have a 1-255 ms range that we need to convert to a 2^x * 128 us
+- * 	range. We use the linear conversion and then add 3 to account for the
+- * 	multiplying by 8 conversion from frames to microframes.
++ *	These have a 1-255 ms range that we need to convert to a 2^x * 128 us
++ *	range. We use the linear conversion and then add 3 to account for the
++ *	multiplying by 8 conversion from frames to microframes.
+  *
+  * Case 5: High Speed Interrupt and Bulk Output
+- * 	These are a bit of a weird case. The spec and other implementations make
+- * 	it seem that it's similar to case 4, but without the fixed addition as
+- * 	its interpreted differently due to NAKs.
++ *	These are a bit of a weird case. The spec and other implementations make
++ *	it seem that it's similar to case 4, but without the fixed addition as
++ *	its interpreted differently due to NAKs.
+  *
+  * Case 6: Low Speed Isochronous Endpoints
+- * 	These are not actually defined; however, like other implementations we
+- * 	treat them like case 4.
++ *	These are not actually defined; however, like other implementations we
++ *	treat them like case 4.
+  */
+ static uint_t
+ xhci_endpoint_interval(xhci_device_t *xd, usb_ep_descr_t *ep)
+@@ -875,9 +875,11 @@ xhci_endpoint_schedule(xhci_t *xhcip, xhci_device_t *xd, xhci_endpoint_t *xep,
+ 		return (USB_NO_RESOURCES);
+ 
+ 	for (i = xt->xt_ntrbs - 1; i > 0; i--) {
+-		xhci_ring_trb_fill(rp, i, &xt->xt_trbs[i], B_TRUE);
++		xhci_ring_trb_fill(rp, i, &xt->xt_trbs[i], &xt->xt_trbs_pa[i],
++		    B_TRUE);
+ 	}
+-	xhci_ring_trb_fill(rp, 0U, &xt->xt_trbs[0], B_FALSE);
++	xhci_ring_trb_fill(rp, 0U, &xt->xt_trbs[0], &xt->xt_trbs_pa[0],
++	    B_FALSE);
+ 
+ 	XHCI_DMA_SYNC(rp->xr_dma, DDI_DMA_SYNC_FORDEV);
+ 	xhci_ring_trb_produce(rp, xt->xt_ntrbs);
+@@ -909,8 +911,10 @@ xhci_endpoint_schedule(xhci_t *xhcip, xhci_device_t *xd, xhci_endpoint_t *xep,
+ 
+ static xhci_transfer_t *
+ xhci_endpoint_determine_transfer(xhci_t *xhcip, xhci_endpoint_t *xep,
+-    xhci_trb_t *trb, int *offp)
++    xhci_trb_t *trb, uint_t *offp)
+ {
++	uint_t i;
++	uint64_t addr;
+ 	xhci_transfer_t *xt;
+ 
+ 	ASSERT(xhcip != NULL);
+@@ -922,10 +926,40 @@ xhci_endpoint_determine_transfer(xhci_t *xhcip, xhci_endpoint_t *xep,
+ 	if ((xt = list_head(&xep->xep_transfers)) == NULL)
+ 		return (NULL);
+ 
+-	*offp = xhci_ring_trb_valid_range(&xep->xep_ring, LE_64(trb->trb_addr),
+-	    xt->xt_ntrbs);
+-	if (*offp == -1)
++	addr = LE_64(trb->trb_addr);
++
++	/*
++	 * Check if this is the simple case of an event data. If it is, then all
++	 * we need to do is look and see its data matches the address of the
++	 * transfer.
++	 */
++	if (XHCI_TRB_GET_ED(LE_32(trb->trb_flags)) != 0) {
++		if (LE_64(trb->trb_addr) != (uintptr_t)xt)
++			return (NULL);
++
++		*offp = xt->xt_ntrbs - 1;
++		return (xt);
++	}
++
++	/*
++	 * This represents an error that has occurred. We need to check two
++	 * different things. The first is that the TRB PA maps to one of the
++	 * TRBs in the transfer. Secondly, we need to make sure that it makes
++	 * sense in the context of the ring and our notion of where the tail is.
++	 */
++	for (i = 0; i < xt->xt_ntrbs; i++) {
++		if (xt->xt_trbs_pa[i] == addr)
++			break;
++	}
++
++	if (i == xt->xt_ntrbs)
++		return (NULL);
++
++	if (xhci_ring_trb_valid_range(&xep->xep_ring, LE_64(trb->trb_addr),
++	    xt->xt_ntrbs) == -1)
+ 		return (NULL);
++
++	*offp = i;
+ 	return (xt);
+ }
+ 
+@@ -995,7 +1029,7 @@ xhci_endpoint_reschedule_periodic(xhci_t *xhcip, xhci_device_t *xd,
+  */
+ static boolean_t
+ xhci_endpoint_control_callback(xhci_t *xhcip, xhci_device_t *xd,
+-    xhci_endpoint_t *xep, xhci_transfer_t *xt, int off, xhci_trb_t *trb)
++    xhci_endpoint_t *xep, xhci_transfer_t *xt, uint_t off, xhci_trb_t *trb)
+ {
+ 	int code;
+ 	usb_ctrl_req_t *ucrp;
+@@ -1009,10 +1043,9 @@ xhci_endpoint_control_callback(xhci_t *xhcip, xhci_device_t *xd,
+ 	/*
+ 	 * Now that we know what this TRB is for, was it for a data/normal stage
+ 	 * or is it the status stage. We cheat by looking at the last entry. If
+-	 * it's a data stage, then we must have gotten a short write. In that
+-	 * case, we should go through and check to make sure it's allowed. If
+-	 * not, we need to fail the transfer, try to stop the ring, and make
+-	 * callbacks. We'll clean up the xhci transfer at this time.
++	 * it's a data stage, then we must have gotten a short write. We record
++	 * this fact and whether we should consider the transfer fatal for the
++	 * subsequent status stage.
+ 	 */
+ 	if (off != xt->xt_ntrbs - 1) {
+ 		uint_t remain;
+@@ -1150,7 +1183,7 @@ xhci_device_lookup_by_slot(xhci_t *xhcip, int slot)
+  */
+ static boolean_t
+ xhci_endpoint_norm_callback(xhci_t *xhcip, xhci_device_t *xd,
+-    xhci_endpoint_t *xep, xhci_transfer_t *xt, int off, xhci_trb_t *trb)
++    xhci_endpoint_t *xep, xhci_transfer_t *xt, uint_t off, xhci_trb_t *trb)
+ {
+ 	int code;
+ 	usb_cr_t cr;
+@@ -1167,9 +1200,15 @@ xhci_endpoint_norm_callback(xhci_t *xhcip, xhci_device_t *xd,
+ 	code = XHCI_TRB_GET_CODE(LE_32(trb->trb_status));
+ 
+ 	if (code == XHCI_CODE_SHORT_XFER) {
+-		int residue;
++		uint_t residue;
+ 		residue = XHCI_TRB_REMAIN(LE_32(trb->trb_status));
+-		xt->xt_short = xt->xt_buffer.xdb_len - residue;
++
++		if (xep->xep_type == USB_EP_ATTR_BULK) {
++			VERIFY3U(XHCI_TRB_GET_ED(LE_32(trb->trb_flags)), !=, 0);
++			xt->xt_short = residue;
++		} else {
++			xt->xt_short = xt->xt_buffer.xdb_len - residue;
++		}
+ 	}
+ 
+ 	/*
+@@ -1238,7 +1277,11 @@ xhci_endpoint_norm_callback(xhci_t *xhcip, xhci_device_t *xd,
+ 	cr = USB_CR_OK;
+ 
+ out:
+-	VERIFY(xhci_ring_trb_consumed(&xep->xep_ring, LE_64(trb->trb_addr)));
++	/*
++	 * Don't use the address from the TRB here. When we're dealing with
++	 * event data that will be entirely wrong.
++	 */
++	VERIFY(xhci_ring_trb_consumed(&xep->xep_ring, xt->xt_trbs_pa[off]));
+ 	rem = list_remove_head(&xep->xep_transfers);
+ 	VERIFY3P(rem, ==, xt);
+ 	mutex_exit(&xhcip->xhci_lock);
+@@ -1255,7 +1298,7 @@ out:
+ 
+ static boolean_t
+ xhci_endpoint_isoch_callback(xhci_t *xhcip, xhci_device_t *xd,
+-    xhci_endpoint_t *xep, xhci_transfer_t *xt, int off, xhci_trb_t *trb)
++    xhci_endpoint_t *xep, xhci_transfer_t *xt, uint_t off, xhci_trb_t *trb)
+ {
+ 	int code;
+ 	usb_cr_t cr;
+@@ -1345,7 +1388,8 @@ boolean_t
+ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
+ {
+ 	boolean_t ret;
+-	int slot, endpoint, code, off;
++	int slot, endpoint, code;
++	uint_t off;
+ 	xhci_device_t *xd;
+ 	xhci_endpoint_t *xep;
+ 	xhci_transfer_t *xt;
+@@ -1355,6 +1399,40 @@ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
+ 	slot = XHCI_TRB_GET_SLOT(LE_32(trb->trb_flags));
+ 	code = XHCI_TRB_GET_CODE(LE_32(trb->trb_status));
+ 
++	switch (code) {
++	case XHCI_CODE_RING_UNDERRUN:
++	case XHCI_CODE_RING_OVERRUN:
++		/*
++		 * If we have an ISOC overrun or underrun then there will be no
++		 * valid data pointer in the TRB associated with it. Just drive
++		 * on.
++		 */
++		return (B_TRUE);
++	case XHCI_CODE_UNDEFINED:
++		xhci_error(xhcip, "received transfer trb with undefined fatal "
++		    "error: resetting device");
++		xhci_fm_runtime_reset(xhcip);
++		return (B_FALSE);
++	case XHCI_CODE_XFER_STOPPED:
++	case XHCI_CODE_XFER_STOPINV:
++	case XHCI_CODE_XFER_STOPSHORT:
++		/*
++		 * This causes us to transition the endpoint to a stopped state.
++		 * Each of these indicate a different possible state that we
++		 * have to deal with. Effectively we're going to drop it and
++		 * leave it up to the consumers to figure out what to do. For
++		 * the moment, that's generally okay because stops are only used
++		 * in cases where we're cleaning up outstanding reqs, etc.
++		 *
++		 * We do this before we check for the corresponding transfer as
++		 * this will generally be generated by a command issued that's
++		 * stopping the ring.
++		 */
++		return (B_TRUE);
++	default:
++		break;
++	}
++
+ 	mutex_enter(&xhcip->xhci_lock);
+ 	xd = xhci_device_lookup_by_slot(xhcip, slot);
+ 	if (xd == NULL) {
+@@ -1381,14 +1459,27 @@ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
+ 	}
+ 
+ 	/*
+-	 * This TRB should be part of a transfer. If it's not, then we ignore
+-	 * it. We also check whether or not it's for the first transfer. Because
+-	 * the rings are serviced in order, it should be.
++	 * The TRB that we recieved may be an event data TRB for a bulk
++	 * endpoint, a normal or short completion for any other endpoint or an
++	 * error. In all cases, we need to figure out what transfer this
++	 * corresponds to. If this is an error, then we need to make sure that
++	 * the generating ring has been cleaned up.
++	 *
++	 * TRBs should be delivered in order, based on the ring. If for some
++	 * reason we find something that doesn't add up here, then we need to
++	 * assume that something has gone horribly wrong in the system and issue
++	 * a runtime reset. We issue the runtime reset rather than just trying
++	 * to stop and flush the ring, because it's unclear if we could stop
++	 * the ring in time.
+ 	 */
+ 	if ((xt = xhci_endpoint_determine_transfer(xhcip, xep, trb, &off)) ==
+ 	    NULL) {
++		xhci_error(xhcip, "received transfer trb with code %d, slot "
++		    "%d, and endpoint %d, but does not match current transfer "
++		    "for endpoint: resetting device", code, slot, endpoint);
+ 		mutex_exit(&xhcip->xhci_lock);
+-		return (B_TRUE);
++		xhci_fm_runtime_reset(xhcip);
++		return (B_FALSE);
+ 	}
+ 
+ 	transfer_done = B_FALSE;
+@@ -1398,19 +1489,6 @@ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
+ 	case XHCI_CODE_SHORT_XFER:
+ 		/* Handled by endpoint logic */
+ 		break;
+-	case XHCI_CODE_XFER_STOPPED:
+-	case XHCI_CODE_XFER_STOPINV:
+-	case XHCI_CODE_XFER_STOPSHORT:
+-		/*
+-		 * This causes us to transition the endpoint to a stopped state.
+-		 * Each of these indicate a different possible state that we
+-		 * have to deal with. Effectively we're going to drop it and
+-		 * leave it up to the consumers to figure out what to do. For
+-		 * the moment, that's generally okay because stops are only used
+-		 * in cases where we're cleaning up outstanding reqs, etc.
+-		 */
+-		mutex_exit(&xhcip->xhci_lock);
+-		return (B_TRUE);
+ 	case XHCI_CODE_STALL:
+ 		/*
+ 		 * This causes us to transition to the halted state;
+@@ -1432,6 +1510,17 @@ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
+ 		xt->xt_cr = USB_CR_DEV_NOT_RESP;
+ 		xep->xep_state |= XHCI_ENDPOINT_HALTED;
+ 		break;
++	case XHCI_CODE_BW_OVERRUN:
++		transfer_done = B_TRUE;
++		xt->xt_cr = USB_CR_DATA_OVERRUN;
++		break;
++	case XHCI_CODE_DATA_BUF:
++		transfer_done = B_TRUE;
++		if (xt->xt_data_tohost)
++			xt->xt_cr = USB_CR_DATA_OVERRUN;
++		else
++			xt->xt_cr = USB_CR_DATA_UNDERRUN;
++		break;
+ 	default:
+ 		/*
+ 		 * Treat these as general unspecified errors that don't cause a
+@@ -1441,6 +1530,7 @@ xhci_endpoint_transfer_callback(xhci_t *xhcip, xhci_trb_t *trb)
+ 		 * quiescing.
+ 		 */
+ 		transfer_done = B_TRUE;
++		xt->xt_cr = USB_CR_HC_HARDWARE_ERR;
+ 		break;
+ 	}
+ 
+diff --git a/usr/src/uts/common/io/usb/hcd/xhci/xhci_ring.c b/usr/src/uts/common/io/usb/hcd/xhci/xhci_ring.c
+index 8f3e8289e5..66cbef7630 100644
+--- a/usr/src/uts/common/io/usb/hcd/xhci/xhci_ring.c
++++ b/usr/src/uts/common/io/usb/hcd/xhci/xhci_ring.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -288,7 +288,7 @@ xhci_ring_trb_space(xhci_ring_t *xrp, uint_t ntrb)
+  */
+ void
+ xhci_ring_trb_fill(xhci_ring_t *xrp, uint_t trboff, xhci_trb_t *host_trb,
+-    boolean_t put_cycle)
++    uint64_t *trb_pap, boolean_t put_cycle)
+ {
+ 	uint_t i;
+ 	uint32_t flags;
+@@ -324,6 +324,20 @@ xhci_ring_trb_fill(xhci_ring_t *xrp, uint_t trboff, xhci_trb_t *host_trb,
+ 	}
+ 
+ 	trb->trb_flags = flags;
++
++	if (trb_pap != NULL) {
++		uint64_t pa;
++
++		/*
++		 * This logic only works if we have a single cookie address.
++		 * However, this is prettty tightly assumed for rings through
++		 * the xhci driver at this time.
++		 */
++		ASSERT3U(xrp->xr_dma.xdb_ncookies, ==, 1);
++		pa = xrp->xr_dma.xdb_cookies[0].dmac_laddress;
++		pa += ((uintptr_t)trb - (uintptr_t)&xrp->xr_trb[0]);
++		*trb_pap = pa;
++	}
+ }
+ 
+ /*
+@@ -380,7 +394,7 @@ xhci_ring_trb_produce(xhci_ring_t *xrp, uint_t ntrb)
+ void
+ xhci_ring_trb_put(xhci_ring_t *xrp, xhci_trb_t *trb)
+ {
+-	xhci_ring_trb_fill(xrp, 0U, trb, B_FALSE);
++	xhci_ring_trb_fill(xrp, 0U, trb, NULL, B_FALSE);
+ 	xhci_ring_trb_produce(xrp, 1U);
+ }
+ 
+diff --git a/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c b/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c
+index 65cfc98452..9dafe21434 100644
+--- a/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c
++++ b/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -172,10 +172,13 @@ xhci_hcdi_pipe_open(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
+ 	mutex_exit(&xhcip->xhci_lock);
+ 
+ 	/*
+-	 * Update the slot and input context for this endpoint.
++	 * Update the slot and input context for this endpoint. We make sure to
++	 * always set the slot as having changed in the context field as the
++	 * specification suggests we should and some hardware requires it.
+ 	 */
+ 	xd->xd_input->xic_drop_flags = LE_32(0);
+-	xd->xd_input->xic_add_flags = LE_32(XHCI_INCTX_MASK_DCI(epid + 1));
++	xd->xd_input->xic_add_flags = LE_32(XHCI_INCTX_MASK_DCI(0) |
++	    XHCI_INCTX_MASK_DCI(epid + 1));
+ 
+ 	if (epid + 1 > XHCI_SCTX_GET_DCI(LE_32(xd->xd_slotin->xsc_info))) {
+ 		uint32_t info;
+@@ -471,11 +474,11 @@ xhci_hcdi_pipe_close(usba_pipe_handle_data_t *ph, usb_flags_t usb_flags)
+ 
+ 	/*
+ 	 * Potentially update the slot input context about the current max
+-	 * endpoint. While we don't update the slot context with this,
+-	 * surrounding code expects it to be updated to be consistent.
++	 * endpoint. Make sure to set that the slot context is being updated
++	 * here as it may be changing and some hardware requires it.
+ 	 */
+ 	xd->xd_input->xic_drop_flags = LE_32(XHCI_INCTX_MASK_DCI(epid + 1));
+-	xd->xd_input->xic_add_flags = LE_32(0);
++	xd->xd_input->xic_add_flags = LE_32(XHCI_INCTX_MASK_DCI(0));
+ 	for (i = XHCI_NUM_ENDPOINTS - 1; i >= 0; i--) {
+ 		if (xd->xd_endpoints[i] != NULL &&
+ 		    xd->xd_endpoints[i] != xep)
+@@ -798,6 +801,7 @@ xhci_hcdi_pipe_ctrl_xfer(usba_pipe_handle_data_t *ph, usb_ctrl_req_t *ucrp,
+ 	xt->xt_trbs[xt->xt_ntrbs - 1].trb_flags = LE_32(XHCI_TRB_TYPE_STATUS |
+ 	    XHCI_TRB_IOC | statusdir);
+ 
++
+ 	mutex_enter(&xhcip->xhci_lock);
+ 
+ 	/*
+@@ -930,8 +934,8 @@ xhci_hcdi_isoc_transfer_fill(xhci_device_t *xd, xhci_endpoint_t *xep,
+ 		trb->trb_addr = LE_64(buf);
+ 
+ 		/*
+-		 * Beacuse we know that a single frame can have all of its data
+-		 * in a single instance, we know that we don't neeed to do
++		 * Because we know that a single frame can have all of its data
++		 * in a single instance, we know that we don't need to do
+ 		 * anything special here.
+ 		 */
+ 		trb->trb_status = LE_32(XHCI_TRB_LEN(len) | XHCI_TRB_TDREM(0) |
+@@ -940,7 +944,9 @@ xhci_hcdi_isoc_transfer_fill(xhci_device_t *xd, xhci_endpoint_t *xep,
+ 		/*
+ 		 * Always enable SIA to start the frame ASAP. We also always
+ 		 * enable an interrupt on a short packet. If this is the last
+-		 * trb, then we will set IOC.
++		 * trb, then we will set IOC. Each TRB created here is really
++		 * its own TD. However, we only set an interrupt on the last
++		 * entry to better deal with scheduling.
+ 		 */
+ 		flags = XHCI_TRB_SIA | XHCI_TRB_ISP | XHCI_TRB_SET_FRAME(0);
+ 		flags |= XHCI_TRB_TYPE_ISOCH;
+diff --git a/usr/src/uts/common/sys/usb/hcd/xhci/xhci.h b/usr/src/uts/common/sys/usb/hcd/xhci/xhci.h
+index fe21cdacae..d92bd06862 100644
+--- a/usr/src/uts/common/sys/usb/hcd/xhci/xhci.h
++++ b/usr/src/uts/common/sys/usb/hcd/xhci/xhci.h
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_USB_XHCI_XHCI_H
+@@ -56,18 +56,36 @@ extern "C" {
+  *
+  * We can transfer up to 64K in one transfer request block (TRB) which
+  * corresponds to a single SGL entry. Each ring we create is a single page in
+- * size and will support at most 256 TRBs. We've selected to use up to 8 SGLs
+- * for these transfer cases. This allows us to put up to 512 KiB in a given
+- * transfer request and in the worst case, we can have about 30 of them
+- * outstanding. Experimentally, this has proven to be sufficient for most of the
+- * drivers that we support today.
++ * size and will support at most 256 TRBs. To try and give the operating system
++ * flexibility when allocating DMA transfers, we've opted to allow up to 63
++ * SGLs. Because there isn't a good way to support DMA windows with the xHCI
++ * controller design, if this number is too small then DMA allocations and
++ * binding might fail. If the DMA binding fails, the transfer will fail.
++ *
++ * The reason that we use 63 SGLs and not the expected 64 is that we always need
++ * to allocate an additional TRB for the event data. This leaves us with a
++ * nicely divisible number of entries.
++ *
++ * The final piece of this is the maximum sized transfer that the driver
++ * advertises to the broader framework. This is currently sized at 512 KiB. For
++ * reference the ehci driver sized this value at 640 KiB. It's important to
++ * understand that this isn't reflected in the DMA attribute limitation, because
++ * it's not an attribute of the hardware. Experimentally, this has proven to be
++ * sufficient for most of the drivers that we support today. When considering
++ * increasing this number, please note the impact that might have on the
++ * required number of DMA SGL entries required to satisfy the allocation.
++ *
++ * The value of 512 KiB was originally based on the number of SGLs we supported
++ * multiplied by the maximum transfer size. The original number of
++ * XHCI_TRANSFER_DMA_SGL was 8. The 512 KiB value was based upon taking the
++ * number of SGLs and assuming that each TRB used its maximum transfer size of
++ * 64 KiB.
+  */
+-#define	XHCI_TRB_MAX_TRANSFER	65536
++#define	XHCI_TRB_MAX_TRANSFER	65536	/* 64 KiB */
+ #define	XHCI_DMA_ALIGN		64
+ #define	XHCI_DEF_DMA_SGL	1
+-#define	XHCI_TRANSFER_DMA_SGL	8
+-#define	XHCI_MAX_TRANSFER	(XHCI_TRB_MAX_TRANSFER * XHCI_TRANSFER_DMA_SGL)
+-#define	XHCI_DMA_STRUCT_SIZE	4096
++#define	XHCI_TRANSFER_DMA_SGL	63
++#define	XHCI_MAX_TRANSFER	524288	/* 512 KiB */
+ 
+ /*
+  * Properties and values for rerouting ehci ports to xhci.
+@@ -97,6 +115,13 @@ extern "C" {
+ 					    (flag)))
+ #endif
+ 
++/*
++ * TRBs need to indicate the number of remaining USB packets in the overall
++ * transfer. This is a 5-bit value, which means that the maximum value we can
++ * store in that TRD field is 31.
++ */
++#define	XHCI_MAX_TDSIZE		31
++
+ /*
+  * This defines a time in 2-ms ticks that is required to wait for the controller
+  * to be ready to go. Section 5.4.8 of the XHCI specification in the description
+@@ -118,7 +143,7 @@ extern "C" {
+  * second. This is supposed to be the default value of the controller. See xHCI
+  * 1.1 / 4.17.2 for more information.
+  */
+-#define	XHCI_IMOD_DEFAULT 	0x000003F8U
++#define	XHCI_IMOD_DEFAULT	0x000003F8U
+ 
+ /*
+  * Definitions that surround the default values used in various contexts. These
+@@ -198,15 +223,15 @@ extern "C" {
+ /*
+  * These represent known issues with various xHCI controllers.
+  *
+- * 	XHCI_QUIRK_NO_MSI	MSI support on this controller is known to be
+- * 				broken.
++ *	XHCI_QUIRK_NO_MSI	MSI support on this controller is known to be
++ *				broken.
+  *
+- * 	XHCI_QUIRK_32_ONLY	Only use 32-bit DMA addreses with this
+- * 				controller.
++ *	XHCI_QUIRK_32_ONLY	Only use 32-bit DMA addreses with this
++ *				controller.
+  *
+- * 	XHCI_QUIRK_INTC_EHCI	This is an Intel platform which supports
+- * 				rerouting ports between EHCI and xHCI
+- * 				controllers on the platform.
++ *	XHCI_QUIRK_INTC_EHCI	This is an Intel platform which supports
++ *				rerouting ports between EHCI and xHCI
++ *				controllers on the platform.
+  */
+ typedef enum xhci_quirk {
+ 	XHCI_QUIRK_NO_MSI	= 0x01,
+@@ -218,7 +243,7 @@ typedef enum xhci_quirk {
+  * xHCI capability parameter flags. These are documented in xHCI 1.1 / 5.3.6.
+  */
+ typedef enum xhci_cap_flags {
+-	XCAP_AC64 	= 0x001,
++	XCAP_AC64	= 0x001,
+ 	XCAP_BNC	= 0x002,
+ 	XCAP_CSZ	= 0x004,
+ 	XCAP_PPC	= 0x008,
+@@ -310,6 +335,7 @@ typedef struct xhci_transfer {
+ 	usb_cr_t		xt_cr;
+ 	boolean_t		xt_data_tohost;
+ 	xhci_trb_t		*xt_trbs;
++	uint64_t		*xt_trbs_pa;
+ 	usb_isoc_pkt_descr_t	*xt_isoc;
+ 	usb_opaque_t		xt_usba_req;
+ } xhci_transfer_t;
+@@ -427,19 +453,19 @@ typedef struct xhci_command_ring {
+  * Individual command states.
+  *
+  * XHCI_COMMAND_S_INIT		The command has yet to be inserted into the
+- * 				command ring.
++ *				command ring.
+  *
+  * XHCI_COMMAND_S_QUEUED	The command is queued in the command ring.
+  *
+  * XHCI_COMMAND_S_RECEIVED	A command completion for this was received.
+  *
+  * XHCI_COMMAND_S_DONE		The command has been executed. Note that it may
+- * 				have been aborted.
++ *				have been aborted.
+  *
+  * XHCI_COMMAND_S_RESET		The ring is being reset due to a fatal error and
+- * 				this command has been removed from the ring.
+- * 				This means it has been aborted, but it was not
+- * 				the cause of the abort.
++ *				this command has been removed from the ring.
++ *				This means it has been aborted, but it was not
++ *				the cause of the abort.
+  *
+  * Note, when adding states, anything after XHCI_COMMAND_S_DONE implies that
+  * upon reaching this state, it is no longer in the ring.
+@@ -648,7 +674,7 @@ extern uint64_t xhci_dma_pa(xhci_dma_buffer_t *);
+  * DMA Transfer Ring functions
+  */
+ extern xhci_transfer_t *xhci_transfer_alloc(xhci_t *, xhci_endpoint_t *, size_t,
+-    int, int);
++    uint_t, int);
+ extern void xhci_transfer_free(xhci_t *, xhci_transfer_t *);
+ extern void xhci_transfer_copy(xhci_transfer_t *, void *, size_t, boolean_t);
+ extern int xhci_transfer_sync(xhci_t *, xhci_transfer_t *, uint_t);
+@@ -714,7 +740,8 @@ extern boolean_t xhci_ring_trb_tail_valid(xhci_ring_t *, uint64_t);
+ extern int xhci_ring_trb_valid_range(xhci_ring_t *, uint64_t, uint_t);
+ 
+ extern boolean_t xhci_ring_trb_space(xhci_ring_t *, uint_t);
+-extern void xhci_ring_trb_fill(xhci_ring_t *, uint_t, xhci_trb_t *, boolean_t);
++extern void xhci_ring_trb_fill(xhci_ring_t *, uint_t, xhci_trb_t *, uint64_t *,
++    boolean_t);
+ extern void xhci_ring_trb_produce(xhci_ring_t *, uint_t);
+ extern boolean_t xhci_ring_trb_consumed(xhci_ring_t *, uint64_t);
+ extern void xhci_ring_trb_put(xhci_ring_t *, xhci_trb_t *);

@@ -1,0 +1,342 @@
+commit 26964fd98733fef12362305c8a530a410f4bcca0 (refs/changes/67/5067/1)
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2018-11-16T00:34:28+00:00 (11 months ago)
+    
+    OS-7369 full UART FIFO can send bhyve into a spin
+    OS-7381 bhyve should handle UART socket reconnect
+
+diff --git a/usr/src/cmd/bhyve/uart_emul.c b/usr/src/cmd/bhyve/uart_emul.c
+index 656a48f93c..e83287d55c 100644
+--- a/usr/src/cmd/bhyve/uart_emul.c
++++ b/usr/src/cmd/bhyve/uart_emul.c
+@@ -161,7 +161,6 @@ struct uart_softc {
+ };
+ 
+ static void uart_drain(int fd, enum ev_type ev, void *arg);
+-static int uart_sock_drain(struct uart_softc *sc);
+ 
+ static void
+ ttyclose(void)
+@@ -242,6 +241,19 @@ rxfifo_reset(struct uart_softc *sc, int size)
+ 		error = mevent_enable(sc->mev);
+ 		assert(error == 0);
+ 	}
++#ifndef	__FreeBSD__
++	if (sc->sock && sc->usc_sock.clifd != -1) {
++		/* Flush any unread input from the socket buffer. */
++		do {
++			nread = read(sc->usc_sock.clifd, flushbuf,
++			    sizeof (flushbuf));
++		} while (nread == sizeof (flushbuf));
++
++		/* Enable mevent to trigger when new data available on sock */
++		error = mevent_enable(sc->mev);
++		assert(error == 0);
++	}
++#endif /* __FreeBSD__ */
+ }
+ 
+ static int
+@@ -273,6 +285,15 @@ rxfifo_putchar(struct uart_softc *sc, uint8_t ch)
+ 				error = mevent_disable(sc->mev);
+ 				assert(error == 0);
+ 			}
++#ifndef	__FreeBSD__
++			if (sc->sock && sc->usc_sock.clifd != -1) {
++				/*
++				 * Disable mevent callback if the FIFO is full.
++				 */
++				error = mevent_disable(sc->mev);
++				assert(error == 0);
++			}
++#endif /* __FreeBSD__ */
+ 		}
+ 		return (0);
+ 	} else
+@@ -298,6 +319,12 @@ rxfifo_getchar(struct uart_softc *sc)
+ 				error = mevent_enable(sc->mev);
+ 				assert(error == 0);
+ 			}
++#ifndef	__FreeBSD__
++			if (sc->sock && sc->usc_sock.clifd != -1) {
++				error = mevent_enable(sc->mev);
++				assert(error == 0);
++			}
++#endif /* __FreeBSD__ */
+ 		}
+ 		return (c);
+ 	} else
+@@ -436,47 +463,6 @@ uart_drain(int fd, enum ev_type ev, void *arg)
+ 	pthread_mutex_unlock(&sc->mtx);
+ }
+ 
+-static int
+-uart_sock_drain(struct uart_softc *sc)
+-{
+-	char ch;
+-	int nbytes;
+-	int ret = 0;
+-
+-	/*
+-	 * Take the softc lock to protect against concurrent
+-	 * access from a vCPU i/o exit
+-	 */
+-	pthread_mutex_lock(&sc->mtx);
+-
+-	if ((sc->mcr & MCR_LOOPBACK) != 0) {
+-		(void) read(sc->usc_sock.clifd, &ch, 1);
+-	} else {
+-		while (rxfifo_available(sc)) {
+-			nbytes = read(sc->usc_sock.clifd, &ch, 1);
+-			if (nbytes == 0) {
+-				ret = 1;
+-				break;
+-			}
+-			if (nbytes == -1 &&
+-			    errno != EINTR && errno != EAGAIN) {
+-				ret = -1;
+-				break;
+-			}
+-			if (nbytes == -1) {
+-				break;
+-			}
+-
+-			rxfifo_putchar(sc, ch);
+-		}
+-		uart_toggle_intr(sc);
+-	}
+-
+-	pthread_mutex_unlock(&sc->mtx);
+-
+-	return (ret);
+-}
+-
+ void
+ uart_write(struct uart_softc *sc, int offset, uint8_t value)
+ {
+@@ -695,96 +681,125 @@ done:
+ }
+ 
+ #ifndef	__FreeBSD__
+-static int
+-uart_sock_accept_client(struct uart_softc *sc)
++static void
++uart_sock_client_close(struct uart_softc *sc)
+ {
+-	int connfd;
+-	struct sockaddr_un cliaddr;
+-	socklen_t clilen;
++	assert(sc->usc_sock.clifd != -1);
+ 
+-	clilen = sizeof (cliaddr);
+-	connfd = accept(sc->usc_sock.servfd, (struct sockaddr *)&cliaddr,
+-	    &clilen);
+-	if (connfd == -1) {
+-		return (-1);
+-	}
+-	if (fcntl(connfd, F_SETFL, O_NONBLOCK) < 0) {
+-		(void) shutdown(connfd, SHUT_RDWR);
+-		(void) close(connfd);
+-		return (-1);
+-	}
+-
+-	sc->usc_sock.clifd = connfd;
+-
+-	return (0);
++	fprintf(stderr, "closing uart socket client\n");
++	(void) shutdown(sc->usc_sock.clifd, SHUT_RDWR);
++	mevent_delete_close(sc->mev);
++	sc->mev = NULL;
++	sc->usc_sock.clifd = -1;
+ }
+ 
+ static void
+-uart_sock_reject_client(struct uart_softc *sc)
++uart_sock_drain(int fd, enum ev_type ev, void *arg)
+ {
+-	int connfd;
+-	struct sockaddr_un cliaddr;
+-	socklen_t clilen;
++	struct uart_softc *sc = arg;
++	char ch;
++
++	/*
++	 * Take the softc lock to protect against concurrent
++	 * access from a vCPU i/o exit
++	 */
++	pthread_mutex_lock(&sc->mtx);
++
++	if ((sc->mcr & MCR_LOOPBACK) != 0) {
++		(void) read(sc->usc_sock.clifd, &ch, 1);
++	} else {
++		bool err_close = false;
++
++		while (rxfifo_available(sc)) {
++			int res;
++
++			res = read(sc->usc_sock.clifd, &ch, 1);
++			if (res == 0) {
++				err_close = true;
++				break;
++			} else if (res == -1) {
++				if (errno != EAGAIN && errno != EINTR) {
++					err_close = true;
++				}
++				break;
++			}
++
++			rxfifo_putchar(sc, ch);
++		}
++		uart_toggle_intr(sc);
+ 
+-	clilen = sizeof (cliaddr);
+-	connfd = accept(sc->usc_sock.servfd,
+-			(struct sockaddr *)&cliaddr, &clilen);
++		if (err_close) {
++			uart_sock_client_close(sc);
++		}
++	}
+ 
+-	(void) fprintf(stderr, "Shutting down unexpected client connection\n");
+-	(void) shutdown(connfd, SHUT_RDWR);
+-	(void) close(connfd);
++	pthread_mutex_unlock(&sc->mtx);
+ }
+ 
+ static void
+-uart_sock_client_event(struct uart_softc *sc)
++uart_sock_server_accept(struct uart_softc *sc)
+ {
+-	int res;
++	int connfd;
+ 
+-	res = uart_sock_drain(sc);
+-	if (res < 0)
++	connfd = accept(sc->usc_sock.servfd, NULL, NULL);
++	if (connfd == -1) {
+ 		return;
++	}
+ 
+-	if (res > 0) {
+-		fprintf(stderr, "Closing connection with bhyve socket\n");
+-		(void) shutdown(sc->usc_sock.clifd, SHUT_RDWR);
+-		(void) close(sc->usc_sock.clifd);
+-		sc->usc_sock.clifd = -1;
++	/*
++	 * Do client connection management under protection of the softc lock
++	 * to avoid racing with concurrent UART events.
++	 */
++	pthread_mutex_lock(&sc->mtx);
++
++	if (sc->usc_sock.clifd != -1) {
++		/* we're already handling a client */
++		(void) fprintf(stderr,
++		    "Shutting down unexpected client connection\n");
++		(void) shutdown(connfd, SHUT_RDWR);
++		(void) close(connfd);
++	} else {
++		if (fcntl(connfd, F_SETFL, O_NONBLOCK) < 0) {
++			perror("fcntl(O_NONBLOCK)");
++			(void) shutdown(connfd, SHUT_RDWR);
++			(void) close(connfd);
++		} else {
++			sc->usc_sock.clifd = connfd;
++			sc->mev = mevent_add(sc->usc_sock.clifd, EVF_READ,
++			    uart_sock_drain, sc);
++		}
+ 	}
++
++	pthread_mutex_unlock(&sc->mtx);
+ }
+ 
+ static void
+-uart_sock_server_event(struct uart_softc *sc)
++uart_sock_server_bail(struct uart_softc *sc)
+ {
++	pthread_mutex_lock(&sc->mtx);
+ 	if (sc->usc_sock.clifd != -1) {
+-		/* we're already handling a client */
+-		uart_sock_reject_client(sc);
+-		return;
++		uart_sock_client_close(sc);
+ 	}
+-
+-	uart_sock_accept_client(sc);
++	(void) shutdown(sc->usc_sock.servfd, SHUT_RDWR);
++	(void) close(sc->usc_sock.servfd);
++	sc->usc_sock.servfd = -1;
++	pthread_mutex_unlock(&sc->mtx);
+ }
+ 
+ static void *
+ uart_sock_thread(void *param)
+ {
+ 	struct uart_softc *sc = param;
+-	struct pollfd pollfds[2];
+-	int res;
+-
+-	/* read from client and write to vm */
+-	pollfds[0].events = POLLIN | POLLRDNORM | POLLRDBAND |
+-	    POLLPRI | POLLERR | POLLHUP;
+-
+-	/* the server socket; watch for events (new connections) */
+-	pollfds[1].events = pollfds[0].events;
+ 
+ 	for (;;) {
+-		pollfds[0].fd = sc->usc_sock.clifd;
+-		pollfds[1].fd = sc->usc_sock.servfd;
+-		pollfds[0].revents = pollfds[1].revents = 0;
++		struct pollfd pfd;
++		int res;
++
++		pfd.fd = sc->usc_sock.servfd;
++		pfd.events = POLLIN | POLLERR | POLLHUP;
++		pfd.revents = 0;
+ 
+-		res = poll(pollfds,
+-		    sizeof (pollfds) / sizeof (struct pollfd), -1);
++		res = poll(&pfd, 1, -1);
+ 
+ 		if (res == -1 && errno != EINTR) {
+ 			perror("poll failed");
+@@ -792,33 +807,17 @@ uart_sock_thread(void *param)
+ 			break;
+ 		}
+ 
+-		/* event from client side */
+-		if (pollfds[0].revents) {
+-			if (pollfds[0].revents &
+-			    (POLLIN | POLLRDNORM | POLLRDBAND | POLLPRI)) {
+-				uart_sock_client_event(sc);
+-			} else {
+-				break;
+-			}
+-		}
+-
+ 		/* event from server socket */
+-		if (pollfds[1].revents) {
+-			if (pollfds[1].revents & (POLLIN | POLLRDNORM)) {
+-				uart_sock_server_event(sc);
+-			} else {
+-				break;
+-			}
++		if ((pfd.revents & POLLIN) != 0) {
++			uart_sock_server_accept(sc);
++		} else if (pfd.revents != 0) {
++			/* HUP/ERR on server sock, bail */
++			fprintf(stderr, "closing uart socket server\n");
++			uart_sock_server_bail(sc);
++			break;
+ 		}
+ 	}
+ 
+-	if (sc->usc_sock.clifd != -1) {
+-		fprintf(stderr, "Closing connection with bhyve console\n");
+-		(void) shutdown(sc->usc_sock.clifd, SHUT_RDWR);
+-		(void) close(sc->usc_sock.clifd);
+-		sc->usc_sock.clifd = -1;
+-	}
+-
+ 	return (NULL);
+ }
+ 

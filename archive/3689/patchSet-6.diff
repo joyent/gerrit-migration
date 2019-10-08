@@ -1,0 +1,996 @@
+commit 1353a91b6a41dbdb9dfb81a6bd61101927437b87 (refs/changes/89/3689/6)
+Author: Jason King <jason.king@joyent.com>
+Date:   2018-03-20T19:58:41-05:00 (1 year, 7 months ago)
+    
+    Update varpd_files to support VL3->UL3 lookups
+
+diff --git a/usr/src/lib/varpd/files/common/libvarpd_files.c b/usr/src/lib/varpd/files/common/libvarpd_files.c
+index 77426b7fc7..5a82337e10 100644
+--- a/usr/src/lib/varpd/files/common/libvarpd_files.c
++++ b/usr/src/lib/varpd/files/common/libvarpd_files.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2015, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -28,7 +28,7 @@
+  * The plug-in only has a single property, which is the location of the JSON
+  * file. The JSON file itself looks something like:
+  *
+- * 	{
++ *	{
+  *		"aa:bb:cc:dd:ee:ff": {
+  *			"arp": "10.23.69.1",
+  *			"ndp": "2600:3c00::f03c:91ff:fe96:a264",
+@@ -36,7 +36,41 @@
+  *			"port": 8080
+  *		},
+  *		...
+- *	}
++ *
++ *		"local-subnet1": {
++ *			"prefix": "192.168.1.0/24",
++ *			"vlan": 123
++ *		},
++ *		...
++ *
++ *		"remote-subnet1": {
++ *			"dcid": 11223344,
++ *			"prefix": "10.21.10.0/24",
++ *			"vnet": 5340123,
++ *			"vlan": 789,
++ *			"routermac": "12:34:56:78:aa:bb",
++ *			"macs": {
++ *				"aa:bb:cc:dd:ee:ff": {
++ *					"arp": "192.168.50.22",
++ *					...
++ *				}
++ *			}
++ *		},
++ *		...
++ *		"attach-group1": [
++ *			"remote-subnet1",
++ *			"remote-subnet2",
++ *			"local-subnet1",
++ *			...
++ *		],
++ *		...
++ *
++ * Entries for performing VL3 routing (local-, remote-, and attach-) must
++ * all start with their respective prefixes (local-, remote-, or attach-) to
++ * identify the type of entry.
++ *
++ * NOTE: This isn't very sophisticated, so attachment entries need to appear
++ * after the entries referenced in it.
+  */
+ 
+ #include <libvarpd_provider.h>
+@@ -60,6 +94,22 @@
+ 
+ #include <libvarpd_files_json.h>
+ 
++#define	FABRIC_NAME_MAX	64
++typedef struct varpd_files_fabric {
++	char		vafs_name[FABRIC_NAME_MAX];
++	nvlist_t	*vafs_nvl;
++	struct in6_addr	vafs_addr;
++	uint64_t	vafs_vnet;
++	uint32_t	vafs_dcid;
++	uint16_t	vafs_vlan;
++	uint8_t		vafs_prefixlen;
++	uint8_t		vafs_routermac[ETHERADDRL];
++} varpd_files_fabric_t;
++
++typedef struct varpd_files_attach {
++	varpd_files_fabric_t **vff_fabrics;
++} varpd_files_attach_t;
++
+ typedef struct varpd_files {
+ 	overlay_plugin_dest_t	vaf_dest;	/* RO */
+ 	varpd_provider_handle_t	*vaf_hdl;	/* RO */
+@@ -67,12 +117,88 @@ typedef struct varpd_files {
+ 	nvlist_t		*vaf_nvl;	/* WO */
+ 	uint64_t		vaf_nmisses;	/* Atomic */
+ 	uint64_t		vaf_narp;	/* Atomic */
++	varpd_files_fabric_t	*vaf_fabrics;	/* RO */
++	varpd_files_attach_t	*vaf_attach;	/* RO */
++	uint64_t		vaf_vnet;	/* RO */
++	uint32_t		vaf_dcid;	/* RO */
+ } varpd_files_t;
+ 
+ static const char *varpd_files_props[] = {
+ 	"files/config"
+ };
+ 
++/*
++ * Try to convert a string to an IP address.  We first try to convert as
++ * an IPv6 address, and if that fails, we try to convert as an IPv4 adress
++ * and then wrap it in an IPv6 address.  If prefixlen is not NULL, it allows
++ * '/prefixlen' to appear at the end of the address.  *prefixlen is then
++ * set to the number of address bits in v6.
++ *
++ * Note: if this is a wrapped IPv4 address with a prefix, *prefixlen is adjusted
++ * to reflect the value as an IPv6 address, e.g. 192.168.1.0/24 will have a
++ * prefixlen of 120 (96 + 24).
++ *
++ */
++static int
++str_to_ip(const char *s, struct in6_addr *v6, uint8_t *prefixlen)
++{
++	const char *slash;	/* he is real */
++	char addrstr[INET6_ADDRSTRLEN] = { 0 };
++	size_t addrlen;
++	boolean_t is_v4 = B_FALSE;
++
++	slash = strchr(s, '/');
++
++	if (prefixlen != NULL) {
++		addrlen = (slash != NULL) ? (size_t)(slash - s) : strlen(s);
++	} else {
++		if (slash != NULL)
++			return (EINVAL);
++		addrlen = strlen(s);
++	}
++
++	if (addrlen > sizeof (addrstr))
++		return (EINVAL);
++
++	bcopy(s, addrstr, addrlen);
++
++	if (inet_pton(AF_INET6, addrstr, v6) != 1) {
++		uint32_t v4;
++
++		if (inet_pton(AF_INET, addrstr, &v4) != 1)
++			return (EINVAL);
++
++		IN6_IPADDR_TO_V4MAPPED(v4, v6);
++		is_v4 = B_TRUE;
++	}
++
++	if (prefixlen != NULL) {
++		if (slash == NULL) {
++			*prefixlen = is_v4 ? 32 : 128;
++		} else {
++			unsigned long mask = 0;
++
++			errno = 0;
++			mask = strtoul(slash + 1, NULL, 10);
++			if (errno != 0)
++				return (EINVAL);
++
++			if (is_v4) {
++				if (mask > 32)
++					return (EINVAL);
++				mask += 96;
++			}
++
++			if (mask > 128)
++				return (EINVAL);
++
++			*prefixlen = (uint8_t)mask;
++		}
++	}
++
++	return (0);
++}
++
+ static boolean_t
+ varpd_files_valid_dest(overlay_plugin_dest_t dest)
+ {
+@@ -103,20 +229,19 @@ varpd_files_create(varpd_provider_handle_t *hdl, void **outp,
+ 	vaf->vaf_path = NULL;
+ 	vaf->vaf_nvl = NULL;
+ 	vaf->vaf_hdl = hdl;
++	vaf->vaf_dcid = libvarpd_plugin_dcid(hdl);
+ 	*outp = vaf;
+ 	return (0);
+ }
+ 
++static int varpd_files_normalize_remote(nvlist_t *, nvlist_t *);
++
+ static int
+-varpd_files_normalize_nvlist(varpd_files_t *vaf, nvlist_t *nvl)
++varpd_files_normalize_ethers(nvlist_t *nvl, nvlist_t *out, boolean_t is_sub)
+ {
+ 	int ret;
+-	nvlist_t *out;
+ 	nvpair_t *pair;
+ 
+-	if ((ret = nvlist_alloc(&out, NV_UNIQUE_NAME, 0)) != 0)
+-		return (ret);
+-
+ 	for (pair = nvlist_next_nvpair(nvl, NULL); pair != NULL;
+ 	    pair = nvlist_next_nvpair(nvl, pair)) {
+ 		char *name, fname[ETHERADDRSTRL];
+@@ -135,6 +260,40 @@ varpd_files_normalize_nvlist(varpd_files_t *vaf, nvlist_t *nvl)
+ 			return (EINVAL);
+ 		}
+ 
++		/* Remote subnet */
++		if (!is_sub && strncmp(name, "remote-", 7) == 0) {
++			nvlist_t *rem;
++
++			ret = nvlist_alloc(&rem, NV_UNIQUE_NAME, 0);
++			if (ret != 0) {
++				nvlist_free(out);
++				return (EINVAL);
++			}
++
++			ret = varpd_files_normalize_remote(data, rem);
++			if (ret != 0) {
++				nvlist_free(out);
++				return (EINVAL);
++			}
++
++			if ((ret = nvlist_add_nvlist(out, name, rem)) != 0) {
++				nvlist_free(rem);
++				nvlist_free(out);
++				return (EINVAL);
++			}
++			continue;
++		}
++
++		/* attached and local fabrics */
++		if (!is_sub && (strncmp(name, "attach-", 7) == 0 ||
++		    strncmp(name, "local-", 6) == 0)) {
++			if ((ret = nvlist_add_nvlist(out, name, data)) != 0) {
++				nvlist_free(out);
++				return (EINVAL);
++			}
++			continue;
++		}
++
+ 		if (ether_aton_r(name, e) == NULL) {
+ 			nvlist_free(out);
+ 			return (EINVAL);
+@@ -151,10 +310,325 @@ varpd_files_normalize_nvlist(varpd_files_t *vaf, nvlist_t *nvl)
+ 		}
+ 	}
+ 
++	return (0);
++}
++
++static int
++varpd_files_normalize_remote(nvlist_t *nvl, nvlist_t *out)
++{
++	nvlist_t *macs, *mout;
++	nvpair_t *pair;
++	int ret;
++
++	for (pair = nvlist_next_nvpair(nvl, NULL); pair != NULL;
++	    pair = nvlist_next_nvpair(nvl, pair)) {
++		char *name;
++
++		name = nvpair_name(pair);
++
++		if (strcmp(name, "macs") == 0) {
++			if ((ret = nvpair_value_nvlist(pair, &macs)) != 0) {
++				nvlist_free(out);
++				return (EINVAL);
++			}
++
++			/* This entry is handled at the end */
++			continue;
++		}
++
++		if ((ret = nvlist_add_nvpair(out, pair)) != 0) {
++			nvlist_free(out);
++			return (EINVAL);
++		}
++	}
++
++	if (macs == NULL) {
++		nvlist_free(out);
++		return (EINVAL);
++	}
++
++	if ((ret = nvlist_alloc(&mout, NV_UNIQUE_NAME, 0)) != 0) {
++		nvlist_free(out);
++		return (EINVAL);
++	}
++
++	if ((ret = varpd_files_normalize_ethers(macs, mout, B_TRUE)) != 0) {
++		/* mout is freed on error by varpd_files_normalize_ethers() */
++		nvlist_free(out);
++		return (EINVAL);
++	}
++
++	if ((ret = nvlist_add_nvlist(out, "macs", mout)) == 0) {
++		nvlist_free(out);
++		nvlist_free(mout);
++		return (EINVAL);
++	}
++
++	return (0);
++}
++
++static int
++varpd_files_normalize_nvlist(varpd_files_t *vaf, nvlist_t *nvl)
++{
++	int ret;
++	nvlist_t *out;
++	nvpair_t *pair;
++
++	if ((ret = nvlist_alloc(&out, NV_UNIQUE_NAME, 0)) != 0)
++		return (ret);
++
++	if ((ret = varpd_files_normalize_ethers(nvl, out, B_FALSE)) != 0) {
++		/* varpd_files_normalize_ethers() frees out on error */
++		return (EINVAL);
++	}
++
+ 	vaf->vaf_nvl = out;
+ 	return (0);
+ }
+ 
++static int
++varpd_files_add_local_subnet(varpd_files_t *vaf, varpd_files_fabric_t *net,
++    const char *name, nvlist_t *nvl)
++{
++	char *s;
++	int32_t vlan;
++	int ret;
++
++	net->vafs_dcid = vaf->vaf_dcid;
++	net->vafs_vnet = vaf->vaf_vnet;
++	net->vafs_nvl = vaf->vaf_nvl;
++
++	(void) strlcpy(net->vafs_name, name, sizeof (net->vafs_name));
++
++	if ((ret = nvlist_lookup_string(nvl, "prefix", &s)) != 0)
++		return (EINVAL);
++	if (str_to_ip(s, &net->vafs_addr, &net->vafs_prefixlen) != 0)
++		return (EINVAL);
++
++	if ((ret = nvlist_lookup_int32(nvl, "prefix", &vlan)) != 0)
++		return (EINVAL);
++	if (vlan < 0 || vlan > 4096)
++		return (EINVAL);
++	net->vafs_vlan = (uint16_t)vlan;
++
++	/* XXX: routermac */
++	return (0);
++}
++
++static int
++varpd_files_add_remote_subnet(varpd_files_fabric_t *net, const char *name,
++    nvlist_t *nvl)
++{
++	nvpair_t *pair;
++	int ret;
++
++	(void) strlcpy(net->vafs_name, name, sizeof (net->vafs_name));
++
++	for (pair = nvlist_next_nvpair(nvl, NULL); pair != NULL;
++	    pair = nvlist_next_nvpair(nvl, pair)) {
++		char *name = nvpair_name(pair);
++		int32_t i32;
++
++		if (strcmp(name, "dcid") == 0) {
++			if ((ret = nvpair_value_int32(pair, &i32)) != 0)
++				return (ret);
++
++			net->vafs_dcid = (uint32_t)i32;
++		} else if (strcmp(name, "prefix") == 0) {
++			char *s;
++
++			if ((ret = nvpair_value_string(pair, &s)) != 0)
++				return (ret);
++
++			if (str_to_ip(s, &net->vafs_addr,
++			    &net->vafs_prefixlen) != 0)
++				return (EINVAL);
++		} else if (strcmp(name, "vnet") == 0) {
++			if ((ret = nvpair_value_int32(pair, &i32)) != 0)
++				return (ret);
++			net->vafs_vnet = i32;
++		} else if (strcmp(name, "vlan") == 0) {
++			if ((ret = nvpair_value_int32(pair, &i32)) != 0)
++				return (ret);
++			if (i32 > 4096 || i32 < 0)
++				return (EINVAL);
++			net->vafs_vlan = i32;
++		} else if (strcmp(name, "macs") == 0) {
++			nvlist_t *macs;
++
++			if ((ret = nvpair_value_nvlist(pair, &macs)) != 0)
++				return (ret);
++
++			net->vafs_nvl = macs;
++		} else if (strcmp(name, "routermac") == 0) {
++			char *s;
++			struct ether_addr *e;
++			e = (struct ether_addr *)&net->vafs_routermac;
++
++			if ((ret = nvpair_value_string(pair, &s)) != 0)
++				return (ret);
++
++			if (ether_aton_r(s, e) == NULL)
++				return (EINVAL);
++
++		}
++	}
++
++	return (0);
++}
++
++static void varpd_files_stop_fabrics(varpd_files_t *);
++
++static int
++varpd_files_start_fabrics(varpd_files_t *vaf)
++{
++	nvpair_t *pair;
++	size_t nfabric = 0;
++	int ret;
++
++	for (pair = nvlist_next_nvpair(vaf->vaf_nvl, NULL); pair != NULL;
++	    pair = nvlist_next_nvpair(vaf->vaf_nvl, pair)) {
++		char *name = nvpair_name(pair);
++
++		if (strncmp(name, "remote-", 7) != 0 &&
++		    strncmp(name, "attach-", 7) != 0)
++			continue;
++
++		nfabric++;
++	}
++
++	if (nfabric == 0)
++		return (0);
++
++	vaf->vaf_fabrics = calloc(nfabric + 1, sizeof (varpd_files_fabric_t));
++	if (vaf->vaf_fabrics == NULL)
++		return (ENOMEM);
++
++	nfabric = 0;
++	for (pair = nvlist_next_nvpair(vaf->vaf_nvl, NULL); pair != NULL;
++	    pair = nvlist_next_nvpair(vaf->vaf_nvl, pair)) {
++		char *name = nvpair_name(pair);
++		boolean_t is_remote = B_FALSE;
++		boolean_t is_local = B_FALSE;
++
++		if (strncmp(name, "remote-", 7) == 0)
++			is_remote = B_TRUE;
++		if (strncmp(name, "local-", 7) == 0)
++			is_local = B_TRUE;
++
++		if (!is_remote && !is_local)
++			continue;
++
++		varpd_files_fabric_t *net = &vaf->vaf_fabrics[nfabric++];
++		nvlist_t *netnvl;
++
++		if ((ret = nvpair_value_nvlist(pair, &netnvl)) != 0) {
++			varpd_files_stop_fabrics(vaf);
++			return (ret);
++		}
++
++		ret = is_remote ?
++		    varpd_files_add_remote_subnet(net, name, netnvl) :
++		    varpd_files_add_local_subnet(vaf, net, name, netnvl);
++
++		if (ret != 0) {
++			varpd_files_stop_fabrics(vaf);
++			return (ret);
++		}
++	}
++
++	return (0);
++}
++
++static varpd_files_fabric_t *
++varpd_files_fabric_getbyname(varpd_files_t *vaf, const char *name)
++{
++	varpd_files_fabric_t *fab = &vaf->vaf_fabrics[0];
++
++	for (fab = &vaf->vaf_fabrics[0]; fab->vafs_name[0] != '\0'; fab++) {
++		if (strcmp(fab->vafs_name, name) != 0)
++			continue;
++		return (fab);
++	}
++
++	return (NULL);
++}
++
++static void
++varpd_files_stop_attached(varpd_files_t *vaf)
++{
++	size_t i;
++
++	if (vaf->vaf_attach == NULL)
++		return;
++
++	for (i = 0; vaf->vaf_attach[i].vff_fabrics != NULL; i++)
++		free(vaf->vaf_attach[i].vff_fabrics);
++
++	free(vaf->vaf_attach);
++	vaf->vaf_attach = NULL;
++}
++
++static int
++varpd_files_start_attached(varpd_files_t *vaf)
++{
++	nvpair_t *pair;
++	size_t nattach = 0;
++	int ret;
++
++	for (pair = nvlist_next_nvpair(vaf->vaf_nvl, NULL); pair != NULL;
++	    pair = nvlist_next_nvpair(vaf->vaf_nvl, pair)) {
++		char *name;
++
++		name = nvpair_name(pair);
++		if (strncmp(name, "attach-", 7) != 0)
++			continue;
++
++		if (nvpair_type(pair) != DATA_TYPE_STRING_ARRAY)
++			return (EINVAL);
++
++		nattach++;
++	}
++
++	if (nattach == 0)
++		return (0);
++
++	if ((vaf->vaf_attach = calloc(nattach + 1,
++	    sizeof (varpd_files_attach_t))) == NULL)
++		return (ENOMEM);
++
++	nattach = 0;
++	for (pair = nvlist_next_nvpair(vaf->vaf_nvl, NULL); pair != NULL;
++	    pair = nvlist_next_nvpair(vaf->vaf_nvl, pair)) {
++		varpd_files_attach_t *fa = &vaf->vaf_attach[nattach++];
++		char **fabrics = NULL;
++		uint_t i, nelem = 0;
++
++		if ((ret = nvpair_value_string_array(pair, &fabrics,
++		    &nelem)) != NULL) {
++			varpd_files_stop_attached(vaf);
++			return (ret);
++		}
++
++		if ((fa = calloc(nelem + 1, sizeof (varpd_files_fabric_t *))) ==
++		    NULL) {
++			varpd_files_stop_attached(vaf);
++			return (ENOMEM);
++		}
++
++		for (i = 0; i < nelem; i++) {
++			fa->vff_fabrics[i] =
++			    varpd_files_fabric_getbyname(vaf, fabrics[i]);
++			if (fa->vff_fabrics[i] == NULL) {
++				varpd_files_stop_attached(vaf);
++				return (ENOENT);
++			}
++		}
++	}
++
++	return (0);
++}
++
+ static int
+ varpd_files_start(void *arg)
+ {
+@@ -191,20 +665,54 @@ varpd_files_start(void *arg)
+ 	if (ret == 0) {
+ 		ret = varpd_files_normalize_nvlist(vaf, nvl);
+ 		nvlist_free(nvl);
++		nvl = NULL;
+ 	}
+ 	if (munmap(maddr, st.st_size) != 0)
+ 		abort();
+ 	if (close(fd) != 0)
+ 		abort();
++	if (ret != 0) {
++		nvlist_free(nvl);
++		return (ret);
++	}
++
++	if ((ret = varpd_files_start_fabrics(vaf)) != 0) {
++		nvlist_free(nvl);
++		return (ret);
++	}
++
++	if ((ret = varpd_files_start_attached(vaf)) != 0) {
++		varpd_files_stop_fabrics(vaf);
++		nvlist_free(nvl);
++		return (ret);
++	}
+ 
+ 	return (ret);
+ }
+ 
++static void
++varpd_files_stop_fabrics(varpd_files_t *vaf)
++{
++	varpd_files_fabric_t *net = NULL;
++
++	if (vaf == NULL || vaf->vaf_fabrics == NULL)
++		return;
++
++	for (net = vaf->vaf_fabrics; net->vafs_name[0] != '\0'; net++) {
++		if (net->vafs_nvl != vaf->vaf_nvl)
++			nvlist_free(net->vafs_nvl);
++	}
++	free(vaf->vaf_fabrics);
++	vaf->vaf_fabrics = NULL;
++}
++
++
+ static void
+ varpd_files_stop(void *arg)
+ {
+ 	varpd_files_t *vaf = arg;
+ 
++	varpd_files_stop_fabrics(vaf);
+ 	nvlist_free(vaf->vaf_nvl);
+ 	vaf->vaf_nvl = NULL;
+ }
+@@ -222,12 +730,150 @@ varpd_files_destroy(void *arg)
+ 	umem_free(vaf, sizeof (varpd_files_t));
+ }
+ 
++static nvlist_t *
++varpd_files_lookup_l3subnet(varpd_files_t *vaf, varpd_files_attach_t *attach,
++    const struct in6_addr *dst, overlay_target_point_t *otp,
++    overlay_target_route_t *otr)
++{
++	varpd_files_fabric_t *net = NULL;
++	nvlist_t *macs = NULL;
++	size_t i;
++	boolean_t found = B_FALSE;
++
++	for (i = 0; attach->vff_fabrics[i] != NULL; i++) {
++		net = attach->vff_fabrics[i];
++
++		if (IN6_ARE_PREFIXEDADDR_EQUAL(dst, &net->vafs_addr,
++		    net->vafs_prefixlen)) {
++			found = B_TRUE;
++			break;
++		}
++	}
++
++	if (nvlist_lookup_nvlist(net->vafs_nvl, "macs", &macs) != 0)
++		return (NULL);
++
++	otr->otr_vnet = net->vafs_vnet;
++	otr->otr_vlan = net->vafs_vlan;
++	otr->otr_dcid = net->vafs_dcid;
++	otr->otr_dst_prefixlen = net->vafs_prefixlen;
++	bcopy(net->vafs_routermac, otr->otr_srcmac, ETHERADDRL);
++	return (macs);
++}
++
++static varpd_files_attach_t *
++varpd_files_find_attach(varpd_files_t *vaf, const struct in6_addr *src,
++    uint16_t vlan, overlay_target_route_t *otr)
++{
++	varpd_files_attach_t *attach;
++	varpd_files_fabric_t *fab;
++	size_t i;
++
++	if (vaf->vaf_attach == NULL)
++		return (NULL);
++
++	for (attach = vaf->vaf_attach; attach->vff_fabrics != NULL; attach++) {
++		for (i = 0; attach->vff_fabrics[i] != NULL; i++) {
++			fab = attach->vff_fabrics[i];
++
++			if (fab->vafs_dcid == vaf->vaf_dcid &&
++			    fab->vafs_vlan == vlan &&
++			    IN6_ARE_PREFIXEDADDR_EQUAL(src, &fab->vafs_addr,
++			    fab->vafs_prefixlen)) {
++				otr->otr_src_prefixlen = fab->vafs_prefixlen;
++				return (attach);
++			}
++			fab++;
++		}
++	}
++
++	return (NULL);
++}
++
+ static void
+ varpd_files_lookup_l3(varpd_files_t *vaf, varpd_query_handle_t *qh,
+     const overlay_targ_lookup_t *otl, overlay_target_point_t *otp,
+     overlay_target_route_t *otr)
+ {
+-	/* XXX KEBE SAYS START HERE... */
++	const struct in6_addr *dest_ip;
++	const struct in6_addr *src_ip;
++	struct in6_addr ul3 = { 0 };
++	varpd_files_attach_t *attach = NULL;
++	char *s;
++	nvlist_t *macs = NULL, *entry = NULL;
++	nvpair_t *pair = NULL;
++	int32_t prefixlen;
++
++	dest_ip = &otl->otl_addru.otlu_l3.otl3_dstip;
++	src_ip = &otl->otl_addru.otlu_l3.otl3_srcip;
++
++	if ((attach = varpd_files_find_attach(vaf, src_ip, otl->otl_vlan,
++	    otr)) == NULL) {
++		libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++		return;
++	}
++
++	if ((macs = varpd_files_lookup_l3subnet(vaf, attach, dest_ip,
++	    otp, otr)) == NULL) {
++		libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++		return;
++	}
++
++	for (pair = nvlist_next_nvpair(macs, NULL); pair != NULL;
++	    pair = nvlist_next_nvpair(macs, pair)) {
++		char *s;
++		struct in6_addr v6;
++
++		if (nvpair_value_nvlist(pair, &entry) != 0)
++			continue;
++
++		if (nvlist_lookup_string(entry, "arp", &s) != 0)
++			continue;
++
++		if (str_to_ip(s, &v6, NULL) != 0)
++			continue;
++
++		if (IN6_ARE_ADDR_EQUAL(dest_ip, &v6))
++			break;
++	}
++
++	if (pair == NULL) {
++		libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++		return;
++	}
++
++	if (nvlist_lookup_string(entry, "ip", &s) != 0) {
++		libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++		return;
++	}
++
++	if (str_to_ip(s, &ul3, NULL) != 0) {
++		libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++		return;
++	}
++	bcopy(&ul3, &otp->otp_ip, sizeof (ul3));
++
++	if (vaf->vaf_dest & OVERLAY_PLUGIN_D_PORT) {
++		int32_t port;
++
++		if (nvlist_lookup_int32(entry, "port", &port) != 0) {
++			libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++			return;
++		}
++
++		otp->otp_port = port;
++	} else {
++		otp->otp_port = 0;
++	}
++
++	s = nvpair_name(pair);
++
++	if (ether_aton_r(s, (struct ether_addr *)otp->otp_mac) == NULL) {
++		libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++		return;
++	}
++
++	libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_OK);
+ }
+ 
+ static void
+@@ -254,6 +900,7 @@ varpd_files_lookup(void *arg, varpd_query_handle_t *qh,
+ 		varpd_files_lookup_l3(vaf, qh, otl, otp, otr);
+ 		return;
+ 	}
++
+ 	/*
+ 	 * At this point, the traditional overlay_target_point_t is all that
+ 	 * needs filling in.  Zero-out the otr for safety.
+@@ -278,7 +925,8 @@ varpd_files_lookup(void *arg, varpd_query_handle_t *qh,
+ 		struct ether_addr a, *addr;
+ 
+ 		addr = &a;
+-		if (ether_ntoa_r((struct ether_addr *)otl->otl_addru.otlu_l2.otl2_srcaddr,
++		if (ether_ntoa_r(
++		    (struct ether_addr *)otl->otl_addru.otlu_l2.otl2_srcaddr,
+ 		    macstr) == NULL) {
+ 			libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
+ 			return;
+@@ -331,18 +979,9 @@ varpd_files_lookup(void *arg, varpd_query_handle_t *qh,
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Try to parse it as a v6 address and then if it's not, try to
+-	 * transform it into a v4 address which we'll then wrap it into a v4
+-	 * mapped address.
+-	 */
+-	if (inet_pton(AF_INET6, ipstr, &otp->otp_ip) != 1) {
+-		uint32_t v4;
+-		if (inet_pton(AF_INET, ipstr, &v4) != 1) {
+-			libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
+-			return;
+-		}
+-		IN6_IPADDR_TO_V4MAPPED(v4, &otp->otp_ip);
++	if (str_to_ip(ipstr, &otp->otp_ip, NULL) != 0) {
++		libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_DROP);
++		return;
+ 	}
+ 
+ 	libvarpd_plugin_query_reply(qh, VARPD_LOOKUP_OK);
+@@ -367,6 +1006,7 @@ varpd_files_propinfo(void *arg, uint_t propid, varpd_prop_handle_t *vph)
+ 	libvarpd_prop_set_prot(vph, OVERLAY_PROP_PERM_RRW);
+ 	libvarpd_prop_set_type(vph, OVERLAY_PROP_T_STRING);
+ 	libvarpd_prop_set_nodefault(vph);
++
+ 	return (0);
+ }
+ 
+@@ -384,7 +1024,6 @@ varpd_files_getprop(void *arg, const char *pname, void *buf, uint32_t *sizep)
+ 			return (EOVERFLOW);
+ 		*sizep = len;
+ 		(void) strlcpy(buf, vaf->vaf_path, *sizep);
+-
+ 	} else {
+ 		*sizep = 0;
+ 	}
+diff --git a/usr/src/lib/varpd/libvarpd/common/mapfile-plugin b/usr/src/lib/varpd/libvarpd/common/mapfile-plugin
+index 8cef7f669f..d9043b2d3a 100644
+--- a/usr/src/lib/varpd/libvarpd/common/mapfile-plugin
++++ b/usr/src/lib/varpd/libvarpd/common/mapfile-plugin
+@@ -10,7 +10,7 @@
+ #
+ 
+ #
+-# Copyright 2015 Joyent, Inc.
++# Copyright 2018 Joyent, Inc.
+ #
+ 
+ #
+@@ -39,6 +39,7 @@ SYMBOL_SCOPE {
+ 	libvarpd_panic			{ FLAGS = EXTERN };
+ 	libvarpd_plugin_alloc		{ FLAGS = EXTERN };
+ 	libvarpd_plugin_arp_reply	{ FLAGS = EXTERN };
++	libvarpd_plugin_dcid		{ FLAGS = EXTERN };
+ 	libvarpd_plugin_dhcp_reply	{ FLAGS = EXTERN };
+ 	libvarpd_plugin_free		{ FLAGS = EXTERN };
+ 	libvarpd_plugin_proxy_arp	{ FLAGS = EXTERN };
+diff --git a/usr/src/lib/varpd/libvarpd/common/mapfile-vers b/usr/src/lib/varpd/libvarpd/common/mapfile-vers
+index 7aa930cb54..5980100aff 100644
+--- a/usr/src/lib/varpd/libvarpd/common/mapfile-vers
++++ b/usr/src/lib/varpd/libvarpd/common/mapfile-vers
+@@ -10,7 +10,7 @@
+ #
+ 
+ #
+-# Copyright 2015 Joyent, Inc.
++# Copyright 2018 Joyent, Inc.
+ #
+ 
+ #
+@@ -82,6 +82,7 @@ SYMBOL_VERSION SUNWprivate {
+ 	libvarpd_plugin_free;
+ 	libvarpd_plugin_arp_reply;
+ 	libvarpd_plugin_dhcp_reply;
++	libvarpd_plugin_dcid;
+ 	libvarpd_plugin_query_reply;
+ 	libvarpd_plugin_proxy_arp;
+ 	libvarpd_plugin_proxy_dhcp;
+diff --git a/usr/src/uts/common/io/overlay/overlay_target.c b/usr/src/uts/common/io/overlay/overlay_target.c
+index cb79bfdfdb..399919cf80 100644
+--- a/usr/src/uts/common/io/overlay/overlay_target.c
++++ b/usr/src/uts/common/io/overlay/overlay_target.c
+@@ -401,6 +401,9 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 	mutex_enter(&entry->ote_lock);
+ 	if (entry->ote_flags & OVERLAY_ENTRY_F_DROP) {
+ 		ret = OVERLAY_TARGET_DROP;
++	} else if (entry->ote_flags & OVERLAY_ENTRY_F_ROUTER) {
++		/* TODO: kick out to router */
++		ret = OVERLAY_TARGET_OK;
+ 	} else if (entry->ote_flags & OVERLAY_ENTRY_F_VALID) {
+ 		bcopy(&entry->ote_dest.otp_ip, &v6->sin6_addr,
+ 		    sizeof (struct in6_addr));
+@@ -608,9 +611,9 @@ overlay_target_lookup_request(overlay_target_hdl_t *thdl, void *arg)
+ {
+ 	overlay_targ_lookup_t *otl = arg;
+ 	overlay_target_entry_t *entry;
++	struct in6_addr *srcip, *dstip;
+ 	clock_t ret, timeout;
+ 	mac_header_info_t mhi;
+-
+ 	timeout = ddi_get_lbolt() + drv_usectohz(MICROSEC);
+ again:
+ 	mutex_enter(&overlay_target_lock);
+@@ -632,12 +635,16 @@ again:
+ 	}
+ 	ASSERT(entry->ote_chead != NULL);
+ 
++	otl->otl_l3req =
++	    IN6_IS_ADDR_UNSPECIFIED(&entry->ote_ip) ? B_TRUE : B_FALSE;
++
+ 	/*
+-	 * If we have a bogon that doesn't have a valid mac header, drop it and
+-	 * try again.
++	 * If we have a bogon that doesn't have a valid mac header, or a valid
++	 * IP header for IP requests, drop it and try again.
+ 	 */
+-	if (mac_vlan_header_info(entry->ote_odd->odd_mh, entry->ote_chead,
+-	    &mhi) != 0) {
++	if ((mac_vlan_header_info(entry->ote_odd->odd_mh, entry->ote_chead,
++	    &mhi) != 0) || (otl->otl_l3req &&
++	    overlay_mblk_vl3ip(entry->ote_chead, &srcip, &dstip != 0))) {
+ 		boolean_t queue = B_FALSE;
+ 		mblk_t *mp = entry->ote_chead;
+ 		entry->ote_chead = mp->b_next;
+@@ -654,13 +661,6 @@ again:
+ 		goto again;
+ 	}
+ 
+-	/*
+-	 * TODO: If VL3 request,
+-	 *	set otl->otl_l3req
+-	 *	Fill in otl_{src,dst}ip
+-	 * Else
+-	 *	clear otl->otl_l3req
+-	 */
+ 	otl->otl_dlid = entry->ote_odd->odd_linkid;
+ 	otl->otl_reqid = (uintptr_t)entry;
+ 	otl->otl_varpdid = entry->ote_ott->ott_id;
+@@ -668,11 +668,18 @@ again:
+ 
+ 	otl->otl_hdrsize = mhi.mhi_hdrsize;
+ 	otl->otl_pktsize = msgsize(entry->ote_chead) - otl->otl_hdrsize;
+-	bcopy(mhi.mhi_daddr, otl->otl_addru.otlu_l2.otl2_dstaddr, ETHERADDRL);
+-	bcopy(mhi.mhi_saddr, otl->otl_addru.otlu_l2.otl2_srcaddr, ETHERADDRL);
+ 	otl->otl_addru.otlu_l2.otl2_dsttype = mhi.mhi_dsttype;
+ 	otl->otl_addru.otlu_l2.otl2_sap = mhi.mhi_bindsap;
+ 	otl->otl_vlan = VLAN_ID(mhi.mhi_tci);
++	if (otl->otl_l3req) {
++		bcopy(srcip, &otl->otl_srcip, sizeof (*srcip));
++		bcopy(dstip, &otl->otl_dstip, sizeof (*dstip));
++	} else {
++		bcopy(mhi.mhi_daddr, otl->otl_addru.otlu_l2.otl2_dstaddr,
++		    ETHERADDRL);
++		bcopy(mhi.mhi_saddr, otl->otl_addru.otlu_l2.otl2_srcaddr,
++		    ETHERADDRL);
++	}
+ 	mutex_exit(&entry->ote_lock);
+ 
+ 	mutex_enter(&thdl->oth_lock);
+@@ -688,6 +695,11 @@ overlay_target_lookup_respond(overlay_target_hdl_t *thdl, void *arg)
+ 	const overlay_targ_resp_t *otr = arg;
+ 	overlay_target_entry_t *entry;
+ 	mblk_t *mp;
++	boolean_t is_router = B_FALSE;
++
++	if (IN6_IS_ADDR_UNSPECIFIED(&otr->otr_answer.otp_ip) &&
++	    otr->otr_answer.otp_port == 0)
++		is_router = B_TRUE;
+ 
+ 	mutex_enter(&thdl->oth_lock);
+ 	for (entry = list_head(&thdl->oth_outstanding); entry != NULL;
+@@ -708,6 +720,8 @@ overlay_target_lookup_respond(overlay_target_hdl_t *thdl, void *arg)
+ 	    sizeof (overlay_target_point_t));
+ 	entry->ote_flags &= ~OVERLAY_ENTRY_F_PENDING;
+ 	entry->ote_flags |= OVERLAY_ENTRY_F_VALID;
++	if (is_router)
++		entry->ote_flags |= OVERLAY_ENTRY_F_ROUTER;
+ 	mp = entry->ote_chead;
+ 	entry->ote_chead = NULL;
+ 	entry->ote_ctail = NULL;
+diff --git a/usr/src/uts/common/sys/overlay_impl.h b/usr/src/uts/common/sys/overlay_impl.h
+index 7d42bfca19..baa546587b 100644
+--- a/usr/src/uts/common/sys/overlay_impl.h
++++ b/usr/src/uts/common/sys/overlay_impl.h
+@@ -157,7 +157,8 @@ typedef enum overlay_target_entry_flags {
+ 	OVERLAY_ENTRY_F_PENDING		= 0x01,	/* lookup in progress */
+ 	OVERLAY_ENTRY_F_VALID		= 0x02,	/* entry is currently valid */
+ 	OVERLAY_ENTRY_F_DROP		= 0x04,	/* always drop target */
+-	OVERLAY_ENTRY_F_VALID_MASK	= 0x06
++	OVERLAY_ENTRY_F_VALID_MASK	= 0x06,
++	OVERLAY_ENTRY_F_ROUTER		= 0x08	/* entry is for router */
+ } overlay_target_entry_flags_t;
+ 
+ typedef struct overlay_target_entry {

@@ -1,0 +1,368 @@
+commit 586dc245b7a5931f3c897f038ad7b95fe0f6293b (refs/changes/92/3792/1)
+Author: Patrick Mooney <pmooney@pfmooney.com>
+Date:   2018-04-10T00:41:17+00:00 (1 year, 6 months ago)
+    
+    OS-6874 viona should untangle status and flags
+
+diff --git a/usr/src/cmd/bhyve/pci_virtio_viona.c b/usr/src/cmd/bhyve/pci_virtio_viona.c
+index a1da39d13b..cd5688a56a 100644
+--- a/usr/src/cmd/bhyve/pci_virtio_viona.c
++++ b/usr/src/cmd/bhyve/pci_virtio_viona.c
+@@ -162,18 +162,21 @@ pci_viona_ring_reset(struct pci_viona_softc *sc, int ring)
+ 	switch (ring) {
+ 	case VIONA_RXQ:
+ 	case VIONA_TXQ:
+-		error = ioctl(sc->vsc_vnafd, VNA_IOC_RING_RESET, ring);
+-		if (error != 0) {
+-			WPRINTF(("ioctl viona ring %u reset failed %d\n",
+-			    ring, errno));
+-		} else {
+-			sc->vsc_pfn[ring] = 0;
+-		}
+ 		break;
+ 	case VIONA_CTLQ:
+ 	default:
+-		break;
++		return;
++	}
++
++retry:
++	error = ioctl(sc->vsc_vnafd, VNA_IOC_RING_RESET, ring);
++	if (error == 0) {
++		sc->vsc_pfn[ring] = 0;
++		return;
++	} else if (errno == EINTR) {
++		goto retry;
+ 	}
++	WPRINTF(("ioctl viona ring %u reset failed %d\n", ring, errno));
+ }
+ 
+ static void
+diff --git a/usr/src/uts/i86pc/io/viona/viona.c b/usr/src/uts/i86pc/io/viona/viona.c
+index 427a45cfad..b76ccca4ca 100644
+--- a/usr/src/uts/i86pc/io/viona/viona.c
++++ b/usr/src/uts/i86pc/io/viona/viona.c
+@@ -173,20 +173,19 @@ struct viona_desb;
+ typedef struct viona_desb viona_desb_t;
+ 
+ enum viona_ring_state {
+-	VRS_RESET	= 0x00,	/* just allocated or reset */
+-	VRS_INIT	= 0x01,	/* init-ed with addrs and worker thread */
+-	VRS_RUN		= 0x02,	/* running work routine */
+-
+-	/* Additional flag(s): */
+-	VRS_SETUP	= 0x04,
+-	VRS_REQ_START	= 0x08,
+-	VRS_REQ_STOP	= 0x10,
+-};
++	VRS_RESET	= 0x0,	/* just allocated or reset */
++	VRS_SETUP	= 0x1,	/* addrs setup and starting worker thread */
++	VRS_INIT	= 0x2,	/* worker thread started & waiting to run */
++	VRS_RUN		= 0x3,	/* running work routine */
+ 
+-#define	VRS_STATE_MASK (VRS_RESET|VRS_INIT|VRS_RUN)
++};
++enum viona_ring_state_flags {
++	VRSF_REQ_START	= 0x1,	/* start running from INIT state */
++	VRSF_REQ_STOP	= 0x2,	/* stop running, clean up, goto RESET state */
++};
+ 
+-#define	VRING_NEED_BAIL(ring, proc)				\
+-		(((ring)->vr_state & VRS_REQ_STOP) != 0 ||	\
++#define	VRING_NEED_BAIL(ring, proc)					\
++		(((ring)->vr_state_flags & VRSF_REQ_STOP) != 0 ||	\
+ 		((proc)->p_flag & SEXITING) != 0)
+ 
+ typedef struct viona_vring {
+@@ -194,7 +193,8 @@ typedef struct viona_vring {
+ 
+ 	kmutex_t	vr_lock;
+ 	kcondvar_t	vr_cv;
+-	uint_t		vr_state;
++	uint16_t	vr_state;
++	uint16_t	vr_state_flags;
+ 	uint_t		vr_xfer_outstanding;
+ 	kthread_t	*vr_worker_thread;
+ 	viona_desb_t	*vr_desb;
+@@ -308,12 +308,13 @@ static int viona_chpoll(dev_t dev, short events, int anyyet, short *reventsp,
+     struct pollhead **phpp);
+ 
+ static int viona_ioc_create(viona_soft_state_t *, void *, int, cred_t *);
+-static int viona_ioc_delete(viona_soft_state_t *ss);
++static int viona_ioc_delete(viona_soft_state_t *, boolean_t);
+ 
+ static void *viona_gpa2kva(viona_link_t *link, uint64_t gpa, size_t len);
+ 
+ static void viona_ring_alloc(viona_link_t *, viona_vring_t *);
+ static void viona_ring_free(viona_vring_t *);
++static int viona_ring_reset(viona_vring_t *, boolean_t);
+ static kthread_t *viona_create_worker(viona_vring_t *);
+ 
+ static int viona_ioc_set_notify_ioport(viona_link_t *, uint_t);
+@@ -559,7 +560,7 @@ viona_close(dev_t dev, int flag, int otype, cred_t *credp)
+ 		return (ENXIO);
+ 	}
+ 
+-	viona_ioc_delete(ss);
++	VERIFY0(viona_ioc_delete(ss, B_TRUE));
+ 	ddi_soft_state_free(viona_state, minor);
+ 	id_free(viona_minors, minor);
+ 
+@@ -583,7 +584,7 @@ viona_ioctl(dev_t dev, int cmd, intptr_t data, int md, cred_t *cr, int *rv)
+ 	case VNA_IOC_CREATE:
+ 		return (viona_ioc_create(ss, dptr, md, cr));
+ 	case VNA_IOC_DELETE:
+-		return (viona_ioc_delete(ss));
++		return (viona_ioc_delete(ss, B_FALSE));
+ 	default:
+ 		break;
+ 	}
+@@ -770,26 +771,37 @@ bail:
+ }
+ 
+ static int
+-viona_ioc_delete(viona_soft_state_t *ss)
++viona_ioc_delete(viona_soft_state_t *ss, boolean_t on_close)
+ {
+ 	viona_link_t *link;
+ 
+ 	mutex_enter(&ss->ss_lock);
+ 	if ((link = ss->ss_link) == NULL) {
++		/* Link destruction already complete */
+ 		mutex_exit(&ss->ss_lock);
+ 		return (0);
+ 	}
+ 
+ 	if (link->l_destroyed) {
+-		/* Another thread made it here first. */
++		/*
++		 * Link destruction has been started by another thread, but has
++		 * not completed.  This condition should be impossible to
++		 * encounter when performing the on-close destroy of the link,
++		 * since racing ioctl accessors must necessarily be absent.
++		 */
++		VERIFY(!on_close);
+ 		mutex_exit(&ss->ss_lock);
+ 		return (EAGAIN);
+ 	}
+ 	link->l_destroyed = B_TRUE;
+ 	mutex_exit(&ss->ss_lock);
+ 
+-	VERIFY0(viona_ioc_ring_reset(link, VIONA_VQ_RX));
+-	VERIFY0(viona_ioc_ring_reset(link, VIONA_VQ_TX));
++	/*
++	 * Return the rings to their reset state, ignoring any possible
++	 * interruptions from signals.
++	 */
++	VERIFY0(viona_ring_reset(&link->l_vrings[VIONA_VQ_RX], B_FALSE));
++	VERIFY0(viona_ring_reset(&link->l_vrings[VIONA_VQ_TX], B_FALSE));
+ 
+ 	mutex_enter(&ss->ss_lock);
+ 	VERIFY0(viona_ioc_set_notify_ioport(link, 0));
+@@ -847,6 +859,36 @@ viona_ring_free(viona_vring_t *ring)
+ 	ring->vr_link = NULL;
+ }
+ 
++static int
++viona_ring_reset(viona_vring_t *ring, boolean_t heed_signals)
++{
++	mutex_enter(&ring->vr_lock);
++	if (ring->vr_state == VRS_RESET) {
++		mutex_exit(&ring->vr_lock);
++		return (0);
++	}
++
++	if ((ring->vr_state_flags & VRSF_REQ_STOP) == 0) {
++		ring->vr_state_flags |= VRSF_REQ_STOP;
++		cv_broadcast(&ring->vr_cv);
++	}
++	while (ring->vr_state != VRS_RESET) {
++		if (!heed_signals) {
++			cv_wait(&ring->vr_cv, &ring->vr_lock);
++		} else {
++			int rs;
++
++			rs = cv_wait_sig(&ring->vr_cv, &ring->vr_lock);
++			if (rs <= 0 && ring->vr_state != VRS_RESET) {
++				mutex_exit(&ring->vr_lock);
++				return (EINTR);
++			}
++		}
++	}
++	mutex_exit(&ring->vr_lock);
++	return (0);
++}
++
+ static int
+ viona_ioc_ring_init(viona_link_t *link, void *udata, int md)
+ {
+@@ -876,6 +918,7 @@ viona_ioc_ring_init(viona_link_t *link, void *udata, int md)
+ 		mutex_exit(&ring->vr_lock);
+ 		return (EBUSY);
+ 	}
++	VERIFY(ring->vr_state_flags == 0);
+ 
+ 	pos = kri.ri_qaddr;
+ 	desc_sz = cnt * sizeof (struct virtio_desc);
+@@ -941,7 +984,7 @@ viona_ioc_ring_init(viona_link_t *link, void *udata, int md)
+ 		goto fail;
+ 	}
+ 	ring->vr_worker_thread = t;
+-	ring->vr_state = VRS_RESET|VRS_SETUP;
++	ring->vr_state = VRS_SETUP;
+ 	cv_broadcast(&ring->vr_cv);
+ 	mutex_exit(&ring->vr_lock);
+ 	return (0);
+@@ -949,6 +992,7 @@ viona_ioc_ring_init(viona_link_t *link, void *udata, int md)
+ fail:
+ 	if (ring->vr_desb != NULL) {
+ 		kmem_free(ring->vr_desb, sizeof (viona_desb_t) * cnt);
++		ring->vr_desb = NULL;
+ 	}
+ 	ring->vr_size = 0;
+ 	ring->vr_mask = 0;
+@@ -961,7 +1005,6 @@ fail:
+ 	ring->vr_used_idx = NULL;
+ 	ring->vr_used_ring = NULL;
+ 	ring->vr_used_avail_event = NULL;
+-	ring->vr_state = VRS_RESET;
+ 	mutex_exit(&ring->vr_lock);
+ 	return (err);
+ }
+@@ -976,29 +1019,13 @@ viona_ioc_ring_reset(viona_link_t *link, uint_t idx)
+ 	}
+ 	ring = &link->l_vrings[idx];
+ 
+-	mutex_enter(&ring->vr_lock);
+-	if (ring->vr_state != VRS_RESET) {
+-		ring->vr_state |= VRS_REQ_STOP;
+-		cv_broadcast(&ring->vr_cv);
+-		while (ring->vr_state != VRS_RESET) {
+-			cv_wait_sig(&ring->vr_cv, &ring->vr_lock);
+-		}
+-	}
+-	if (ring->vr_desb != NULL) {
+-		VERIFY(ring->vr_xfer_outstanding == 0);
+-		kmem_free(ring->vr_desb, sizeof (viona_desb_t) * ring->vr_size);
+-		ring->vr_desb = NULL;
+-	}
+-	mutex_exit(&ring->vr_lock);
+-
+-	return (0);
++	return (viona_ring_reset(ring, B_TRUE));
+ }
+ 
+ static int
+ viona_ioc_ring_kick(viona_link_t *link, uint_t idx)
+ {
+ 	viona_vring_t *ring;
+-	uint_t state;
+ 	int err;
+ 
+ 	if (idx >= VIONA_VQ_MAX) {
+@@ -1007,10 +1034,16 @@ viona_ioc_ring_kick(viona_link_t *link, uint_t idx)
+ 	ring = &link->l_vrings[idx];
+ 
+ 	mutex_enter(&ring->vr_lock);
+-	state = ring->vr_state & VRS_STATE_MASK;
+-	switch (state) {
++	switch (ring->vr_state) {
++	case VRS_SETUP:
++		/*
++		 * An early kick to a ring which is starting its worker thread
++		 * is fine.  Once that thread is active, it will process the
++		 * start-up request immediately.
++		 */
++		/* FALLTHROUGH */
+ 	case VRS_INIT:
+-		ring->vr_state |= VRS_REQ_START;
++		ring->vr_state_flags |= VRSF_REQ_START;
+ 		/* FALLTHROUGH */
+ 	case VRS_RUN:
+ 		cv_broadcast(&ring->vr_cv);
+@@ -1110,11 +1143,10 @@ viona_worker_rx(viona_vring_t *ring, viona_link_t *link)
+ 	proc_t *p = ttoproc(curthread);
+ 
+ 	ASSERT(MUTEX_HELD(&ring->vr_lock));
+-	ASSERT(ring->vr_state == (VRS_INIT|VRS_REQ_START));
++	ASSERT3U(ring->vr_state, ==, VRS_RUN);
+ 
+ 	atomic_or_16(ring->vr_used_flags, VRING_USED_F_NO_NOTIFY);
+ 	mac_rx_set(link->l_mch, viona_rx, link);
+-	ring->vr_state = VRS_RUN;
+ 
+ 	do {
+ 		/*
+@@ -1144,9 +1176,8 @@ viona_worker_tx(viona_vring_t *ring, viona_link_t *link)
+ 	proc_t *p = ttoproc(curthread);
+ 
+ 	ASSERT(MUTEX_HELD(&ring->vr_lock));
+-	ASSERT(ring->vr_state == (VRS_INIT|VRS_REQ_START));
++	ASSERT3U(ring->vr_state, ==, VRS_RUN);
+ 
+-	ring->vr_state = VRS_RUN;
+ 	mutex_exit(&ring->vr_lock);
+ 
+ 	for (;;) {
+@@ -1203,6 +1234,12 @@ viona_worker_tx(viona_vring_t *ring, viona_link_t *link)
+ 		 */
+ 		cv_wait(&ring->vr_cv, &ring->vr_lock);
+ 	}
++
++	/* Free any desb resources before the ring is completely stopped */
++	if (ring->vr_desb != NULL) {
++		kmem_free(ring->vr_desb, sizeof (viona_desb_t) * ring->vr_size);
++		ring->vr_desb = NULL;
++	}
+ }
+ 
+ static void
+@@ -1213,20 +1250,28 @@ viona_worker(void *arg)
+ 	proc_t *p = ttoproc(curthread);
+ 
+ 	mutex_enter(&ring->vr_lock);
+-	VERIFY(ring->vr_state == (VRS_RESET|VRS_SETUP));
++	VERIFY3U(ring->vr_state, ==, VRS_SETUP);
++
++	/* Bail immediately if ring shutdown or process exit was requested */
++	if (VRING_NEED_BAIL(ring, p)) {
++		goto cleanup;
++	}
+ 
+ 	/* Report worker thread as alive and notify creator */
+ 	ring->vr_state = VRS_INIT;
+ 	cv_broadcast(&ring->vr_cv);
+ 
+-	while (ring->vr_state == VRS_INIT) {
++	while (ring->vr_state_flags == 0) {
+ 		(void) cv_wait_sig(&ring->vr_cv, &ring->vr_lock);
+ 
+ 		if (VRING_NEED_BAIL(ring, p)) {
+ 			goto cleanup;
+ 		}
+ 	}
+-	ASSERT(ring->vr_state & VRS_REQ_START);
++
++	ASSERT((ring->vr_state_flags & VRSF_REQ_START) != 0);
++	ring->vr_state = VRS_RUN;
++	ring->vr_state_flags &= ~VRSF_REQ_START;
+ 
+ 	/* Process actual work */
+ 	if (ring == &link->l_vrings[VIONA_VQ_RX]) {
+@@ -1238,8 +1283,16 @@ viona_worker(void *arg)
+ 	}
+ 
+ cleanup:
++	/* Free any desb resources before the ring is completely stopped */
++	if (ring->vr_desb != NULL) {
++		VERIFY(ring->vr_xfer_outstanding == 0);
++		kmem_free(ring->vr_desb, sizeof (viona_desb_t) * ring->vr_size);
++		ring->vr_desb = NULL;
++	}
++
+ 	ring->vr_cur_aidx = 0;
+ 	ring->vr_state = VRS_RESET;
++	ring->vr_state_flags = 0;
+ 	ring->vr_worker_thread = NULL;
+ 	cv_broadcast(&ring->vr_cv);
+ 	mutex_exit(&ring->vr_lock);

@@ -1,0 +1,888 @@
+commit aa7f7eae08332b11828ac3ced528d1da9db8fe0c (refs/changes/69/2469/1)
+Author: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date:   2017-08-28T16:03:36+00:00 (2 years, 1 month ago)
+    
+    OS-6306 accurate in-kernel zone RSS tracking
+
+diff --git a/usr/src/cmd/zoneadmd/mcap.c b/usr/src/cmd/zoneadmd/mcap.c
+index 88b72b6c55..d280c49b5b 100644
+--- a/usr/src/cmd/zoneadmd/mcap.c
++++ b/usr/src/cmd/zoneadmd/mcap.c
+@@ -28,29 +28,18 @@
+  * the associated zone's physical memory.  A thread to do this is started
+  * when the zone boots and is halted when the zone shuts down.
+  *
+- * Because of the way that the VM system is currently implemented, there is no
+- * way to go from the bottom up (page to process to zone).  Thus, there is no
+- * obvious way to hook an rctl into the kernel's paging code to enforce a hard
+- * memory cap.  Instead, we implement a soft physical memory cap which looks
+- * at the zone's overall rss and once it is over the cap, works from the top
+- * down (zone to process to page), looking at zone processes, to determine
+- * what to try to pageout to get the zone under its memory cap.
+- *
+- * The code uses the fast, cheap, but potentially very inaccurate sum of the
+- * rss values from psinfo_t to first approximate the zone's rss and will
+- * fallback to the vm_getusage syscall to determine the zone's rss if needed.
++ * The code obtains the accurate in-kernel RSS for the zone.
+  * It then checks the rss against the zone's zone.max-physical-memory rctl.
+  * Once the zone goes over its cap, then this thread will work through the
+  * zone's /proc process list, Pgrab-bing each process and stepping through the
+- * address space segments attempting to use pr_memcntl(...MS_INVALCURPROC...)
+- * to pageout pages, until the zone is again under its cap.
++ * address space segments, using a private option (_RUSAGESYS_INVALMAP) to the
++ * private SYS_rusagesys syscall to attempt to unload page translations, until
++ * the zone is again under its cap.
+  *
+  * Although zone memory capping is implemented as a soft cap by this user-level
+  * thread, the interfaces around memory caps that are exposed to the user are
+  * the standard ones; an rctl and kstats.  This thread uses the rctl value
+- * to obtain the cap and works with the zone kernel code to update the kstats.
+- * If the implementation ever moves into the kernel, these exposed interfaces
+- * do not need to change.
++ * to obtain the cap.
+  *
+  * The thread adaptively sleeps, periodically checking the state of the
+  * zone.  As the zone's rss gets closer to the cap, the thread will wake up
+@@ -129,14 +118,6 @@
+ #define	TUNE_NPAGE	"phys-mcap-no-pageout"
+ #define	TUNE_NPFTHROT	"phys-mcap-no-pf-throttle"
+ 
+-/*
+- * These are only used in get_mem_info but global. We always need scale_rss and
+- * prev_fast_rss to be persistent but we also have the other two global so we
+- * can easily see these with mdb.
+- */
+-uint64_t	scale_rss = 0;
+-uint64_t	prev_fast_rss = 0;
+-uint64_t	fast_rss = 0;
+ uint64_t	accurate_rss = 0;
+ 
+ /*
+@@ -160,8 +141,6 @@ static boolean_t skip_vmusage = B_FALSE;
+ static boolean_t skip_pageout = B_FALSE;
+ static boolean_t skip_pf_throttle = B_FALSE;
+ 
+-static zlog_t	*logp;
+-
+ static int64_t check_suspend();
+ static void get_mcap_tunables();
+ 
+@@ -535,127 +514,12 @@ done:
+ static uint64_t
+ get_mem_info()
+ {
+-	uint64_t		n = 1;
+-	zsd_vmusage64_t		buf;
+-	uint64_t		tmp_rss;
+-	DIR			*pdir = NULL;
+-	struct dirent		*dent;
+-
+-	/*
+-	 * Start by doing the fast, cheap RSS calculation using the rss value
+-	 * in psinfo_t.  Because that's per-process, it can lead to double
+-	 * counting some memory and overestimating how much is being used, but
+-	 * as long as that's not over the cap, then we don't need do the
+-	 * expensive calculation.
+-	 *
+-	 * If we have to do the expensive calculation, we remember the scaling
+-	 * factor so that we can try to use that on subsequent iterations for
+-	 * the fast rss.
+-	 */
+-	if (shutting_down)
+-		return (0);
+-
+-	if ((pdir = opendir(zoneproc)) == NULL)
+-		return (0);
+-
+-	accurate_rss = 0;
+-	fast_rss = 0;
+-	while (!shutting_down && (dent = readdir(pdir)) != NULL) {
+-		pid_t		pid;
+-		int		psfd;
+-		int64_t		rss;
+-		char		pathbuf[MAXPATHLEN];
+-		psinfo_t	psinfo;
+-
+-		if (strcmp(".", dent->d_name) == 0 ||
+-		    strcmp("..", dent->d_name) == 0)
+-			continue;
+-
+-		pid = atoi(dent->d_name);
+-		if (pid == 0 || pid == 1)
+-			continue;
+-
+-		(void) snprintf(pathbuf, sizeof (pathbuf), "%s/%d/psinfo",
+-		    zoneproc, pid);
+-
+-		rss = 0;
+-		if ((psfd = open(pathbuf, O_RDONLY, 0000)) != -1) {
+-			if (pread(psfd, &psinfo, sizeof (psinfo), 0) ==
+-			    sizeof (psinfo))
+-				rss = (int64_t)psinfo.pr_rssize;
+-
+-			(void) close(psfd);
+-		}
+-
+-		fast_rss += rss;
+-	}
+-
+-	(void) closedir(pdir);
+-
+ 	if (shutting_down)
+ 		return (0);
+ 
+-	debug("fast rss: %lluKB, scale: %llu, prev: %lluKB\n", fast_rss,
+-	    scale_rss, prev_fast_rss);
+-
+-	/* see if we can get by with a scaled fast rss */
+-	tmp_rss = fast_rss;
+-	if (scale_rss > 1 && prev_fast_rss > 0) {
+-		/*
+-		 * Only scale the fast value if it hasn't ballooned too much
+-		 * to trust.
+-		 */
+-		if (fast_rss / prev_fast_rss < 2) {
+-			fast_rss /= scale_rss;
+-			debug("scaled fast rss: %lluKB\n", fast_rss);
+-		}
+-	}
+-
+-	if (fast_rss <= zone_rss_cap || skip_vmusage) {
+-		uint64_t zone_rss_bytes;
+-
+-		zone_rss_bytes = fast_rss * 1024;
+-		/* Use the zone's approx. RSS in the kernel */
+-		(void) zone_setattr(zid, ZONE_ATTR_RSS, &zone_rss_bytes, 0);
+-		return (fast_rss);
+-	}
+-
+-	buf.vmu_id = zid;
+-
+-	/* get accurate usage (cached data may be up to 5 seconds old) */
+-	if (syscall(SYS_rusagesys, _RUSAGESYS_GETVMUSAGE, VMUSAGE_A_ZONE, 5,
+-	    (uintptr_t)&buf, (uintptr_t)&n) != 0) {
+-		debug("vmusage failed\n");
+-		(void) sleep_shutdown(1);
+-		return (0);
+-	}
+-
+-	if (n > 1) {
+-		/* This should never happen */
+-		debug("vmusage returned more than one result\n");
+-		(void) sleep_shutdown(1);
+-		return (0);
+-	}
+-
+-	if (buf.vmu_id != zid) {
+-		/* This should never happen */
+-		debug("vmusage returned the incorrect zone\n");
+-		(void) sleep_shutdown(1);
+-		return (0);
+-	}
+-
+-	accurate_rss = buf.vmu_rss_all / 1024;
+-
+-	/* calculate scaling factor to use for fast_rss from now on */
+-	if (accurate_rss > 0) {
+-		scale_rss = fast_rss / accurate_rss;
+-		debug("new scaling factor: %llu\n", scale_rss);
+-		/* remember the fast rss when we had to get the accurate rss */
+-		prev_fast_rss = tmp_rss;
+-	}
+-
+-	debug("accurate rss: %lluKB, scale: %llu, prev: %lluKB\n", accurate_rss,
+-	    scale_rss, prev_fast_rss);
++	(void) zone_getattr(zid, ZONE_ATTR_RSS, &accurate_rss,
++	    sizeof (accurate_rss));
++	accurate_rss /= 1024;
+ 	return (accurate_rss);
+ }
+ 
+@@ -987,75 +851,6 @@ has_proc()
+ 	return (fnd);
+ }
+ 
+-/*
+- * We run this loop for brands with no /proc to simply update the RSS, using
+- * the cheap GZ /proc data, every 5 minutes.
+- */
+-static void
+-no_procfs()
+-{
+-	DIR			*pdir = NULL;
+-	struct dirent		*dent;
+-	uint64_t		zone_rss_bytes;
+-
+-	(void) sleep_shutdown(30);
+-	while (!shutting_down) {
+-		/*
+-		 * Just do the fast, cheap RSS calculation using the rss value
+-		 * in psinfo_t.  Because that's per-process, it can lead to
+-		 * double counting some memory and overestimating how much is
+-		 * being used. Since there is no /proc in the zone, we use the
+-		 * GZ /proc and check for the correct zone.
+-		 */
+-		if ((pdir = opendir("/proc")) == NULL)
+-			return;
+-
+-		fast_rss = 0;
+-		while (!shutting_down && (dent = readdir(pdir)) != NULL) {
+-			pid_t		pid;
+-			int		psfd;
+-			int64_t		rss;
+-			char		pathbuf[MAXPATHLEN];
+-			psinfo_t	psinfo;
+-
+-			if (strcmp(".", dent->d_name) == 0 ||
+-			    strcmp("..", dent->d_name) == 0)
+-				continue;
+-
+-			pid = atoi(dent->d_name);
+-			if (pid == 0 || pid == 1)
+-				continue;
+-
+-			(void) snprintf(pathbuf, sizeof (pathbuf),
+-			    "/proc/%d/psinfo", pid);
+-
+-			rss = 0;
+-			if ((psfd = open(pathbuf, O_RDONLY, 0000)) != -1) {
+-				if (pread(psfd, &psinfo, sizeof (psinfo), 0) ==
+-				    sizeof (psinfo)) {
+-					if (psinfo.pr_zoneid == zid)
+-						rss = (int64_t)psinfo.pr_rssize;
+-				}
+-
+-				(void) close(psfd);
+-			}
+-
+-			fast_rss += rss;
+-		}
+-
+-		(void) closedir(pdir);
+-
+-		if (shutting_down)
+-			return;
+-
+-		zone_rss_bytes = fast_rss * 1024;
+-		/* Use the zone's approx. RSS in the kernel */
+-		(void) zone_setattr(zid, ZONE_ATTR_RSS, &zone_rss_bytes, 0);
+-
+-		(void) sleep_shutdown(300);
+-	}
+-}
+-
+ /*
+  * Thread that checks zone's memory usage and when over the cap, goes through
+  * the zone's process list trying to pageout processes to get under the cap.
+@@ -1066,21 +861,17 @@ mcap_zone()
+ 	DIR *pdir = NULL;
+ 	int64_t excess;
+ 
+-	debug("thread startup\n");
+-
+-	get_mcap_tunables();
+-
+ 	/*
+-	 * If the zone has no /proc filesystem, we can't use the fast algorithm
+-	 * to check RSS or pageout any processes. All we can do is periodically
+-	 * update it's RSS kstat using the expensive sycall.
++	 * If the zone has no /proc filesystem (e.g. KVM), we can't pageout any
++	 * processes. Terminate this thread.
+ 	 */
+ 	if (!has_proc()) {
+-		no_procfs();
+-		debug("thread shutdown\n");
+ 		return;
+ 	}
+ 
++	debug("thread startup\n");
++	get_mcap_tunables();
++
+ 	/*
+ 	 * When first starting it is likely lots of other zones are starting
+ 	 * too because the system is booting.  Since we just started the zone
+@@ -1172,7 +963,6 @@ create_mcap_thread(zlog_t *zlogp, zoneid_t id)
+ 
+ 	shutting_down = 0;
+ 	zid = id;
+-	logp = zlogp;
+ 
+ 	/* all but the lx brand currently use /proc */
+ 	if (strcmp(brand_name, "lx") == 0) {
+diff --git a/usr/src/uts/common/os/zone.c b/usr/src/uts/common/os/zone.c
+index 2912df0a29..3b6df3a906 100644
+--- a/usr/src/uts/common/os/zone.c
++++ b/usr/src/uts/common/os/zone.c
+@@ -328,8 +328,8 @@ static list_t zone_active;
+ static list_t zone_deathrow;
+ static kmutex_t zone_deathrow_lock;
+ 
+-/* number of zones is limited by virtual interface limit in IP */
+-uint_t maxzones = 8192;
++/* This can be dynamically reduced if various subsystems hit internal limits. */
++uint_t maxzones = MAX_ZONES;
+ 
+ /* Event channel to sent zone state change notifications */
+ evchan_t *zone_event_chan;
+@@ -3063,22 +3063,6 @@ zone_set_page_fault_delay(zone_t *zone, const uint32_t *pfdelay)
+ 	return (err);
+ }
+ 
+-/*
+- * The zone_set_rss function is used to set the zone's RSS when we do the
+- * fast, approximate calculation in user-land.
+- */
+-static int
+-zone_set_rss(zone_t *zone, const uint64_t *prss)
+-{
+-	uint64_t rss;
+-	int err;
+-
+-	if ((err = copyin(prss, &rss, sizeof (uint64_t))) == 0)
+-		zone->zone_phys_mem = rss;
+-
+-	return (err);
+-}
+-
+ static int
+ zone_set_sched_class(zone_t *zone, const char *new_class)
+ {
+@@ -6228,6 +6212,14 @@ zone_getattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 		    bufsize) != 0)
+ 			error = EFAULT;
+ 		break;
++	case ZONE_ATTR_RSS:
++		size = sizeof (zone->zone_phys_mem);
++		if (bufsize > size)
++			bufsize = size;
++		if (buf != NULL &&
++		    copyout(&zone->zone_phys_mem, buf, bufsize) != 0)
++			error = EFAULT;
++		break;
+ 	default:
+ 		if ((attr >= ZONE_ATTR_BRAND_ATTRS) && ZONE_IS_BRANDED(zone)) {
+ 			size = bufsize;
+@@ -6281,8 +6273,7 @@ zone_setattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 	 */
+ 	zone_status = zone_status_get(zone);
+ 	if (attr != ZONE_ATTR_PMCAP_NOVER && attr != ZONE_ATTR_PMCAP_PAGEOUT &&
+-	    attr != ZONE_ATTR_PG_FLT_DELAY && attr != ZONE_ATTR_RSS &&
+-	    zone_status > ZONE_IS_READY) {
++	    attr != ZONE_ATTR_PG_FLT_DELAY && zone_status > ZONE_IS_READY) {
+ 		err = EINVAL;
+ 		goto done;
+ 	}
+@@ -6313,9 +6304,6 @@ zone_setattr(zoneid_t zoneid, int attr, void *buf, size_t bufsize)
+ 	case ZONE_ATTR_PG_FLT_DELAY:
+ 		err = zone_set_page_fault_delay(zone, (const uint32_t *)buf);
+ 		break;
+-	case ZONE_ATTR_RSS:
+-		err = zone_set_rss(zone, (const uint64_t *)buf);
+-		break;
+ 	case ZONE_ATTR_SECFLAGS:
+ 		err = zone_set_secflags(zone, (psecflags_t *)buf);
+ 		break;
+@@ -8074,3 +8062,207 @@ done:
+ 	else
+ 		return (0);
+ }
++
++/*
++ * "zone_over_cap" is an array indexed by zoneid, indicating which zones are
++ * over their physical memory cap. This is the interface for the page scanner
++ * to use when reclaiming pages for zones that are over their cap.
++ *
++ * The page scanner can run when "zone_num_over_cap" is non-zero. It can
++ * do a direct lookup of a zoneid into the "zone_over_cap" array to determine
++ * if that zone is over its cap.
++ *
++ * There is no locking for the page scanner to perform these two checks.
++ * We cannot have the page scanner blocking normal paging activity for
++ * running processes. Because the physical memory cap is a soft cap, it is
++ * fine for the scanner to simply read the current state of the counter and
++ * the zone's entry in the array. The scanner should never modify either of
++ * these items. Internally the entries and the counter are managed with the
++ * "zone_physcap_lock" mutex as we add/remove mappings to pages. We take care
++ * to ensure that we only take the zone_physcap_lock mutex when a zone is
++ * transitioning over/under its physical memory cap.
++ *
++ * The "zone_incr_capped", "zone_decr_capped" and "zone_clr_capped" functions
++ * are used manage the "zone_over_cap" array and associated counter.
++ */
++uint8_t zone_over_cap[MAX_ZONES];
++uint_t zone_num_over_cap;
++static kmutex_t zone_physcap_lock;
++
++static void
++zone_incr_capped(zone_t *zone)
++{
++	/* See if over (unlimited is UINT64_MAX), or already marked that way. */
++	if (zone->zone_phys_mem <= zone->zone_phys_mem_ctl ||
++	    zone_over_cap[zone->zone_id] == 1) {
++		return;
++	}
++
++	mutex_enter(&zone_physcap_lock);
++	/* Recheck setting under mutex */
++	if (zone->zone_phys_mem > zone->zone_phys_mem_ctl &&
++	    zone_over_cap[zone->zone_id] == 0) {
++		zone_over_cap[zone->zone_id] = 1;
++		zone_num_over_cap++;
++	}
++	mutex_exit(&zone_physcap_lock);
++}
++
++static void
++zone_decr_capped(zone_t *zone)
++{
++	/*
++	 * See if under, or already marked that way. There is no need to
++	 * check for an unlimited cap (zone_phys_mem_ctl == UINT64_MAX)
++	 * since we'll never add the zone in zone_incr_capped_zone().
++	 */
++	if (zone_over_cap[zone->zone_id] == 0 ||
++	    zone->zone_phys_mem >= zone->zone_phys_mem_ctl) {
++		return;
++	}
++
++	mutex_enter(&zone_physcap_lock);
++	/* Recheck setting under mutex */
++	if (zone->zone_phys_mem < zone->zone_phys_mem_ctl &&
++	    zone_over_cap[zone->zone_id] == 1) {
++		ASSERT(zone_num_over_cap > 0);
++		zone_over_cap[zone->zone_id] = 0;
++		zone_num_over_cap--;
++	}
++	mutex_exit(&zone_physcap_lock);
++}
++
++/* Clear out an entry for a zone which no longer exists. */
++static void
++zone_clr_capped(zoneid_t zid)
++{
++	if (zone_over_cap[zid] == 0)
++		return;
++
++	mutex_enter(&zone_physcap_lock);
++	/* Recheck setting under mutex */
++	if (zone_over_cap[zid] == 1) {
++		ASSERT(zone_num_over_cap > 0);
++		zone_over_cap[zid] = 0;
++		zone_num_over_cap--;
++	}
++	mutex_exit(&zone_physcap_lock);
++}
++
++/*
++ * For zone_add_page() and zone_rm_page(), access to the page we're touching is
++ * controlled by our caller's locking.
++ * On x86 our callers already did: ASSERT(x86_hm_held(pp))
++ * On SPARC our callers already did: ASSERT(sfmmu_mlist_held(pp))
++ */
++void
++zone_add_page(page_t *pp)
++{
++	int64_t psize;
++
++	/* Skip pages in segkmem, etc. (KV_KVP, ...) */
++	if (PP_ISKAS(pp))
++		return;
++
++	ASSERT(!PP_ISFREE(pp));
++
++	if (pp->p_zoneid == curzone->zone_id) {
++		/* Another mapping to this page for this zone, do nothing */
++		return;
++	}
++
++	if (pp->p_share == 0) {
++		/* First mapping to this page. */
++		pp->p_zoneid = curzone->zone_id;
++		if (pp->p_szc == 0) {
++			psize = (int64_t)PAGESIZE;
++		} else {
++			/* large page */
++			psize = (int64_t)page_get_pagesize(pp->p_szc);
++		}
++		atomic_add_64_nv((uint64_t *)&curzone->zone_phys_mem, psize);
++		zone_incr_capped(curzone);
++		return;
++	}
++
++	if (pp->p_zoneid != ALL_ZONES) {
++		/*
++		 * The page is now being shared across a different zone.
++		 * Decrement the original zone's usage.
++		 */
++		zoneid_t id;
++		zone_t *zone;
++
++		id = pp->p_zoneid;
++		pp->p_zoneid = ALL_ZONES;
++		if ((zone = zone_find_by_id(id)) == NULL) {
++			/*
++			 * Perhaps the zone has halted but since we have the
++			 * page locked down, the page hasn't been freed yet.
++			 * In any case, there is no zone RSS to update.
++			 */
++			zone_clr_capped(id);
++			return;
++		}
++
++		if (pp->p_szc == 0) {
++			psize = (int64_t)PAGESIZE;
++		} else {
++			/* large page */
++			psize = (int64_t)page_get_pagesize(pp->p_szc);
++		}
++		atomic_add_64_nv((uint64_t *)&zone->zone_phys_mem, -psize);
++		if ((int64_t)zone->zone_phys_mem < 0) {
++			DTRACE_PROBE1(zone__ap__neg, zoneid_t, id);
++			cmn_err(CE_WARN, "zone %d: RSS negative", id);
++			zone->zone_phys_mem = 0;
++		}
++		zone_decr_capped(zone);
++		zone_rele(zone);
++	}
++}
++
++void
++zone_rm_page(page_t *pp)
++{
++	zone_t *zone;
++	boolean_t do_rele = B_FALSE;
++	int64_t psize;
++
++	/* Skip pages in segkmem, etc. (KV_KVP, ...) */
++	if (PP_ISKAS(pp))
++		return;
++
++	if (pp->p_zoneid == ALL_ZONES || pp->p_share != 0)
++		return;
++
++	/* This is the last mapping to the page for a zone. */
++	if (pp->p_szc == 0) {
++		psize = (int64_t)PAGESIZE;
++	} else {
++		/* large page */
++		psize = (int64_t)page_get_pagesize(pp->p_szc);
++	}
++
++	if (pp->p_zoneid == curzone->zone_id) {
++		zone = curzone;
++	} else if ((zone = zone_find_by_id(pp->p_zoneid)) != NULL) {
++		do_rele = B_TRUE;
++	}
++
++	if (zone != NULL) {
++		atomic_add_64_nv((uint64_t *)&zone->zone_phys_mem, -psize);
++		if ((int64_t)zone->zone_phys_mem < 0) {
++			DTRACE_PROBE1(zone__rp__neg, zoneid_t, zone->zone_id);
++			cmn_err(CE_WARN, "zone %d: RSS negative",
++			    zone->zone_id);
++			zone->zone_phys_mem = 0;
++		}
++		zone_decr_capped(zone);
++		if (do_rele)
++			zone_rele(zone);
++	} else {
++		zone_clr_capped(pp->p_zoneid);
++	}
++	pp->p_zoneid = ALL_ZONES;
++}
+diff --git a/usr/src/uts/common/sys/zone.h b/usr/src/uts/common/sys/zone.h
+index 3bf7979174..32b2b7bf38 100644
+--- a/usr/src/uts/common/sys/zone.h
++++ b/usr/src/uts/common/sys/zone.h
+@@ -22,7 +22,7 @@
+  * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright 2014 Nexenta Systems, Inc. All rights reserved.
+  * Copyright 2014 Igor Kozhukhov <ikozhukhov@gmail.com>.
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_ZONE_H
+@@ -51,15 +51,27 @@ extern "C" {
+  * NOTE
+  *
+  * The contents of this file are private to the implementation of
+- * Solaris and are subject to change at any time without notice.
++ * illumos and are subject to change at any time without notice.
+  * Applications and drivers using these interfaces may fail to
+  * run on future releases.
+  */
+ 
+ /* Available both in kernel and for user space */
+ 
+-/* zone id restrictions and special ids */
+-#define	MAX_ZONEID	9999
++/*
++ * zone id restrictions and special ids.
++ * See 'maxzones' for run-time zone limit.
++ *
++ * The current 8k value for MAX_ZONES was originally derived from the virtual
++ * interface limit in IP when "shared-stack" was the only supported networking
++ * for zones. The virtual interface limit is the number of addresses allowed
++ * on an interface (see MAX_ADDRS_PER_IF). Even with exclusive stacks, an 8k
++ * zone limit is still a reasonable choice at this time, given other limits
++ * within the kernel. Since we only support 8192 zones (which includes GZ),
++ * there is no point in allowing MAX_ZONEID > 8k.
++ */
++#define	MAX_ZONES	8192
++#define	MAX_ZONEID	(MAX_ZONES - 1)
+ #define	MIN_USERZONEID	1	/* lowest user-creatable zone ID */
+ #define	MIN_ZONEID	0	/* minimum zone ID on system */
+ #define	GLOBAL_ZONEID	0
+@@ -647,7 +659,7 @@ typedef struct zone {
+ 	zone_zfs_kstat_t *zone_zfs_stats;
+ 
+ 	/*
+-	 * Solaris Auditing per-zone audit context
++	 * illumos Auditing per-zone audit context
+ 	 */
+ 	struct au_kcontext	*zone_audit_kctxt;
+ 	/*
+@@ -963,6 +975,14 @@ extern void mount_completed(zone_t *);
+ 
+ extern int zone_walk(int (*)(zone_t *, void *), void *);
+ 
++struct page;
++extern void zone_add_page(struct page *);
++extern void zone_rm_page(struct page *);
++
++/* Interfaces for page scanning */
++extern uint_t zone_num_over_cap;
++extern uint8_t zone_over_cap[MAX_ZONES];
++
+ extern rctl_hndl_t rc_zone_locked_mem;
+ extern rctl_hndl_t rc_zone_max_swap;
+ extern rctl_hndl_t rc_zone_phys_mem;
+diff --git a/usr/src/uts/common/syscall/sysconfig.c b/usr/src/uts/common/syscall/sysconfig.c
+index 92daeed703..fc38f8770c 100644
+--- a/usr/src/uts/common/syscall/sysconfig.c
++++ b/usr/src/uts/common/syscall/sysconfig.c
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -186,8 +186,6 @@ sysconfig(int which)
+ 		 * the phys. memory cap - zone's rss.  We always
+ 		 * report the system-wide value for the global zone, even
+ 		 * though memory capping can be used on the global zone too.
+-		 * We use the cached value for the RSS since vm_getusage()
+-		 * is so expensive and we don't need this value to be exact.
+ 		 */
+ 		if (!INGLOBALZONE(curproc) &&
+ 		    curproc->p_zone->zone_phys_mem_ctl != UINT64_MAX) {
+diff --git a/usr/src/uts/common/vm/page.h b/usr/src/uts/common/vm/page.h
+index 8747b96acc..ae9b0be758 100644
+--- a/usr/src/uts/common/vm/page.h
++++ b/usr/src/uts/common/vm/page.h
+@@ -20,6 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1986, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -229,6 +230,7 @@ struct as;
+  *				p_nrm
+  *				p_mapping
+  *				p_share
++ *				p_zoneid
+  *
+  * The following field is file system dependent.  How it is used and
+  * the locking strategies applied are up to the individual file system
+@@ -527,9 +529,8 @@ typedef struct page {
+ 	pfn_t		p_pagenum;	/* physical page number */
+ 
+ 	uint_t		p_share;	/* number of translations */
+-#if defined(_LP64)
+-	uint_t		p_sharepad;	/* pad for growing p_share */
+-#endif
++	short		p_zoneid;	/* zone page use tracking */
++	short		p_pad1;		/* TBD */
+ 	uint_t		p_slckcnt;	/* number of softlocks */
+ #if defined(__sparc)
+ 	uint_t		p_kpmref;	/* number of kpm mapping sharers */
+diff --git a/usr/src/uts/common/vm/vm_usage.c b/usr/src/uts/common/vm/vm_usage.c
+index 1d5ef71e3e..91296e9c8d 100644
+--- a/usr/src/uts/common/vm/vm_usage.c
++++ b/usr/src/uts/common/vm/vm_usage.c
+@@ -25,7 +25,7 @@
+  */
+ 
+ /*
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -1791,28 +1791,6 @@ vmu_cache_rele(vmu_cache_t *cache)
+ 	}
+ }
+ 
+-/*
+- * When new data is calculated, update the phys_mem rctl usage value in the
+- * zones.
+- */
+-static void
+-vmu_update_zone_rctls(vmu_cache_t *cache)
+-{
+-	vmusage_t	*rp;
+-	size_t		i = 0;
+-	zone_t		*zp;
+-
+-	for (rp = cache->vmc_results; i < cache->vmc_nresults; rp++, i++) {
+-		if (rp->vmu_type == VMUSAGE_ZONE &&
+-		    rp->vmu_zoneid != ALL_ZONES) {
+-			if ((zp = zone_find_by_id(rp->vmu_zoneid)) != NULL) {
+-				zp->zone_phys_mem = rp->vmu_rss_all;
+-				zone_rele(zp);
+-			}
+-		}
+-	}
+-}
+-
+ /*
+  * Copy out the cached results to a caller.  Inspect the callers flags
+  * and zone to determine which cached results should be copied.
+@@ -2112,8 +2090,6 @@ start:
+ 
+ 		mutex_exit(&vmu_data.vmu_lock);
+ 
+-		/* update zone's phys. mem. rctl usage */
+-		vmu_update_zone_rctls(cache);
+ 		/* copy cache */
+ 		ret = vmu_copyout_results(cache, buf, nres, flags_orig,
+ 		    req_zone_id, cpflg);
+diff --git a/usr/src/uts/i86pc/os/startup.c b/usr/src/uts/i86pc/os/startup.c
+index 16c683d993..27c83bb463 100644
+--- a/usr/src/uts/i86pc/os/startup.c
++++ b/usr/src/uts/i86pc/os/startup.c
+@@ -22,7 +22,7 @@
+  * Copyright (c) 1993, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright 2012 DEY Storage Systems, Inc.  All rights reserved.
+  * Copyright 2013 Nexenta Systems, Inc. All rights reserved.
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  * Copyright (c) 2015 by Delphix. All rights reserved.
+  */
+ /*
+@@ -2603,6 +2603,7 @@ add_physmem_cb(page_t *pp, pfn_t pnum)
+ 	pp->p_mapping = NULL;
+ 	pp->p_embed = 0;
+ 	pp->p_share = 0;
++	pp->p_zoneid = -1;
+ 	pp->p_mlentry = 0;
+ }
+ 
+diff --git a/usr/src/uts/i86pc/vm/hment.c b/usr/src/uts/i86pc/vm/hment.c
+index d00d756828..079f64e92e 100644
+--- a/usr/src/uts/i86pc/vm/hment.c
++++ b/usr/src/uts/i86pc/vm/hment.c
+@@ -21,10 +21,9 @@
+ /*
+  * Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+-#pragma ident	"%Z%%M%	%I%	%E% SMI"
+-
+ #include <sys/types.h>
+ #include <sys/sysmacros.h>
+ #include <sys/kmem.h>
+@@ -37,6 +36,7 @@
+ #include <vm/hat_i86.h>
+ #include <sys/cmn_err.h>
+ #include <sys/avl.h>
++#include <sys/zone.h>
+ 
+ 
+ /*
+@@ -323,6 +323,8 @@ hment_insert(hment_t *hm, page_t *pp)
+ 		((hment_t *)pp->p_mapping)->hm_prev = hm;
+ 	pp->p_mapping = hm;
+ 
++	zone_add_page(pp);
++
+ 	/*
+ 	 * Add the hment to the system-wide hash table.
+ 	 */
+@@ -464,6 +466,7 @@ hment_assign(htable_t *htable, uint_t entry, page_t *pp, hment_t *hm)
+ 		pp->p_embed = 1;
+ 		pp->p_mapping = htable;
+ 		pp->p_mlentry = entry;
++		zone_add_page(pp);
+ 		return;
+ 	}
+ 
+@@ -545,6 +548,7 @@ hment_remove(page_t *pp, htable_t *ht, uint_t entry)
+ 		pp->p_mapping = NULL;
+ 		pp->p_mlentry = 0;
+ 		pp->p_embed = 0;
++		zone_rm_page(pp);
+ 		return (NULL);
+ 	}
+ 
+@@ -580,6 +584,7 @@ hment_remove(page_t *pp, htable_t *ht, uint_t entry)
+ 	hm->hm_hashlink = null_avl_link;
+ 	hm->hm_next = NULL;
+ 	hm->hm_prev = NULL;
++	zone_rm_page(pp);
+ 
+ 	return (hm);
+ }
+diff --git a/usr/src/uts/sfmmu/vm/hat_sfmmu.c b/usr/src/uts/sfmmu/vm/hat_sfmmu.c
+index b7539c828c..2ef3ea20e8 100644
+--- a/usr/src/uts/sfmmu/vm/hat_sfmmu.c
++++ b/usr/src/uts/sfmmu/vm/hat_sfmmu.c
+@@ -24,6 +24,7 @@
+ /*
+  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+  * Copyright 2016 Gary Mills
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -85,6 +86,7 @@
+ #include <sys/fpu/fpusystm.h>
+ #include <vm/mach_kpm.h>
+ #include <sys/callb.h>
++#include <sys/zone.h>
+ 
+ #ifdef	DEBUG
+ #define	SFMMU_VALIDATE_HMERID(hat, rid, saddr, len)			\
+@@ -933,6 +935,7 @@ static kphysm_setup_vector_t sfmmu_update_vec = {
+ 	}							\
+ 	pp->p_mapping = hme;					\
+ 	pp->p_share++;						\
++	zone_add_page(pp);					\
+ }
+ 
+ /*
+@@ -953,6 +956,7 @@ static kphysm_setup_vector_t sfmmu_update_vec = {
+ 								\
+ 	ASSERT(pp->p_share > 0);				\
+ 	pp->p_share--;						\
++	zone_rm_page(pp);					\
+ 								\
+ 	if (hme->hme_prev) {					\
+ 		ASSERT(pp->p_mapping != hme);			\
+@@ -7350,6 +7354,8 @@ retry:
+ 	tpp->p_mapping = NULL;
+ 	dpp->p_share = tpp->p_share;
+ 	tpp->p_share = 0;
++	dpp->p_zoneid = tpp->p_zoneid;
++	tpp->p_zoneid = ALL_ZONES;
+ 
+ 	while (index != 0) {
+ 		index = index >> 1;

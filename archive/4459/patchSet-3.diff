@@ -1,0 +1,210 @@
+commit 2d5eb70600f78e2e143370890dfd6ca098dd4573 (refs/changes/59/4459/3)
+Author: Jason King <jason.king@joyent.com>
+Date:   2018-06-29T10:18:18-05:00 (1 year, 3 months ago)
+    
+    More lock fixing
+
+diff --git a/usr/src/uts/common/io/overlay/overlay_target.c b/usr/src/uts/common/io/overlay/overlay_target.c
+index 75357512c2..db67401fae 100644
+--- a/usr/src/uts/common/io/overlay/overlay_target.c
++++ b/usr/src/uts/common/io/overlay/overlay_target.c
+@@ -367,9 +367,16 @@ overlay_target_busy()
+ 	return (ret);
+ }
+ 
++/* Queue the target entry on the list of varpd requests */
+ static void
+ overlay_target_queue(overlay_target_entry_t *entry)
+ {
++	/*
++	 * ote_ott is read-only and set at entry creation, so it can be
++	 * read without ote_lock held
++	 */
++	ASSERT(!MUTEX_HELD(&entry->ote_lock));
++
+ 	mutex_enter(&overlay_target_lock);
+ 	mutex_enter(&entry->ote_ott->ott_lock);
+ 	if (entry->ote_ott->ott_flags & OVERLAY_T_TEARDOWN) {
+@@ -563,15 +570,27 @@ overlay_route(overlay_dev_t *odd, mblk_t *mp,
+ #endif
+ }
+ 
++/*
++ * Attempt to add mp to the packet queue of target entry.  If the queue is
++ * already full, it returns OVERLAY_TARGET_DROP, otherwise OVERLAY_TARGET_ASYNC
++ * is returned.  If the entry isn't already pending a response from varpd,
++ * queue the target entry on the list of outstanding varpd requests.
++ *
++ * Entry should already be locked, however since it is intended that this
++ * should be the final step in dealing with this entry (for handling the
++ * packet in question), it always releases ote_lock before returning.
++ */
+ static int
+ overlay_target_try_queue(overlay_target_entry_t *entry, mblk_t *mp)
+ {
+ 	size_t mlen = msgsize(mp);
++	boolean_t queue = B_FALSE;
+ 
+ 	ASSERT(MUTEX_HELD(&entry->ote_lock));
+ 
+ 	if (mlen + entry->ote_mbsize > overlay_ent_size) {
+ 		OVERLAY_DROP(mp, "target queue full");
++		mutex_exit(&entry->ote_lock);
+ 		return (OVERLAY_TARGET_DROP);
+ 	}
+ 
+@@ -586,11 +605,31 @@ overlay_target_try_queue(overlay_target_entry_t *entry, mblk_t *mp)
+ 	entry->ote_mbsize += mlen;
+ 	if ((entry->ote_flags & OVERLAY_ENTRY_F_PENDING) == 0) {
+ 		entry->ote_flags |= OVERLAY_ENTRY_F_PENDING;
+-		overlay_target_queue(entry);
++		queue = B_TRUE;
+ 	}
++	mutex_exit(&entry->ote_lock);
++
++	if (queue)
++		overlay_target_queue(entry);
++
+ 	return (OVERLAY_TARGET_ASYNC);
+ }
+ 
++/*
++ * Given the VL3 IP->VL2 mac entry (vl3e), and the corresponding VL2 MAC->UL3
++ * entry (vl2e), if both entries are valid, sets *vidp, *v6, *slenp to the
++ * correct UL3 destination and return OVERLAY_TARGET_OK.  If either of the
++ * entries are still pending lookups (or v2le is NULL because the entry is
++ * missing), mp is queued (if there is space) on the appropriate entry and
++ * OVERLAY_TARGET_ASYNC is returned.  If the VL2 entry is flagged to drop all
++ * packets, OVERLAY_TARGET_DROP is returned.
++ *
++ * In all cases, the caller should acquire vl3e->ote_lock prior to calling
++ * overlay_route_lookup_vl2(). Because vl2e can be missing (NULL), the caller
++ * should not acquire vl2e->ote_lock prior to calling
++ * overlay_route_lookup_vl2(). vl3e->ote_lock is alway dropped prior to
++ * returning.
++ */
+ static int
+ overlay_route_lookup_vl2(overlay_target_entry_t *vl3e,
+     overlay_target_entry_t *vl2e, uint64_t *vidp, struct sockaddr_in6 *v6,
+@@ -603,6 +642,7 @@ overlay_route_lookup_vl2(overlay_target_entry_t *vl3e,
+ 
+ 	if (vl2e == NULL) {
+ 		vl3e->ote_flags &= ~OVERLAY_ENTRY_F_VALID;
++		/* This drops vl3e->ote_lock */
+ 		return (overlay_target_try_queue(vl3e, mp));
+ 	}
+ 
+@@ -611,6 +651,7 @@ overlay_route_lookup_vl2(overlay_target_entry_t *vl3e,
+ 		overlay_target_entry_flags_t flags = vl2e->ote_flags;
+ 
+ 		mutex_exit(&vl2e->ote_lock);
++		mutex_exit(&vl3e->ote_lock);
+ 
+ 		if (flags & OVERLAY_ENTRY_F_DROP) {
+ 			OVERLAY_DROP(mp, "VL2 target marked drop");
+@@ -629,6 +670,7 @@ overlay_route_lookup_vl2(overlay_target_entry_t *vl3e,
+ 		mutex_exit(&vl2e->ote_lock);
+ 
+ 		vl3e->ote_flags &= ~OVERLAY_ENTRY_F_VALID;
++		/* This drops vl3e->ote_lock */
+ 		return (overlay_target_try_queue(vl3e, mp));
+ 	}
+ 
+@@ -647,19 +689,17 @@ overlay_route_lookup_vl2(overlay_target_entry_t *vl3e,
+ 	 * VL2 entry is remote, we have to do a VL3->UL3 lookup.
+ 	 */
+ 	if ((vl2e->ote_flags & OVERLAY_ENTRY_F_VALID) == 0) {
+-		overlay_target_entry_t *queue_e;
+-
+ 		if ((vl2e->ote_flags & OVERLAY_ENTRY_F_PENDING) == 0 &&
+ 		    vl2e->ote_u.ote_vl2.otvl2_mac.otm_dcid !=
+ 		    vl2e->ote_odd->odd_dcid) {
+-			queue_e = vl3e;
+-		} else {
+-			queue_e = vl2e;
++			mutex_exit(&vl2e->ote_lock);
++			/* This drops vl3e->ote_lock */
++			return (overlay_target_try_queue(vl3e, mp));
+ 		}
+ 
+-		ret = overlay_target_try_queue(queue_e, mp);
+-		mutex_exit(&vl2e->ote_lock);
+-		return (ret);
++		mutex_exit(&vl3e->ote_lock);
++		/* This drops vl2e->ote_lock */
++		return (overlay_target_try_queue(vl2e, mp));
+ 	}
+ 
+ 	ASSERT(vl2e->ote_flags & OVERLAY_ENTRY_F_VALID);
+@@ -675,7 +715,7 @@ overlay_route_lookup_vl2(overlay_target_entry_t *vl3e,
+ 	ret = overlay_route(vl2e->ote_odd, mp, &vl2p->otvl2_route,
+ 	    &vl2p->otvl2_mac);
+ 	mutex_exit(&vl2e->ote_lock);
+-
++	mutex_exit(&vl3e->ote_lock);
+ 	return (ret);
+ }
+ 
+@@ -748,6 +788,7 @@ overlay_route_lookup(overlay_dev_t *odd, mblk_t *mp, uint16_t vlan,
+ 	ASSERT(entry->ote_flags & OVERLAY_ENTRY_F_VL3);
+ 
+ 	if (entry->ote_flags & OVERLAY_ENTRY_F_DROP) {
++		mutex_exit(&entry->ote_lock);
+ 		OVERLAY_DROP(mp, "VL3 target entry marked drop");
+ 		ret = OVERLAY_TARGET_DROP;
+ 	} else if (entry->ote_flags & OVERLAY_ENTRY_F_ROUTER) {
+@@ -755,15 +796,17 @@ overlay_route_lookup(overlay_dev_t *odd, mblk_t *mp, uint16_t vlan,
+ 		 * XXX: A packet with a dst IP of an overlay router.
+ 		 * Maybe generate an ICMP reply?  For now, we drop.
+ 		 */
++		mutex_exit(&entry->ote_lock);
+ 		OVERLAY_DROP(mp, "VL3 target entry is router");
+ 		ret = OVERLAY_TARGET_DROP;
+ 	} else if ((entry->ote_flags & OVERLAY_ENTRY_F_VALID) == 0) {
++		/* This drops entry->ote_lock */
+ 		ret = overlay_target_try_queue(entry, mp);
+ 	} else {
++		/* This drops entry->ote_lock */
+ 		ret = overlay_route_lookup_vl2(entry, vl2_entry, vidp, v6,
+ 		    slenp, mp);
+ 	}
+-	mutex_exit(&entry->ote_lock);
+ 
+ 	mutex_enter(&ott->ott_lock);
+ 	sarc_rele(ott->ott_u.ott_dyn.ott_l3dhash, entry);
+@@ -868,6 +911,7 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 
+ 	mutex_enter(&entry->ote_lock);
+ 	if (entry->ote_flags & OVERLAY_ENTRY_F_DROP) {
++		mutex_exit(&entry->ote_lock);
+ 		OVERLAY_DROP(mp, "VL2 target marked drop");
+ 		ret = OVERLAY_TARGET_DROP;
+ 	} else if (entry->ote_flags & OVERLAY_ENTRY_F_ROUTER) {
+@@ -875,9 +919,11 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 			/*
+ 			 * Send unicast ARP requests to varpd for processing.
+ 			 * We will eventually need something similar for IPv6.
++			 * This drops entry->ote_lock.
+ 			 */
+ 			ret = overlay_target_try_queue(entry, mp);
+ 		} else {
++			mutex_exit(&entry->ote_lock);
+ 			ret = overlay_route_lookup(odd, mp,
+ 			    VLAN_ID(mhi.mhi_tci), sock, slenp, vidp);
+ 		}
+@@ -886,12 +932,14 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 
+ 		bcopy(&otp->otp_ip, &v6->sin6_addr, sizeof (struct in6_addr));
+ 		v6->sin6_port = htons(otp->otp_port);
++		mutex_exit(&entry->ote_lock);
++
+ 		*slenp = sizeof (struct sockaddr_in6);
+ 		ret = OVERLAY_TARGET_OK;
+ 	} else {
++		/* This drops entry->ote_lock */
+ 		ret = overlay_target_try_queue(entry, mp);
+ 	}
+-	mutex_exit(&entry->ote_lock);
+ 
+ 	mutex_enter(&ott->ott_lock);
+ 	sarc_rele(ott->ott_u.ott_dyn.ott_dhash, entry);

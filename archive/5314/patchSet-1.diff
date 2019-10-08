@@ -1,0 +1,174 @@
+commit 4f3353a5d018ec68df10ed0924036a5de2073c06 (refs/changes/14/5314/1)
+Author: Kody A Kantor <kody@kkantor.com>
+Date:   2019-01-04T21:35:14+00:00 (9 months ago)
+    
+    OS-6602 ZFS not detecting faulty spares in a timely manner
+
+diff --git a/usr/src/cmd/fm/modules/common/zfs-diagnosis/zfs_de.c b/usr/src/cmd/fm/modules/common/zfs-diagnosis/zfs_de.c
+index d1206a34d3..2b899d592b 100644
+--- a/usr/src/cmd/fm/modules/common/zfs-diagnosis/zfs_de.c
++++ b/usr/src/cmd/fm/modules/common/zfs-diagnosis/zfs_de.c
+@@ -627,7 +627,8 @@ zfs_fm_recv(fmd_hdl_t *hdl, fmd_event_t *ep, nvlist_t *nvl, const char *class)
+ 			pool_found = B_TRUE;
+ 			pool_load = zcp->zc_when;
+ 		}
+-		if (zcp->zc_data.zc_vdev_guid == vdev_guid)
++		if (zcp->zc_data.zc_vdev_guid == vdev_guid &&
++		    zcp->zc_data.zc_pool_guid == pool_guid)
+ 			break;
+ 	}
+ 
+diff --git a/usr/src/cmd/fm/modules/common/zfs-retire/zfs_retire.c b/usr/src/cmd/fm/modules/common/zfs-retire/zfs_retire.c
+index 4856676d7d..5a70686c82 100644
+--- a/usr/src/cmd/fm/modules/common/zfs-retire/zfs_retire.c
++++ b/usr/src/cmd/fm/modules/common/zfs-retire/zfs_retire.c
+@@ -121,13 +121,21 @@ find_vdev(libzfs_handle_t *zhdl, nvlist_t *nv, const char *search_fru,
+ 	}
+ 
+ 	if (nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_L2CACHE,
+-	    &child, &children) != 0)
+-		return (NULL);
++	    &child, &children) == 0) {
++		for (c = 0; c < children; c++) {
++			if ((ret = find_vdev(zhdl, child[c], search_fru,
++			    search_guid)) != NULL)
++				return (ret);
++		}
++	}
+ 
+-	for (c = 0; c < children; c++) {
+-		if ((ret = find_vdev(zhdl, child[c], search_fru,
+-		    search_guid)) != NULL)
+-			return (ret);
++	if (nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_SPARES,
++	    &child, &children) == 0) {
++		for (c = 0; c < children; c++) {
++			if ((ret = find_vdev(zhdl, child[c], search_fru,
++			    search_guid)) != NULL)
++				return (ret);
++		}
+ 	}
+ 
+ 	return (NULL);
+diff --git a/usr/src/uts/common/fs/zfs/spa_misc.c b/usr/src/uts/common/fs/zfs/spa_misc.c
+index 8ba49fed41..128c85213e 100644
+--- a/usr/src/uts/common/fs/zfs/spa_misc.c
++++ b/usr/src/uts/common/fs/zfs/spa_misc.c
+@@ -238,6 +238,8 @@ static avl_tree_t spa_l2cache_avl;
+ kmem_cache_t *spa_buffer_pool;
+ int spa_mode_global;
+ 
++int spa_spare_poll_interval_seconds = 30;
++
+ #ifdef ZFS_DEBUG
+ /*
+  * Everything except dprintf, spa, and indirect_remap is on by default
+@@ -1009,6 +1011,94 @@ spa_aux_activate(vdev_t *vd, avl_tree_t *avl)
+  * be completely consistent with respect to other vdev configuration changes.
+  */
+ 
++
++typedef struct spa_spare_poll {
++	kthread_t	*poll_thread;
++	kmutex_t	poll_lock;
++	kcondvar_t	poll_cv;
++	boolean_t	poll_cancel;
++} spa_spare_poll_t;
++static spa_spare_poll_t spa_spare_poller;
++
++
++/*
++ * Poll the spare vdevs to make sure they are not faulty.
++ *
++ * vdev_probe will raise an ENXIO error and create an FM ereport if the probe
++ * fails.
++ */
++void
++spa_spare_poll_thread(void *arg)
++{
++	spa_spare_poll_t *poll = &spa_spare_poller;
++	spa_aux_t *aux;
++	spa_t *spa = NULL;
++	vdev_t *vd;
++
++	while (!poll->poll_cancel) {
++		mutex_enter(&poll->poll_lock);
++		(void) cv_timedwait_hires(&poll->poll_cv, &poll->poll_lock,
++		    SEC2NSEC(spa_spare_poll_interval_seconds), SEC2NSEC(1), 0);
++		mutex_exit(&poll->poll_lock);
++
++		mutex_enter(&spa_spare_lock);
++		for (aux = avl_first(&spa_spare_avl); aux != NULL;
++		    aux = AVL_NEXT(&spa_spare_avl, aux)) {
++			/* This spare is in use by a pool. */
++			if (aux->aux_pool != NULL)
++			    continue;
++
++			/*
++			 * Synchronously probe all occurrences of each spare
++			 * vdev to make sure all pools fault their spares
++			 * properly if they are inaccessible.
++			 */
++			while ((spa = spa_next(spa)) != NULL) {
++				if ((vd = spa_lookup_by_guid(spa, aux->aux_guid,
++				    B_TRUE)) != NULL)
++					zio_wait(vdev_probe(vd, NULL));
++			}
++		}
++		mutex_exit(&spa_spare_lock);
++	}
++
++	mutex_enter(&poll->poll_lock);
++	poll->poll_thread = NULL;
++	cv_broadcast(&poll->poll_cv);
++	mutex_exit(&poll->poll_lock);
++	thread_exit();
++}
++
++void
++spa_spare_poll_thread_destroy()
++{
++	mutex_enter(&spa_spare_poller.poll_lock);
++	spa_spare_poller.poll_cancel = B_TRUE;
++	while (spa_spare_poller.poll_thread != NULL)
++		cv_wait(&spa_spare_poller.poll_cv,
++		    &spa_spare_poller.poll_lock);
++	mutex_exit(&spa_spare_poller.poll_lock);
++
++	mutex_destroy(&spa_spare_poller.poll_lock);
++	cv_destroy(&spa_spare_poller.poll_cv);
++}
++
++/*
++ * Start a thread that will poll unused spare vdevs in the background.
++ * This is used to detect when spare devices are faulty before they are used to
++ * replace another vdev.
++ */
++void
++spa_spare_poll_thread_create()
++{
++	mutex_init(&spa_spare_poller.poll_lock, NULL, MUTEX_DEFAULT,
++	    NULL);
++	cv_init(&spa_spare_poller.poll_cv, NULL, CV_DEFAULT, NULL);
++	spa_spare_poller.poll_cancel = B_FALSE;
++	spa_spare_poller.poll_thread = thread_create(NULL, 0,
++	    spa_spare_poll_thread, NULL, 0, &p0, TS_RUN, minclsyspri);
++}
++
+ static int
+ spa_spare_compare(const void *a, const void *b)
+ {
+@@ -1942,11 +2032,13 @@ spa_init(int mode)
+ 	zpool_feature_init();
+ 	spa_config_load();
+ 	l2arc_start();
++	spa_spare_poll_thread_create();
+ }
+ 
+ void
+ spa_fini(void)
+ {
++	spa_spare_poll_thread_destroy();
+ 	l2arc_stop();
+ 
+ 	spa_evict_all();

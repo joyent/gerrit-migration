@@ -1,0 +1,687 @@
+commit 17d35cc662a4fc13809703a0ce96563d895743d0 (refs/changes/21/3521/3)
+Author: Mike Gerdts <mike.gerdts@joyent.com>
+Date:   2018-03-01T23:13:16+00:00 (1 year, 7 months ago)
+    
+    OS-6668 need preliminary sdev plugin for vmm
+    OS-6401 vmm should present zone-aware sdev instances
+    OS-6670 bhyve instances need to be cleaned up on zone halt
+    Reviewed by: Jerry Jelinek <jerry.jelinek@joyent.com>
+    Approved by: Jerry Jelinek <jerry.jelinek@joyent.com>
+
+diff --git a/usr/src/uts/i86pc/Makefile.files b/usr/src/uts/i86pc/Makefile.files
+index 755c4b7270..5709e0dc63 100644
+--- a/usr/src/uts/i86pc/Makefile.files
++++ b/usr/src/uts/i86pc/Makefile.files
+@@ -269,7 +269,8 @@ VMM_OBJS += vmm.o \
+ 	sol_iommu.o \
+ 	sol_ppt.o \
+ 	vmm_sol_vm.o \
+-	vmm_sol_glue.o
++	vmm_sol_glue.o \
++	vmm_zsd.o
+ 
+ VIONA_OBJS += viona.o
+ 
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c b/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c
+index ce0e8ba607..dfcd66587c 100644
+--- a/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c
++++ b/usr/src/uts/i86pc/io/vmm/vmm_sol_dev.c
+@@ -11,7 +11,7 @@
+ 
+ /*
+  * Copyright 2015 Pluribus Networks Inc.
+- * Copyright 2017 Joyent, Inc.
++ * Copyright 2018 Joyent, Inc.
+  */
+ 
+ #include <sys/types.h>
+@@ -27,6 +27,7 @@
+ #include <sys/pc_hvm.h>
+ #include <sys/cpuset.h>
+ #include <sys/id_space.h>
++#include <sys/fs/sdev_plugin.h>
+ 
+ #include <sys/vmm.h>
+ #include <sys/vmm_instruction_emul.h>
+@@ -56,6 +57,12 @@ static boolean_t	vmmdev_load_failure;
+ 
+ static const char *vmmdev_hvm_name = "bhyve";
+ 
++/*
++ * For sdev plugin (/dev)
++ */
++#define	VMM_SDEV_ROOT "/dev/vmm"
++static sdev_plugin_hdl_t vmm_sdev_hdl;
++
+ /*
+  * vmm trace ring
+  */
+@@ -1208,7 +1215,7 @@ vmm_lookup(const char *name)
+ }
+ 
+ static int
+-vmmdev_do_vm_create(dev_info_t *dip, char *name)
++vmmdev_do_vm_create(char *name, cred_t *cr)
+ {
+ 	vmm_softc_t	*sc = NULL;
+ 	minor_t		minor;
+@@ -1231,13 +1238,25 @@ vmmdev_do_vm_create(dev_info_t *dip, char *name)
+ 		return (EEXIST);
+ 	}
+ 
++	/* Allow only one instance per non-global zone. */
++	if (!INGLOBALZONE(curproc)) {
++		for (sc = list_head(&vmmdev_list); sc != NULL;
++		    sc = list_next(&vmmdev_list, sc)) {
++			if (sc->vmm_zone == curzone) {
++				vmmdev_mod_decr();
++				mutex_exit(&vmmdev_mtx);
++				return (EINVAL);
++			}
++		}
++	}
++
+ 	minor = id_alloc(vmmdev_minors);
+ 	if (ddi_soft_state_zalloc(vmm_statep, minor) != DDI_SUCCESS) {
+ 		goto fail;
+ 	} else if ((sc = ddi_get_soft_state(vmm_statep, minor)) == NULL) {
+ 		ddi_soft_state_free(vmm_statep, minor);
+ 		goto fail;
+-	} else if (ddi_create_minor_node(dip, name, S_IFCHR, minor,
++	} else if (ddi_create_minor_node(vmm_dip, name, S_IFCHR, minor,
+ 	    DDI_PSEUDO, 0) != DDI_SUCCESS) {
+ 		goto fail;
+ 	}
+@@ -1252,12 +1271,17 @@ vmmdev_do_vm_create(dev_info_t *dip, char *name)
+ 		list_create(&sc->vmm_holds, sizeof (vmm_hold_t),
+ 		    offsetof(vmm_hold_t, vmh_node));
+ 		cv_init(&sc->vmm_cv, NULL, CV_DEFAULT, NULL);
++
++		sc->vmm_zone = crgetzone(cr);
++		zone_hold(sc->vmm_zone);
++		vmm_zsd_add_vm(sc);
++
+ 		list_insert_tail(&vmmdev_list, sc);
+ 		mutex_exit(&vmmdev_mtx);
+ 		return (0);
+ 	}
+ 
+-	ddi_remove_minor_node(dip, name);
++	ddi_remove_minor_node(vmm_dip, name);
+ fail:
+ 	id_free(vmmdev_minors, minor);
+ 	vmmdev_mod_decr();
+@@ -1479,24 +1503,22 @@ done:
+ }
+ 
+ static int
+-vmmdev_do_vm_destroy(dev_info_t *dip, const char *name)
++vmm_do_vm_destroy_locked(vmm_softc_t *sc, boolean_t clean_zsd)
+ {
+-	vmm_softc_t	*sc;
+-	dev_info_t	*pdip = ddi_get_parent(dip);
++	dev_info_t	*pdip = ddi_get_parent(vmm_dip);
+ 	minor_t		minor;
+ 
+-	mutex_enter(&vmmdev_mtx);
++	ASSERT(MUTEX_HELD(&vmmdev_mtx));
+ 
+-	if ((sc = vmm_lookup(name)) == NULL) {
+-		mutex_exit(&vmmdev_mtx);
+-		return (ENOENT);
+-	}
+ 	if (sc->vmm_is_open) {
+-		mutex_exit(&vmmdev_mtx);
+ 		return (EBUSY);
+ 	}
++
++	if (clean_zsd) {
++		vmm_zsd_rem_vm(sc);
++	}
++
+ 	if (vmm_drv_purge(sc) != 0) {
+-		mutex_exit(&vmmdev_mtx);
+ 		return (EINTR);
+ 	}
+ 
+@@ -1505,16 +1527,47 @@ vmmdev_do_vm_destroy(dev_info_t *dip, const char *name)
+ 
+ 	vm_destroy(sc->vmm_vm);
+ 	list_remove(&vmmdev_list, sc);
+-	ddi_remove_minor_node(dip, sc->vmm_name);
++	ddi_remove_minor_node(vmm_dip, sc->vmm_name);
+ 	minor = sc->vmm_minor;
++	zone_rele(sc->vmm_zone);
+ 	ddi_soft_state_free(vmm_statep, minor);
+ 	id_free(vmmdev_minors, minor);
+ 	(void) devfs_clean(pdip, NULL, DV_CLEAN_FORCE);
+ 	vmmdev_mod_decr();
+ 
++	return (0);
++}
++
++int
++vmm_do_vm_destroy(vmm_softc_t *sc, boolean_t clean_zsd)
++{
++	int 		err;
++
++	mutex_enter(&vmmdev_mtx);
++	err = vmm_do_vm_destroy_locked(sc, clean_zsd);
+ 	mutex_exit(&vmmdev_mtx);
+ 
+-	return (0);
++	return (err);
++}
++
++/* ARGSUSED */
++static int
++vmmdev_do_vm_destroy(const char *name, cred_t *cr)
++{
++	vmm_softc_t	*sc;
++	int		err;
++
++	mutex_enter(&vmmdev_mtx);
++
++	if ((sc = vmm_lookup(name)) == NULL) {
++		mutex_exit(&vmmdev_mtx);
++		return (ENOENT);
++	}
++	err = vmm_do_vm_destroy_locked(sc, B_TRUE);
++
++	mutex_exit(&vmmdev_mtx);
++
++	return (err);
+ }
+ 
+ 
+@@ -1602,11 +1655,11 @@ vmm_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
+ 		case VMM_CREATE_VM:
+ 			if ((mode & FWRITE) == 0)
+ 				return (EPERM);
+-			return (vmmdev_do_vm_create(vmm_dip, name));
++			return (vmmdev_do_vm_create(name, credp));
+ 		case VMM_DESTROY_VM:
+ 			if ((mode & FWRITE) == 0)
+ 				return (EPERM);
+-			return (vmmdev_do_vm_destroy(vmm_dip, name));
++			return (vmmdev_do_vm_destroy(name, credp));
+ 		default:
+ 			/* No other actions are legal on ctl device */
+ 			return (ENOTTY);
+@@ -1675,6 +1728,117 @@ out:
+ 	return (err);
+ }
+ 
++static sdev_plugin_validate_t
++vmm_sdev_validate(sdev_ctx_t ctx)
++{
++	const char *name;
++	vmm_softc_t *sc;
++	sdev_plugin_validate_t ret;
++	minor_t minor;
++
++	if (sdev_ctx_vtype(ctx) != VCHR)
++		return (SDEV_VTOR_INVALID);
++
++	VERIFY3S(sdev_ctx_minor(ctx, &minor), ==, 0);
++
++	name = sdev_ctx_name(ctx);
++	if (strcmp(name, VMM_CTL_MINOR_NODE) == 0) {
++		ASSERT3U(minor, ==, VMM_CTL_MINOR);
++		return (SDEV_VTOR_VALID);
++	}
++
++	mutex_enter(&vmmdev_mtx);
++	if ((sc = vmm_lookup(name)) == NULL)
++		ret = SDEV_VTOR_INVALID;
++	else if (sc->vmm_minor != minor)
++		ret = SDEV_VTOR_STALE;
++	else
++		ret = SDEV_VTOR_VALID;
++	mutex_exit(&vmmdev_mtx);
++
++	return (ret);
++}
++
++static int
++vmm_sdev_filldir(sdev_ctx_t ctx)
++{
++	vmm_softc_t *sc;
++	int ret;
++
++	if (strcmp(sdev_ctx_path(ctx), VMM_SDEV_ROOT) != 0) {
++		cmn_err(CE_WARN, "%s: bad path '%s' != '%s'\n", __func__,
++		    sdev_ctx_path(ctx), VMM_SDEV_ROOT);
++		return (EINVAL);
++	}
++
++	/* Driver not initialized, directory empty. */
++	if (vmm_dip == NULL)
++		return (0);
++
++	mutex_enter(&vmmdev_mtx);
++
++	ret = sdev_plugin_mknod(ctx, VMM_CTL_MINOR_NODE, S_IFCHR | 0600,
++	    makedevice(ddi_driver_major(vmm_dip), VMM_CTL_MINOR));
++	if (ret != 0 && ret != EEXIST)
++		goto out;
++
++	for (sc = list_head(&vmmdev_list); sc != NULL;
++	    sc = list_next(&vmmdev_list, sc)) {
++		if (INGLOBALZONE(curproc) || sc->vmm_zone == curzone) {
++			ret = sdev_plugin_mknod(ctx, sc->vmm_name,
++			    S_IFCHR | 0600,
++			    makedevice(ddi_driver_major(vmm_dip),
++			    sc->vmm_minor));
++		} else {
++			continue;
++		}
++		if (ret != 0 && ret != EEXIST)
++			goto out;
++	}
++
++	ret = 0;
++
++out:
++	mutex_exit(&vmmdev_mtx);
++	return (ret);
++}
++
++/* ARGSUSED */
++static void
++vmm_sdev_inactive(sdev_ctx_t ctx)
++{
++}
++
++static sdev_plugin_ops_t vmm_sdev_ops = {
++	.spo_version = SDEV_PLUGIN_VERSION,
++	.spo_flags = SDEV_PLUGIN_SUBDIR,
++	.spo_validate = vmm_sdev_validate,
++	.spo_filldir = vmm_sdev_filldir,
++	.spo_inactive = vmm_sdev_inactive
++};
++
++/* ARGSUSED */
++static int
++vmm_info(dev_info_t *dip, ddi_info_cmd_t cmd, void *arg, void **result)
++{
++	int error;
++
++	switch (cmd) {
++	case DDI_INFO_DEVT2DEVINFO:
++		*result = (void *)vmm_dip;
++		error = DDI_SUCCESS;
++		break;
++	case DDI_INFO_DEVT2INSTANCE:
++		*result = (void *)0;
++		error = DDI_SUCCESS;
++		break;
++	default:
++		error = DDI_FAILURE;
++		break;
++	}
++	return (error);
++}
++
+ static int
+ vmm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ {
+@@ -1686,8 +1850,6 @@ vmm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	}
+ 
+ 	vmm_sol_glue_init();
+-	vmmdev_load_failure = B_FALSE;
+-	vmm_dip = dip;
+ 
+ 	/*
+ 	 * Create control node.  Other nodes will be created on demand.
+@@ -1697,11 +1859,21 @@ vmm_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 		return (DDI_FAILURE);
+ 	}
+ 
++	if ((vmm_sdev_hdl = sdev_plugin_register("vmm", &vmm_sdev_ops,
++	    NULL)) == NULL) {
++		ddi_remove_minor_node(dip, NULL);
++		dip = NULL;
++		return (DDI_FAILURE);
++	}
++
+ 	ddi_report_dev(dip);
+ 
+ 	/* XXX: This needs updating */
+ 	vmm_arena_init();
+ 
++	vmmdev_load_failure = B_FALSE;
++	vmm_dip = dip;
++
+ 	return (DDI_SUCCESS);
+ }
+ 
+@@ -1717,6 +1889,7 @@ vmm_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+ 
+ 	/* Ensure that all resources have been cleaned up */
+ 	mutex_enter(&vmmdev_mtx);
++
+ 	if (!list_is_empty(&vmmdev_list) || vmmdev_inst_count != 0) {
+ 		mutex_exit(&vmmdev_mtx);
+ 		return (DDI_FAILURE);
+@@ -1728,6 +1901,12 @@ vmm_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+ 		return (DDI_FAILURE);
+ 	}
+ 
++	if (vmm_sdev_hdl != NULL && sdev_plugin_unregister(vmm_sdev_hdl) != 0) {
++		mutex_exit(&vmmdev_mtx);
++		return (DDI_FAILURE);
++	}
++	vmm_sdev_hdl = NULL;
++
+ 	/* Remove the control node. */
+ 	ddi_remove_minor_node(dip, VMM_CTL_MINOR_NODE);
+ 	vmm_dip = NULL;
+@@ -1758,7 +1937,7 @@ static struct cb_ops vmm_cb_ops = {
+ static struct dev_ops vmm_ops = {
+ 	DEVO_REV,
+ 	0,
+-	ddi_no_info,
++	vmm_info,
+ 	nulldev,	/* identify */
+ 	nulldev,	/* probe */
+ 	vmm_attach,
+@@ -1796,6 +1975,8 @@ _init(void)
+ 		return (error);
+ 	}
+ 
++	vmm_zsd_init();
++
+ 	error = mod_install(&modlinkage);
+ 	if (error) {
+ 		ddi_soft_state_fini(&vmm_statep);
+@@ -1813,6 +1994,9 @@ _fini(void)
+ 	if (error) {
+ 		return (error);
+ 	}
++
++	vmm_zsd_fini();
++
+ 	ddi_soft_state_fini(&vmm_statep);
+ 
+ 	return (0);
+diff --git a/usr/src/uts/i86pc/io/vmm/vmm_zsd.c b/usr/src/uts/i86pc/io/vmm/vmm_zsd.c
+new file mode 100644
+index 0000000000..586773ac8e
+--- /dev/null
++++ b/usr/src/uts/i86pc/io/vmm/vmm_zsd.c
+@@ -0,0 +1,197 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++#include <sys/cpuvar.h>
++#include <sys/debug.h>
++#include <sys/kmem.h>
++#include <sys/ksynch.h>
++#include <sys/list.h>
++#include <sys/types.h>
++#include <sys/vmm.h>
++#include <sys/vmm_impl.h>
++#include <sys/zone.h>
++
++/*
++ * zone specific data
++ *
++ * Zone specific data is used to keep an association between zones and the vmm
++ * instances that may be running in them.  This is used to ensure that vmm
++ * instances do not outlive their parent zone.
++ *
++ * Locking strategy
++ *
++ * The global vmm_zsd_lock is held while modifying vmm_zsd_list.
++ *
++ * The per zone vz_lock in vmm_zsd_t is held while reading or writing anything
++ * within in vmm_zsd_t instance.  This is important to ensure that there's not
++ * an accidental VM creating as a zone is going down.
++ */
++
++/*
++ * One of these per zone.
++ */
++struct vmm_zsd {
++	list_t		vz_vmms;	/* vmm instances in the zone */
++	list_node_t	vz_linkage;	/* link to other zones */
++	boolean_t	vz_active;	/* B_FALSE early in shutdown callback */
++	zoneid_t	vz_zoneid;
++	kmutex_t	vz_lock;
++};
++
++static kmutex_t vmm_zsd_lock;		/* Protects vmm_zsd_list */
++static list_t vmm_zsd_list;		/* Linkage between all zsd instances */
++
++static zone_key_t vmm_zsd_key;
++
++int
++vmm_zsd_add_vm(vmm_softc_t *sc)
++{
++	vmm_zsd_t *zsd;
++
++	ASSERT(sc->vmm_zone != NULL);
++
++	mutex_enter(&vmm_zsd_lock);
++
++	for (zsd = list_head(&vmm_zsd_list); zsd != NULL;
++	    zsd = list_next(&vmm_zsd_list, zsd)) {
++		if (zsd->vz_zoneid == sc->vmm_zone->zone_id) {
++			break;
++		}
++	}
++
++	VERIFY(zsd != NULL);
++	mutex_exit(&vmm_zsd_lock);
++
++	mutex_enter(&zsd->vz_lock);
++	if (!zsd->vz_active) {
++		mutex_exit(&zsd->vz_lock);
++		return (ENOSYS);
++	}
++
++	sc->vmm_zsd = zsd;
++	list_insert_tail(&zsd->vz_vmms, sc);
++
++	mutex_exit(&zsd->vz_lock);
++
++	return (0);
++}
++
++void
++vmm_zsd_rem_vm(vmm_softc_t *sc)
++{
++	vmm_zsd_t *zsd = sc->vmm_zsd;
++
++	mutex_enter(&zsd->vz_lock);
++
++	list_remove(&zsd->vz_vmms, sc);
++	sc->vmm_zsd = NULL;
++
++	mutex_exit(&zsd->vz_lock);
++}
++
++static void *
++vmm_zsd_create(zoneid_t zid)
++{
++	vmm_zsd_t *zsd;
++
++	zsd = kmem_zalloc(sizeof (*zsd), KM_SLEEP);
++
++	list_create(&zsd->vz_vmms, sizeof (vmm_softc_t),
++	    offsetof(vmm_softc_t, vmm_zsd_linkage));
++
++	zsd->vz_zoneid = zid;
++
++	mutex_init(&zsd->vz_lock, NULL, MUTEX_DEFAULT, NULL);
++	zsd->vz_active = B_TRUE;
++
++	mutex_enter(&vmm_zsd_lock);
++	list_insert_tail(&vmm_zsd_list, zsd);
++	mutex_exit(&vmm_zsd_lock);
++
++	return (zsd);
++}
++
++/*
++ * Tells all runing VMs in the zone to poweroff.  This does not reclaim guest
++ * resources (memory, etc.).
++ */
++static void
++vmm_zsd_shutdown(zoneid_t zid, void *data)
++{
++	vmm_zsd_t *zsd = data;
++	vmm_softc_t *sc;
++
++	mutex_enter(&zsd->vz_lock);
++	ASSERT(zsd->vz_active);
++	zsd->vz_active = B_FALSE;
++
++	for (sc = list_head(&zsd->vz_vmms); sc != NULL;
++	    sc = list_next(&zsd->vz_vmms, sc)) {
++		/* Send a poweroff to the VM, whether running or not. */
++		(void) vm_suspend(sc->vmm_vm, VM_SUSPEND_POWEROFF);
++	}
++	mutex_exit(&zsd->vz_lock);
++}
++
++/*
++ * Reap all VMs that remain and free up guest resources.
++ */
++static void
++vmm_zsd_destroy(zoneid_t zid, void *data)
++{
++	vmm_zsd_t *zsd = data;
++	vmm_softc_t *sc;
++
++	mutex_enter(&zsd->vz_lock);
++	ASSERT(!zsd->vz_active);
++
++	while ((sc = list_remove_head(&zsd->vz_vmms)) != NULL) {
++		int err;
++
++		/*
++		 * This frees all resources associated with the vm, including
++		 * sc.
++		 */
++		err = vmm_do_vm_destroy(sc, B_FALSE);
++		ASSERT3S(err, ==, 0);
++	}
++
++	mutex_exit(&zsd->vz_lock);
++	mutex_destroy(&zsd->vz_lock);
++
++	list_remove(&vmm_zsd_list, zsd);
++	kmem_free(zsd, sizeof (*zsd));
++}
++
++void
++vmm_zsd_init(void)
++{
++	mutex_init(&vmm_zsd_lock, NULL, MUTEX_DEFAULT, NULL);
++	list_create(&vmm_zsd_list, sizeof (vmm_zsd_t),
++	    offsetof(vmm_zsd_t, vz_linkage));
++	zone_key_create(&vmm_zsd_key, vmm_zsd_create, vmm_zsd_shutdown,
++	    vmm_zsd_destroy);
++}
++
++void
++vmm_zsd_fini(void)
++{
++	/* Calls vmm_zsd_destroy() on all zones. */
++	zone_key_delete(vmm_zsd_key);
++	ASSERT(list_is_empty(&vmm_zsd_list));
++
++	list_destroy(&vmm_zsd_list);
++	mutex_destroy(&vmm_zsd_lock);
++}
+diff --git a/usr/src/uts/i86pc/sys/vmm_impl.h b/usr/src/uts/i86pc/sys/vmm_impl.h
+index 365567a5cd..90f9d0e65f 100644
+--- a/usr/src/uts/i86pc/sys/vmm_impl.h
++++ b/usr/src/uts/i86pc/sys/vmm_impl.h
+@@ -11,7 +11,7 @@
+ 
+ /*
+  * Copyright 2014 Pluribus Networks Inc.
+- * Copyright 2017 Joyent, Inc.
++ * Copyright 2018 Joyent, Inc.
+  */
+ 
+ #ifndef _VMM_IMPL_H_
+@@ -20,6 +20,7 @@
+ #include <sys/mutex.h>
+ #include <sys/queue.h>
+ #include <sys/varargs.h>
++#include <sys/zone.h>
+ 
+ /*
+  * /dev names:
+@@ -27,9 +28,7 @@
+  *      /dev/vmm/<name>     - vm devices
+  */
+ #define	VMM_DRIVER_NAME		"vmm"
+-
+ #define	VMM_CTL_MINOR_NODE	"ctl"
+-#define	VMM_CTL_MINOR_NAME	VMM_DRIVER_NAME VMM_CTL_MINOR_NODE
+ #define	VMM_CTL_MINOR		0
+ 
+ #ifdef	_KERNEL
+@@ -51,6 +50,8 @@ struct vmm_devmem_entry {
+ };
+ typedef struct vmm_devmem_entry vmm_devmem_entry_t;
+ 
++typedef struct vmm_zsd vmm_zsd_t;
++
+ enum vmm_softc_state {
+ 	VMM_HELD	= 1,	/* external driver(s) possess hold on VM */
+ 	VMM_CLEANUP	= 2,	/* request that holds are released */
+@@ -68,9 +69,21 @@ struct vmm_softc {
+ 	list_t		vmm_devmem_list;
+ 	list_t		vmm_holds;
+ 	kcondvar_t	vmm_cv;
++
++	/* For zone specific data */
++	list_node_t	vmm_zsd_linkage;
++	zone_t		*vmm_zone;
++	vmm_zsd_t	*vmm_zsd;
+ };
+ typedef struct vmm_softc vmm_softc_t;
+-#endif
++
++void vmm_zsd_init(void);
++void vmm_zsd_fini(void);
++int vmm_zsd_add_vm(vmm_softc_t *sc);
++void vmm_zsd_rem_vm(vmm_softc_t *sc);
++int vmm_do_vm_destroy(vmm_softc_t *, boolean_t);
++
++#endif /* _KERNEL */
+ 
+ /*
+  * VMM trace ring buffer constants
+diff --git a/usr/src/uts/i86pc/vmm/Makefile b/usr/src/uts/i86pc/vmm/Makefile
+index 914e3c61b6..3456634173 100644
+--- a/usr/src/uts/i86pc/vmm/Makefile
++++ b/usr/src/uts/i86pc/vmm/Makefile
+@@ -92,6 +92,8 @@ CFLAGS		+= -_gcc=-Wimplicit-function-declaration
+ # The FreeBSD %# notation makes gcc gripe
+ CFLAGS		+= -_gcc=-Wno-format
+ 
++LDFLAGS         += -dy -Nfs/dev
++
+ $(OBJS_DIR)/vmm.o := CERRWARN += -_gcc=-Wno-pointer-sign -_gcc=-Wno-type-limits
+ $(OBJS_DIR)/svm.o := CERRWARN += -_gcc=-Wno-pointer-sign -_gcc=-Wno-type-limits
+ 

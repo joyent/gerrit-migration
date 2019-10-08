@@ -1,0 +1,691 @@
+commit 9797cda932a36703cbf9647cf08456e534f61374 (refs/changes/04/3704/1)
+Author: Jason King <jason.king@joyent.com>
+Date:   2018-03-21T11:25:06-05:00 (1 year, 7 months ago)
+    
+    Overlay fabric router
+
+diff --git a/usr/src/uts/common/Makefile.files b/usr/src/uts/common/Makefile.files
+index ad668b9e71..7845822699 100644
+--- a/usr/src/uts/common/Makefile.files
++++ b/usr/src/uts/common/Makefile.files
+@@ -25,7 +25,7 @@
+ # Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
+ # Copyright 2015 Nexenta Systems, Inc.  All rights reserved.
+ # Copyright 2016 Garrett D'Amore <garrett@damore.org>
+-# Copyright 2017 Joyent, Inc.
++# Copyright 2018 Joyent, Inc.
+ # Copyright 2016 OmniTI Computer Consulting, Inc.  All rights reserved.
+ # Copyright 2016 Hans Rosenfeld <rosenfeld@grumpf.hope-2000.org>
+ #
+@@ -697,7 +697,7 @@ NET80211_OBJS += net80211.o net80211_proto.o net80211_input.o \
+ VNIC_OBJS +=	vnic_ctl.o vnic_dev.o
+ 
+ OVERLAY_OBJS +=	overlay.o overlay_fm.o overlay_mux.o overlay_plugin.o \
+-		overlay_prop.o overlay_target.o
++		overlay_prop.o overlay_target.o overlay_router.o
+ 
+ OVERLAY_VXLAN_OBJS +=	overlay_vxlan.o
+ 
+diff --git a/usr/src/uts/common/io/overlay/overlay.c b/usr/src/uts/common/io/overlay/overlay.c
+index c2f79d06ef..05e24c5128 100644
+--- a/usr/src/uts/common/io/overlay/overlay.c
++++ b/usr/src/uts/common/io/overlay/overlay.c
+@@ -1072,7 +1072,7 @@ overlay_m_tx(void *arg, mblk_t *mp_chain)
+ 	bzero(&hdr, sizeof (struct msghdr));
+ 
+ 	bzero(&einfo, sizeof (ovep_encap_info_t));
+-	einfo.ovdi_id = odd->odd_vid;
++
+ 	mp = mp_chain;
+ 	while (mp != NULL) {
+ 		socklen_t slen;
+@@ -1082,13 +1082,8 @@ overlay_m_tx(void *arg, mblk_t *mp_chain)
+ 		mp->b_next = NULL;
+ 		ep = NULL;
+ 
+-		/*
+-		 * TODO: we probably need to change 'storage' to a
+-		 * refheld overlay_target_entry_t and also maybe set
+-		 * local vlan from packet header for check below
+-		 */
+ 		ret = overlay_target_lookup(odd, mp,
+-		    (struct sockaddr *)&storage, &slen);
++		    (struct sockaddr *)&storage, &slen, &einfo.ovdi_id);
+ 		if (ret != OVERLAY_TARGET_OK) {
+ 			if (ret == OVERLAY_TARGET_DROP)
+ 				freemsg(mp);
+@@ -1096,17 +1091,6 @@ overlay_m_tx(void *arg, mblk_t *mp_chain)
+ 			continue;
+ 		}
+ 
+-		/*
+-		 * TODO:
+-		 *	set hdr.msg_name from target_entry
+-		 *
+-		 *	if !local:
+-		 *		check fabric attachment
+-		 *		modify vlan tag, VL2 mac addresses
+-		 *
+-		 *	set einfo.ovdi_id to vnet id (move into loop since
+-		 *	things cannot assume to all have same vnet id anymore)
+-		 */
+ 		hdr.msg_name = &storage;
+ 		hdr.msg_namelen = slen;
+ 
+diff --git a/usr/src/uts/common/io/overlay/overlay_router.c b/usr/src/uts/common/io/overlay/overlay_router.c
+new file mode 100644
+index 0000000000..598725a59d
+--- /dev/null
++++ b/usr/src/uts/common/io/overlay/overlay_router.c
+@@ -0,0 +1,317 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright 2018, Joyent, Inc.
++ */
++
++#include <sys/types.h>
++#include <sys/ethernet.h>
++#include <sys/mac_client.h>
++#include <sys/vlan.h>
++#include <sys/ddi.h>
++#include <sys/strsun.h>
++#include <inet/ip.h>
++#include <inet/ip6.h>
++#include <netinet/in.h>
++
++#include <sys/overlay_impl.h>
++
++
++/*
++ * It is currently permissible (though uncommon) to have multiple L3 networks
++ * on top of the same L2 network. E.g.
++ *	ifconfig e1000g0 192.168.0.5/24
++ *	ifconfig e1000g0:1 10.0.20.7/24
++ *
++ * This complicates things since a given vlan can then have multiple IP
++ * subnets on top of them.  We also don't know their netmasks a priori, so
++ * the best we can do is hash fabrics on dcid, vnet, vlan, and then link
++ * any L3 subnets shared on the same vlan via the ofb_shared field and
++ * check each individually to find the correct local fabric.
++ */
++static uint64_t
++overlay_fabric_hash(const void *v)
++{
++	/* TODO */
++	return (0);
++}
++
++static int
++overlay_fabric_cmp(const void *a, const void *b)
++{
++	/* TODO */
++	return (0);
++}
++
++/*
++ * Using the source and destination IP address, locate the target fabric, or
++ * create larval entries and queue for missing information.
++ */
++static overlay_fabric_t *
++overlay_route_find(overlay_dev_t *odd, mac_header_info_t *mhi,
++    const struct in6_addr *src, const struct in6_addr *dst)
++{
++	overlay_target_t *ott;
++	overlay_fabric_t *ofb_local, *ofb_src, *ofb_dst;
++	overlay_route_table_t *orte;
++	overlay_fabric_t fab = {
++		.ofb_dcid = odd->odd_dcid,
++		.ofb_vnet = odd->odd_vid,
++		.ofb_vlan = VLAN_ID(mhi->mhi_tci)
++	};
++	boolean_t dst_found = B_FALSE;
++
++	/* First attempt to find the overlay_fabric_t for the source */
++	ott = odd->odd_target;
++	ASSERT(ott->ott_mode == OVERLAY_TARGET_DYNAMIC);
++
++	mutex_enter(&ott->ott_lock);
++	ofb_local = refhash_lookup(ott->ott_u.ott_dyn.ott_fabhash, &fab);
++	refhash_hold(ott->ott_u.ott_dyn.ott_fabhash, ofb_local);
++	mutex_exit(&ott->ott_lock);
++
++	ofb_src = ofb_local;
++	while (ofb_src != NULL) {
++		if (IN6_ARE_PREFIXEDADDR_EQUAL(src, &ofb_src->ofb_addr,
++		    ofb_src->ofb_prefixlen))
++			break;
++		ofb_src = ofb_src->ofb_shared;
++	}
++
++	if (ofb_src == NULL || ofb_src->ofb_route_table == NULL) {
++		mutex_enter(&ott->ott_lock);
++		refhash_rele(ott->ott_u.ott_dyn.ott_fabhash, ofb_local);
++		mutex_exit(&ott->ott_lock);
++		return (NULL);
++	}
++
++	/* XXX: locking and such here is not right and needs to be sorted out */
++	/* Go through the fabric route table and try to find a destination */
++	orte = ofb_src->ofb_route_table;
++	for (size_t i = 0; orte->ort_dest[i] != NULL; i++) {
++		ofb_dst = orte->ort_dest[i];
++		if (IN6_ARE_PREFIXEDADDR_EQUAL(dst, &ofb_dst->ofb_addr,
++		    ofb_dst->ofb_prefixlen)) {
++			dst_found = B_TRUE;
++			break;
++		}
++	}
++
++	refhash_hold(ott->ott_u.ott_dyn.ott_fabhash, ofb_dst);
++	mutex_exit(&ott->ott_lock);
++
++	return (dst_found ? ofb_dst : NULL);
++}
++
++/*
++ * Adjust packet fields as necessary for delivery of an encapsulated packet
++ * to a remote target (e.g. cross-DC).
++ */
++int
++overlay_route(overlay_dev_t *odd, mblk_t *mp, const overlay_fabric_t *ofb,
++    const overlay_target_entry_t *ote)
++{
++	/* We should only store valid vlan values */
++	ASSERT3U(ntohs(otr->otr_vlan), >, 1);
++	ASSERT3U(ntohs(otr->otr_vlan), <=, 4096);
++
++	if (MBLKL(mp) >= sizeof (struct ether_vlan_header)) {
++		/* The easy way */
++		struct ether_vlan_header *evh;
++
++		evh = (struct ether_vlan_header *)mp->b_rptr;
++
++		/*
++		 * Today, we require all encapsulated frames to be vlan tagged.
++		 * In the future, we might relax this and insert the vlan tag if
++		 * the destination is tagged and the source is not.
++		 */
++		if (evh->ether_tpid != ETHERTYPE_VLAN)
++			return (OVERLAY_TARGET_DROP);
++
++		evh->ether_tci = evh->ether_tci & ~(VLAN_ID_MASK);
++		evh->ether_tci |= ofb->ofb_vlan;
++		bcopy(ote->ote_addr, &evh->ether_dhost, ETHERADDRL);
++		bcopy(ofb->ofb_mac, &evh->ether_shost, ETHERADDRL);
++		return (OVERLAY_TARGET_OK);
++	}
++
++	/* The painful, long, tedious way */
++	unsigned char *p = mp->b_rptr;
++	unsigned char *end = mp->b_wptr;
++	unsigned char *vlanp = NULL;
++	uint16_t sap = 0;
++	uint16_t vlan = 0;
++	size_t i;
++
++	for (i = 0; i < ETHERADDRL; i++) {
++		if (p == end) {
++			mp = mp->b_cont;
++			if (mp == NULL)
++				return (OVERLAY_TARGET_DROP);
++			p = mp->b_rptr;
++			end = mp->b_wptr;
++		}
++		*p++ = ote->ote_addr[i];
++	}
++
++	for (i = 0; i < ETHERADDRL; i++) {
++		if (p == end) {
++			mp = mp->b_cont;
++			if (mp == NULL)
++				return (OVERLAY_TARGET_DROP);
++			p = mp->b_rptr;
++			end = mp->b_wptr;
++		}
++		*p++ = ofb->ofb_mac[i];
++	}
++
++	for (i = 0; i < 2; i++) {
++		if (p == end) {
++			mp = mp->b_cont;
++			if (mp == NULL)
++				return (OVERLAY_TARGET_DROP);
++			p = mp->b_rptr;
++			end = mp->b_wptr;
++		}
++		sap |= *p++ << (8 - i*8);
++	}
++
++	if (sap != ETHERTYPE_VLAN)
++		return (OVERLAY_TARGET_DROP);
++
++	if (p == end) {
++		mp = mp->b_cont;
++		if (mp == NULL)
++			return (OVERLAY_TARGET_DROP);
++		p = mp->b_rptr;
++		end = mp->b_wptr;
++	}
++	vlanp = p;
++
++	for (i = 0; i < 2; i++) {
++		if (p == end) {
++			mp = mp->b_cont;
++			if (mp == NULL)
++				return (OVERLAY_TARGET_DROP);
++			p = mp->b_rptr;
++			end = mp->b_wptr;
++		}
++		vlan |= *p++ << (8 - i*8);
++	}
++
++	vlan &= ~(VLAN_ID_MASK);
++	vlan |= ofb->ofb_vlan;
++
++	for (p = vlanp, i = 0; i < 2; i++) {
++		if (p == end) {
++			mp = mp->b_cont;
++			if (mp == NULL)
++				return (OVERLAY_TARGET_DROP);
++			p = mp->b_rptr;
++			end = mp->b_wptr;
++		}
++		*p++ = vlan >> (8 - i*8);
++	}
++
++	return (OVERLAY_TARGET_OK);
++}
++
++int
++overlay_route_lookup(overlay_dev_t *odd, mblk_t *mp,
++    const mac_header_info_t *mhi, struct sockaddr *sock, socklen_t *slenp)
++{
++	overlay_target_t *ott = odd->odd_target;
++	struct in6_addr src, dst;
++
++	ASSERT(ott->ott_mode == OVERLAY_TARGET_DYNAMIC);
++
++	return (OVERLAY_TARGET_DROP);
++}
++
++/*
++ * Obtain the source and/or destination VL3 IPs of a packet.  If this is
++ * IPV4 packet, the addresses are returned as IPV6 mapped addresses.
++ *
++ * XXX: The name seems a bit ugly, anyone have better suggestions?
++ */
++int
++overlay_mblk_vl3ip(mblk_t *mp, struct in6_addr *src, struct in6_addr *dst)
++{
++	struct ether_header *ehp;
++	ipha_t *iphp;
++	ip6_t *ip6hp;
++	size_t skip_len;
++	uint16_t sap;
++
++	/*
++	 * This is only used for outbound packets, so we use a similar
++	 * approach as inet_pkt_hash().
++	 */
++	ASSERT(IS_P2ALIGNED(mp->b_rptr, sizeof (uint16_t)));
++	ASSERT(MBLKL(mp) >= sizeof (struct ether_header));
++
++	ehp = (struct ether_header *)mp->b_rptr;
++	sap = ntohs(ehp->ether_type);
++	if (sap == ETHERTYPE_VLAN) {
++		struct ether_vlan_header *evhp;
++		mblk_t *newmp = NULL;
++
++		skip_len = sizeof (struct ether_vlan_header);
++		if (MBLKL(mp) < skip_len) {
++			/* the vlan tag is the payload, pull up first */
++			newmp = msgpullup(mp, -1);
++			if ((newmp == NULL) || (MBLKL(newmp) < skip_len)) {
++				freemsg(newmp);
++				return (ENOMEM);
++			}
++			evhp = (struct ether_vlan_header *)newmp->b_rptr;
++		} else {
++			evhp = (struct ether_vlan_header *)mp->b_rptr;
++		}
++		sap = ntohs(evhp->ether_type);
++		freemsg(newmp);
++	} else {
++		skip_len = sizeof (struct ether_header);
++	}
++
++	/* if the ethernet header is in its own mblk, skip it */
++	if (MBLKL(mp) <= skip_len) {
++		skip_len -= MBLKL(mp);
++		mp = mp->b_cont;
++		if (mp == NULL)
++			return (EINVAL);
++	}
++
++	switch (sap) {
++	case ETHERTYPE_IP:
++		iphp = (ipha_t *)(mp->b_rptr + skip_len);
++		if (((unsigned char *)iphp + sizeof (ipha_t) > mp->b_wptr) ||
++		    !OK_32PTR((char *)iphp))
++			return (EINVAL);	/* XXX: better error code? */
++
++		IN6_IPADDR_TO_V4MAPPED(iphp->ipha_src, src);
++		IN6_IPADDR_TO_V4MAPPED(iphp->ipha_dst, dst);
++		return (0);
++	case ETHERTYPE_IPV6:
++		ip6hp = (ip6_t *)(mp->b_rptr + skip_len);
++		if (((unsigned char *)ip6hp + IPV6_HDR_LEN > mp->b_wptr) ||
++		    !OK_32PTR((char *)ip6hp))
++			return (EINVAL);
++
++		bcopy(&ip6hp->ip6_src, src, sizeof (*src));
++		bcopy(&ip6hp->ip6_dst, dst, sizeof (*dst));
++		return (0);
++	default:
++		return (EINVAL);
++	}
++}
+diff --git a/usr/src/uts/common/io/overlay/overlay_target.c b/usr/src/uts/common/io/overlay/overlay_target.c
+index cb79bfdfdb..8613dae6e6 100644
+--- a/usr/src/uts/common/io/overlay/overlay_target.c
++++ b/usr/src/uts/common/io/overlay/overlay_target.c
+@@ -306,15 +306,11 @@ overlay_target_quiesce(overlay_target_t *ott)
+ /*
+  * This functions assumes that the destination mode is OVERLAY_PLUGIN_D_IP |
+  * OVERLAY_PLUGIN_D_PORT. As we don't have an implementation of anything else at
+- * this time, say for NVGRE, we drop all packets that mcuh this.
+- *
+- * XXX: It might be better to replace the 'sock' argument with
+- * overlay_target_entry_t** and set it with the found entry in the case
+- * of OVERLAY_TARGET_OK.
++ * this time, say for NVGRE, we drop all packets that match this.
+  */
+ int
+ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+-    socklen_t *slenp)
++    socklen_t *slenp, uint64_t *vidp)
+ {
+ 	int ret;
+ 	struct sockaddr_in6 *v6;
+@@ -324,6 +320,8 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 
+ 	ASSERT(odd->odd_target != NULL);
+ 
++	*vidp = odd->odd_vid;
++
+ 	/*
+ 	 * At this point, the overlay device is in a mux which means that it's
+ 	 * been activated. At this point, parts of the target, such as the mode
+@@ -352,22 +350,13 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 	ASSERT(ott->ott_mode == OVERLAY_TARGET_DYNAMIC);
+ 
+ 	/*
+-	 * Note we only want the MAC address here, therefore we won't bother
+-	 * using mac_vlan_header_info(). If any caller needs the vlan info at
+-	 * this point, this should change to a call to mac_vlan_header_info().
++	 * VL2 -> UL3 lookups only need the destination VL2 mac address,
++	 * however, if we end up having to route the packet, we will need
++	 * the source vlan as part of the destination selection.
+ 	 */
+-	if (mac_header_info(odd->odd_mh, mp, &mhi) != 0)
++	if (mac_vlan_header_info(odd->odd_mh, mp, &mhi) != 0)
+ 		return (OVERLAY_TARGET_DROP);
+ 
+-	/*
+-	 * TODO: compare mhi.mhi_daddr with odd->macaddr.
+-	 * If match,
+-	 * 	get VL3 dest from mp
+-	 * 	lookup target using VL3 dest
+-	 * otherwise,
+-	 * 	lookup target using VL2 dest (existing refhash_lookup() call
+-	 * 	below)
+-	 */
+ 	mutex_enter(&ott->ott_lock);
+ 	entry = refhash_lookup(ott->ott_u.ott_dyn.ott_dhash,
+ 	    mhi.mhi_daddr);
+@@ -378,11 +367,6 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 			mutex_exit(&ott->ott_lock);
+ 			return (OVERLAY_TARGET_DROP);
+ 		}
+-		/*
+-		 * TODO: set entry->ote_dcid, if VL3 lookup, copy dst addr
+-		 * into entry->ote_ip.  Probably zero out the address we're
+-		 * not lookup up (VL2 or VL3) as well.
+-		 */
+ 		bcopy(mhi.mhi_daddr, entry->ote_addr, ETHERADDRL);
+ 		entry->ote_chead = entry->ote_ctail = mp;
+ 		entry->ote_mbsize = msgsize(mp);
+@@ -401,6 +385,8 @@ overlay_target_lookup(overlay_dev_t *odd, mblk_t *mp, struct sockaddr *sock,
+ 	mutex_enter(&entry->ote_lock);
+ 	if (entry->ote_flags & OVERLAY_ENTRY_F_DROP) {
+ 		ret = OVERLAY_TARGET_DROP;
++	} else if (entry->ote_flags & OVERLAY_ENTRY_F_ROUTER) {
++		ret = overlay_route_lookup(odd, mp, &mhi, sock, slenp);
+ 	} else if (entry->ote_flags & OVERLAY_ENTRY_F_VALID) {
+ 		bcopy(&entry->ote_dest.otp_ip, &v6->sin6_addr,
+ 		    sizeof (struct in6_addr));
+@@ -608,9 +594,9 @@ overlay_target_lookup_request(overlay_target_hdl_t *thdl, void *arg)
+ {
+ 	overlay_targ_lookup_t *otl = arg;
+ 	overlay_target_entry_t *entry;
++	void *src, *dst;
+ 	clock_t ret, timeout;
+ 	mac_header_info_t mhi;
+-
+ 	timeout = ddi_get_lbolt() + drv_usectohz(MICROSEC);
+ again:
+ 	mutex_enter(&overlay_target_lock);
+@@ -632,12 +618,25 @@ again:
+ 	}
+ 	ASSERT(entry->ote_chead != NULL);
+ 
++	otl->otl_l3req =
++	    IN6_IS_ADDR_UNSPECIFIED(&entry->ote_ip) ? B_TRUE : B_FALSE;
++
++	if (otl->otl_l3req) {
++		src = &otl->otl_addru.otlu_l3.otl3_srcip;
++		dst = &otl->otl_addru.otlu_l3.otl3_dstip;
++	} else {
++		src = &otl->otl_addru.otlu_l2.otl2_srcaddr;
++		dst = &otl->otl_addru.otlu_l2.otl2_dstaddr;
++	}
++
+ 	/*
+-	 * If we have a bogon that doesn't have a valid mac header, drop it and
+-	 * try again.
++	 * If we have a bogon that doesn't have a valid mac header, or an
++	 * invalid IP header for IP requests, drop it and try again.
+ 	 */
+-	if (mac_vlan_header_info(entry->ote_odd->odd_mh, entry->ote_chead,
+-	    &mhi) != 0) {
++	if ((mac_vlan_header_info(entry->ote_odd->odd_mh, entry->ote_chead,
++	    &mhi) != 0) ||
++	    (otl->otl_l3req && overlay_mblk_vl3ip(entry->ote_chead, src,
++	    dst) != 0)) {
+ 		boolean_t queue = B_FALSE;
+ 		mblk_t *mp = entry->ote_chead;
+ 		entry->ote_chead = mp->b_next;
+@@ -654,13 +653,6 @@ again:
+ 		goto again;
+ 	}
+ 
+-	/*
+-	 * TODO: If VL3 request,
+-	 *	set otl->otl_l3req
+-	 *	Fill in otl_{src,dst}ip
+-	 * Else
+-	 *	clear otl->otl_l3req
+-	 */
+ 	otl->otl_dlid = entry->ote_odd->odd_linkid;
+ 	otl->otl_reqid = (uintptr_t)entry;
+ 	otl->otl_varpdid = entry->ote_ott->ott_id;
+@@ -668,11 +660,18 @@ again:
+ 
+ 	otl->otl_hdrsize = mhi.mhi_hdrsize;
+ 	otl->otl_pktsize = msgsize(entry->ote_chead) - otl->otl_hdrsize;
+-	bcopy(mhi.mhi_daddr, otl->otl_addru.otlu_l2.otl2_dstaddr, ETHERADDRL);
+-	bcopy(mhi.mhi_saddr, otl->otl_addru.otlu_l2.otl2_srcaddr, ETHERADDRL);
+ 	otl->otl_addru.otlu_l2.otl2_dsttype = mhi.mhi_dsttype;
+ 	otl->otl_addru.otlu_l2.otl2_sap = mhi.mhi_bindsap;
+ 	otl->otl_vlan = VLAN_ID(mhi.mhi_tci);
++
++	/*
++	 * The overlay_mblk_vl3ip() call above fills in dst & src for
++	 * VL3->UL3 requests, so only need to care about VL2->UL3 here.
++	 */
++	if (!otl->otl_l3req) {
++		bcopy(mhi.mhi_daddr, dst, ETHERADDRL);
++		bcopy(mhi.mhi_saddr, src, ETHERADDRL);
++	}
+ 	mutex_exit(&entry->ote_lock);
+ 
+ 	mutex_enter(&thdl->oth_lock);
+@@ -688,6 +687,16 @@ overlay_target_lookup_respond(overlay_target_hdl_t *thdl, void *arg)
+ 	const overlay_targ_resp_t *otr = arg;
+ 	overlay_target_entry_t *entry;
+ 	mblk_t *mp;
++	boolean_t is_router = B_FALSE;
++
++	/*
++	 * If we ever support a protocol that uses MAC addresses for the UL
++	 * destination addr, we probably should expand this to check that
++	 * all of otr is zero.
++	 */
++	if (IN6_IS_ADDR_UNSPECIFIED(&otr->otr_answer.otp_ip) &&
++	    otr->otr_answer.otp_port == 0)
++		is_router = B_TRUE;
+ 
+ 	mutex_enter(&thdl->oth_lock);
+ 	for (entry = list_head(&thdl->oth_outstanding); entry != NULL;
+@@ -708,6 +717,8 @@ overlay_target_lookup_respond(overlay_target_hdl_t *thdl, void *arg)
+ 	    sizeof (overlay_target_point_t));
+ 	entry->ote_flags &= ~OVERLAY_ENTRY_F_PENDING;
+ 	entry->ote_flags |= OVERLAY_ENTRY_F_VALID;
++	if (is_router)
++		entry->ote_flags |= OVERLAY_ENTRY_F_ROUTER;
+ 	mp = entry->ote_chead;
+ 	entry->ote_chead = NULL;
+ 	entry->ote_ctail = NULL;
+diff --git a/usr/src/uts/common/sys/overlay_impl.h b/usr/src/uts/common/sys/overlay_impl.h
+index 7d42bfca19..09e44a002c 100644
+--- a/usr/src/uts/common/sys/overlay_impl.h
++++ b/usr/src/uts/common/sys/overlay_impl.h
+@@ -82,7 +82,7 @@ typedef struct overlay_target {
+ 		overlay_target_point_t	ott_point;
+ 		struct overlay_target_dyn {
+ 			refhash_t	*ott_dhash;
+-			refhash_t	*ott_l3dhash;
++			refhash_t	*ott_fabhash;
+ 			avl_tree_t	ott_tree;
+ 			/* XXX: Do we actually need a tree sorted by VL3? */
+ 			avl_tree_t	ott_l3tree;
+@@ -90,33 +90,6 @@ typedef struct overlay_target {
+ 	} ott_u;
+ } overlay_target_t;
+ 
+-/*
+- * Initially at least, we represent a group of fabrics that are attached to
+- * each other as a circular linked list.  Within an overlay_dev_t, we then
+- * maintain a list of pointers into these lists for each fabric that's
+- * present locally on the CN as we learn them:
+- *
+- */
+-typedef struct overlay_fabric_attach {
+-	struct overlay_fabric_attach *ofa_next;
+-	struct in6_addr	ofa_addr;
+-	uint32_t	ofa_dcid;
+-	uint16_t	ofa_vlan;
+-	uint8_t		ofa_prefixlen;
+-	uint8_t		ofa_pad;
+-} overlay_fabric_attach_t;
+-
+-/*
+- * Since we have two different refhashes for an overlay_target_entry_t
+- * (VL2 aka MAC address and VL3 aka IP address), we want to maintain
+- * the refcount in only one place. We elect to use the ott_dhash
+- * refhash to do so.
+- */
+-#define	OVERLAY_TARGET_ENTRY_HOLD(tgt, e) \
+-	refhash_hold((tgt)->ott_u.ott_dyn.ott_dhash, e)
+-#define	OVERLAY_TARGET_ENTRY_RELE(tgt, e) \
+-	refhash_rele((tgt)->ott_u.ott_dyn.ott_dhash, e)
+-
+ typedef enum overlay_dev_flag {
+ 	OVERLAY_F_ACTIVATED	= 0x01, /* Activate ioctl completed */
+ 	OVERLAY_F_IN_MUX	= 0x02,	/* Currently in a mux */
+@@ -147,17 +120,39 @@ typedef struct overlay_dev {
+ 	uint64_t	odd_vid;		/* RO if active else odd_lock */
+ 	avl_node_t	odd_muxnode;		/* managed by mux */
+ 	overlay_target_t *odd_target;		/* See big theory statement */
+-	overlay_fabric_attach_t **odd_fattach;	/* protected by odd_lock */
+ 	uint32_t	odd_dcid;		/* RO if active else odd_lock */
+ 	uint8_t		odd_macaddr[ETHERADDRL]; /* RO same as odd_dcid */
+ 	char		odd_fmamsg[OVERLAY_STATUS_BUFLEN];	/* odd_lock */
+ } overlay_dev_t;
+ 
++typedef struct overlay_route_table {
++	struct overlay_fabric **ort_dest;
++	size_t			ort_nalloc;
++} overlay_route_table_t;
++
++struct overlay_fabric {
++	refhash_link_t		ofb_reflink;
++	struct overlay_fabric	*ofb_shared;
++	overlay_route_table_t	*ofb_route_table;
++	refhash_t		*ofb_target_entries;
++	overlay_dev_t		*ofb_odd;
++	struct in6_addr	ofb_addr;
++	uint64_t	ofb_vnet;
++	uint32_t	ofb_dcid;
++	uint16_t	ofb_vlan;	/* Stored in network byte order */
++	uint8_t		ofb_prefixlen;
++	uint8_t		ofb_pad;
++	uint8_t		ofb_mac[ETHERADDRL];
++	uint8_t		ofb_pad2[2];
++};
++typedef struct overlay_fabric overlay_fabric_t;
++
+ typedef enum overlay_target_entry_flags {
+ 	OVERLAY_ENTRY_F_PENDING		= 0x01,	/* lookup in progress */
+ 	OVERLAY_ENTRY_F_VALID		= 0x02,	/* entry is currently valid */
+ 	OVERLAY_ENTRY_F_DROP		= 0x04,	/* always drop target */
+-	OVERLAY_ENTRY_F_VALID_MASK	= 0x06
++	OVERLAY_ENTRY_F_VALID_MASK	= 0x06,
++	OVERLAY_ENTRY_F_ROUTER		= 0x08	/* entry is for router */
+ } overlay_target_entry_flags_t;
+ 
+ typedef struct overlay_target_entry {
+@@ -168,7 +163,6 @@ typedef struct overlay_target_entry {
+ 	avl_node_t		ote_l3_avllink;	/* IP iteration link */
+ 	list_node_t		ote_qlink;
+ 	overlay_target_entry_flags_t ote_flags;	/* RW: state flags */
+-	uint32_t		ote_dcid;
+ 	uint16_t		ote_vlan;	/* RO: VL3 vlan id */
+ 	uint8_t			ote_addr[ETHERADDRL];	/* RO: mac addr */
+ 	struct in6_addr		ote_ip;		/* RO: VL3 IP */
+@@ -223,10 +217,14 @@ extern void overlay_target_free(overlay_dev_t *);
+ #define	OVERLAY_TARGET_DROP	1
+ #define	OVERLAY_TARGET_ASYNC	2
+ extern int overlay_target_lookup(overlay_dev_t *, mblk_t *, struct sockaddr *,
+-    socklen_t *);
++    socklen_t *, uint64_t *);
+ extern void overlay_target_quiesce(overlay_target_t *);
+ extern void overlay_target_fini(void);
+ 
++extern int overlay_route_lookup(overlay_dev_t *, mblk_t *,
++    const mac_header_info_t *, struct sockaddr *, socklen_t *);
++extern int overlay_mblk_vl3ip(mblk_t *, struct in6_addr *, struct in6_addr *);
++
+ extern void overlay_fm_init(void);
+ extern void overlay_fm_fini(void);
+ extern void overlay_fm_degrade(overlay_dev_t *, const char *);
