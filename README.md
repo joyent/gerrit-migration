@@ -4,17 +4,14 @@ GitHub PRs.
 
 See [MANTA-4594](https://jira.joyent.us/browse/MANTA-4594) for full details.
 
-# How to move a repo from cr.joyent.us (Gerrit) to GitHub PRs
+## How to move a repo from cr.joyent.us (Gerrit) to GitHub PRs
 
 We will use "joyent/node-manta" as the example project/repo in these notes.
 Substitute with your project/repo.
 
 1.  Look at any currently open CRs for the project and take note of the CR
-    numbers.
-
-    https://cr.joyent.us/#/q/is:open+project:joyent/node-manta
-
-    and/or:
+    numbers. Visit <https://cr.joyent.us/#/q/is:open+project:joyent/node-manta>
+    and/or run:
 
         ssh cr gerrit query --format=JSON -- is:open project:joyent/node-manta \
             | json -ga project url owner.email subject
@@ -112,7 +109,7 @@ Substitute with your project/repo.
     any remain for your repo.
 
 
-# How to move an archived CR to a PR
+## How to move an archived CR to a PR
 
 All cr.joyent.us CRs have been archived at
 https://github.com/joyent/gerrit-migration/tree/master/archive
