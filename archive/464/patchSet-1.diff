@@ -1,0 +1,971 @@
+commit 61ac05dadbf96ae0d503ae6f9505c7d6eae6c9bd (refs/changes/64/464/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-09-13T17:01:58-07:00 (3 years, 1 month ago)
+    
+    joyent/node-cueball#13 Pool can enter "failed" when 1 backend is down out of N and spares = 1
+    joyent/node-cueball#18 periodic randomness in preference lists
+
+diff --git a/lib/pool-monitor.js b/lib/pool-monitor.js
+index 9baa19c..b58ef92 100644
+--- a/lib/pool-monitor.js
++++ b/lib/pool-monitor.js
+@@ -51,9 +51,22 @@ CueBallPoolMonitor.prototype.toKangOptions = function () {
+ 		var obj = {};
+ 		obj.backends = pool.p_backends;
+ 		obj.connections = {};
+-		Object.keys(pool.p_connections).forEach(function (k) {
+-			obj.connections[k] = pool.p_connections[k].length;
++		var ks = pool.p_keys;
++		Object.keys(obj.connections).forEach(function (k) {
++			if (ks.indexOf(k) === -1)
++				ks.push(k);
+ 		});
++		ks.forEach(function (k) {
++			var conns = pool.p_connections[k] || [];
++			obj.connections[k] = {};
++			conns.forEach(function (fsm) {
++				var s = fsm.getState();
++				if (obj.connections[k][s] === undefined)
++					obj.connections[k][s] = 0;
++				++obj.connections[k][s];
++			});
++		});
++		obj.dead_backends = Object.keys(pool.p_dead);
+ 		obj.last_rebalance = Math.round(
+ 		    pool.p_lastRebalance.getTime() / 1000);
+ 		obj.resolvers = pool.p_resolver.r_resolvers;
+diff --git a/lib/pool.js b/lib/pool.js
+index 22ad766..595987a 100644
+--- a/lib/pool.js
++++ b/lib/pool.js
+@@ -88,11 +88,11 @@ function ConnectionFSM(options) {
+ 	this.cf_maxTimeout = initialRecov.maxTimeout || Infinity;
+ 
+ 	/*
+-	 * If our parent pool is failed, resume connection attempts with the
+-	 * maximum delay and timeout. Something is going wrong, let's not
+-	 * retry too aggressively and make it worse.
++	 * If our parent pool thinks this backend is dead, resume connection
++	 * attempts with the maximum delay and timeout. Something is going
++	 * wrong, let's not retry too aggressively and make it worse.
+ 	 */
+-	if (this.cf_pool.isInState('failed')) {
++	if (this.cf_pool.p_dead[this.cf_backend.key] === true) {
+ 		/*
+ 		 * We might be given an infinite maxDelay or maxTimeout. If
+ 		 * we are, then multiply it by 2^(retries) to get to what the
+@@ -105,8 +105,13 @@ function ConnectionFSM(options) {
+ 		this.cf_timeout = this.cf_maxTimeout;
+ 		if (!isFinite(this.cf_timeout))
+ 			this.cf_timeout = initialRecov.timeout * mult;
++		/* Keep retrying a failed backend forever */
++		this.cf_retries = Infinity;
++		this.cf_retriesLeft = Infinity;
+ 	}
+ 
++	this.allStateEvent('closeAsserted');
++
+ 	FSM.call(this, 'init');
+ }
+ mod_util.inherits(ConnectionFSM, FSM);
+@@ -191,14 +196,19 @@ ConnectionFSM.prototype.closeAfterRelease = function () {
+ 	this.cf_closeAfter = true;
+ };
+ 
+-ConnectionFSM.prototype.state_init = function (on, once) {
++ConnectionFSM.prototype.state_init = function (on) {
++	this.validTransitions(['connect']);
+ 	var self = this;
+-	once(this, 'startAsserted', function () {
++	on(this, 'startAsserted', function () {
+ 		self.gotoState('connect');
+ 	});
++	on(this, 'closeAsserted', function () {
++		self.gotoState('closed');
++	});
+ };
+ 
+ ConnectionFSM.prototype.state_connect = function (on, once, timeout) {
++	this.validTransitions(['error', 'idle', 'closed']);
+ 	var self = this;
+ 	timeout(this.cf_timeout, function () {
+ 		self.cf_lastError = new mod_errors.ConnectionTimeoutError(self);
+@@ -235,16 +245,19 @@ ConnectionFSM.prototype.state_connect = function (on, once, timeout) {
+ 	});
+ };
+ 
+-ConnectionFSM.prototype.state_closed = function () {
++ConnectionFSM.prototype.state_closed = function (on) {
++	this.validTransitions([]);
+ 	if (this.cf_conn && this.cf_conn.destroy)
+ 		this.cf_conn.destroy();
+ 	this.cf_conn = undefined;
+ 	this.cf_closeAfter = false;
+ 	this.cf_lastError = undefined;
+-	this.cf_log.trace('closed');
++	this.cf_log.trace('ConnectionFSM closed');
++	on(this, 'closeAsserted', function () { });
+ };
+ 
+ ConnectionFSM.prototype.state_error = function (on, once, timeout) {
++	this.validTransitions(['delay', 'closed']);
+ 	if (this.cf_conn && this.cf_conn.destroy)
+ 		this.cf_conn.destroy();
+ 	this.cf_conn = undefined;
+@@ -254,12 +267,16 @@ ConnectionFSM.prototype.state_error = function (on, once, timeout) {
+ 		this.cf_shadow = undefined;
+ 	}
+ 
+-	if (this.cf_closeAfter === true) {
++	if (this.cf_retries === Infinity && this.cf_closeAfter) {
++		this.cf_retriesLeft = 0;
+ 		this.gotoState('closed');
+ 		return;
+ 	}
+ 
+-	if (this.cf_retries === Infinity || --this.cf_retriesLeft > 0) {
++	if (this.cf_retries !== Infinity)
++		--this.cf_retriesLeft;
++
++	if (this.cf_retries === Infinity || this.cf_retriesLeft > 0) {
+ 		this.gotoState('delay');
+ 	} else {
+ 		this.cf_log.warn(this.cf_lastError, 'failed to connect to ' +
+@@ -269,6 +286,7 @@ ConnectionFSM.prototype.state_error = function (on, once, timeout) {
+ };
+ 
+ ConnectionFSM.prototype.state_delay = function (on, once, timeout) {
++	this.validTransitions(['connect', 'closed']);
+ 	var delay = this.cf_delay;
+ 
+ 	this.cf_delay *= 2;
+@@ -289,6 +307,7 @@ ConnectionFSM.prototype.state_delay = function (on, once, timeout) {
+ };
+ 
+ ConnectionFSM.prototype.state_idle = function (on, once, timeout) {
++	this.validTransitions(['busy', 'error', 'closed']);
+ 	var self = this;
+ 
+ 	this.cf_claimed = false;
+@@ -349,6 +368,10 @@ ConnectionFSM.prototype.state_idle = function (on, once, timeout) {
+ 		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+ 		self.gotoState('error');
+ 	});
++	once(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		self.gotoState('error');
++	});
+ 	once(this, 'closeAsserted', function () {
+ 		self.gotoState('closed');
+ 	});
+@@ -371,6 +394,7 @@ ConnectionFSM.prototype.state_idle = function (on, once, timeout) {
+ };
+ 
+ ConnectionFSM.prototype.state_ping = function (on, once, timeout) {
++	this.validTransitions(['error', 'closed', 'idle']);
+ 	this.cf_lastCheck = new Date();
+ 
+ 	this.cf_claimStack = [
+@@ -420,6 +444,10 @@ ConnectionFSM.prototype.state_ping = function (on, once, timeout) {
+ 		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+ 		self.gotoState('error');
+ 	});
++	once(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		self.gotoState('error');
++	});
+ 	once(this, 'closeAsserted', function () {
+ 		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+ 		self.gotoState('error');
+@@ -437,6 +465,7 @@ ConnectionFSM.prototype.state_ping = function (on, once, timeout) {
+ };
+ 
+ ConnectionFSM.prototype.state_busy = function (on, once, timeout) {
++	this.validTransitions(['error', 'closed', 'idle']);
+ 	var self = this;
+ 	this.cf_conn.ref();
+ 
+@@ -476,6 +505,10 @@ ConnectionFSM.prototype.state_busy = function (on, once, timeout) {
+ 		self.cf_lastError = err;
+ 		self.gotoState('error');
+ 	});
++	once(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		self.gotoState('error');
++	});
+ 	once(this.cf_conn, 'close', function () {
+ 		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+ 		self.gotoState('error');
+@@ -598,6 +631,7 @@ function CueBallConnectionPool(options) {
+ 	this.p_keys = [];
+ 	this.p_backends = {};
+ 	this.p_connections = {};
++	this.p_dead = {};
+ 
+ 	this.p_lastRebalance = undefined;
+ 	this.p_inRebalance = false;
+@@ -635,13 +669,19 @@ function CueBallConnectionPool(options) {
+ 	}, 10000);
+ 	this.p_rebalTimerInst.unref();
+ 
++	this.p_shuffleTimer = new EventEmitter();
++	this.p_shuffleTimerInst = setInterval(function () {
++		self.p_shuffleTimer.emit('timeout');
++	}, 60000);
++	this.p_shuffleTimerInst.unref();
++
+ 	FSM.call(this, 'starting');
+ }
+ mod_util.inherits(CueBallConnectionPool, FSM);
+ 
+ CueBallConnectionPool.prototype.on_resolver_added = function (k, backend) {
+ 	backend.key = k;
+-	var idx = Math.floor(Math.random() * this.p_keys.length);
++	var idx = Math.floor(Math.random() * (this.p_keys.length + 1));
+ 	this.p_keys.splice(idx, 0, k);
+ 	this.p_backends[k] = backend;
+ 	this.rebalance();
+@@ -662,6 +702,7 @@ CueBallConnectionPool.prototype.on_resolver_removed = function (k) {
+ 
+ CueBallConnectionPool.prototype.state_starting =
+     function (on, once, timeout, onState) {
++	this.validTransitions(['failed', 'running', 'stopping']);
+ 	mod_monitor.monitor.registerPool(this);
+ 
+ 	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
+@@ -698,13 +739,11 @@ CueBallConnectionPool.prototype.state_starting =
+ 		self.gotoState('running');
+ 	});
+ 
+-	var failures = 0;
+ 	on(this, 'closedBackend', function (fsm) {
+-		if (fsm.retriesExhausted())
+-			++failures;
+-		if (failures >= self.p_spares) {
++		var dead = Object.keys(self.p_dead).length;
++		if (dead >= self.p_keys.length) {
+ 			self.p_log.error(
+-			    { failures: failures },
++			    { dead: dead },
+ 			    'pool has exhausted all retries, now moving to ' +
+ 			    '"failed" state');
+ 			self.gotoState('failed');
+@@ -717,8 +756,10 @@ CueBallConnectionPool.prototype.state_starting =
+ };
+ 
+ CueBallConnectionPool.prototype.state_failed = function (on) {
++	this.validTransitions(['running', 'stopping']);
+ 	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
+ 	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
++	on(this.p_shuffleTimer, 'timeout', this.reshuffle.bind(this));
+ 
+ 	var self = this;
+ 	on(this, 'connectedToBackend', function () {
+@@ -734,41 +775,18 @@ CueBallConnectionPool.prototype.state_failed = function (on) {
+ };
+ 
+ CueBallConnectionPool.prototype.state_running = function (on) {
++	this.validTransitions(['failed', 'stopping']);
+ 	var self = this;
+ 	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
+ 	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
+ 	on(this.p_rebalTimer, 'timeout', this.rebalance.bind(this));
++	on(this.p_shuffleTimer, 'timeout', this.reshuffle.bind(this));
+ 
+-	/*
+-	 * Count the number of backends that have closed due to exhausting their
+-	 * retry policy. Reset the counter whenever we have a good new
+-	 * connection open. The idea is to detect the case where we've lost
+-	 * all of our backends and have exhausted at least self.p_spares
+-	 * new attempts to connect, to decide to go into the 'failed' state.
+-	 */
+-	var exhaustedSinceLastOpen = 0;
+-	on(this, 'connectedToBackend', function () {
+-		exhaustedSinceLastOpen = 0;
+-	});
+ 	on(this, 'closedBackend', function (fsm) {
+-		if (fsm.retriesExhausted())
+-			++exhaustedSinceLastOpen;
+-		var fsms = 0;
+-		self.p_keys.forEach(function (k) {
+-			var conns = self.p_connections[k];
+-			if (conns)
+-				fsms += conns.length;
+-		});
+-		/*
+-		 * If we have no FSMs left at all, OR if all of our FSMs are
+-		 * on the init queue (just starting up) and we've had at least
+-		 * self.p_spares failures to connect since we last saw a
+-		 * successful connect, give up and go to 'failed'.
+-		 */
+-		if (fsms < 1 || (fsms === self.p_initq.length &&
+-		    exhaustedSinceLastOpen >= self.p_spares)) {
++		var dead = Object.keys(self.p_dead).length;
++		if (dead >= self.p_keys.length) {
+ 			self.p_log.error(
+-			    { failures: exhaustedSinceLastOpen },
++			    { dead: dead },
+ 			    'pool has exhausted all retries, now moving to ' +
+ 			    '"failed" state');
+ 			self.gotoState('failed');
+@@ -782,6 +800,7 @@ CueBallConnectionPool.prototype.state_running = function (on) {
+ 
+ CueBallConnectionPool.prototype.state_stopping =
+     function (on, once, timeout, onState) {
++	this.validTransitions(['stopping.backends']);
+ 	var self = this;
+ 	if (this.p_startedResolver) {
+ 		onState(this.p_resolver, 'stopped', function () {
+@@ -794,6 +813,7 @@ CueBallConnectionPool.prototype.state_stopping =
+ };
+ 
+ CueBallConnectionPool.prototype.state_stopping.backends = function () {
++	this.validTransitions(['stopped']);
+ 	var conns = this.p_connections;
+ 	var self = this;
+ 	var fsms = [];
+@@ -819,11 +839,20 @@ CueBallConnectionPool.prototype.state_stopping.backends = function () {
+ };
+ 
+ CueBallConnectionPool.prototype.state_stopped = function () {
++	this.validTransitions([]);
+ 	mod_monitor.monitor.unregisterPool(this);
+ 	this.p_keys = [];
+ 	this.p_connections = {};
+ 	this.p_backends = {};
+ 	clearInterval(this.p_rebalTimerInst);
++	clearInterval(this.p_shuffleTimerInst);
++};
++
++CueBallConnectionPool.prototype.reshuffle = function () {
++	var taken = this.p_keys.pop();
++	var idx = Math.floor(Math.random() * (this.p_keys.length + 1));
++	this.p_keys.splice(idx, 0, taken);
++	this.rebalance();
+ };
+ 
+ /* Stop and kill everything. */
+@@ -854,15 +883,25 @@ CueBallConnectionPool.prototype.rebalance = function () {
+ 
+ 	var total = 0;
+ 	var conns = {};
++	var keyMap = {};
+ 	this.p_keys.forEach(function (k) {
+ 		conns[k] = (self.p_connections[k] || []).slice();
+ 		total += conns[k].length;
+ 	});
++	Object.keys(this.p_connections).forEach(function (k) {
++		if (conns[k] === undefined &&
++		    self.p_connections[k] !== undefined &&
++		    self.p_connections[k].length > 0) {
++			conns[k] = (self.p_connections[k] || []).slice();
++		}
++	});
+ 	var spares = this.p_idleq.length + this.p_initq.length -
+ 	    this.p_waiters.length;
+ 	if (spares < 0)
+ 		spares = 0;
+ 	var busy = total - spares;
++	if (busy < 0)
++		busy = 0;
+ 	var extras = this.p_waiters.length - this.p_initq.length;
+ 	if (extras < 0)
+ 		extras = 0;
+@@ -871,26 +910,43 @@ CueBallConnectionPool.prototype.rebalance = function () {
+ 	if (target > this.p_max)
+ 		target = this.p_max;
+ 
+-	var plan = mod_utils.planRebalance(conns, total, target);
++	var plan = mod_utils.planRebalance(conns, self.p_dead, target,
++	    self.p_max);
++
+ 	if (plan.remove.length > 0 || plan.add.length > 0) {
+ 		this.p_log.trace('rebalancing pool, remove %d, ' +
+-		    'add %d (busy = %d, idle = %d, target = %d)',
++		    'add %d (busy = %d, spares = %d, target = %d)',
+ 		    plan.remove.length, plan.add.length,
+ 		    busy, spares, target);
+ 	}
+ 	plan.remove.forEach(function (fsm) {
+-		if (fsm.isInState('busy')) {
+-			fsm.closeAfterRelease();
+-		} else {
++		/*
++		 * Only tell the FSM to quit *right now* if either:
++		 *   1. it's idle
++		 *   2. there are other FSMs for this backend
++		 *   2. it is connected to a backend that has been
++		 *      removed from the resolver
++		 * Otherwise get it to quit gracefully once it's done
++		 * doing whatever it's doing (using closeAfterRelease).
++		 * This way we when we have a failing backend that we
++		 * want to mark as "dead" ASAP, we don't give up early
++		 * and never figure out if it's actually dead or not.
++		 */
++		var fsmIdx = self.p_connections[fsm.cf_backend.key].
++		    indexOf(fsm);
++		if (fsm.isInState('idle') || fsmIdx > 0 ||
++		    self.p_keys.indexOf(fsm.cf_backend.key) === -1) {
+ 			fsm.close();
+ 			--total;
++		} else {
++			fsm.closeAfterRelease();
+ 		}
+ 	});
+ 	plan.add.forEach(function (k) {
+-		if (total > self.p_max)
++		/* Make sure we *never* exceed our socket limit. */
++		if (++total > self.p_max)
+ 			return;
+ 		self.addConnection(k);
+-		++total;
+ 	});
+ 
+ 	this.p_inRebalance = false;
+@@ -902,6 +958,7 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 		return;
+ 
+ 	var backend = this.p_backends[key];
++	backend.key = key;
+ 
+ 	var fsm = new ConnectionFSM({
+ 		constructor: this.p_constructor,
+@@ -920,6 +977,8 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 
+ 	var self = this;
+ 	fsm.on('stateChanged', function (newState) {
++		var doRebalance = false;
++
+ 		if (fsm.p_initq_node) {
+ 			/* These transitions mean we're still starting up. */
+ 			if (newState === 'delay' || newState === 'error' ||
+@@ -932,8 +991,14 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 			fsm.p_initq_node.remove();
+ 			delete (fsm.p_initq_node);
+ 
+-			if (newState === 'idle')
+-				self.emit('connectedToBackend', fsm);
++			if (newState === 'idle') {
++				self.emit('connectedToBackend', key, fsm);
++
++				if (self.p_dead[key] !== undefined) {
++					delete (self.p_dead[key]);
++					doRebalance = true;
++				}
++			}
+ 		}
+ 
+ 		if (newState === 'idle') {
+@@ -979,9 +1044,11 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 				var idx = self.p_connections[key].indexOf(fsm);
+ 				self.p_connections[key].splice(idx, 1);
+ 			}
+-
+-			self.emit('closedBackend', fsm);
+-			self.rebalance();
++			if (fsm.retriesExhausted()) {
++				self.p_dead[key] = true;
++			}
++			self.emit('closedBackend', key, fsm);
++			doRebalance = true;
+ 		}
+ 
+ 		if (fsm.p_idleq_node) {
+@@ -993,9 +1060,11 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 			delete (fsm.p_idleq_node);
+ 
+ 			/* Also rebalance, in case we were closed or died. */
+-			if (newState !== 'closed')
+-				self.rebalance();
++			doRebalance = true;
+ 		}
++
++		if (doRebalance)
++			self.rebalance();
+ 	});
+ 
+ 	fsm.start();
+diff --git a/lib/utils.js b/lib/utils.js
+index ce6bc91..991ca9a 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -82,122 +82,124 @@ function shuffle(array) {
+ 	return (array);
+ }
+ 
+-function planRebalance(inSpares, total, target) {
+-	var spares = {};
+-	var keyCount = 0;
+-	var buckets = {};
++function planRebalance(inSpares, dead, target, max) {
++	var liveSpares = {};
++	var replacements = 0;
++	var countIdx = {};
++	var wantedSpares = {};
+ 
+ 	mod_assert.object(inSpares, 'connections');
+-	mod_assert.number(total, 'count');
+ 	mod_assert.number(target, 'target');
++	mod_assert.number(max, 'max');
+ 
+-	mod_assert.ok(total >= 0, 'count must be >= 0');
+ 	mod_assert.ok(target >= 0, 'target must be >= 0');
++	mod_assert.ok(max >= target, 'max must be >= target');
+ 
+-	Object.keys(inSpares).forEach(function (key) {
+-		mod_assert.array(inSpares[key], 'connections[' + key + ']');
+-		spares[key] = inSpares[key].slice();
+-		++keyCount;
+-		var count = spares[key].length;
+-		if (buckets[count] === undefined)
+-			buckets[count] = [];
+-		buckets[count].push(key);
+-	});
++	var keys = Object.keys(inSpares);
+ 
+ 	var plan = { add: [], remove: [] };
+ 
+-	var max = Math.round(target / keyCount);
+-	if (max < 1)
+-		max = 1;
+-
+-	function bucketsBySize() {
+-		return (Object.keys(buckets).map(function (cnt) {
+-			return (parseInt(cnt, 10));
+-		}).sort().reverse());
++	/*
++	 * Build up the number of FSMs we *want* to have for each backend in
++	 * the wantedSpares map.
++	 *
++	 * First, we want to have the "target" number of connections, spread
++	 * evenly across all the backends. If we find any dead backends along
++	 * the way, make sure we have exactly 1 connection to each and we
++	 * request a replacement for each time we wanted to use it.
++	 */
++	var done = 0;
++	for (var i = 0; i < target; ++i) {
++		var k = keys.shift();
++		keys.push(k);
++		if (wantedSpares[k] === undefined)
++			wantedSpares[k] = 0;
++		if (dead[k] !== true) {
++			++wantedSpares[k];
++			++done;
++			continue;
++		}
++		if (wantedSpares[k] === 0) {
++			wantedSpares[k] = 1;
++			++done;
++		}
++		++replacements;
+ 	}
+ 
+-	function findFatBuckets() {
+-		return (bucketsBySize().filter(function (cnt) {
+-			return (cnt > max);
+-		}));
+-	}
++	/* Apply the max cap. */
++	if (done + replacements > max)
++		replacements = max - done;
+ 
+ 	/*
+-	 * First, cull any excess beyond the target size, working from the
+-	 * biggest buckets down to the smallest ones.
++	 * Now try to allocate replacements. These proceed similarly to the
++	 * first allocation, round-robin across all available backends.
+ 	 */
+-	var bkts = bucketsBySize();
+-	while (total > target) {
+-		var b = bkts[0];
+-		mod_assert.number(b, 'a backend key');
+-		mod_assert.ok(b > 0, 'backend key must not be zero');
+-		var ks = buckets[b];
+-		mod_assert.arrayOfString(ks, 'at least one key of order ' + b);
+-		while (total > target && ks.length > 0) {
+-			var k = ks.shift();
+-			--total;
+-
+-			var fsm = spares[k].shift();
+-			mod_assert.ok(fsm, 'a spare ' + k + ' connection is ' +
+-			    'required');
+-			plan.remove.push(fsm);
+-
+-			if (buckets[b - 1] === undefined)
+-				buckets[b - 1] = [];
+-			buckets[b - 1].push(k);
++	for (var i = 0; i < replacements; ++i) {
++		k = keys.shift();
++		keys.push(k);
++		if (wantedSpares[k] === undefined)
++			wantedSpares[k] = 0;
++		if (dead[k] !== true) {
++			++wantedSpares[k];
++			++done;
++			continue;
+ 		}
+-		if (ks.length === 0)
+-			delete (buckets[b]);
+-		bkts = bucketsBySize();
+-	}
+-
+-	/* Now, cull any buckets that are bigger than the average cap (max). */
+-	var fatbkts = findFatBuckets();
+-	while (fatbkts.length > 0) {
+-		b = fatbkts[0];
+-		mod_assert.number(b, 'a backend key');
+-		mod_assert.ok(b > 0, 'backend key must not be zero');
+-		ks = buckets[b];
+-		mod_assert.arrayOfString(ks, 'at least one key of order ' + b);
+-		while (ks.length > 0) {
+-			k = ks.shift();
+-			--total;
+-
+-			fsm = spares[k].shift();
+-			mod_assert.ok(fsm, 'a spare ' + k + ' connection is ' +
+-			    'required');
+-			plan.remove.push(fsm);
+-
+-			if (buckets[b - 1] === undefined)
+-				buckets[b - 1] = [];
+-			buckets[b - 1].push(k);
++		/*
++		 * We can make replacements for a replacement (and so on) as
++		 * long as we have room under our max socket cap and we haven't
++		 * already tried every backend available.
++		 *
++		 * If this one is marked as dead, though, and we don't have room
++		 * to add both it and a replacement, AND there are backends we
++		 * haven't tried yet or that are alive, skip this one and use
++		 * one of those.
++		 *
++		 * In this way we guarantee that even if our socket cap
++		 * prevents us from making a double-replacement, we still try
++		 * all the backends at least once.
++		 */
++		var count = done + replacements - i;
++		var empties = keys.filter(function (k) {
++			return (dead[k] !== true ||
++			    wantedSpares[k] === undefined ||
++			    wantedSpares[k] === 0);
++		});
++		if (count + 1 <= max) {
++			if (wantedSpares[k] === 0) {
++				wantedSpares[k] = 1;
++				++done;
++			}
++			if (empties.length > 0)
++				++replacements;
++
++		} else if (count <= max && empties.length > 0) {
++			++replacements;
+ 		}
+-		delete (buckets[b]);
+-		fatbkts = findFatBuckets();
+ 	}
+ 
+ 	/*
+-	 * Finally, if we're now under target, add evenly to the lowest buckets
+-	 * until we hit it.
++	 * Now calculate the difference between what we want and what we have:
++	 * this will be our plan to return for what to do next.
+ 	 */
+-	while (total < target) {
+-		var bs = Object.keys(buckets).map(function (cnt) {
+-			return (parseInt(cnt, 10));
+-		}).sort();
+-		b = bs[0];
+-		ks = buckets[b];
+-		var i = 0;
+-		while (total < target && i < ks.length) {
+-			var kk = ks[i];
+-			plan.add.push(kk);
+-			++total;
+-			if (buckets[b + 1] === undefined)
+-				buckets[b + 1] = [];
+-			buckets[b + 1].push(kk);
+-			++i;
++	keys = Object.keys(inSpares).reverse();
++	keys.forEach(function (key) {
++		var have = (inSpares[key] || []).length;
++		var want = wantedSpares[key] || 0;
++		var list = inSpares[key].slice();
++		while (have > want) {
++			plan.remove.push(list.shift());
++			--have;
+ 		}
+-		delete (buckets[b]);
+-	}
++	});
++	keys.reverse();
++	keys.forEach(function (key) {
++		var have = (inSpares[key] || []).length;
++		var want = wantedSpares[key] || 0;
++		while (have < want) {
++			plan.add.push(key);
++			++have;
++		}
++	});
+ 
+ 	return (plan);
+ }
+diff --git a/package.json b/package.json
+index 8e62fdb..57fa7eb 100644
+--- a/package.json
++++ b/package.json
+@@ -9,7 +9,7 @@
+     "cmdutil": ">=1.0.0 <2.0.0",
+     "extsprintf": ">=1.3.0 <2.0.0",
+     "ipaddr.js": ">=1.1.0 <2.0.0",
+-    "mooremachine": ">=1.3.0 <2.0.0",
++    "mooremachine": ">=1.4.0 <2.0.0",
+     "named-client": "git+https://github.com/arekinath/node-named-client.git#v0.3.5",
+     "node-uuid": ">=1.4.7 <2.0.0",
+     "posix-getopt": ">=1.2.0 <2.0.0",
+diff --git a/test/pool.test.js b/test/pool.test.js
+index 9f2e954..f60cfd4 100644
+--- a/test/pool.test.js
++++ b/test/pool.test.js
+@@ -232,12 +232,12 @@ mod_tape.test('spares are evenly balanced', function (t) {
+ 	resolver.emit('added', 'b1', {});
+ 	resolver.emit('added', 'b2', {});
+ 	setImmediate(function () {
++		connections.forEach(function (c) { c.connect(); });
++
+ 		t.equal(connections.length, 4);
+ 		var bs = connections.map(function (c) { return (c.backend); });
+ 		t.deepEqual(bs.sort(), ['b1', 'b1', 'b2', 'b2']);
+ 
+-		connections.forEach(function (c) { c.connect(); });
+-
+ 		resolver.emit('added', 'b3', {});
+ 		resolver.emit('added', 'b4', {});
+ 
+diff --git a/test/utils.test.js b/test/utils.test.js
+index 98be164..8be91b6 100644
+--- a/test/utils.test.js
++++ b/test/utils.test.js
+@@ -14,7 +14,7 @@ mod_tape.test('rebalance: simple addition', function (t) {
+ 	var spares = {
+ 		'b1': []
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 0, 4);
++	var plan = mod_utils.planRebalance(spares, {}, 4, 10);
+ 	t.deepEqual(plan.remove, []);
+ 	t.deepEqual(plan.add, ['b1', 'b1', 'b1', 'b1']);
+ 	t.end();
+@@ -25,9 +25,9 @@ mod_tape.test('rebalance: addition over 2 options', function (t) {
+ 		'b1': [],
+ 		'b2': []
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 0, 5);
++	var plan = mod_utils.planRebalance(spares, {}, 5, 10);
+ 	t.deepEqual(plan.remove, []);
+-	t.deepEqual(plan.add, ['b1', 'b2', 'b1', 'b2', 'b1']);
++	t.deepEqual(plan.add, ['b1', 'b1', 'b1', 'b2', 'b2']);
+ 	t.end();
+ });
+ 
+@@ -36,7 +36,7 @@ mod_tape.test('rebalance: add with existing', function (t) {
+ 		'b1': ['c1'],
+ 		'b2': ['c2']
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 2, 4);
++	var plan = mod_utils.planRebalance(spares, {}, 4, 10);
+ 	t.deepEqual(plan.remove, []);
+ 	t.deepEqual(plan.add, ['b1', 'b2']);
+ 	t.end();
+@@ -47,7 +47,7 @@ mod_tape.test('rebalance: add none', function (t) {
+ 		'b1': ['c1', 'c3'],
+ 		'b2': ['c2', 'c4']
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 4, 4);
++	var plan = mod_utils.planRebalance(spares, {}, 4, 10);
+ 	t.deepEqual(plan.remove, []);
+ 	t.deepEqual(plan.add, []);
+ 	t.end();
+@@ -58,7 +58,7 @@ mod_tape.test('rebalance: add and remove', function (t) {
+ 		'b1': ['c1', 'c2', 'c3'],
+ 		'b2': ['c4']
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 4, 4);
++	var plan = mod_utils.planRebalance(spares, {}, 4, 10);
+ 	t.equal(plan.remove.length, 1);
+ 	t.ok(['c1', 'c2', 'c3'].indexOf(plan.remove[0]) !== -1);
+ 	t.deepEqual(plan.add, ['b2']);
+@@ -70,7 +70,7 @@ mod_tape.test('rebalance: add from unbalanced', function (t) {
+ 		'b1': ['c1', 'c2', 'c3'],
+ 		'b2': ['c4']
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 4, 6);
++	var plan = mod_utils.planRebalance(spares, {}, 6, 10);
+ 	t.deepEqual(plan.remove, []);
+ 	t.deepEqual(plan.add, ['b2', 'b2']);
+ 	t.end();
+@@ -81,8 +81,8 @@ mod_tape.test('rebalance: shrink', function (t) {
+ 		'b1': ['c1', 'c2', 'c3'],
+ 		'b2': ['c4', 'c5', 'c6']
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 6, 4);
+-	t.deepEqual(plan.remove, ['c1', 'c4']);
++	var plan = mod_utils.planRebalance(spares, {}, 4, 10);
++	t.deepEqual(plan.remove, ['c4', 'c1']);
+ 	t.deepEqual(plan.add, []);
+ 	t.end();
+ });
+@@ -97,7 +97,7 @@ mod_tape.test('rebalance: lots of nodes', function (t) {
+ 		'b6': [],
+ 		'b7': []
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 4, 5);
++	var plan = mod_utils.planRebalance(spares, {}, 5, 10);
+ 	t.deepEqual(plan.remove, ['c1', 'c2', 'c3']);
+ 	t.deepEqual(plan.add, ['b2', 'b3', 'b4', 'b5']);
+ 	t.end();
+@@ -113,7 +113,7 @@ mod_tape.test('rebalance: more nodes', function (t) {
+ 		'b6': [],
+ 		'b7': []
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 4, 6);
++	var plan = mod_utils.planRebalance(spares, {}, 6, 10);
+ 	t.deepEqual(plan.remove, ['c1', 'c2', 'c3']);
+ 	t.deepEqual(plan.add, ['b3', 'b1', 'b2', 'b4', 'b6']);
+ 	t.end();
+@@ -129,8 +129,8 @@ mod_tape.test('rebalance: excess spread out', function (t) {
+ 		'b6': ['c6'],
+ 		'b7': []
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 6, 3);
+-	t.deepEqual(plan.remove, ['c1', 'c2', 'c3']);
++	var plan = mod_utils.planRebalance(spares, {}, 3, 10);
++	t.deepEqual(plan.remove, ['c6', 'c5', 'c4']);
+ 	t.deepEqual(plan.add, []);
+ 	t.end();
+ });
+@@ -141,8 +141,125 @@ mod_tape.test('rebalance: odd number', function (t) {
+ 		'b1': [],
+ 		'b2': []
+ 	};
+-	var plan = mod_utils.planRebalance(spares, 1, 4);
++	var plan = mod_utils.planRebalance(spares, {}, 4, 10);
++	t.deepEqual(plan.remove, []);
++	t.deepEqual(plan.add, ['b3', 'b1', 'b2']);
++	t.end();
++});
++
++mod_tape.test('rebalance: re-ordering', function (t) {
++	var spares = {
++		'b2': [],
++		'b1': ['c1'],
++		'b3': ['c2']
++	};
++	var plan = mod_utils.planRebalance(spares, {}, 2, 10);
++	t.deepEqual(plan.remove, ['c2']);
++	t.deepEqual(plan.add, ['b2']);
++	t.end();
++});
++
++mod_tape.test('rebalance: dead replacement', function (t) {
++	var spares = {
++		'b1': [],
++		'b2': [],
++		'b3': []
++	};
++	var dead = {
++		'b1': true
++	};
++	var plan = mod_utils.planRebalance(spares, dead, 2, 10);
+ 	t.deepEqual(plan.remove, []);
+ 	t.deepEqual(plan.add, ['b1', 'b2', 'b3']);
+ 	t.end();
+ });
++
++mod_tape.test('rebalance: dead replacement and shrink', function (t) {
++	var spares = {
++		'b1': ['c1', 'c3'],
++		'b2': ['c2'],
++		'b3': []
++	};
++	var dead = {
++		'b1': true
++	};
++	var plan = mod_utils.planRebalance(spares, dead, 3, 10);
++	t.deepEqual(plan.remove, ['c1']);
++	t.deepEqual(plan.add, ['b2', 'b3']);
++	t.end();
++});
++
++mod_tape.test('rebalance: dead again', function (t) {
++	var spares = {
++		'b1': ['c1'],
++		'b2': ['c2']
++	};
++	var dead = {
++		'b1': true
++	};
++	var plan = mod_utils.planRebalance(spares, dead, 1, 2);
++	t.deepEqual(plan.remove, []);
++	t.deepEqual(plan.add, []);
++	t.end();
++});
++
++mod_tape.test('rebalance: nested dead', function (t) {
++	var spares = {
++		'b1': [],
++		'b2': ['c2'],
++		'b3': [],
++		'b4': []
++	};
++	var dead = {
++		'b1': true,
++		'b3': true
++	};
++	var plan = mod_utils.planRebalance(spares, dead, 2, 10);
++	t.deepEqual(plan.remove, []);
++	t.deepEqual(plan.add, ['b1', 'b3', 'b4']);
++	t.end();
++});
++
++mod_tape.test('rebalance: nested dead with cap', function (t) {
++	var spares = {
++		'b1': [],
++		'b2': ['c2'],
++		'b3': [],
++		'b4': []
++	};
++	var dead = {
++		'b1': true,
++		'b3': true
++	};
++	var plan = mod_utils.planRebalance(spares, dead, 2, 3);
++	t.deepEqual(plan.remove, []);
++	t.deepEqual(plan.add, ['b1', 'b4']);
++	t.end();
++});
++
++mod_tape.test('rebalance: dead, backend starvation', function (t) {
++	var spares = {
++		'b1': ['c1'],
++	};
++	var dead = {
++		'b1': true
++	};
++	var plan = mod_utils.planRebalance(spares, dead, 2, 10);
++	t.deepEqual(plan.remove, []);
++	t.deepEqual(plan.add, []);
++	t.end();
++});
++
++mod_tape.test('rebalance: dead, backend starvation', function (t) {
++	var spares = {
++		'b1': ['c1'],
++		'b2': []
++	};
++	var dead = {
++		'b1': true
++	};
++	var plan = mod_utils.planRebalance(spares, dead, 3, 10);
++	t.deepEqual(plan.remove, []);
++	t.deepEqual(plan.add, ['b2', 'b2', 'b2']);
++	t.end();
++});

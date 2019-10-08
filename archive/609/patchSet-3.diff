@@ -1,0 +1,549 @@
+commit 763190a974f4bef7846e864ea27ae933a863d232 (refs/changes/09/609/3)
+Author: Todd Whiteman <todd.whiteman@joyent.com>
+Date:   2016-10-06T12:52:27-07:00 (3 years ago)
+    
+    DOCKER-663 Support Amazon ECR Registry
+    
+    Note that I've added a generate digest helper function (so IMGAPI can make use of this)
+    when the Docker-Content-Digest header is not provided.
+
+diff --git a/lib/registry-client-v2.js b/lib/registry-client-v2.js
+index 4ade4fe..bf763e0 100644
+--- a/lib/registry-client-v2.js
++++ b/lib/registry-client-v2.js
+@@ -1180,8 +1180,11 @@ RegistryClientV2.prototype.listTags = function listTags(cb) {
+  * Get an image manifest. `ref` is either a tag or a digest.
+  * <https://docs.docker.com/registry/spec/api/#pulling-an-image-manifest>
+  *
+- *   client.getManifest({ref: <tag or digest>}, function (err, manifest, res) {
++ *   client.getManifest({ref: <tag or digest>}, function (err, manifest, res,
++ *      manifestStr) {
+  *      // Use `manifest` and digest is `res.headers['docker-content-digest']`.
++ *      // Note that docker-content-digest header can be undefined, so if you
++ *      // need a manifest digest, use the `getDigestFromManifestStr` function.
+  *   });
+  */
+ RegistryClientV2.prototype.getManifest = function getManifest(opts, cb) {
+@@ -1191,7 +1194,7 @@ RegistryClientV2.prototype.getManifest = function getManifest(opts, cb) {
+     assert.optionalNumber(opts.maxSchemaVersion, 'opts.maxSchemaVersion');
+     assert.func(cb, 'cb');
+ 
+-    var res, manifest;
++    var res, manifest, manifestStr;
+     var maxSchemaVersion = (opts.maxSchemaVersion || self.maxSchemaVersion);
+     vasync.pipeline({arg: this, funcs: [
+         function doLogin(_, next) {
+@@ -1217,10 +1220,20 @@ RegistryClientV2.prototype.getManifest = function getManifest(opts, cb) {
+                     return next(err);
+                 }
+ 
++                manifestStr = String(body);
++
+                 if (manifest_.schemaVersion === 1) {
+                     try {
+                         var jws = _jwsFromManifest(manifest_, body);
+-                        _verifyManifestDockerContentDigest(res_, jws);
++                        // Some v2 registries (Amazon ECR) do not provide the
++                        // 'docker-content-digest' header.
++                        if (res_.headers['docker-content-digest']) {
++                            _verifyManifestDockerContentDigest(res_, jws);
++                        } else {
++                            self.log.debug({headers: res_.headers},
++                                'no Docker-Content-Digest header on ' +
++                                'getManifest response');
++                        }
+                         _verifyJws(jws);
+                     } catch (verifyErr) {
+                         return next(verifyErr);
+@@ -1258,12 +1271,50 @@ RegistryClientV2.prototype.getManifest = function getManifest(opts, cb) {
+             });
+         }
+     ]}, function (err) {
+-        cb(err, manifest, res);
++        cb(err, manifest, res, manifestStr);
+     });
+ };
+ 
+ 
+ 
++/**
++ * Calculate the 'Docker-Content-Digest' header for the given manifest.
++ *
++ * @returns {String} The docker digest string.
++ * @throws {InvalidContentError} if there is a problem parsing the manifest.
++ */
++RegistryClientV2.prototype.getDigestFromManifestStr =
++function getDigestFromManifestStr(manifestStr) {
++    var hash = crypto.createHash('sha256');
++    var digestPrefix = 'sha256:';
++
++    var manifest;
++    try {
++        manifest = JSON.parse(manifestStr);
++    } catch (err) {
++        throw new restifyErrors.InvalidContentError(err, fmt(
++            'could not parse manifest: %s', manifestStr));
++    }
++    if (manifest.schemaVersion === 1) {
++        try {
++            var manifestBuffer = Buffer(manifestStr);
++            var jws = _jwsFromManifest(manifest, manifestBuffer);
++            hash.update(jws.payload, 'binary');
++            return digestPrefix + hash.digest('hex');
++        } catch (verifyErr) {
++            if (!(verifyErr instanceof restifyErrors.InvalidContentError)) {
++                throw verifyErr;
++            }
++            // Couldn't parse (or doesn't have) the signatures section,
++            // fall through.
++        }
++    }
++    hash.update(manifestStr);
++    return digestPrefix + hash.digest('hex');
++};
++
++
++
+ RegistryClientV2.prototype._headOrGetBlob = function _headOrGetBlob(opts, cb) {
+     var self = this;
+     assert.object(opts, 'opts');
+diff --git a/test/v2.amazonecr.test.js b/test/v2.amazonecr.test.js
+new file mode 100644
+index 0000000..cb7849b
+--- /dev/null
++++ b/test/v2.amazonecr.test.js
+@@ -0,0 +1,308 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++var assert = require('assert-plus');
++var crypto = require('crypto');
++var test = require('tape');
++
++var drc = require('..');
++
++
++// --- globals
++
++var log = require('./lib/log');
++
++var CONFIG;
++try {
++    CONFIG = require(__dirname + '/config.json').amazonecr;
++    assert.object(CONFIG, 'config.json#amazonecr');
++    assert.string(CONFIG.repo, 'CONFIG.repo');
++    assert.string(CONFIG.tag, 'CONFIG.tag');
++    assert.string(CONFIG.username, 'CONFIG.username');
++    assert.string(CONFIG.password, 'CONFIG.password');
++} catch (e) {
++    CONFIG = null;
++    log.warn(e, 'skipping Amazon ECR repo tests: ' +
++        'could not load "amazonecr" key from test/config.json');
++    console.warn('# warning: skipping Amazon ECR private repo tests: %s',
++        e.message);
++}
++
++// --- Tests
++
++if (CONFIG)
++test('v2 amazonecr', function (tt) {
++    var client;
++    var noauthClient;
++    var repo = drc.parseRepo(CONFIG.repo);
++
++    tt.test('  createClient', function (t) {
++        noauthClient = drc.createClientV2({
++            name: CONFIG.repo,
++            log: log
++        });
++        t.ok(noauthClient);
++        t.equal(noauthClient.version, 2);
++        t.end();
++    });
++
++    tt.test('  supportsV2', function (t) {
++        noauthClient.supportsV2(function (err, supportsV2) {
++            t.ifErr(err);
++            t.ok(supportsV2, 'supportsV2');
++            t.end();
++        });
++    });
++
++    tt.test('  ping', function (t) {
++        noauthClient.ping(function (err, body, res) {
++            t.ok(err);
++            t.ok(res, 'have a response');
++            if (res) {
++                t.equal(res.statusCode, 401);
++                t.ok(res.headers['www-authenticate']);
++            }
++            t.equal(res.headers['docker-distribution-api-version'],
++                'registry/2.0');
++            t.end();
++        });
++    });
++
++    /*
++     * Test that we need to be logged in to list repo tags.
++     */
++    tt.test('  listTags (no auth)', function (t) {
++        noauthClient.listTags(function (err) {
++            t.ok(err);
++            t.equal(err.statusCode, 401, 'Expect a 401 status code');
++            t.equal(String(err.message).trim(), 'Not Authorizied');
++            t.end();
++        });
++    });
++
++    /*
++     * Login using auth.
++     */
++    tt.test('  createClient', function (t) {
++        client = drc.createClientV2({
++            name: CONFIG.repo,
++            username: CONFIG.username,
++            password: CONFIG.password,
++            log: log
++        });
++        t.ok(client);
++        t.equal(client.version, 2);
++        t.end();
++    });
++
++    /*
++     * Example expected output:
++     *  {
++     *      "name": "library/alpine",
++     *      "tags": [ "2.6", "2.7", "3.1", "3.2", "edge", "latest" ]
++     *  }
++     */
++    tt.test('  listTags', function (t) {
++        client.listTags(function (err, tags) {
++            t.ifErr(err);
++            t.ok(tags);
++            t.equal(tags.name, repo.remoteName);
++            t.ok(tags.tags.indexOf(CONFIG.tag) !== -1,
++                'no "' + CONFIG.tag + '" tag');
++            t.end();
++        });
++    });
++
++    /*
++     *  {
++     *      "name": <name>,
++     *      "tag": <tag>,
++     *      "fsLayers": [
++     *         {
++     *            "blobSum": <tarsum>
++     *         },
++     *         ...
++     *      ],
++     *      "history": <v1 images>,
++     *      "signature": <JWS>
++     *  }
++     */
++    var manifest;
++    var manifestDigest;
++    tt.test('  getManifest', function (t) {
++        client.getManifest({ref: CONFIG.tag}, function (err, manifest_, res) {
++            t.ifErr(err);
++            manifest = manifest_;
++            // Note that Amazon ECR does not return a docker-content-digest
++            // header.
++            manifestDigest = res.headers['docker-content-digest'];
++            t.equal(manifestDigest, undefined, 'no docker-content-digest');
++            t.ok(manifest);
++            t.equal(manifest.schemaVersion, 1);
++            t.equal(manifest.name, repo.remoteName);
++            t.equal(manifest.tag, CONFIG.tag);
++            t.ok(manifest.architecture);
++            t.ok(manifest.fsLayers);
++            t.ok(manifest.history[0].v1Compatibility);
++            t.ok(manifest.signatures[0].signature);
++            t.end();
++        });
++    });
++
++    tt.test('  getManifest (unknown tag)', function (t) {
++        client.getManifest({ref: 'unknowntag'}, function (err, manifest_) {
++            t.ok(err);
++            t.notOk(manifest_);
++            t.equal(err.statusCode, 404);
++            t.end();
++        });
++    });
++
++    tt.test('  headBlob', function (t) {
++        var digest = manifest.fsLayers[0].blobSum;
++        client.headBlob({digest: digest}, function (err, ress) {
++            t.ifErr(err);
++            t.ok(ress);
++            t.ok(Array.isArray(ress));
++            var first = ress[0];
++
++            // First request statusCode on a redirect:
++            // - ecr.amazonaws.com gives 302 (Found)
++            // - docker.io gives 307
++            t.ok([200, 302, 303, 307].indexOf(first.statusCode) !== -1,
++                'first request status code 200, 302 or 307: statusCode=' +
++                first.statusCode);
++
++            // No digest head is returned (it's using an earlier version of the
++            // registry API).
++            if (first.headers['docker-content-digest']) {
++                t.equal(first.headers['docker-content-digest'], digest);
++            }
++
++            t.equal(first.headers['docker-distribution-api-version'],
++                'registry/2.0');
++
++            var last = ress[ress.length - 1];
++            t.ok(last);
++            t.equal(last.statusCode, 200);
++
++            // Content-Type:
++            // - docker.io gives 'application/octet-stream', but amazon isn't so
++            //   nice for a HEAD request, it just returns text/plain.
++            t.equal(last.headers['content-type'],
++                'text/plain; charset=utf-8');
++
++            t.ok(last.headers['content-length']);
++            t.end();
++        });
++    });
++
++    tt.test('  headBlob (unknown digest)', function (t) {
++        client.headBlob({digest: 'cafebabe'}, function (err, ress) {
++            t.ok(err);
++            t.ok(ress);
++            t.ok(Array.isArray(ress));
++            t.equal(ress.length, 1);
++            // var res = ress[0];
++
++            // statusCode:
++            // - docker.io gives 404, which is what I'd expect
++            // - ecr.amazonaws.com gives 405 (Method Not Allowed). Hrm.
++            // The spec doesn't specify:
++            // https://docs.docker.com/registry/spec/api/#existing-layers
++            // t.equal(res.statusCode, 404);
++
++            // Docker-Distribution-Api-Version header:
++            // docker.io includes this header here, ecr.amazonaws.com does not.
++            // t.equal(res.headers['docker-distribution-api-version'],
++            //    'registry/2.0');
++
++            t.end();
++        });
++    });
++
++    tt.test('  createBlobReadStream', function (t) {
++        var digest = manifest.fsLayers[0].blobSum;
++        client.createBlobReadStream({digest: digest},
++                function (err, stream, ress) {
++            t.ifErr(err);
++
++            t.ok(ress);
++            t.ok(Array.isArray(ress));
++            var first = ress[0];
++            // First request statusCode on a redirect:
++            // - ecr.amazonaws.com gives 302 (Found)
++            // - docker.io gives 307
++            t.ok([200, 302, 307].indexOf(first.statusCode) !== -1,
++                'first request status code 200, 302 or 307: statusCode=' +
++                first.statusCode);
++
++            // No digest head is returned (it's using an earlier version of the
++            // registry API).
++            if (first.headers['docker-content-digest']) {
++                t.equal(first.headers['docker-content-digest'], digest);
++            }
++
++            // Docker-Distribution-Api-Version header:
++            // docker.io includes this header here, ecr.amazonaws.com does not.
++            t.equal(first.headers['docker-distribution-api-version'],
++                'registry/2.0');
++
++            t.ok(stream);
++            t.equal(stream.statusCode, 200);
++            t.equal(stream.headers['content-type'],
++                'application/octet-stream');
++            t.ok(stream.headers['content-length']);
++
++            var numBytes = 0;
++            var hash = crypto.createHash(digest.split(':')[0]);
++            stream.on('data', function (chunk) {
++                hash.update(chunk);
++                numBytes += chunk.length;
++            });
++            stream.on('end', function () {
++                t.equal(hash.digest('hex'), digest.split(':')[1]);
++                t.equal(numBytes, Number(stream.headers['content-length']));
++                t.end();
++            });
++            stream.resume();
++        });
++    });
++
++    tt.test('  createBlobReadStream (unknown digest)', function (t) {
++        client.createBlobReadStream({digest: 'cafebabe'},
++                function (err, stream, ress) {
++            t.ok(err);
++            t.ok(ress);
++            t.ok(Array.isArray(ress));
++            t.equal(ress.length, 1);
++            // var res = ress[0];
++
++            // statusCode:
++            // - docker.io gives 404, which is what I'd expect
++            // - ecr.amazonaws.com gives 405 (Method Not Allowed). Hrm.
++            // The spec doesn't specify:
++            // https://docs.docker.com/registry/spec/api/#existing-layers
++            // t.equal(res.statusCode, 404);
++
++            // Docker-Distribution-Api-Version header:
++            // docker.io includes this header here, ecr.amazonaws.com does not.
++            // t.equal(res.headers['docker-distribution-api-version'],
++            //    'registry/2.0');
++
++            t.end();
++        });
++    });
++
++    tt.test('  close', function (t) {
++        client.close();
++        t.end();
++    });
++});
+diff --git a/test/v2.other.test.js b/test/v2.other.test.js
+new file mode 100644
+index 0000000..61838df
+--- /dev/null
++++ b/test/v2.other.test.js
+@@ -0,0 +1,120 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++var test = require('tape');
++
++var drc = require('..');
++
++// --- Globals
++
++var log = require('./lib/log');
++
++// --- Tests
++
++/* BEGIN JSSTYLED */
++test('getDigestFromManifestStr', function (t) {
++    var v1Manifest = {
++       'schemaVersion': 1,
++       'name': 'joyentunsupported/boxplay',
++       'tag': 'latest',
++       'architecture': 'amd64',
++       'fsLayers': [
++          {
++             'blobSum': 'sha256:208e4cb1d5e8c6fdfadc4329baf4002821fe5e5359626336f64f0005737af272'
++          },
++          {
++             'blobSum': 'sha256:84ff92691f909a05b224e1c56abb4864f01b4f8e3c854e4bb4c7baf1d3f6d652'
++          },
++          {
++             'blobSum': 'sha256:483a41b4dbd5bb9bf388f24139441aa9b90735992ed8f31ec2092eb024d99130'
++          },
++          {
++             'blobSum': 'sha256:84ff92691f909a05b224e1c56abb4864f01b4f8e3c854e4bb4c7baf1d3f6d652'
++          }
++       ],
++       'history': [
++          {
++             'v1Compatibility': '{"architecture":"amd64","author":"Me Now \\u003cme@now.com\\u003e","comment":"","config":{"AttachStdin":false,"AttachStderr":false,"AttachStdout":false,"Cmd":["/bin/sh"],"Domainname":"","Entrypoint":null,"Env":null,"Hostname":"","Image":"d392a1eead454251ea968dc4f428d47ef48908a76d12ef35f779fb10a50b201a","Labels":null,"OnBuild":null,"OpenStdin":false,"StdinOnce":false,"Tty":false,"User":"","Volumes":null,"WorkingDir":""},"container_config":{"AttachStdin":false,"AttachStderr":false,"AttachStdout":false,"Cmd":["/bin/sh","-c","#(nop) ADD file:b8e9ba1de198a7d96b79a7c36b550cb173e43b0e284982cd499b3237eb4dba5a in /foo.txt"],"Domainname":"","Entrypoint":null,"Env":null,"Hostname":"","Image":"d392a1eead454251ea968dc4f428d47ef48908a76d12ef35f779fb10a50b201a","Labels":null,"OnBuild":null,"OpenStdin":false,"StdinOnce":false,"Tty":false,"User":"","Volumes":null,"WorkingDir":""},"created":"2016-06-09T09:12:07.905Z","docker_id":"8456d302663a475ece98e45f39c63c3e99a87e2f4a5866b6a9a18b086ea2a672","head":true,"heads":["8456d302663a475ece98e45f39c63c3e99a87e2f4a5866b6a9a18b086ea2a672"],"id":"c41134024f546d6799b51a0d0a804e3f46c15916f7953991f50d3ff82d5fe2ff","image_uuid":"ace5e05e-9b15-4535-b015-b55756769bbf","index_name":"docker.io","owner_uuid":"a270bf5f-8f75-4fb0-8b37-747e1b5d183d","parent":"10e6b79101c22e0a3f1df5111ee9c376bca885b4954ea9898f898fa6d51d21f0","private":true,"size":0,"virtual_size":11028992}'
++          },
++          {
++             'v1Compatibility': '{"id":"10e6b79101c22e0a3f1df5111ee9c376bca885b4954ea9898f898fa6d51d21f0","parent":"86307648b49df4cdb60c9dc674621d3904be24748a72826a527f6fecb87efbdd","created":"2016-06-09T09:12:06.757Z","container_config":{"Cmd":["/bin/sh -c #(nop) [\\"/bin/sh\\"]"]},"author":"Me Now \\u003cme@now.com\\u003e"}'
++          },
++          {
++             'v1Compatibility': '{"id":"86307648b49df4cdb60c9dc674621d3904be24748a72826a527f6fecb87efbdd","parent":"e35592687f380e8626ed172858fcdee3fab316977bc81296bc01de0a525241b1","created":"2016-06-09T09:12:06.648Z","container_config":{"Cmd":["/bin/sh -c #(nop) ADD file:c36f77eebbf6ed4c99488f33a7051c95ad358df4414dfed5006787f39b3cf518 in /"]},"author":"Me Now \\u003cme@now.com\\u003e"}'
++          },
++          {
++             'v1Compatibility': '{"id":"e35592687f380e8626ed172858fcdee3fab316977bc81296bc01de0a525241b1","created":"2016-06-09T09:12:03.8Z","container_config":{"Cmd":["/bin/sh -c #(nop) MAINTAINER Me Now \\u003cme@now.com\\u003e"]},"author":"Me Now \\u003cme@now.com\\u003e"}'
++          }
++       ],
++       'signatures': [
++          {
++             'header': {
++                'jwk': {
++                   'crv': 'P-256',
++                   'kid': 'TDHB:4TXA:GUTQ:HPET:DV5N:PJPB:XDMT:X2FX:P4SR:OJ77:FSSN:MD5T',
++                   'kty': 'EC',
++                   'x': 'qXf9Xdjpv6zuDnXQQozI7kgr4NzrxfGamhzIYk1AtB0',
++                   'y': 'TTtzXr2y44oHeDINWrrI8QZG18n7SzzOOuvKSMd9gKo'
++                },
++                'alg': 'ES256'
++             },
++             'signature': 'E7ZNnHDbAxIqo6-9fv1RxLzui0d4KG6k4Ciy6Jas5UIbElCYSukvI3PiRZZrEi3vn6JKGVDlYq5rExLByywCUg',
++             'protected': 'eyJmb3JtYXRMZW5ndGgiOjMzMDYsImZvcm1hdFRhaWwiOiJDbjAiLCJ0aW1lIjoiMjAxNi0xMC0wNFQyMzozMDozNloifQ'
++          }
++       ]
++    };
++    var v1ManifestStr = JSON.stringify(v1Manifest, null, 3); // <-- Yes, f*n 3
++
++    var client = drc.createClientV2({
++        name: 'foo',
++        log: log
++    });
++    t.ok(client);
++    var v1Digest = client.getDigestFromManifestStr(v1ManifestStr);
++    t.equal(v1Digest, 'sha256:b524e5d7837da98010567886762935bf3c10ad5ac1ff5112bc43299329ca9a54');
++
++
++    var v2Manifest = {
++        'schemaVersion': 2,
++        'mediaType': 'application/vnd.docker.distribution.manifest.v2+json',
++        'config': {
++            'mediaType': 'application/vnd.docker.container.image.v1+json',
++            'size': 2372,
++            'digest': 'sha256:ea880aeae3c3e357bbb7bb715f0f63f086038c7d279736d7f32960064951c00a'
++        },
++        'layers': [
++            {
++                'mediaType': 'application/vnd.docker.image.rootfs.diff.tar',
++                'size': 10240,
++                'digest': 'sha256:84ff92691f909a05b224e1c56abb4864f01b4f8e3c854e4bb4c7baf1d3f6d652'
++            },
++            {
++                'mediaType': 'application/vnd.docker.image.rootfs.diff.tar',
++                'size': 3573760,
++                'digest': 'sha256:483a41b4dbd5bb9bf388f24139441aa9b90735992ed8f31ec2092eb024d99130'
++            },
++            {
++                'mediaType': 'application/vnd.docker.image.rootfs.diff.tar',
++                'size': 10240,
++                'digest': 'sha256:84ff92691f909a05b224e1c56abb4864f01b4f8e3c854e4bb4c7baf1d3f6d652'
++            },
++            {
++                'mediaType': 'application/vnd.docker.image.rootfs.diff.tar',
++                'size': 10240,
++                'digest': 'sha256:208e4cb1d5e8c6fdfadc4329baf4002821fe5e5359626336f64f0005737af272'
++            }
++        ]
++    };
++    var v2ManifestStr = JSON.stringify(v2Manifest);
++    var v2Digest = client.getDigestFromManifestStr(v2ManifestStr);
++    t.equal(v2Digest, 'sha256:28a63cc341ad4ad7ba7de0af4061ca8068e425ecca4e2c4c326dd8d07442ab71');
++    t.end();
++});
++/* END JSSTYLED */

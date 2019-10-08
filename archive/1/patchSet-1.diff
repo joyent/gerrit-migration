@@ -1,0 +1,840 @@
+commit 5a71e8aa3d36c2f762a30c8e1d7cd42133cf8455 (refs/changes/01/1/1)
+Author: Dave Pacheco <dap@joyent.com>
+Date:   2016-06-14T16:53:11-07:00 (3 years, 4 months ago)
+    
+    first cut at static resolver, factory function, and "cbresolve" program
+
+diff --git a/Makefile b/Makefile
+index c4788b3..1bbc681 100644
+--- a/Makefile
++++ b/Makefile
+@@ -25,7 +25,7 @@ include ./tools/mk/Makefile.defs
+ #
+ DOC_FILES	 = index.md boilerplateapi.md
+ JSON_FILES	 = package.json
+-JS_FILES	:= $(shell find lib test -name '*.js')
++JS_FILES	:= bin/cbresolve $(shell find lib test -name '*.js')
+ JSL_FILES_NODE	 = $(JS_FILES)
+ JSSTYLE_FILES	 = $(JS_FILES)
+ 
+diff --git a/bin/cbresolve b/bin/cbresolve
+new file mode 100755
+index 0000000..0931766
+--- /dev/null
++++ b/bin/cbresolve
+@@ -0,0 +1,351 @@
++#!/usr/bin/env node
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++const mod_assert = require('assert-plus');
++const mod_bunyan = require('bunyan');
++const mod_cmdutil = require('cmdutil');
++const mod_cueball = require('..');
++const mod_extsprintf = require('extsprintf');
++const mod_getopt = require('posix-getopt');
++const mod_net = require('net');
++const mod_verror = require('verror');
++const mod_util = require('util');
++
++const VError = mod_verror.VError;
++const printf = mod_extsprintf.printf;
++
++var cbrForceStatic = false;
++var cbrFollow = false;
++var cbrBackends = {};
++var cbrNbackends = 0;
++var cbrDone = false;
++var cbrLog;
++var cbrResolver;
++
++function main()
++{
++	var optstr, parser, option, args;
++	var timeout, resolverConf;
++
++	resolverConf = {};
++	timeout = 5000;
++
++	mod_cmdutil.configure({
++	    'synopses': [
++		'HOSTNAME[:PORT]                # for DNS-based lookup',
++		'-S | --static IP[:PORT]...     # for static IPs'
++	    ],
++
++	    'usageMessage': [
++	        'Locate services in DNS using Cueball resolver.',
++		'',
++		'The following options are available for DNS-based lookups:',
++		'',
++		'    -f, --follow                periodically re-resolve ' +
++		'and report changes',
++		'    -p, --port PORT             default backend port',
++		'    -r, --resolvers IP[,IP...]  list of DNS resolvers',
++		'    -s, --service SERVICE       "service" name (for SRV)',
++		'    -t, --timeout TIMEOUT       timeout for lookups',
++		''
++	    ].join('\n')
++	});
++
++	/*
++	 * By default, we don't log anything, but users can enable logging by
++	 * setting LOG_LEVEL in the environment.
++	 */
++	cbrLog = new mod_bunyan({
++	    'name': 'cbresolve',
++	    'level': process.env['LOG_LEVEL'] || 'fatal'
++	});
++
++	optstr = [
++	    /* general options */
++	    'S(static)',
++
++	    /* DNS-specific options */
++	    'f(follow)',
++	    'p:(port)',
++	    'r:(resolvers)',
++	    's:(service)',
++	    't:(timeout)'
++	].join('');
++	parser = new mod_getopt.BasicParser(optstr, process.argv);
++	while ((option = parser.getopt()) !== undefined) {
++		switch (option.option) {
++		case 'S':
++			cbrForceStatic = true;
++			break;
++
++		case 'f':
++			cbrFollow = true;
++			break;
++
++		case 'p':
++			resolverConf['defaultPort'] =
++			    parseInt(option.optarg, 10);
++			if (isNaN(resolverConf['defaultPort']) ||
++			    resolverConf['defaultPort'] < 0 ||
++			    resolverConf['defaultPort'] > 65535) {
++				mod_cmdutil.usage('bad value for -p/--port: %s',
++				    option.optarg);
++			}
++			break;
++
++		case 'r':
++			if (!resolverConf.hasOwnProperty('resolvers')) {
++				resolverConf['resolvers'] = [];
++			}
++
++			option.optarg.split(',').forEach(function (ip) {
++				if (ip.length === 0) {
++					return;
++				}
++
++				resolverConf['resolvers'].push(ip);
++			});
++			break;
++
++		case 's':
++			resolverConf['service'] = option.optarg;
++			break;
++
++		case 't':
++			timeout = parseTimeInterval(option.optarg);
++			if (timeout instanceof Error) {
++				mod_cmdutil.usage(timeout);
++			}
++			break;
++
++		default:
++			/* error message already emitted */
++			mod_cmdutil.usage();
++			break;
++		}
++	}
++
++	args = process.argv.slice(parser.optind());
++	resolverConf['log'] = cbrLog;
++	if (cbrForceStatic) {
++		resolverConf['backends'] = args.map(function (pair) {
++			var parsed = parseIpPort(pair);
++
++			if (parsed instanceof Error) {
++				mod_cmdutil.usage(parsed);
++			}
++
++			return (parsed);
++		});
++
++		if (resolverConf['backends'].length === 0) {
++			mod_cmdutil.usage();
++		}
++
++		console.error('using static IP resolver');
++
++		if (resolverConf['service'] !== undefined ||
++		    resolverConf['defaultPort'] !== undefined ||
++		    resolverConf['resolvers'] !== undefined) {
++			console.error('note: the -s/--service, -p/--port, ' +
++			    'and -r/--resolvers options are not used with ' +
++			    '-S/--static.');
++		}
++
++		cbrResolver = new mod_cueball.StaticIpResolver(resolverConf);
++	} else {
++		if (args.length != 1) {
++			mod_cmdutil.usage();
++		}
++
++		console.error('domain: %s', args[0]);
++		console.error('timeout: %s millisecond%s', timeout,
++		    timeout == 1 ? '' : 's');
++
++		if (resolverConf['service'] !== undefined) {
++			console.error('service: %s',
++			    resolverConf['service']);
++		}
++
++		if (resolverConf['defaultPort'] !== undefined) {
++			console.error('port: %s',
++			    resolverConf['defaultPort']);
++		}
++
++		if (resolverConf['resolvers'] !== undefined) {
++			console.error('resolvers: %s',
++			    resolverConf['resolvers'].join(', '));
++		}
++
++		resolverConf['recovery'] = {
++		    'default': {
++			'retries': 0,
++			'timeout': timeout,
++			'maxTimeout': timeout,
++			'delay': 0,
++			'maxDelay': 0
++		    }
++		};
++
++		cbrResolver = mod_cueball.resolverForIpOrDomain({
++		    'input': args[0],
++		    'resolverConfig': resolverConf
++		});
++
++		if (cbrResolver instanceof Error) {
++			mod_cmdutil.usage(cbrResolver);
++		}
++	}
++
++	cbrResolver.start();
++	cbrResolver.on('added', cbrPrintAdded);
++	cbrResolver.on('removed', cbrPrintRemoved);
++
++	if (!cbrFollow) {
++		cbrResolver.on('updated', cbrUpdated);
++		process.on('exit', function (code) {
++			if (code === 0) {
++				mod_assert.ok(cbrDone, 'premature exit');
++			}
++		});
++	} else {
++		if (cbrForceStatic) {
++			mod_cmdutil.fail('-f/--follow cannot be used with ' +
++			    '-S/--static');
++		}
++
++		/*
++		 * XXX It's not ideal that cueball unref's its timer here.
++		 * This is the maximum allowed timeout value, according to the
++		 * MDN documentation.
++		 */
++		setInterval(function () {}, Math.pow(2, 31) - 1);
++	}
++}
++
++/*
++ * Given a string of the from "IP_ADDRESS:PORT", returns either:
++ *
++ *    o an object with properties "address" (a valid IP address, as a string)
++ *      and "port" (an integer), if the string has the expected form; or
++ *
++ *    o an error indicating that the string does not have the expected form
++ */
++function parseIpPort(str)
++{
++	var colon, ip, port;
++
++	mod_assert.string(str, 'str');
++	colon = str.lastIndexOf(':');
++	if (colon == -1) {
++		return (new VError('not an "IP:port" pair: %s', str));
++	}
++
++	ip = str.substr(0, colon);
++	port = parseInt(str.substr(colon + 1), 10);
++	if (!mod_net.isIP(ip) || isNaN(port)) {
++		return (new VError('not an "IP:port pair: %s"', str));
++	}
++
++	return ({
++	    'address': ip,
++	    'port': port
++	});
++}
++
++/*
++ * Given a string describing a time interval, return the corresponding number of
++ * milliseconds.  Time intervals consist of a non-negative integer followed by
++ * one of the suffixes "ms" (for milliseconds), "s" (for seconds), or "m" (for
++ * minutes).  The suffix can be omitted, in which case the unit is milliseconds.
++ * If the given string is invalid, an Error is returned.
++ */
++function parseTimeInterval(str)
++{
++	var match, ret;
++
++	match = str.match(/^([1-9][0-9]*)(s|ms|m)?$/);
++	if (match === null) {
++		return (new VError('invalid time interval: %s', str));
++	}
++
++	ret = parseInt(match[1], 10);
++	mod_assert.ok(!isNaN(ret) && ret > 0);
++	if (match[2] == 's') {
++		ret *= 1000;
++	} else if (match[2] == 'm') {
++		ret *= 60000;
++	} else {
++		mod_assert.ok(match[2] === undefined || match[2] == 'ms');
++	}
++
++	return (ret);
++}
++
++/*
++ * Respond to the resolver's "added" event by printing out information about the
++ * instance that was found.
++ */
++function cbrPrintAdded(key, backend)
++{
++	mod_assert.ok(!cbrBackends.hasOwnProperty(key),
++	    'received "added" event for already-existing backend');
++	cbrBackends[key] = backend;
++	cbrNbackends++;
++
++	if (cbrFollow) {
++		printf('%s added   %16s:%-5d (%s)\n',
++		    new Date().toISOString(),
++		    backend.address, backend.port, key);
++	} else {
++		printf('%-16s %5d %s\n', backend.address, backend.port, key);
++	}
++}
++
++/*
++ * Respond to the resolver's "removed" event by printing out information about
++ * the instance that has been removed.
++ */
++function cbrPrintRemoved(key)
++{
++	var old;
++
++	mod_assert.ok(cbrBackends.hasOwnProperty(key),
++	    'received "removed" event for non-existent backend');
++	old = cbrBackends[key];
++	delete (cbrBackends[key]);
++
++	if (!cbrFollow) {
++		/*
++		 * This is extremely unlikely, but ignore if this happens.
++		 */
++		return;
++	}
++
++	printf('%s removed %16s:%-5d (%s)\n', new Date().toISOString(),
++	    old.address, old.port, key);
++}
++
++/*
++ * Invoked in non-follow mode once the resolver has finished emitting the first
++ * set of backends.
++ */
++function cbrUpdated()
++{
++	mod_assert.ok(!cbrFollow);
++	cbrResolver.stop();
++	cbrDone = true;
++
++	if (cbrNbackends === 0) {
++		console.error('error: no backends found');
++		process.exit(1);
++	}
++}
++
++main();
+diff --git a/lib/index.js b/lib/index.js
+index 1bd39b3..f02f864 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -17,6 +17,8 @@ module.exports = {
+ 	HttpsAgent: mod_agent.HttpsAgent,
+ 	ConnectionPool: mod_pool.ConnectionPool,
+ 	Resolver: mod_resolver.Resolver,
++	StaticIpResolver: mod_resolver.StaticIpResolver,
++	resolverForIpOrDomain: mod_resolver.resolverForIpOrDomain,
+ 
+ 	poolMonitor: mod_pmonitor.monitor,
+ 
+diff --git a/lib/resolver.js b/lib/resolver.js
+index a6eaa3f..5e4dc90 100644
+--- a/lib/resolver.js
++++ b/lib/resolver.js
+@@ -7,7 +7,10 @@
+  */
+ 
+ module.exports = {
+-	Resolver: CueBallResolver
++	Resolver: CueBallResolver,
++	StaticIpResolver: CueBallStaticResolver,
++	resolverForIpOrDomain: resolverForIpOrDomain,
++	parseIpOrDomain: parseIpOrDomain
+ };
+ 
+ const mod_nsc = require('named-client');
+@@ -27,23 +30,38 @@ const FSM = mod_mooremachine.FSM;
+ const EventEmitter = mod_events.EventEmitter;
+ 
+ /*
+- * The CueBallResolver takes a domain (plus service name and default port) and
+- * resolves it, emitting events 'added' and 'removed' as new hosts behind this
+- * domain + service are added or removed from DNS.
++ * Cueball provides two types of resolvers: the primary interface is the
++ * DNS-based resolver (called just "Resolver" for historical reasons) that
++ * uses DNS servers to locate backends.  This is appropriate for most server
++ * deployments.  The static resolver emits a pre-configured set of IP addresses
++ * and is intended for development environments and debugging tools where the
++ * user may want to target specific instances.
+  *
+- * Its basic workflow is to query for SRV records, then AAAA, then A, then
+- * work out which events to emit (if any). After this it sleeps.
+- * At each step it records the TTL for the information collected, and when a
+- * TTL expires, we resume the workflow at the point where the expiring
+- * information was gathered (e.g. if an SRV record expired we would re-query
+- * all the AAAA and A records, but if an A record expired, only that stage
+- * would be re-run).
++ * Resolvers take a domain (plus service name and default port) and resolve it,
++ * emitting events 'added' and 'removed' as new hosts behind this domain +
++ * service are discovered (or discovered to be gone).
+  *
+  * The 'added' event receives both a key and an object. The key is a unique
+  * string to identify this particular backend host (and will be provided again
+  * on the 'removed' event if this backend later goes away). The object contains
+  * the address and port to connect to to reach this backend.
+  *
++ * The factory method resolverForDomain can be used for programs that intend to
++ * support both DNS-based resolution or static IP resolution, depending on
++ * whether the user provides a DNS hostname or an IP address.
++ */
++
++/*
++ * DNS-based Resolver
++ *
++ * The basic workflow for the DNS-based resolver is to query for SRV records,
++ * then AAAA, then A, then work out which events to emit (if any). After this it
++ * sleeps.  At each step it records the TTL for the information collected, and
++ * when a TTL expires, we resume the workflow at the point where the expiring
++ * information was gathered (e.g. if an SRV record expired we would re-query all
++ * the AAAA and A records, but if an A record expired, only that stage would be
++ * re-run).
++ *
+  * When SRV record lookup succeeds, the ports will be set based on the contents
+  * of these records. If SRV records are not available, then the 'domain' will
+  * be looked up as a plain A/AAAA name, and the defaultPort option will
+@@ -62,7 +80,6 @@ const EventEmitter = mod_events.EventEmitter;
+  * zero impact just like any other service, by removing them from DNS and
+  * waiting until traffic subsides.
+  */
+-
+ function CueBallResolver(options) {
+ 	mod_assert.object(options);
+ 	mod_assert.optionalArrayOfString(options.resolvers,
+@@ -531,6 +548,7 @@ CueBallResolver.prototype.state_process = function () {
+ 		this.r_log.warn(this.r_lastError, 'failed to find any ' +
+ 		    'backend records for (%s.)%s (more details in TRACE)',
+ 		    this.r_service, this.r_domain);
++		this.emit('updated');
+ 		this.gotoState('sleep');
+ 		return;
+ 	}
+@@ -555,6 +573,7 @@ CueBallResolver.prototype.state_process = function () {
+ 		self.emit('added', k, newBackends[k]);
+ 	});
+ 
++	this.emit('updated');
+ 	this.gotoState('sleep');
+ };
+ 
+@@ -700,3 +719,176 @@ CueBallResolver.prototype.resolve = function (domain, type, timeout) {
+ 		em.emit('answers', ans, minTTL);
+ 	}
+ };
++
++
++/*
++ * Static IP Resolver
++ *
++ * This Resolver implementation emits a fixed list of IP addresses.  This is
++ * useful in development environments and debugging tools, where users may want
++ * to target specific service instances.
++ */
++function CueBallStaticResolver(options) {
++	mod_assert.object(options);
++
++	mod_assert.arrayOfObject(options.backends);
++	this.sr_backends = options.backends.map(function (backend, i) {
++		mod_assert.string(backend.address,
++		    'options.backends[' + i + '].address');
++		mod_assert.ok(mod_net.isIP(backend.address),
++		    'options.backends[' + i +
++		    '].address must be an IP address');
++		mod_assert.number(backend.port,
++		    'options.backends[' + i + '].port');
++
++		return ({
++		    'name': backend.address + ':' + backend.port,
++		    'address': backend.address,
++		    'port': backend.port
++		});
++	});
++	this.sr_state = 'idle';
++
++	EventEmitter.call(this);
++}
++
++mod_util.inherits(CueBallStaticResolver, EventEmitter);
++
++CueBallStaticResolver.prototype.start = function ()
++{
++	var self = this;
++
++	mod_assert.equal(this.sr_state, 'idle',
++	    'cannot call start() again without calling stop()');
++	this.sr_state = 'started';
++
++	setImmediate(function () {
++		self.sr_backends.forEach(function (be) {
++			self.emit('added', srvKey(be), be);
++		});
++
++		self.emit('updated');
++	});
++};
++
++CueBallStaticResolver.prototype.stop = function ()
++{
++	mod_assert.equal(this.sr_state, 'started',
++	    'cannot call stop() again without calling start()');
++	this.sr_state = 'idle';
++};
++
++CueBallStaticResolver.prototype.count = function ()
++{
++	return (this.sr_backends.length);
++};
++
++CueBallStaticResolver.prototype.list = function ()
++{
++	var ret = {};
++
++	this.sr_backends.forEach(function (be) {
++		ret[srvKey(be)] = be;
++	});
++
++	return (ret);
++};
++
++
++/*
++ * resolverForIpOrDomain(args): given an input string of the form:
++ *
++ *     HOSTNAME[:PORT]
++ *
++ * where HOSTNAME may be either a DNS domain or IP address and PORT is an
++ * integer representing a TCP port, return an appropriate resolver instance that
++ * either uses the static IP resolver (if HOSTNAME is determined to be an IP
++ * address) or the DNS-based Resolver class (otherwise).
++ *
++ * Named arguments include:
++ *
++ *    input           the input string (described above)
++ *
++ *    resolverConfig  configuration properties passed to the resolver's
++ *                    constructor
++ *
++ * This is the appropriate interface for constructing a resolver from
++ * user-specified configuration because it allows users to specify IP addresses
++ * or DNS names interchangeably, which is what most users expect.
++ *
++ * If the input is well-formed but invalid (e.g., has the correct JavaScript
++ * types, but the port number is out of range, or the HOSTNAME portion cannot be
++ * interpreted as either an IP address or a DNS domain), then an Error object is
++ * returned.
++ */
++function resolverForIpOrDomain(args)
++{
++	var rcfg, speccfg, k;
++
++	mod_assert.object(args, 'args');
++	mod_assert.string(args.input, 'args.input');
++	mod_assert.optionalObject(args.resolverConfig, 'args.resolverConfig');
++
++	rcfg = {};
++	if (args.resolverConfig) {
++		for (k in args.resolverConfig) {
++			rcfg[k] = args.resolverConfig[k];
++		}
++	}
++
++	speccfg = parseIpOrDomain(args.input);
++	if (speccfg instanceof Error) {
++		return (speccfg);
++	}
++
++	for (k in speccfg.config) {
++		rcfg[k] = speccfg.config[k];
++	}
++
++	return (new speccfg.cons(rcfg));
++}
++
++/*
++ * This is not a public function.
++ */
++function parseIpOrDomain(str)
++{
++	var colon, first, port, ret;
++
++	colon = str.lastIndexOf(':');
++	if (colon == -1) {
++		first = str;
++		port = undefined;
++	} else {
++		first = str.substr(0, colon);
++		port = parseInt(str.substr(colon + 1), 10);
++		if (isNaN(port) || port < 0 || port > 65535) {
++			return (new Error('unsupported port in input: ' + str));
++		}
++	}
++
++	ret = {};
++	if (mod_net.isIP(first) === 0) {
++		ret['kind'] = 'dns';
++		ret['cons'] = CueBallResolver;
++		/* XXX validate DNS domain? */
++		ret['config'] = {
++		    'domain': first
++		};
++
++		if (port !== undefined) {
++			ret['config']['defaultPort'] = port;
++		}
++	} else {
++		ret['kind'] = 'static';
++		ret['cons'] = CueBallStaticResolver;
++		ret['config'] = {
++		    'backends': [ {
++			'address': first,
++			'port': port
++		    } ]
++		};
++	}
++
++	return (ret);
++}
+diff --git a/package.json b/package.json
+index 992b851..a3a3d64 100644
+--- a/package.json
++++ b/package.json
+@@ -6,12 +6,16 @@
+   "dependencies": {
+     "assert-plus": ">=1.0.0 <2.0.0",
+     "bunyan": ">=1.5.1 <2.0.0",
++    "cmdutil": ">=1.0.0 <2.0.0",
++    "extsprintf": ">=1.3.0 <2.0.0",
+     "ipaddr.js": ">=1.1.0 <2.0.0",
+     "mooremachine": ">=1.2.0 <2.0.0",
+     "named-client": "git://github.com/arekinath/node-named-client#v0.3.3",
+     "node-uuid": ">=1.4.7 <2.0.0",
++    "posix-getopt": ">=1.2.0 <2.0.0",
+     "restify-clients": ">=1.1.2 <2.0.0",
+-    "vasync": ">=1.6.3 <2.0.0"
++    "vasync": ">=1.6.3 <2.0.0",
++    "verror": ">=1.6.1 <2.0.0"
+   },
+   "devDependencies": {
+     "tape": ">=4.4.0 <5.0.0",
+diff --git a/test/resolver_for.test.js b/test/resolver_for.test.js
+new file mode 100644
+index 0000000..173ad23
+--- /dev/null
++++ b/test/resolver_for.test.js
+@@ -0,0 +1,157 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++const mod_resolver = require('../lib/resolver');
++const mod_tape = require('tape');
++
++/*
++ * Test the resolverForIpOrDomain() factory function and related interfaces.
++ */
++
++mod_tape.test('resolverForIpOrDomain: bad arguments', function (t) {
++	t.throws(function () {
++		mod_resolver.resolverForIpOrDomain({});
++	}, /args\.input/);
++
++	t.throws(function () {
++		mod_resolver.resolverForIpOrDomain('foobar');
++	}, /args/);
++
++	t.throws(function () {
++		mod_resolver.resolverForIpOrDomain({
++		    'input': 1234
++		});
++	}, /args\.input/);
++
++	t.throws(function () {
++		mod_resolver.resolverForIpOrDomain({
++		    'input': 'foobar',
++		    'resolverConfig': 17
++		});
++	}, /args\.resolverConfig/);
++
++	t.end();
++});
++
++mod_tape.test('parseIpOrDomain: ipv4', function (t) {
++	var result;
++
++	result = mod_resolver.parseIpOrDomain('127.0.0.1');
++	t.ok(!(result instanceof Error));
++	t.equal(result.kind, 'static');
++	t.equal(result.cons.name, 'CueBallStaticResolver');
++	t.deepEqual(result.config, {
++	    'backends': [ { 'address': '127.0.0.1', 'port': undefined } ]
++	});
++
++	result = mod_resolver.parseIpOrDomain('127.0.0.1:1234');
++	t.ok(!(result instanceof Error));
++	t.equal(result.kind, 'static');
++	t.equal(result.cons.name, 'CueBallStaticResolver');
++	t.deepEqual(result.config, {
++	    'backends': [ { 'address': '127.0.0.1', 'port': 1234 } ]
++	});
++
++	result = mod_resolver.parseIpOrDomain('127.0.0.1:-3');
++	t.ok(result instanceof Error);
++	t.ok(/unsupported port in input:/.test(result.message));
++
++	result = mod_resolver.parseIpOrDomain('127.0.0.1:ab123');
++	t.ok(result instanceof Error);
++	t.ok(/unsupported port in input:/.test(result.message));
++
++	t.end();
++});
++
++mod_tape.test('parseIpOrDomain: hostname', function (t) {
++	var result;
++
++	result = mod_resolver.parseIpOrDomain('1.moray.emy-10.joyent.us');
++	t.ok(!(result instanceof Error));
++	t.equal(result.kind, 'dns');
++	t.equal(result.cons.name, 'CueBallResolver');
++	t.deepEqual(result.config, {
++	    'domain': '1.moray.emy-10.joyent.us'
++	});
++
++	result = mod_resolver.parseIpOrDomain('myservice');
++	t.ok(!(result instanceof Error));
++	t.equal(result.kind, 'dns');
++	t.equal(result.cons.name, 'CueBallResolver');
++	t.deepEqual(result.config, {
++	    'domain': 'myservice'
++	});
++
++	result = mod_resolver.parseIpOrDomain('myservice:1234');
++	t.ok(!(result instanceof Error));
++	t.equal(result.kind, 'dns');
++	t.equal(result.cons.name, 'CueBallResolver');
++	t.deepEqual(result.config, {
++	    'domain': 'myservice',
++	    'defaultPort': 1234
++	});
++
++	result = mod_resolver.parseIpOrDomain('myservice:-3');
++	t.ok(result instanceof Error);
++	t.ok(/unsupported port in input:/.test(result.message));
++
++	t.end();
++});
++
++mod_tape.test('resolverForIpOrDomain: static IP', function (t) {
++	var result, list;
++
++	result = mod_resolver.resolverForIpOrDomain({
++	    'input': '127.0.0.1:2020'
++	});
++	t.ok(!(result instanceof Error));
++	t.ok(result instanceof mod_resolver.StaticIpResolver);
++	list = result.list();
++	t.equal(1, Object.keys(list).length);
++	t.deepEqual(list[Object.keys(list)[0]], {
++	    'name': '127.0.0.1:2020',
++	    'address': '127.0.0.1',
++	    'port': 2020
++	});
++
++	result = mod_resolver.resolverForIpOrDomain({
++	    'input': '127.0.0.1:70000'
++	});
++	t.ok(result instanceof Error);
++	t.ok(/unsupported port in input:/.test(result.message));
++
++	t.end();
++});
++
++mod_tape.test('resolverForIpOrDomain: hostname', function (t) {
++	var result;
++
++	result = mod_resolver.resolverForIpOrDomain({
++	    'input': '1.moray.emy-10.joyent.us',
++	    'resolverConfig': {
++		'recovery': {
++		    'default': {
++			'retries': 1,
++			'timeout': 1000,
++			'delay': 1000,
++			'maxDelay': 1000
++		    }
++		}
++	    }
++	});
++	t.ok(!(result instanceof Error));
++	t.ok(result instanceof mod_resolver.Resolver);
++
++	result = mod_resolver.resolverForIpOrDomain({
++	    'input': '1.moray.emy-10.joyent.us:70000'
++	});
++	t.ok(result instanceof Error);
++	t.ok(/unsupported port in input:/.test(result.message));
++
++	t.end();
++});

@@ -1,0 +1,3057 @@
+commit 34819b6389cf799a5de81a885ec6527ba54d8416 (refs/changes/09/509/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-09-20T14:02:52-07:00 (3 years, 1 month ago)
+    
+    joyent/node-cueball#7 add support for multiplexing requests on individual backends
+
+diff --git a/README.md b/README.md
+index b9fa804..a5a7353 100644
+--- a/README.md
++++ b/README.md
+@@ -195,6 +195,11 @@ When a client is done with a connection, they must call `handle.release()` to
+ return it to the pool. All event handlers should be disconnected from the
+ `connection` prior to calling `release()`.
+ 
++If a client determines that a connection must be closed immediately (e.g. due
++to a protocol error making it impossible to continue using it safely), it must
++call the `.close()` method on the *handle*, not any `.destroy()` or similar
++method on the connection itself.
++
+ Calling `claim()` on a Pool that is in the "stopping", "stopped" or "failed"
+ states will result in the callback being called with an error on the next run of
+ the event loop.
+@@ -616,6 +621,70 @@ the records from the previous lookup as the list of nameservers to query in
+ order to find out what the new records should be. Then, we will use any new
+ nameservers we find for the next `napi.coal.joyent.us` lookup as well.
+ 
++ConnectionSet
++-------------
++
++Cueball also includes an alternative to the ConnectionPool, named ConnectionSet.
++This is a more low-level API which is useful for implementing clients for
++protocols that are not as strictly connection-oriented.
++
++Key differences to ConnectionPool:
++ - Each backend in a ConnectionSet has a maximum of 1 connection open to it
++   (it's expected to be used with protocols that multiplex operations over a
++   single socket.)
++ - No support for leases (claim/release). ConnectionSet does not track whether
++   connections are busy or not, and expects its consumer to manage this.
++
++ConnectionSets have an identical state graph to ConnectionPools.
++
++### `new mod_cueball.ConnectionSet(options)`
++
++Parameters
++ - `options` -- Object, with keys:
++   - `resolver` -- Object, an instance of the Resolver interface
++   - `constructor` -- Function, same as in ConnectionPool
++   - `recovery` -- Object, a recovery spec (see below)
++   - `log` -- optional Object, a `bunyan`-style logger to use
++   - `target` -- optional Number, target number of connections to be made
++                 available
++   - `maximum` -- optional Number, maximum number of connections per host
++
++### Event `'added'`
++
++Emitted when a new connection becomes available in the set. This event *must*
++have a handler on it at all times.
++
++Parameters
++ - `key` -- String, a unique key to identify this connection
++ - `connection` -- Object, the connection as returned by the constructor
++
++### Event `removed`
++
++Emitted when an existing connection should be removed from the pool. This event
++*must* have a handler on it at all times. The handler is obligated to take all
++necessary actions to drain the connection of outstanding requests and then close
++it. The emission of this event must cause the connection object to emit
++`'close'` as soon as possible.
++
++Parameters
++ - `key` -- String, a unique key to identify the connection
++
++### `ConnectionSet#stop()`
++
++Stops the ConnectionSet, disconnecting all available connections (by first
++emitting `'removed'` for them.)
++
++### `ConnectionSet#setTarget(target)`
++
++Sets the target number of connections in the ConnectionSet. Will trigger an
++async operation to add or remove connections in order to meet the new target.
++
++Parameters:
++ - `target` -- Number
++
++### `ConnectionSet#getConnections()`
++
++Returns all the currently open connections in the Set, as an Array.
+ 
+ Tools
+ -----
+diff --git a/lib/connection-fsm.js b/lib/connection-fsm.js
+new file mode 100644
+index 0000000..130aaca
+--- /dev/null
++++ b/lib/connection-fsm.js
+@@ -0,0 +1,624 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++module.exports = ConnectionFSM;
++
++const mod_events = require('events');
++const mod_net = require('net');
++const mod_util = require('util');
++const mod_mooremachine = require('mooremachine');
++const mod_assert = require('assert-plus');
++const mod_utils = require('./utils');
++const mod_vasync = require('vasync');
++const mod_bunyan = require('bunyan');
++const mod_resolver = require('./resolver');
++const mod_uuid = require('node-uuid');
++const mod_errors = require('./errors');
++
++const mod_monitor = require('./pool-monitor');
++
++const FSM = mod_mooremachine.FSM;
++const EventEmitter = mod_events.EventEmitter;
++
++const Queue = require('./queue');
++
++/*
++ * ConnectionFSM is the state machine for a "connection" -- an abstract entity
++ * that is managed by a ConnectionPool. ConnectionFSMs are associated with a
++ * particular 'backend', and hold a backing object cf_conn. Typically this
++ * backing object is a TCP socket, but may be any EventEmitter that emits
++ * 'close' and 'error'.
++ */
++function ConnectionFSM(options) {
++	mod_assert.object(options, 'options');
++	mod_assert.object(options.pool, 'options.pool');
++	mod_assert.func(options.constructor, 'options.constructor');
++	mod_assert.object(options.backend, 'options.backend');
++	mod_assert.object(options.log, 'options.log');
++	mod_assert.optionalFunc(options.checker, 'options.checker');
++	mod_assert.optionalNumber(options.checkTimeout, 'options.checkTimeout');
++
++	this.cf_pool = options.pool;
++	this.cf_constructor = options.constructor;
++	this.cf_backend = options.backend;
++	this.cf_claimed = false;
++	this.cf_claimStack = [];
++	this.cf_releaseStack = [];
++	this.cf_lastError = undefined;
++	this.cf_conn = undefined;
++	this.cf_shadow = undefined;
++	this.cf_closeAfter = false;
++	mod_assert.optionalBool(options.doRef, 'options.doRef');
++	this.cf_doRef = options.doRef;
++	if (this.cf_doRef === undefined)
++		this.cf_doRef = true;
++	this.cf_oldListeners = {};
++	this.cf_checkTimeout = options.checkTimeout;
++	this.cf_checker = options.checker;
++	this.cf_lastCheck = new Date();
++	this.cf_log = options.log.child({
++		backend: this.cf_backend.key
++	});
++
++	mod_assert.object(options.recovery, 'options.recovery');
++
++	var connectRecov = options.recovery.default;
++	var initialRecov = options.recovery.default;
++	if (options.recovery.connect) {
++		initialRecov = options.recovery.connect;
++		connectRecov = options.recovery.connect;
++	}
++	if (options.recovery.initial)
++		initialRecov = options.recovery.initial;
++	mod_utils.assertRecovery(connectRecov, 'recovery.connect');
++	mod_utils.assertRecovery(initialRecov, 'recovery.initial');
++
++	this.cf_initialRecov = initialRecov;
++	this.cf_connectRecov = connectRecov;
++
++	this.cf_retries = initialRecov.retries;
++	this.cf_retriesLeft = initialRecov.retries;
++	this.cf_minDelay = initialRecov.delay;
++	this.cf_delay = initialRecov.delay;
++	this.cf_maxDelay = initialRecov.maxDelay || Infinity;
++	this.cf_timeout = initialRecov.timeout;
++	this.cf_maxTimeout = initialRecov.maxTimeout || Infinity;
++
++	/*
++	 * If our parent pool thinks this backend is dead, resume connection
++	 * attempts with the maximum delay and timeout. Something is going
++	 * wrong, let's not retry too aggressively and make it worse.
++	 */
++	if (this.cf_pool.isDeclaredDead(this.cf_backend.key)) {
++		/*
++		 * We might be given an infinite maxDelay or maxTimeout. If
++		 * we are, then multiply it by 2^(retries) to get to what the
++		 * value would have been before.
++		 */
++		var mult = 1 << this.cf_retries;
++		this.cf_delay = this.cf_maxDelay;
++		if (!isFinite(this.cf_delay))
++			this.cf_delay = initialRecov.delay * mult;
++		this.cf_timeout = this.cf_maxTimeout;
++		if (!isFinite(this.cf_timeout))
++			this.cf_timeout = initialRecov.timeout * mult;
++		/* Keep retrying a failed backend forever */
++		this.cf_retries = Infinity;
++		this.cf_retriesLeft = Infinity;
++	}
++
++	this.allStateEvent('closeAsserted');
++
++	FSM.call(this, 'init');
++}
++mod_util.inherits(ConnectionFSM, FSM);
++
++/*
++ * Return true if this connection was closed due to retry exhaustion.
++ */
++ConnectionFSM.prototype.retriesExhausted = function () {
++	return (this.isInState('closed') && this.cf_retriesLeft <= 0);
++};
++
++ConnectionFSM.prototype.getConnection = function () {
++	mod_assert.ok(this.isInState('idle'));
++	return (this.cf_conn);
++};
++
++/*
++ * Mark this Connection as "claimed"; in use by a particular client of the
++ * pool.
++ *
++ * Normally this will be called by the pool itself, which will give the 'stack'
++ * argument as a copy of the stack trace from its caller.
++ *
++ * We keep track of the stack trace of our last claimer and releaser to aid
++ * in debugging.
++ */
++ConnectionFSM.prototype.claim = function (stack, cb) {
++	mod_assert.ok(this.cf_claimed === false);
++	mod_assert.strictEqual(this.getState(), 'idle');
++	if (typeof (stack) === 'function') {
++		cb = stack;
++		stack = undefined;
++	}
++	mod_assert.func(cb, 'callback');
++	if (stack === undefined) {
++		var e = {};
++		Error.captureStackTrace(e);
++		stack = e.stack;
++	}
++	this.cf_claimStack = stack.split('\n').slice(1).
++	    map(function (l) { return (l.replace(/^[ ]*at /, '')); });
++	this.cf_claimed = true;
++	var self = this;
++	this.once('stateChanged', function (st) {
++		if (st === 'busy') {
++			cb(null, self.cf_shadow, self.cf_conn);
++		} else {
++			cb(new Error('Claimed connection entered state ' +
++			    st + ' during claim, instead of "busy"'));
++		}
++	});
++	this.emit('claimAsserted');
++};
++
++/*
++ * Mark this Connection as "free" and ready to be re-used. This is normally
++ * called via the ConnectionHandle.
++ */
++ConnectionFSM.prototype.release = function (cb) {
++	mod_assert.ok(this.cf_claimed === true);
++	mod_assert.ok(['busy', 'ping'].indexOf(this.getState()) !== -1,
++	    'connection is not held');
++
++	var e = {};
++	Error.captureStackTrace(e);
++	this.cf_releaseStack = e.stack.split('\n').slice(1).
++	    map(function (l) { return (l.replace(/^[ ]*at /, '')); });
++	this.once('stateChanged', function (st) {
++		mod_assert.notStrictEqual(st, 'busy');
++		if (cb)
++			cb(null);
++	});
++	this.emit('releaseAsserted');
++};
++
++ConnectionFSM.prototype.close = function (cb) {
++	if (cb) {
++		this.on('stateChanged', function (st) {
++			if (st === 'closed')
++				cb();
++		});
++	}
++	this.emit('closeAsserted');
++};
++
++ConnectionFSM.prototype.start = function () {
++	this.emit('startAsserted');
++};
++
++ConnectionFSM.prototype.closeAfterRelease = function () {
++	this.cf_closeAfter = true;
++};
++
++ConnectionFSM.prototype.state_init = function (S) {
++	S.validTransitions(['connect', 'closed']);
++	S.on(this, 'startAsserted', function () {
++		S.gotoState('connect');
++	});
++	S.on(this, 'closeAsserted', function () {
++		S.gotoState('closed');
++	});
++};
++
++ConnectionFSM.prototype.state_connect = function (S) {
++	S.validTransitions(['error', 'idle', 'closed']);
++	var self = this;
++	S.timeout(this.cf_timeout, function () {
++		self.cf_lastError = new mod_errors.ConnectionTimeoutError(self);
++		S.gotoState('error');
++	});
++	this.cf_conn = this.cf_constructor(this.cf_backend);
++	mod_assert.object(this.cf_conn, 'constructor return value');
++	this.cf_conn.cf_fsm = this;
++	S.on(this.cf_conn, 'connect', function () {
++		S.gotoState('idle');
++	});
++	S.on(this.cf_conn, 'error', function (err) {
++		self.cf_lastError = err;
++		S.gotoState('error');
++		self.cf_pool._incrCounter('error-during-connect');
++	});
++	S.on(this.cf_conn, 'connectError', function (err) {
++		self.cf_lastError = err;
++		S.gotoState('error');
++		self.cf_pool._incrCounter('error-during-connect');
++	});
++	S.on(this.cf_conn, 'close', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('close-during-connect');
++	});
++	S.on(this.cf_conn, 'timeout', function () {
++		self.cf_lastError = new mod_errors.ConnectionTimeoutError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('timeout-during-connect');
++	});
++	S.on(this.cf_conn, 'connectTimeout', function (err) {
++		self.cf_lastError = new mod_errors.ConnectionTimeoutError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('timeout-during-connect');
++	});
++	S.on(this, 'closeAsserted', function () {
++		S.gotoState('closed');
++	});
++};
++
++ConnectionFSM.prototype.state_closed = function (S) {
++	S.validTransitions([]);
++	if (this.cf_conn)
++		this.cf_conn.destroy();
++	this.cf_conn = undefined;
++	this.cf_closeAfter = false;
++	this.cf_lastError = undefined;
++	this.cf_log.trace('ConnectionFSM closed');
++	S.on(this, 'closeAsserted', function () { });
++};
++
++ConnectionFSM.prototype.state_error = function (S) {
++	S.validTransitions(['delay', 'closed']);
++
++	S.on(this, 'closeAsserted', function () { });
++
++	if (this.cf_conn)
++		this.cf_conn.destroy();
++	this.cf_conn = undefined;
++
++	if (this.cf_shadow) {
++		this.cf_shadow.sh_error = true;
++		this.cf_shadow = undefined;
++	}
++
++	/*
++	 * If the closeAfter flag is set, and this is a connection to a "dead"
++	 * backend (i.e., a "monitor" watching to see when it comes back), then
++	 * exit now. For an ordinary backend, we don't want to do this,
++	 * because we want to give ourselves the opportunity to run out of
++	 * retries.
++	 *
++	 * Otherwise, in a situation where we have two connections that were
++	 * created at the same time, one to a failing backend that's already
++	 * declared dead, and one to a different failing backend not yet
++	 * declared, we may never learn that the second backend is down and
++	 * declare it dead. The already declared dead backend may exit first
++	 * during a pool reshuffle and cause this one to exit prematurely
++	 * (there's a race in who exits first and causes the planner to engage)
++	 */
++	if (this.cf_retries === Infinity && this.cf_closeAfter) {
++		this.cf_retriesLeft = 0;
++		S.gotoState('closed');
++		return;
++	}
++
++	if (this.cf_retries !== Infinity)
++		--this.cf_retriesLeft;
++
++	if (this.cf_retries === Infinity || this.cf_retriesLeft > 0) {
++		S.gotoState('delay');
++	} else {
++		this.cf_log.warn(this.cf_lastError, 'failed to connect to ' +
++		    'backend %s (%j)', this.cf_backend.key, this.cf_backend);
++		this.cf_pool._incrCounter('retries-exhausted');
++		S.gotoState('closed');
++	}
++};
++
++ConnectionFSM.prototype.state_delay = function (S) {
++	S.validTransitions(['connect', 'closed']);
++	var delay = this.cf_delay;
++
++	this.cf_delay *= 2;
++	this.cf_timeout *= 2;
++	if (this.cf_timeout > this.cf_maxTimeout)
++		this.cf_timeout = this.cf_maxTimeout;
++	if (this.cf_delay > this.cf_maxDelay)
++		this.cf_delay = this.cf_maxDelay;
++
++	var t = S.timeout(delay, function () {
++		S.gotoState('connect');
++	});
++	t.unref();
++	S.on(this, 'closeAsserted', function () {
++		S.gotoState('closed');
++	});
++};
++
++ConnectionFSM.prototype.state_idle = function (S) {
++	S.validTransitions(['busy', 'error', 'closed']);
++	var self = this;
++
++	this.cf_claimed = false;
++	this.cf_claimStack = [];
++	this.cf_log.trace('connected, idling');
++
++	if (this.cf_shadow) {
++		this.cf_shadow.sh_claimed = false;
++		this.cf_shadow.sh_releaseStack = this.cf_releaseStack;
++		this.cf_shadow = undefined;
++	}
++
++	['close', 'error', 'readable', 'data'].forEach(function (evt) {
++		var newCount = self.cf_conn.listeners(evt).filter(
++		    function (h) { return (typeof (h) === 'function'); }).
++		    length;
++		var oldCount = self.cf_oldListeners[evt];
++		if (oldCount !== undefined && newCount > oldCount) {
++			var info = {};
++			info.stack = self.cf_releaseStack;
++			info.handlers = self.cf_conn.listeners(evt).map(
++			    function (f) { return (f.toString()); });
++			info.event = evt;
++			self.cf_log.warn(info, 'connection claimer looks ' +
++			    'like it leaked event handlers');
++		}
++	});
++
++	/*
++	 * Reset retries and retry delay to their defaults since we are now
++	 * connected.
++	 */
++	this.cf_retries = this.cf_connectRecov.retries;
++	this.cf_retriesLeft = this.cf_connectRecov.retries;
++	this.cf_minDelay = this.cf_connectRecov.delay;
++	this.cf_delay = this.cf_connectRecov.delay;
++	this.cf_maxDelay = this.cf_connectRecov.maxDelay || Infinity;
++	this.cf_timeout = this.cf_connectRecov.timeout;
++	this.cf_maxTimeout = this.cf_connectRecov.maxTimeout || Infinity;
++
++	if (this.cf_closeAfter === true) {
++		this.cf_closeAfter = false;
++		this.cf_lastError = undefined;
++		S.gotoState('closed');
++		S.on(this, 'closeAsserted', function () { });
++		return;
++	}
++
++	if (this.cf_doRef)
++		this.cf_conn.unref();
++
++	S.on(this, 'claimAsserted', function () {
++		S.gotoState('busy');
++	});
++	S.on(this.cf_conn, 'error', function (err) {
++		self.cf_lastError = err;
++		S.gotoState('error');
++		self.cf_pool._incrCounter('error-during-idle');
++	});
++	S.on(this.cf_conn, 'close', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('close-during-idle');
++	});
++	S.on(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('end-during-idle');
++	});
++	S.on(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++	});
++	S.on(this, 'closeAsserted', function () {
++		S.gotoState('closed');
++	});
++	if (this.cf_checkTimeout !== undefined) {
++		var now = new Date();
++		var sinceLast = (now - this.cf_lastCheck);
++		var delay;
++		if (sinceLast > this.cf_checkTimeout) {
++			delay = 1000;
++		} else {
++			delay = this.cf_checkTimeout - sinceLast;
++			if (delay < 1000)
++				delay = 1000;
++		}
++		var t = S.timeout(delay, function () {
++			S.gotoState('ping');
++		});
++		t.unref();
++	}
++};
++
++ConnectionFSM.prototype.state_ping = function (S) {
++	S.validTransitions(['error', 'closed', 'idle']);
++	this.cf_lastCheck = new Date();
++
++	this.cf_claimStack = [
++	    'ConnectionFSM.prototype.state_ping',
++	    '(periodic_health_check)'];
++	this.cf_claimed = true;
++
++	var self = this;
++	if (this.cf_doRef)
++		this.cf_conn.ref();
++
++	this.cf_releaseStack = [];
++	this.cf_log.trace('doing health check');
++
++	/*
++	 * Write down the count of event handlers on the backing object so that
++	 * we can spot if the client leaked any common ones in release().
++	 */
++	this.cf_oldListeners = {};
++	['close', 'error', 'readable', 'data'].forEach(function (evt) {
++		var count = self.cf_conn.listeners(evt).filter(
++		    function (h) { return (typeof (h) === 'function'); }).
++		    length;
++		self.cf_oldListeners[evt] = count;
++	});
++
++	/*
++	 * The ConnectionHandle is a one-time use object that proxies calls to
++	 * our release() and close() functions. We use it so that we can assert
++	 * that this particular client only releases us once. If we only
++	 * asserted on our current state, there could be a race where we get
++	 * claimed by a different client in the meantime.
++	 */
++	this.cf_shadow = new ConnectionHandle(this);
++
++	S.on(this, 'releaseAsserted', function () {
++		if (self.cf_closeAfter === true) {
++			S.gotoState('closed');
++		} else {
++			S.gotoState('idle');
++		}
++	});
++	S.on(this.cf_conn, 'error', function (err) {
++		self.cf_lastError = err;
++		S.gotoState('error');
++		self.cf_pool._incrCounter('error-during-ping');
++	});
++	S.on(this.cf_conn, 'close', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('close-during-ping');
++	});
++	S.on(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('end-during-ping');
++	});
++	S.on(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++	});
++	S.on(this, 'closeAsserted', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++	});
++	var t = S.timeout(this.cf_checkTimeout, function () {
++		var info = {};
++		info.stack = self.cf_claimStack;
++		self.cf_log.warn(info, 'health check is taking too ' +
++		    'long to run (has been more than %d ms)',
++		    self.cf_checkTimeout);
++	});
++	t.unref();
++
++	S.immediate(function () {
++		self.cf_checker.call(null, self.cf_shadow, self.cf_conn);
++	});
++};
++
++ConnectionFSM.prototype.state_busy = function (S) {
++	S.validTransitions(['error', 'closed', 'idle']);
++	var self = this;
++	if (this.cf_doRef)
++		this.cf_conn.ref();
++
++	this.cf_releaseStack = [];
++	this.cf_log.trace('busy, claimed by %s',
++	    this.cf_claimStack[1].split(' ')[0]);
++
++	/*
++	 * Write down the count of event handlers on the backing object so that
++	 * we can spot if the client leaked any common ones in release().
++	 */
++	this.cf_oldListeners = {};
++	['close', 'error', 'readable', 'data'].forEach(function (evt) {
++		var count = self.cf_conn.listeners(evt).filter(
++		    function (h) { return (typeof (h) === 'function'); }).
++		    length;
++		self.cf_oldListeners[evt] = count;
++	});
++
++	/*
++	 * The ConnectionHandle is a one-time use object that proxies calls to
++	 * our release() and close() functions. We use it so that we can assert
++	 * that this particular client only releases us once. If we only
++	 * asserted on our current state, there could be a race where we get
++	 * claimed by a different client in the meantime.
++	 */
++	this.cf_shadow = new ConnectionHandle(this);
++
++	S.on(this, 'releaseAsserted', function () {
++		if (self.cf_closeAfter === true) {
++			S.gotoState('closed');
++		} else {
++			S.gotoState('idle');
++		}
++	});
++	S.on(this.cf_conn, 'error', function (err) {
++		self.cf_lastError = err;
++		S.gotoState('error');
++		self.cf_pool._incrCounter('error-during-busy');
++	});
++	S.on(this.cf_conn, 'end', function () {
++		self.cf_closeAfter = true;
++		self.cf_pool._incrCounter('end-during-busy');
++	});
++	S.on(this.cf_conn, 'end', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++	});
++	S.on(this.cf_conn, 'close', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++		self.cf_pool._incrCounter('close-during-busy');
++	});
++	S.on(this, 'closeAsserted', function () {
++		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
++		S.gotoState('error');
++	});
++	if (this.cf_checkTimeout !== undefined) {
++		var t = S.timeout(this.cf_checkTimeout, function () {
++			var info = {};
++			info.stack = self.cf_claimStack;
++			self.cf_log.warn(info, 'connection held for longer ' +
++			    'than checkTimeout (%d ms), may have been leaked',
++			    self.cf_checkTimeout);
++		});
++		t.unref();
++	}
++};
++
++function ConnectionHandle(cf) {
++	this.sh_cf = cf;
++	this.sh_claimed = true;
++	this.sh_error = false;
++	this.sh_releaseStack = [];
++}
++ConnectionHandle.prototype.close = function () {
++	mod_assert.ok(this.sh_claimed, 'Connection not claimed by ' +
++	    'this handle, released by ' + this.sh_releaseStack[2]);
++	if (this.sh_error) {
++		this.sh_claimed = false;
++		return (undefined);
++	}
++	return (this.sh_cf.close.apply(this.sh_cf, arguments));
++};
++ConnectionHandle.prototype.release = function () {
++	mod_assert.ok(this.sh_claimed, 'Connection not claimed by ' +
++	    'this handle, released by ' + this.sh_releaseStack[2]);
++	if (this.sh_error) {
++		this.sh_claimed = false;
++		return (undefined);
++	}
++	return (this.sh_cf.release.apply(this.sh_cf, arguments));
++};
++ConnectionHandle.prototype.closeAfterRelease = function () {
++	mod_assert.ok(this.sh_claimed, 'Connection not claimed by ' +
++	    'this handle, released by ' + this.sh_releaseStack[2]);
++	if (this.sh_error) {
++		this.sh_claimed = false;
++		return (undefined);
++	}
++	return (this.sh_cf.closeAfterRelease.apply(this.sh_cf,
++	    arguments));
++};
+diff --git a/lib/index.js b/lib/index.js
+index 0842dbd..3e584cd 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -11,11 +11,13 @@ const mod_pool = require('./pool');
+ const mod_resolver = require('./resolver');
+ const mod_pmonitor = require('./pool-monitor');
+ const mod_errors = require('./errors');
++const mod_cset = require('./set');
+ 
+ module.exports = {
+ 	HttpAgent: mod_agent.HttpAgent,
+ 	HttpsAgent: mod_agent.HttpsAgent,
+ 	ConnectionPool: mod_pool.ConnectionPool,
++	ConnectionSet: mod_cset.ConnectionSet,
+ 	Resolver: mod_resolver.Resolver,
+ 	StaticIpResolver: mod_resolver.StaticIpResolver,
+ 	resolverForIpOrDomain: mod_resolver.resolverForIpOrDomain,
+diff --git a/lib/pool.js b/lib/pool.js
+index 9bc34fe..187b1ce 100644
+--- a/lib/pool.js
++++ b/lib/pool.js
+@@ -28,577 +28,7 @@ const FSM = mod_mooremachine.FSM;
+ const EventEmitter = mod_events.EventEmitter;
+ 
+ const Queue = require('./queue');
+-
+-/*
+- * ConnectionFSM is the state machine for a "connection" -- an abstract entity
+- * that is managed by a ConnectionPool. ConnectionFSMs are associated with a
+- * particular 'backend', and hold a backing object cf_conn. Typically this
+- * backing object is a TCP socket, but may be any EventEmitter that emits
+- * 'close' and 'error'.
+- */
+-function ConnectionFSM(options) {
+-	mod_assert.object(options, 'options');
+-	mod_assert.object(options.pool, 'options.pool');
+-	mod_assert.func(options.constructor, 'options.constructor');
+-	mod_assert.object(options.backend, 'options.backend');
+-	mod_assert.object(options.log, 'options.log');
+-	mod_assert.optionalFunc(options.checker, 'options.checker');
+-	mod_assert.optionalNumber(options.checkTimeout, 'options.checkTimeout');
+-
+-	this.cf_pool = options.pool;
+-	this.cf_constructor = options.constructor;
+-	this.cf_backend = options.backend;
+-	this.cf_claimed = false;
+-	this.cf_claimStack = [];
+-	this.cf_releaseStack = [];
+-	this.cf_lastError = undefined;
+-	this.cf_conn = undefined;
+-	this.cf_shadow = undefined;
+-	this.cf_closeAfter = false;
+-	this.cf_oldListeners = {};
+-	this.cf_checkTimeout = options.checkTimeout;
+-	this.cf_checker = options.checker;
+-	this.cf_lastCheck = new Date();
+-	this.cf_log = options.log.child({
+-		backend: this.cf_backend.key
+-	});
+-
+-	mod_assert.object(options.recovery, 'options.recovery');
+-
+-	var connectRecov = options.recovery.default;
+-	var initialRecov = options.recovery.default;
+-	if (options.recovery.connect) {
+-		initialRecov = options.recovery.connect;
+-		connectRecov = options.recovery.connect;
+-	}
+-	if (options.recovery.initial)
+-		initialRecov = options.recovery.initial;
+-	mod_utils.assertRecovery(connectRecov, 'recovery.connect');
+-	mod_utils.assertRecovery(initialRecov, 'recovery.initial');
+-
+-	this.cf_initialRecov = initialRecov;
+-	this.cf_connectRecov = connectRecov;
+-
+-	this.cf_retries = initialRecov.retries;
+-	this.cf_retriesLeft = initialRecov.retries;
+-	this.cf_minDelay = initialRecov.delay;
+-	this.cf_delay = initialRecov.delay;
+-	this.cf_maxDelay = initialRecov.maxDelay || Infinity;
+-	this.cf_timeout = initialRecov.timeout;
+-	this.cf_maxTimeout = initialRecov.maxTimeout || Infinity;
+-
+-	/*
+-	 * If our parent pool thinks this backend is dead, resume connection
+-	 * attempts with the maximum delay and timeout. Something is going
+-	 * wrong, let's not retry too aggressively and make it worse.
+-	 */
+-	if (this.cf_pool.p_dead[this.cf_backend.key] === true) {
+-		/*
+-		 * We might be given an infinite maxDelay or maxTimeout. If
+-		 * we are, then multiply it by 2^(retries) to get to what the
+-		 * value would have been before.
+-		 */
+-		var mult = 1 << this.cf_retries;
+-		this.cf_delay = this.cf_maxDelay;
+-		if (!isFinite(this.cf_delay))
+-			this.cf_delay = initialRecov.delay * mult;
+-		this.cf_timeout = this.cf_maxTimeout;
+-		if (!isFinite(this.cf_timeout))
+-			this.cf_timeout = initialRecov.timeout * mult;
+-		/* Keep retrying a failed backend forever */
+-		this.cf_retries = Infinity;
+-		this.cf_retriesLeft = Infinity;
+-	}
+-
+-	this.allStateEvent('closeAsserted');
+-
+-	FSM.call(this, 'init');
+-}
+-mod_util.inherits(ConnectionFSM, FSM);
+-
+-/*
+- * Return true if this connection was closed due to retry exhaustion.
+- */
+-ConnectionFSM.prototype.retriesExhausted = function () {
+-	return (this.isInState('closed') && this.cf_retriesLeft <= 0);
+-};
+-
+-/*
+- * Mark this Connection as "claimed"; in use by a particular client of the
+- * pool.
+- *
+- * Normally this will be called by the pool itself, which will give the 'stack'
+- * argument as a copy of the stack trace from its caller.
+- *
+- * We keep track of the stack trace of our last claimer and releaser to aid
+- * in debugging.
+- */
+-ConnectionFSM.prototype.claim = function (stack, cb) {
+-	mod_assert.ok(this.cf_claimed === false);
+-	mod_assert.strictEqual(this.getState(), 'idle');
+-	if (typeof (stack) === 'function') {
+-		cb = stack;
+-		stack = undefined;
+-	}
+-	if (stack === undefined) {
+-		var e = {};
+-		Error.captureStackTrace(e);
+-		stack = e.stack;
+-	}
+-	this.cf_claimStack = stack.split('\n').slice(1).
+-	    map(function (l) { return (l.replace(/^[ ]*at /, '')); });
+-	this.cf_claimed = true;
+-	if (cb) {
+-		var self = this;
+-		this.onState('busy', function () {
+-			/*
+-			 * Give the client our ConnectionHandle, and the
+-			 * backing object.
+-			 *
+-			 * They use the ConnectionHandle to call release().
+-			 */
+-			cb(null, self.cf_shadow, self.cf_conn);
+-		});
+-	}
+-	this.emit('claimAsserted');
+-};
+-
+-/*
+- * Mark this Connection as "free" and ready to be re-used. This is normally
+- * called via the ConnectionHandle.
+- */
+-ConnectionFSM.prototype.release = function (cb) {
+-	mod_assert.ok(this.cf_claimed === true);
+-	mod_assert.ok(['busy', 'ping'].indexOf(this.getState()) !== -1,
+-	    'connection is not held');
+-
+-	var e = {};
+-	Error.captureStackTrace(e);
+-	this.cf_releaseStack = e.stack.split('\n').slice(1).
+-	    map(function (l) { return (l.replace(/^[ ]*at /, '')); });
+-
+-	if (cb)
+-		this.onState('idle', cb);
+-	this.emit('releaseAsserted');
+-};
+-
+-ConnectionFSM.prototype.close = function (cb) {
+-	if (cb)
+-		this.onState('closed', cb);
+-	this.emit('closeAsserted');
+-};
+-
+-ConnectionFSM.prototype.start = function () {
+-	this.emit('startAsserted');
+-};
+-
+-ConnectionFSM.prototype.closeAfterRelease = function () {
+-	this.cf_closeAfter = true;
+-};
+-
+-ConnectionFSM.prototype.state_init = function (on) {
+-	this.validTransitions(['connect', 'closed']);
+-	var self = this;
+-	on(this, 'startAsserted', function () {
+-		self.gotoState('connect');
+-	});
+-	on(this, 'closeAsserted', function () {
+-		self.gotoState('closed');
+-	});
+-};
+-
+-ConnectionFSM.prototype.state_connect = function (on, once, timeout) {
+-	this.validTransitions(['error', 'idle', 'closed']);
+-	var self = this;
+-	timeout(this.cf_timeout, function () {
+-		self.cf_lastError = new mod_errors.ConnectionTimeoutError(self);
+-		self.gotoState('error');
+-	});
+-	this.cf_conn = this.cf_constructor(this.cf_backend);
+-	mod_assert.object(this.cf_conn, 'constructor return value');
+-	this.cf_conn.cf_fsm = this;
+-	once(this.cf_conn, 'connect', function () {
+-		self.gotoState('idle');
+-	});
+-	once(this.cf_conn, 'error', function (err) {
+-		self.cf_lastError = err;
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('error-during-connect');
+-	});
+-	once(this.cf_conn, 'connectError', function (err) {
+-		self.cf_lastError = err;
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('error-during-connect');
+-	});
+-	once(this.cf_conn, 'close', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('close-during-connect');
+-	});
+-	once(this.cf_conn, 'timeout', function () {
+-		self.cf_lastError = new mod_errors.ConnectionTimeoutError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('timeout-during-connect');
+-	});
+-	once(this.cf_conn, 'connectTimeout', function (err) {
+-		self.cf_lastError = new mod_errors.ConnectionTimeoutError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('timeout-during-connect');
+-	});
+-	once(this, 'closeAsserted', function () {
+-		self.gotoState('closed');
+-	});
+-};
+-
+-ConnectionFSM.prototype.state_closed = function (on) {
+-	this.validTransitions([]);
+-	if (this.cf_conn && this.cf_conn.destroy)
+-		this.cf_conn.destroy();
+-	this.cf_conn = undefined;
+-	this.cf_closeAfter = false;
+-	this.cf_lastError = undefined;
+-	this.cf_log.trace('ConnectionFSM closed');
+-	on(this, 'closeAsserted', function () { });
+-};
+-
+-ConnectionFSM.prototype.state_error = function (on, once, timeout) {
+-	this.validTransitions(['delay', 'closed']);
+-
+-	var self = this;
+-	on(this, 'closeAsserted', function () {
+-		self.gotoState('closed');
+-	});
+-
+-	if (this.cf_conn && this.cf_conn.destroy)
+-		this.cf_conn.destroy();
+-	this.cf_conn = undefined;
+-
+-	if (this.cf_shadow) {
+-		this.cf_shadow.sh_error = true;
+-		this.cf_shadow = undefined;
+-	}
+-
+-	/*
+-	 * If the closeAfter flag is set, and this is a connection to a "dead"
+-	 * backend (i.e., a "monitor" watching to see when it comes back), then
+-	 * exit now. For an ordinary backend, we don't want to do this,
+-	 * because we want to give ourselves the opportunity to run out of
+-	 * retries.
+-	 *
+-	 * Otherwise, in a situation where we have two connections that were
+-	 * created at the same time, one to a failing backend that's already
+-	 * declared dead, and one to a different failing backend not yet
+-	 * declared, we may never learn that the second backend is down and
+-	 * declare it dead. The already declared dead backend may exit first
+-	 * during a pool reshuffle and cause this one to exit prematurely
+-	 * (there's a race in who exits first and causes the planner to engage)
+-	 */
+-	if (this.cf_retries === Infinity && this.cf_closeAfter) {
+-		this.cf_retriesLeft = 0;
+-		this.gotoState('closed');
+-		return;
+-	}
+-
+-	if (this.cf_retries !== Infinity)
+-		--this.cf_retriesLeft;
+-
+-	if (this.cf_retries === Infinity || this.cf_retriesLeft > 0) {
+-		this.gotoState('delay');
+-	} else {
+-		this.cf_log.warn(this.cf_lastError, 'failed to connect to ' +
+-		    'backend %s (%j)', this.cf_backend.key, this.cf_backend);
+-		this.cf_pool._incrCounter('retries-exhausted');
+-		this.gotoState('closed');
+-	}
+-};
+-
+-ConnectionFSM.prototype.state_delay = function (on, once, timeout) {
+-	this.validTransitions(['connect', 'closed']);
+-	var delay = this.cf_delay;
+-
+-	this.cf_delay *= 2;
+-	this.cf_timeout *= 2;
+-	if (this.cf_timeout > this.cf_maxTimeout)
+-		this.cf_timeout = this.cf_maxTimeout;
+-	if (this.cf_delay > this.cf_maxDelay)
+-		this.cf_delay = this.cf_maxDelay;
+-
+-	var self = this;
+-	var t = timeout(delay, function () {
+-		self.gotoState('connect');
+-	});
+-	t.unref();
+-	once(this, 'closeAsserted', function () {
+-		self.gotoState('closed');
+-	});
+-};
+-
+-ConnectionFSM.prototype.state_idle = function (on, once, timeout) {
+-	this.validTransitions(['busy', 'error', 'closed']);
+-	var self = this;
+-
+-	this.cf_claimed = false;
+-	this.cf_claimStack = [];
+-	this.cf_log.trace('connected, idling');
+-
+-	if (this.cf_shadow) {
+-		this.cf_shadow.sh_claimed = false;
+-		this.cf_shadow.sh_releaseStack = this.cf_releaseStack;
+-		this.cf_shadow = undefined;
+-	}
+-
+-	['close', 'error', 'readable', 'data'].forEach(function (evt) {
+-		var newCount = self.cf_conn.listeners(evt).filter(
+-		    function (h) { return (typeof (h) === 'function'); }).
+-		    length;
+-		var oldCount = self.cf_oldListeners[evt];
+-		if (oldCount !== undefined && newCount > oldCount) {
+-			var info = {};
+-			info.stack = self.cf_releaseStack;
+-			info.handlers = self.cf_conn.listeners(evt).map(
+-			    function (f) { return (f.toString()); });
+-			info.event = evt;
+-			self.cf_log.warn(info, 'connection claimer looks ' +
+-			    'like it leaked event handlers');
+-		}
+-	});
+-
+-	/*
+-	 * Reset retries and retry delay to their defaults since we are now
+-	 * connected.
+-	 */
+-	this.cf_retries = this.cf_connectRecov.retries;
+-	this.cf_retriesLeft = this.cf_connectRecov.retries;
+-	this.cf_minDelay = this.cf_connectRecov.delay;
+-	this.cf_delay = this.cf_connectRecov.delay;
+-	this.cf_maxDelay = this.cf_connectRecov.maxDelay || Infinity;
+-	this.cf_timeout = this.cf_connectRecov.timeout;
+-	this.cf_maxTimeout = this.cf_connectRecov.maxTimeout || Infinity;
+-
+-	if (this.cf_closeAfter === true) {
+-		this.cf_closeAfter = false;
+-		this.cf_lastError = undefined;
+-		this.gotoState('closed');
+-		on(this, 'closeAsserted', function () { });
+-		return;
+-	}
+-
+-	this.cf_conn.unref();
+-
+-	once(this, 'claimAsserted', function () {
+-		self.gotoState('busy');
+-	});
+-	once(this.cf_conn, 'error', function (err) {
+-		self.cf_lastError = err;
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('error-during-idle');
+-	});
+-	once(this.cf_conn, 'close', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('close-during-idle');
+-	});
+-	once(this.cf_conn, 'end', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('end-during-idle');
+-	});
+-	once(this, 'closeAsserted', function () {
+-		self.gotoState('closed');
+-	});
+-	if (this.cf_checkTimeout !== undefined) {
+-		var now = new Date();
+-		var sinceLast = (now - this.cf_lastCheck);
+-		var delay;
+-		if (sinceLast > this.cf_checkTimeout) {
+-			delay = 1000;
+-		} else {
+-			delay = this.cf_checkTimeout - sinceLast;
+-			if (delay < 1000)
+-				delay = 1000;
+-		}
+-		var t = timeout(delay, function () {
+-			self.gotoState('ping');
+-		});
+-		t.unref();
+-	}
+-};
+-
+-ConnectionFSM.prototype.state_ping = function (on, once, timeout) {
+-	this.validTransitions(['error', 'closed', 'idle']);
+-	this.cf_lastCheck = new Date();
+-
+-	this.cf_claimStack = [
+-	    'ConnectionFSM.prototype.state_ping',
+-	    '(periodic_health_check)'];
+-	this.cf_claimed = true;
+-
+-	var self = this;
+-	this.cf_conn.ref();
+-
+-	this.cf_releaseStack = [];
+-	this.cf_log.trace('doing health check');
+-
+-	/*
+-	 * Write down the count of event handlers on the backing object so that
+-	 * we can spot if the client leaked any common ones in release().
+-	 */
+-	this.cf_oldListeners = {};
+-	['close', 'error', 'readable', 'data'].forEach(function (evt) {
+-		var count = self.cf_conn.listeners(evt).filter(
+-		    function (h) { return (typeof (h) === 'function'); }).
+-		    length;
+-		self.cf_oldListeners[evt] = count;
+-	});
+-
+-	/*
+-	 * The ConnectionHandle is a one-time use object that proxies calls to
+-	 * our release() and close() functions. We use it so that we can assert
+-	 * that this particular client only releases us once. If we only
+-	 * asserted on our current state, there could be a race where we get
+-	 * claimed by a different client in the meantime.
+-	 */
+-	this.cf_shadow = new ConnectionHandle(this);
+-
+-	once(this, 'releaseAsserted', function () {
+-		if (self.cf_closeAfter === true) {
+-			self.gotoState('closed');
+-		} else {
+-			self.gotoState('idle');
+-		}
+-	});
+-	once(this.cf_conn, 'error', function (err) {
+-		self.cf_lastError = err;
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('error-during-ping');
+-	});
+-	once(this.cf_conn, 'close', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('close-during-ping');
+-	});
+-	once(this.cf_conn, 'end', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('end-during-ping');
+-	});
+-	once(this, 'closeAsserted', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-	});
+-	var t = timeout(this.cf_checkTimeout, function () {
+-		var info = {};
+-		info.stack = self.cf_claimStack;
+-		self.cf_log.warn(info, 'health check is taking too ' +
+-		    'long to run (has been more than %d ms)',
+-		    self.cf_checkTimeout);
+-	});
+-	t.unref();
+-
+-	this.cf_checker.call(undefined, this.cf_shadow, this.cf_conn);
+-};
+-
+-ConnectionFSM.prototype.state_busy = function (on, once, timeout) {
+-	this.validTransitions(['error', 'closed', 'idle']);
+-	var self = this;
+-	this.cf_conn.ref();
+-
+-	this.cf_releaseStack = [];
+-	this.cf_log.trace('busy, claimed by %s',
+-	    this.cf_claimStack[1].split(' ')[0]);
+-
+-	/*
+-	 * Write down the count of event handlers on the backing object so that
+-	 * we can spot if the client leaked any common ones in release().
+-	 */
+-	this.cf_oldListeners = {};
+-	['close', 'error', 'readable', 'data'].forEach(function (evt) {
+-		var count = self.cf_conn.listeners(evt).filter(
+-		    function (h) { return (typeof (h) === 'function'); }).
+-		    length;
+-		self.cf_oldListeners[evt] = count;
+-	});
+-
+-	/*
+-	 * The ConnectionHandle is a one-time use object that proxies calls to
+-	 * our release() and close() functions. We use it so that we can assert
+-	 * that this particular client only releases us once. If we only
+-	 * asserted on our current state, there could be a race where we get
+-	 * claimed by a different client in the meantime.
+-	 */
+-	this.cf_shadow = new ConnectionHandle(this);
+-
+-	once(this, 'releaseAsserted', function () {
+-		if (self.cf_closeAfter === true) {
+-			self.gotoState('closed');
+-		} else {
+-			self.gotoState('idle');
+-		}
+-	});
+-	once(this.cf_conn, 'error', function (err) {
+-		self.cf_lastError = err;
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('error-during-busy');
+-	});
+-	once(this.cf_conn, 'end', function () {
+-		self.cf_closeAfter = true;
+-		self.cf_pool._incrCounter('end-during-busy');
+-	});
+-	once(this.cf_conn, 'close', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-		self.cf_pool._incrCounter('close-during-busy');
+-	});
+-	once(this, 'closeAsserted', function () {
+-		self.cf_lastError = new mod_errors.ConnectionClosedError(self);
+-		self.gotoState('error');
+-	});
+-	if (this.cf_checkTimeout !== undefined) {
+-		var t = timeout(this.cf_checkTimeout, function () {
+-			var info = {};
+-			info.stack = self.cf_claimStack;
+-			self.cf_log.warn(info, 'connection held for longer ' +
+-			    'than checkTimeout (%d ms), may have been leaked',
+-			    self.cf_checkTimeout);
+-		});
+-		t.unref();
+-	}
+-};
+-
+-function ConnectionHandle(cf) {
+-	this.sh_cf = cf;
+-	this.sh_claimed = true;
+-	this.sh_error = false;
+-	this.sh_releaseStack = [];
+-}
+-ConnectionHandle.prototype.close = function () {
+-	mod_assert.ok(this.sh_claimed, 'Connection not claimed by ' +
+-	    'this handle, released by ' + this.sh_releaseStack[2]);
+-	if (this.sh_error) {
+-		this.sh_claimed = false;
+-		return (undefined);
+-	}
+-	return (this.sh_cf.close.apply(this.sh_cf, arguments));
+-};
+-ConnectionHandle.prototype.release = function () {
+-	mod_assert.ok(this.sh_claimed, 'Connection not claimed by ' +
+-	    'this handle, released by ' + this.sh_releaseStack[2]);
+-	if (this.sh_error) {
+-		this.sh_claimed = false;
+-		return (undefined);
+-	}
+-	return (this.sh_cf.release.apply(this.sh_cf, arguments));
+-};
+-ConnectionHandle.prototype.closeAfterRelease = function () {
+-	mod_assert.ok(this.sh_claimed, 'Connection not claimed by ' +
+-	    'this handle, released by ' + this.sh_releaseStack[2]);
+-	if (this.sh_error) {
+-		this.sh_claimed = false;
+-		return (undefined);
+-	}
+-	return (this.sh_cf.closeAfterRelease.apply(this.sh_cf,
+-	    arguments));
+-};
++const ConnectionFSM = require('./connection-fsm');
+ 
+ /*
+  * A ConnectionPool holds a pool of ConnectionFSMs that are kept up to date
+@@ -671,6 +101,7 @@ function CueBallConnectionPool(options) {
+ 
+ 	this.p_lastRebalance = undefined;
+ 	this.p_inRebalance = false;
++	this.p_rebalScheduled = false;
+ 	this.p_startedResolver = false;
+ 
+ 	this.p_idleq = new Queue();
+@@ -744,27 +175,28 @@ CueBallConnectionPool.prototype.on_resolver_removed = function (k) {
+ 	this.rebalance();
+ };
+ 
+-CueBallConnectionPool.prototype.state_starting =
+-    function (on, once, timeout, onState) {
+-	this.validTransitions(['failed', 'running', 'stopping']);
++CueBallConnectionPool.prototype.state_starting = function (S) {
++	S.validTransitions(['failed', 'running', 'stopping']);
+ 	mod_monitor.monitor.registerPool(this);
+ 
+-	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
+-	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
++	S.on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
++	S.on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
+ 
+ 	var self = this;
+ 
+ 	if (this.p_resolver.isInState('failed')) {
+ 		this.p_log.warn('pre-provided resolver has already failed, ' +
+ 		    'pool will start up in "failed" state');
+-		this.gotoState('failed');
++		S.gotoState('failed');
+ 		return;
+ 	}
+ 
+-	onState(this.p_resolver, 'failed', function () {
+-		self.p_log.warn('underlying resolver failed, moving pool ' +
+-		    'to "failed" state');
+-		self.gotoState('failed');
++	S.on(this.p_resolver, 'stateChanged', function (state) {
++		if (state === 'failed') {
++			self.p_log.warn('underlying resolver failed, moving ' +
++			    'pool to "failed" state');
++			S.gotoState('failed');
++		}
+ 	});
+ 
+ 	if (this.p_resolver.isInState('running')) {
+@@ -779,87 +211,89 @@ CueBallConnectionPool.prototype.state_starting =
+ 		this.p_startedResolver = true;
+ 	}
+ 
+-	on(this, 'connectedToBackend', function () {
+-		self.gotoState('running');
++	S.on(this, 'connectedToBackend', function () {
++		S.gotoState('running');
+ 	});
+ 
+-	on(this, 'closedBackend', function (fsm) {
++	S.on(this, 'closedBackend', function (fsm) {
+ 		var dead = Object.keys(self.p_dead).length;
+ 		if (dead >= self.p_keys.length) {
+ 			self.p_log.error(
+ 			    { dead: dead },
+ 			    'pool has exhausted all retries, now moving to ' +
+ 			    '"failed" state');
+-			self.gotoState('failed');
++			S.gotoState('failed');
+ 		}
+ 	});
+ 
+-	on(this, 'stopAsserted', function () {
+-		self.gotoState('stopping');
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
+ 	});
+ };
+ 
+-CueBallConnectionPool.prototype.state_failed = function (on) {
+-	this.validTransitions(['running', 'stopping']);
+-	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
+-	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
+-	on(this.p_shuffleTimer, 'timeout', this.reshuffle.bind(this));
++CueBallConnectionPool.prototype.state_failed = function (S) {
++	S.validTransitions(['running', 'stopping']);
++	S.on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
++	S.on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
++	S.on(this.p_shuffleTimer, 'timeout', this.reshuffle.bind(this));
+ 
+ 	var self = this;
+-	on(this, 'connectedToBackend', function () {
++	S.on(this, 'connectedToBackend', function () {
+ 		mod_assert.ok(!self.p_resolver.isInState('failed'));
+ 		self.p_log.info('successfully connected to a backend, ' +
+ 		    'moving back to running state');
+-		self.gotoState('running');
++		S.gotoState('running');
+ 	});
+ 
+-	on(this, 'stopAsserted', function () {
+-		self.gotoState('stopping');
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
+ 	});
+ };
+ 
+-CueBallConnectionPool.prototype.state_running = function (on) {
+-	this.validTransitions(['failed', 'stopping']);
++CueBallConnectionPool.prototype.state_running = function (S) {
++	S.validTransitions(['failed', 'stopping']);
+ 	var self = this;
+-	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
+-	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
+-	on(this.p_rebalTimer, 'timeout', this.rebalance.bind(this));
+-	on(this.p_shuffleTimer, 'timeout', this.reshuffle.bind(this));
++	S.on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
++	S.on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
++	S.on(this.p_rebalTimer, 'timeout', this.rebalance.bind(this));
++	S.on(this.p_shuffleTimer, 'timeout', this.reshuffle.bind(this));
+ 
+-	on(this, 'closedBackend', function (fsm) {
++	S.on(this, 'closedBackend', function (fsm) {
+ 		var dead = Object.keys(self.p_dead).length;
+ 		if (dead >= self.p_keys.length) {
+ 			self.p_log.error(
+ 			    { dead: dead },
+ 			    'pool has exhausted all retries, now moving to ' +
+ 			    '"failed" state');
+-			self.gotoState('failed');
++			S.gotoState('failed');
+ 		}
+ 	});
+ 
+-	on(this, 'stopAsserted', function () {
+-		self.gotoState('stopping');
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
+ 	});
+ };
+ 
+-CueBallConnectionPool.prototype.state_stopping =
+-    function (on, once, timeout, onState) {
+-	this.validTransitions(['stopping.backends']);
+-	var self = this;
++CueBallConnectionPool.prototype.state_stopping = function (S) {
++	S.validTransitions(['stopping.backends']);
+ 	if (this.p_startedResolver) {
+-		onState(this.p_resolver, 'stopped', function () {
+-			self.gotoState('stopping.backends');
++		S.on(this.p_resolver, 'stateChanged', function (s) {
++			if (s === 'stopped') {
++				S.gotoState('stopping.backends');
++			}
+ 		});
+ 		this.p_resolver.stop();
++		if (this.p_resolver.isInState('stopped')) {
++			S.gotoState('stopping.backends');
++		}
+ 	} else {
+-		this.gotoState('stopping.backends');
++		S.gotoState('stopping.backends');
+ 	}
+ };
+ 
+-CueBallConnectionPool.prototype.state_stopping.backends = function () {
+-	this.validTransitions(['stopped']);
++CueBallConnectionPool.prototype.state_stopping.backends = function (S) {
++	S.validTransitions(['stopped']);
+ 	var conns = this.p_connections;
+-	var self = this;
+ 	var fsms = [];
+ 	Object.keys(conns).forEach(function (k) {
+ 		conns[k].forEach(function (fsm) {
+@@ -870,20 +304,23 @@ CueBallConnectionPool.prototype.state_stopping.backends = function () {
+ 		func: closeBackend,
+ 		inputs: fsms
+ 	}, function () {
+-		self.gotoState('stopped');
++		S.gotoState('stopped');
+ 	});
+ 	function closeBackend(fsm, cb) {
+ 		if (fsm.isInState('busy')) {
+ 			fsm.closeAfterRelease();
+-			fsm.onState('closed', cb);
++			fsm.on('stateChanged', function (st) {
++				if (st === 'closed')
++					cb();
++			});
+ 		} else {
+ 			fsm.close(cb);
+ 		}
+ 	}
+ };
+ 
+-CueBallConnectionPool.prototype.state_stopped = function () {
+-	this.validTransitions([]);
++CueBallConnectionPool.prototype.state_stopped = function (S) {
++	S.validTransitions([]);
+ 	mod_monitor.monitor.unregisterPool(this);
+ 	this.p_keys = [];
+ 	this.p_connections = {};
+@@ -892,6 +329,10 @@ CueBallConnectionPool.prototype.state_stopped = function () {
+ 	clearInterval(this.p_shuffleTimerInst);
+ };
+ 
++CueBallConnectionPool.prototype.isDeclaredDead = function (backend) {
++	return (this.p_dead[backend] === true);
++};
++
+ CueBallConnectionPool.prototype.reshuffle = function () {
+ 	var taken = this.p_keys.pop();
+ 	var idx = Math.floor(Math.random() * (this.p_keys.length + 1));
+@@ -904,6 +345,24 @@ CueBallConnectionPool.prototype.stop = function () {
+ 	this.emit('stopAsserted');
+ };
+ 
++CueBallConnectionPool.prototype.rebalance = function () {
++	if (this.p_keys.length < 1)
++		return;
++
++	if (this.isInState('stopping') || this.isInState('stopped'))
++		return;
++
++	if (this.p_rebalScheduled !== false)
++		return;
++
++	this.p_rebalScheduled = true;
++
++	var self = this;
++	setImmediate(function () {
++		self._rebalance();
++	});
++};
++
+ /*
+  * Rebalance the pool, by looking at the distribution of connections to
+  * backends amongst the "init" and "idle" queues.
+@@ -912,18 +371,13 @@ CueBallConnectionPool.prototype.stop = function () {
+  * then planRebalance() will return a plan to take us back to an even
+  * distribution, which we then apply.
+  */
+-CueBallConnectionPool.prototype.rebalance = function () {
++CueBallConnectionPool.prototype._rebalance = function () {
+ 	var self = this;
+ 
+-	if (this.p_keys.length < 1)
+-		return;
+-
+-	if (this.isInState('stopping') || this.isInState('stopped'))
+-		return;
+-
+ 	if (this.p_inRebalance !== false)
+ 		return;
+ 	this.p_inRebalance = true;
++	this.p_rebalScheduled = false;
+ 
+ 	var total = 0;
+ 	var conns = {};
+@@ -1020,12 +474,10 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 
+ 	var self = this;
+ 	fsm.on('stateChanged', function (newState) {
+-		var doRebalance = false;
+-
+ 		if (fsm.p_initq_node) {
+ 			/* These transitions mean we're still starting up. */
+-			if (newState === 'delay' || newState === 'error' ||
+-			    newState === 'connect')
++			if (newState === 'init' || newState === 'delay' ||
++			    newState === 'error' || newState === 'connect')
+ 				return;
+ 			/*
+ 			 * As soon as we transition out of the init stages
+@@ -1039,12 +491,12 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 
+ 				if (self.p_dead[key] !== undefined) {
+ 					delete (self.p_dead[key]);
+-					doRebalance = true;
++					self.rebalance();
+ 				}
+ 			}
+ 		}
+ 
+-		if (newState === 'idle') {
++		if (newState === 'idle' && fsm.isInState('idle')) {
+ 			/*
+ 			 * This backend has just become available, either
+ 			 * because its previous user released it, or because
+@@ -1091,7 +543,7 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 				self.p_dead[key] = true;
+ 			}
+ 			self.emit('closedBackend', key, fsm);
+-			doRebalance = true;
++			self.rebalance();
+ 		}
+ 
+ 		if (fsm.p_idleq_node) {
+@@ -1103,40 +555,13 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 			delete (fsm.p_idleq_node);
+ 
+ 			/* Also rebalance, in case we were closed or died. */
+-			doRebalance = true;
+-		}
+-
+-		if (doRebalance)
+ 			self.rebalance();
++		}
+ 	});
+ 
+ 	fsm.start();
+ };
+ 
+-CueBallConnectionPool.prototype.claimSync = function () {
+-	if (this.isInState('stopping') || this.isInState('stopped'))
+-		throw (new mod_errors.PoolStoppingError(this));
+-	if (this.isInState('failed'))
+-		throw (new mod_errors.PoolFailedError(this));
+-
+-	var e = {};
+-	Error.captureStackTrace(e);
+-
+-	/* If there are idle connections sitting around, take one. */
+-	if (this.p_idleq.length > 0) {
+-		var fsm = this.p_idleq.shift();
+-		delete (fsm.p_idleq_node);
+-		fsm.claim(e.stack);
+-		mod_assert.ok(fsm.cf_shadow);
+-		return ({
+-			handle: fsm.cf_shadow,
+-			connection: fsm.cf_conn
+-		});
+-	}
+-
+-	throw (new mod_errors.NoBackendsError(this));
+-};
+-
+ CueBallConnectionPool.prototype.claim = function (options, cb) {
+ 	var self = this;
+ 	var done = false;
+@@ -1147,11 +572,13 @@ CueBallConnectionPool.prototype.claim = function (options, cb) {
+ 	}
+ 	mod_assert.object(options, 'options');
+ 	mod_assert.optionalNumber(options.timeout, 'options.timeout');
+-	var timeout = options.timeout || Infinity;
++	var timeout = options.timeout;
++	if (timeout === undefined)
++		timeout = Infinity;
+ 	mod_assert.optionalBool(options.errorOnEmpty, 'options.errorOnEmpty');
+ 	var errOnEmpty = options.errorOnEmpty;
+ 
+-	if (this.isInState('stoppping') || this.isInState('stopped')) {
++	if (this.isInState('stopping') || this.isInState('stopped')) {
+ 		setImmediate(function () {
+ 			if (!done)
+ 				cb(new mod_errors.PoolStoppingError(self));
+@@ -1179,8 +606,23 @@ CueBallConnectionPool.prototype.claim = function (options, cb) {
+ 	if (this.p_idleq.length > 0) {
+ 		var fsm = this.p_idleq.shift();
+ 		delete (fsm.p_idleq_node);
+-		fsm.claim(e.stack, cb);
+-		return (undefined);
++		fsm.claim(e.stack, function (err, hdl, conn) {
++			if (err) {
++				if (!done)
++					cb(err);
++				done = true;
++				return;
++			}
++			if (done) {
++				hdl.release();
++				return;
++			}
++			done = true;
++			cb(err, hdl, conn);
++		});
++		return ({
++			cancel: function () { done = true; }
++		});
+ 	}
+ 
+ 	if (errOnEmpty && this.p_resolver.count() < 1) {
+diff --git a/lib/resolver.js b/lib/resolver.js
+index 9dbb9fa..309aa88 100644
+--- a/lib/resolver.js
++++ b/lib/resolver.js
+@@ -98,50 +98,49 @@ CueBallResolver.prototype.getLastError = function () {
+ 	return (this.r_lastError);
+ };
+ 
+-CueBallResolver.prototype.state_stopped = function (on) {
+-	var self = this;
+-	on(this, 'startAsserted', function () {
+-		self.gotoState('starting');
++CueBallResolver.prototype.state_stopped = function (S) {
++	S.on(this, 'startAsserted', function () {
++		S.gotoState('starting');
+ 	});
+ };
+ 
+-CueBallResolver.prototype.state_starting = function (on) {
++CueBallResolver.prototype.state_starting = function (S) {
+ 	var self = this;
+ 	this.r_fsm.start();
+-	on(this.r_fsm, 'updated', function (err) {
++	S.on(this.r_fsm, 'updated', function (err) {
+ 		if (err) {
+ 			self.r_lastError = err;
+-			self.gotoState('failed');
++			S.gotoState('failed');
+ 		} else {
+-			self.gotoState('running');
++			S.gotoState('running');
+ 		}
+ 	});
+-	on(this, 'stopAsserted', function () {
+-		self.gotoState('stopping');
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
+ 	});
+ };
+ 
+-CueBallResolver.prototype.state_running = function (on) {
+-	var self = this;
+-	on(this, 'stopAsserted', function () {
+-		self.gotoState('stopping');
++CueBallResolver.prototype.state_running = function (S) {
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
+ 	});
+ };
+ 
+-CueBallResolver.prototype.state_failed = function (on) {
+-	var self = this;
+-	on(this.r_fsm, 'updated', function (err) {
++CueBallResolver.prototype.state_failed = function (S) {
++	S.on(this.r_fsm, 'updated', function (err) {
+ 		if (!err)
+-			self.gotoState('running');
++			S.gotoState('running');
+ 	});
+-	on(this, 'stopAsserted', function () {
+-		self.gotoState('stopping');
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
+ 	});
+ };
+ 
+-CueBallResolver.prototype.state_stopping = function (on) {
++CueBallResolver.prototype.state_stopping = function (S) {
+ 	this.r_fsm.stop();
+-	this.gotoState('stopped');
++	S.immediate(function () {
++		S.gotoState('stopped');
++	});
+ };
+ 
+ /*
+@@ -283,22 +282,21 @@ CueBallDNSResolver.prototype.list = function () {
+ 	return (ret);
+ };
+ 
+-CueBallDNSResolver.prototype.state_init = function (on) {
+-	var self = this;
++CueBallDNSResolver.prototype.state_init = function (S) {
+ 	this.r_stopping = false;
+-	on(this, 'startAsserted', function () {
+-		self.gotoState('check_ns');
++	S.on(this, 'startAsserted', function () {
++		S.gotoState('check_ns');
+ 	});
+ };
+ 
+-CueBallDNSResolver.prototype.state_check_ns = function (on, once) {
++CueBallDNSResolver.prototype.state_check_ns = function (S) {
+ 	var self = this;
+ 	if (this.r_resolvers.length > 0) {
+ 		var notIp = this.r_resolvers.filter(function (r) {
+ 			return (!mod_net.isIPv4(r) && !mod_net.isIPv6(r));
+ 		});
+ 		if (notIp.length === 0) {
+-			this.gotoState('srv');
++			S.gotoState('srv');
+ 			return;
+ 		}
+ 		mod_assert.equal(notIp.length, 1);
+@@ -316,13 +314,13 @@ CueBallDNSResolver.prototype.state_check_ns = function (on, once) {
+ 			CueBallDNSResolver.bootstrapResolvers[notIp[0]] =
+ 			    this.r_bootstrap;
+ 		}
+-		this.gotoState('bootstrap_ns');
++		S.gotoState('bootstrap_ns');
+ 	} else {
+ 		mod_fs.readFile('/etc/resolv.conf', 'ascii',
+ 		    function (err, file) {
+ 			if (err) {
+ 				self.r_resolvers = ['8.8.8.8', '8.8.4.4'];
+-				self.gotoState('srv');
++				S.gotoState('srv');
+ 				return;
+ 			}
+ 			self.r_resolvers = [];
+@@ -333,12 +331,12 @@ CueBallDNSResolver.prototype.state_check_ns = function (on, once) {
+ 					self.r_resolvers.push(m[1]);
+ 				}
+ 			});
+-			self.gotoState('srv');
++			S.gotoState('srv');
+ 		});
+ 	}
+ };
+ 
+-CueBallDNSResolver.prototype.state_bootstrap_ns = function (on, once) {
++CueBallDNSResolver.prototype.state_bootstrap_ns = function (S) {
+ 	var self = this;
+ 	this.r_bootstrap.on('added', function (k, srv) {
+ 		self.r_bootstrapRes[k] = srv;
+@@ -364,36 +362,36 @@ CueBallDNSResolver.prototype.state_bootstrap_ns = function (on, once) {
+ 		Object.keys(srvs).forEach(function (k) {
+ 			self.r_resolvers.push(srvs[k].address);
+ 		});
+-		self.gotoState('srv');
++		S.gotoState('srv');
+ 	} else {
+-		once(this.r_bootstrap, 'added', function () {
+-			self.gotoState('srv');
++		S.on(this.r_bootstrap, 'added', function () {
++			S.gotoState('srv');
+ 		});
+ 		this.r_bootstrap.start();
+ 	}
+ };
+ 
+-CueBallDNSResolver.prototype.state_srv = function () {
++CueBallDNSResolver.prototype.state_srv = function (S) {
+ 	var r = this.r_srvRetry;
+ 	r.delay = r.minDelay;
+ 	r.count = r.max;
+-	this.gotoState('srv_try');
++	S.gotoState('srv_try');
+ };
+ 
+-CueBallDNSResolver.prototype.state_srv_try = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_srv_try = function (S) {
+ 	var self = this;
+ 
+ 	var name = this.r_service + '.' + this.r_domain;
+ 	var req = this.resolve(name, 'SRV', this.r_srvRetry.timeout);
+-	once(req, 'answers', function (ans, ttl) {
++	S.on(req, 'answers', function (ans, ttl) {
+ 		var d = new Date();
+ 		d.setTime(d.getTime() + 1000*ttl);
+ 		self.r_nextService = d;
+ 
+ 		self.r_srvs = ans;
+-		self.gotoState('aaaa');
++		S.gotoState('aaaa');
+ 	});
+-	once(req, 'error', function (err) {
++	S.on(req, 'error', function (err) {
+ 		self.r_lastError = err;
+ 
+ 		if (NoRecordsError.isInstance(err)) {
+@@ -419,20 +417,20 @@ CueBallDNSResolver.prototype.state_srv_try = function (on, once, timeout) {
+ 			    '%s, treating as a plain name for next 60min',
+ 			    self.r_service);
+ 
+-			self.gotoState('aaaa');
++			S.gotoState('aaaa');
+ 		} else {
+-			self.gotoState('srv_error');
++			S.gotoState('srv_error');
+ 		}
+ 	});
+ 	req.send();
+ };
+ 
+-CueBallDNSResolver.prototype.state_srv_error = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_srv_error = function (S) {
+ 	var self = this;
+ 	var r = self.r_srvRetry;
+ 	if (--r.count > 0) {
+-		timeout(r.delay, function () {
+-			self.gotoState('srv_try');
++		S.timeout(r.delay, function () {
++			S.gotoState('srv_try');
+ 		});
+ 
+ 		r.delay *= 2;
+@@ -458,17 +456,17 @@ CueBallDNSResolver.prototype.state_srv_error = function (on, once, timeout) {
+ 		d.setTime(d.getTime() + 1000*60*5);
+ 		self.r_nextService = d;
+ 
+-		self.gotoState('aaaa');
++		S.gotoState('aaaa');
+ 	}
+ };
+ 
+-CueBallDNSResolver.prototype.state_aaaa = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_aaaa = function (S) {
+ 	this.r_srvRem = this.r_srvs.slice();
+ 	this.r_nextV6 = undefined;
+-	this.gotoState('aaaa_next');
++	S.gotoState('aaaa_next');
+ };
+ 
+-CueBallDNSResolver.prototype.state_aaaa_next = function () {
++CueBallDNSResolver.prototype.state_aaaa_next = function (S) {
+ 	var r = this.r_retry;
+ 	r.delay = r.minDelay;
+ 	r.count = r.max;
+@@ -476,14 +474,14 @@ CueBallDNSResolver.prototype.state_aaaa_next = function () {
+ 	var srv = this.r_srvRem.shift();
+ 	if (srv) {
+ 		this.r_srv = srv;
+-		this.gotoState('aaaa_try');
++		S.gotoState('aaaa_try');
+ 	} else {
+ 		/* Lookups are all done, proceed on through. */
+-		this.gotoState('a');
++		S.gotoState('a');
+ 	}
+ };
+ 
+-CueBallDNSResolver.prototype.state_aaaa_try = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_aaaa_try = function (S) {
+ 	var self = this;
+ 	var srv = this.r_srv;
+ 
+@@ -493,12 +491,12 @@ CueBallDNSResolver.prototype.state_aaaa_try = function (on, once, timeout) {
+ 		srv.addresses_v6 = srv.additionals.filter(function (a) {
+ 			return (mod_net.isIPv6(a));
+ 		});
+-		self.gotoState('aaaa_next');
++		S.gotoState('aaaa_next');
+ 		return;
+ 	}
+ 
+ 	var req = this.resolve(srv.name, 'AAAA', this.r_retry.timeout);
+-	once(req, 'answers', function (ans, ttl) {
++	S.on(req, 'answers', function (ans, ttl) {
+ 		var d = new Date();
+ 		d.setTime(d.getTime() + 1000*ttl);
+ 		if (self.r_nextV6 === undefined || d <= self.r_nextV6)
+@@ -507,21 +505,21 @@ CueBallDNSResolver.prototype.state_aaaa_try = function (on, once, timeout) {
+ 		srv.addresses_v6 = ans.map(function (v) {
+ 			return (v.address);
+ 		});
+-		self.gotoState('aaaa_next');
++		S.gotoState('aaaa_next');
+ 	});
+-	once(req, 'error', function (err) {
++	S.on(req, 'error', function (err) {
+ 		self.r_lastError = err;
+-		self.gotoState('aaaa_error');
++		S.gotoState('aaaa_error');
+ 	});
+ 	req.send();
+ };
+ 
+-CueBallDNSResolver.prototype.state_aaaa_error = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_aaaa_error = function (S) {
+ 	var self = this;
+ 	var r = self.r_retry;
+ 	if (--r.count > 0) {
+-		timeout(r.delay, function () {
+-			self.gotoState('aaaa_try');
++		S.timeout(r.delay, function () {
++			S.gotoState('aaaa_try');
+ 		});
+ 
+ 		r.delay *= 2;
+@@ -538,17 +536,17 @@ CueBallDNSResolver.prototype.state_aaaa_error = function (on, once, timeout) {
+ 		if (self.r_nextV6 === undefined || d <= self.r_nextV6)
+ 			self.r_nextV6 = d;
+ 
+-		self.gotoState('aaaa_next');
++		S.gotoState('aaaa_next');
+ 	}
+ };
+ 
+-CueBallDNSResolver.prototype.state_a = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_a = function (S) {
+ 	this.r_srvRem = this.r_srvs.slice();
+ 	this.r_nextV4 = undefined;
+-	this.gotoState('a_next');
++	S.gotoState('a_next');
+ };
+ 
+-CueBallDNSResolver.prototype.state_a_next = function () {
++CueBallDNSResolver.prototype.state_a_next = function (S) {
+ 	var r = this.r_retry;
+ 	r.delay = r.minDelay;
+ 	r.count = r.max;
+@@ -556,14 +554,14 @@ CueBallDNSResolver.prototype.state_a_next = function () {
+ 	var srv = this.r_srvRem.shift();
+ 	if (srv) {
+ 		this.r_srv = srv;
+-		this.gotoState('a_try');
++		S.gotoState('a_try');
+ 	} else {
+ 		/* Lookups are all done, proceed on through. */
+-		this.gotoState('process');
++		S.gotoState('process');
+ 	}
+ };
+ 
+-CueBallDNSResolver.prototype.state_a_try = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_a_try = function (S) {
+ 	var self = this;
+ 	var srv = this.r_srv;
+ 
+@@ -573,12 +571,12 @@ CueBallDNSResolver.prototype.state_a_try = function (on, once, timeout) {
+ 		srv.addresses_v4 = srv.additionals.filter(function (a) {
+ 			return (mod_net.isIPv4(a));
+ 		});
+-		self.gotoState('a_next');
++		S.gotoState('a_next');
+ 		return;
+ 	}
+ 
+ 	var req = this.resolve(srv.name, 'A', this.r_retry.timeout);
+-	once(req, 'answers', function (ans, ttl) {
++	S.on(req, 'answers', function (ans, ttl) {
+ 		var d = new Date();
+ 		d.setTime(d.getTime() + 1000*ttl);
+ 		if (self.r_nextV4 === undefined || d <= self.r_nextV4)
+@@ -587,21 +585,21 @@ CueBallDNSResolver.prototype.state_a_try = function (on, once, timeout) {
+ 		srv.addresses_v4 = ans.map(function (v) {
+ 			return (v.address);
+ 		});
+-		self.gotoState('a_next');
++		S.gotoState('a_next');
+ 	});
+-	once(req, 'error', function (err) {
++	S.on(req, 'error', function (err) {
+ 		self.r_lastError = err;
+-		self.gotoState('a_error');
++		S.gotoState('a_error');
+ 	});
+ 	req.send();
+ };
+ 
+-CueBallDNSResolver.prototype.state_a_error = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_a_error = function (S) {
+ 	var self = this;
+ 	var r = self.r_retry;
+ 	if (--r.count > 0) {
+-		timeout(r.delay, function () {
+-			self.gotoState('a_try');
++		S.timeout(r.delay, function () {
++			S.gotoState('a_try');
+ 		});
+ 
+ 		r.delay *= 2;
+@@ -618,11 +616,11 @@ CueBallDNSResolver.prototype.state_a_error = function (on, once, timeout) {
+ 		if (self.r_nextV4 === undefined || d <= self.r_nextV4)
+ 			self.r_nextV4 = d;
+ 
+-		self.gotoState('a_next');
++		S.gotoState('a_next');
+ 	}
+ };
+ 
+-CueBallDNSResolver.prototype.state_process = function () {
++CueBallDNSResolver.prototype.state_process = function (S) {
+ 	var self = this;
+ 
+ 	var oldBackends = this.r_backends;
+@@ -653,7 +651,7 @@ CueBallDNSResolver.prototype.state_process = function () {
+ 		    this.r_service, this.r_domain);
+ 		this.r_log.warn(err, 'finished processing');
+ 		this.emit('updated', err);
+-		this.gotoState('sleep');
++		S.gotoState('sleep');
+ 		return;
+ 	}
+ 
+@@ -678,16 +676,16 @@ CueBallDNSResolver.prototype.state_process = function () {
+ 	});
+ 
+ 	this.emit('updated');
+-	this.gotoState('sleep');
++	S.gotoState('sleep');
+ };
+ 
+-CueBallDNSResolver.prototype.state_sleep = function (on, once, timeout) {
++CueBallDNSResolver.prototype.state_sleep = function (S) {
+ 	var self = this;
+ 	var now = new Date();
+ 	var minDelay, state;
+ 
+ 	if (this.r_stopping) {
+-		this.gotoState('init');
++		S.gotoState('init');
+ 		return;
+ 	}
+ 
+@@ -703,16 +701,16 @@ CueBallDNSResolver.prototype.state_sleep = function (on, once, timeout) {
+ 	}
+ 
+ 	if (minDelay < 0) {
+-		this.gotoState(state);
++		S.gotoState(state);
+ 	} else {
+ 		self.r_log.trace({state: state, delay: minDelay},
+ 		    'sleeping until next TTL expiry');
+-		var t = timeout(minDelay, function () {
+-			self.gotoState(state);
++		var t = S.timeout(minDelay, function () {
++			S.gotoState(state);
+ 		});
+ 		t.unref();
+-		on(this, 'stopAsserted', function () {
+-			self.gotoState('init');
++		S.on(this, 'stopAsserted', function () {
++			S.gotoState('init');
+ 		});
+ 	}
+ };
+diff --git a/lib/set.js b/lib/set.js
+new file mode 100644
+index 0000000..df0037a
+--- /dev/null
++++ b/lib/set.js
+@@ -0,0 +1,447 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++module.exports = {
++	ConnectionSet: CueBallConnectionSet
++};
++
++const mod_events = require('events');
++const mod_net = require('net');
++const mod_util = require('util');
++const mod_mooremachine = require('mooremachine');
++const mod_assert = require('assert-plus');
++const mod_utils = require('./utils');
++const mod_vasync = require('vasync');
++const mod_bunyan = require('bunyan');
++const mod_resolver = require('./resolver');
++const mod_uuid = require('node-uuid');
++const mod_errors = require('./errors');
++
++const FSM = mod_mooremachine.FSM;
++const EventEmitter = mod_events.EventEmitter;
++
++const Queue = require('./queue');
++const ConnectionFSM = require('./connection-fsm');
++
++function CueBallConnectionSet(options) {
++	mod_assert.object(options);
++
++	mod_assert.func(options.constructor, 'options.constructor');
++
++	this.cs_uuid = mod_uuid.v4();
++	this.cs_constructor = options.constructor;
++
++	mod_assert.object(options.resolver, 'options.resolver');
++	this.cs_resolver = options.resolver;
++
++	mod_assert.object(options.recovery, 'options.recovery');
++	this.cs_recovery = options.recovery;
++
++	mod_assert.optionalObject(options.log, 'options.log');
++	this.cs_log = options.log || mod_bunyan.createLogger({
++		name: 'CueBallConnectionPool'
++	});
++	this.cs_log = this.cs_log.child({
++		domain: options.domain,
++		service: options.service,
++		cset: this.cs_uuid
++	});
++
++	mod_assert.number(options.target, 'options.target');
++	mod_assert.number(options.maximum, 'options.maximum');
++	this.cs_target = options.target;
++	this.cs_max = options.maximum;
++
++	this.cs_keys = [];
++	this.cs_backends = {};
++	this.cs_fsms = {};
++	this.cs_serials = {};
++	this.cs_connections = {};
++	this.cs_dead = {};
++
++	this.cs_lastRebalance = undefined;
++	this.cs_inRebalance = false;
++	this.cs_rebalScheduled = false;
++
++	this.cs_counters = {};
++
++	var self = this;
++
++	this.cs_rebalTimer = new EventEmitter();
++	this.cs_rebalTimerInst = setInterval(function () {
++		self.cs_rebalTimer.emit('timeout');
++	}, 10000);
++	this.cs_rebalTimerInst.unref();
++
++	this.cs_shuffleTimer = new EventEmitter();
++	this.cs_shuffleTimerInst = setInterval(function () {
++		self.cs_shuffleTimer.emit('timeout');
++	}, 60000);
++	this.cs_shuffleTimerInst.unref();
++
++	FSM.call(this, 'starting');
++}
++mod_util.inherits(CueBallConnectionSet, FSM);
++
++CueBallConnectionSet.prototype.on_resolver_added = function (k, backend) {
++	backend.key = k;
++	var idx = Math.floor(Math.random() * (this.cs_keys.length + 1));
++	this.cs_keys.splice(idx, 0, k);
++	this.cs_backends[k] = backend;
++	this.rebalance();
++};
++
++CueBallConnectionSet.prototype.on_resolver_removed = function (k) {
++	var idx = this.cs_keys.indexOf(k);
++	if (idx !== -1)
++		this.cs_keys.splice(idx, 1);
++	delete (this.cs_backends[k]);
++	var self = this;
++	var cks = Object.keys(this.cs_connections).filter(function (ck) {
++		return (ck.indexOf(k + '.') === 0);
++	});
++	cks.forEach(function (ck) {
++		var conn = self.cs_connections[ck];
++		delete (self.cs_connections[ck]);
++		self.assertEmit('removed', ck, conn);
++	});
++};
++
++CueBallConnectionSet.prototype.isDeclaredDead = function (backend) {
++	return (this.cs_dead[backend] === true);
++};
++
++CueBallConnectionSet.prototype.state_starting = function (S) {
++	S.validTransitions(['failed', 'running', 'stopping']);
++	/* mod_monitor.monitor.registerPool(this); */
++
++	S.on(this.cs_resolver, 'added', this.on_resolver_added.bind(this));
++	S.on(this.cs_resolver, 'removed', this.on_resolver_removed.bind(this));
++
++	var self = this;
++
++	if (this.cs_resolver.isInState('failed')) {
++		this.cs_log.warn('resolver has already failed, cset will ' +
++		    'start up in "failed" state');
++		S.gotoState('failed');
++		return;
++	}
++
++	S.on(this.cs_resolver, 'failed', function () {
++		self.cs_log.warn('underlying resolver failed, moving cset ' +
++		    'to "failed" state');
++		S.gotoState('failed');
++	});
++
++	if (this.cs_resolver.isInState('running')) {
++		var backends = this.cs_resolver.list();
++		Object.keys(backends).forEach(function (k) {
++			var backend = backends[k];
++			self.on_resolver_added(k, backend);
++		});
++	}
++
++	S.on(this, 'connectedToBackend', function () {
++		S.gotoState('running');
++	});
++
++	S.on(this, 'closedBackend', function (fsm) {
++		var dead = Object.keys(self.cs_dead).length;
++		if (dead >= self.cs_keys.length) {
++			self.cs_log.error(
++			    { dead: dead },
++			    'cset has exhausted all retries, now moving to ' +
++			    '"failed" state');
++			S.gotoState('failed');
++		}
++	});
++
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
++	});
++};
++
++CueBallConnectionSet.prototype.state_failed = function (S) {
++	S.validTransitions(['running', 'stopping']);
++	S.on(this.cs_resolver, 'added', this.on_resolver_added.bind(this));
++	S.on(this.cs_resolver, 'removed', this.on_resolver_removed.bind(this));
++	S.on(this.cs_shuffleTimer, 'timeout', this.reshuffle.bind(this));
++
++	var self = this;
++	S.on(this, 'connectedToBackend', function () {
++		mod_assert.ok(!self.cs_resolver.isInState('failed'));
++		self.cs_log.info('successfully connected to a backend, ' +
++		    'moving back to running state');
++		S.gotoState('running');
++	});
++
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
++	});
++};
++
++CueBallConnectionSet.prototype.state_running = function (S) {
++	S.validTransitions(['failed', 'stopping']);
++	var self = this;
++	S.on(this.cs_resolver, 'added', this.on_resolver_added.bind(this));
++	S.on(this.cs_resolver, 'removed', this.on_resolver_removed.bind(this));
++	S.on(this.cs_rebalTimer, 'timeout', this.rebalance.bind(this));
++	S.on(this.cs_shuffleTimer, 'timeout', this.reshuffle.bind(this));
++
++	S.on(this, 'closedBackend', function (fsm) {
++		var dead = Object.keys(self.cs_dead).length;
++		if (dead >= self.cs_keys.length) {
++			self.cs_log.error(
++			    { dead: dead },
++			    'pool has exhausted all retries, now moving to ' +
++			    '"failed" state');
++			S.gotoState('failed');
++		}
++	});
++
++	S.on(this, 'stopAsserted', function () {
++		S.gotoState('stopping');
++	});
++};
++
++CueBallConnectionSet.prototype.state_stopping = function (S) {
++	S.validTransitions(['stopped']);
++	var conns = this.cs_fsms;
++	var fsms = [];
++	Object.keys(conns).forEach(function (k) {
++		conns[k].forEach(function (fsm) {
++			fsms.push(fsm);
++		});
++	});
++	mod_vasync.forEachParallel({
++		func: closeBackend,
++		inputs: fsms
++	}, function () {
++		S.gotoState('stopped');
++	});
++	function closeBackend(fsm, cb) {
++		if (fsm.isInState('busy')) {
++			fsm.closeAfterRelease();
++			fsm.on('stateChanged', function (s) {
++				if (s === 'closed')
++					cb();
++			});
++		} else {
++			fsm.close(cb);
++		}
++	}
++};
++
++CueBallConnectionSet.prototype.state_stopped = function (S) {
++	S.validTransitions([]);
++	/* mod_monitor.monitor.unregisterPool(this); */
++	this.cs_keys = [];
++	this.cs_fsms = {};
++	this.cs_connections = {};
++	this.cs_backends = {};
++	clearInterval(this.cs_rebalTimerInst);
++	clearInterval(this.cs_shuffleTimerInst);
++};
++
++CueBallConnectionSet.prototype.isDeclaredDead = function (backend) {
++	return (this.cs_dead[backend] === true);
++};
++
++CueBallConnectionSet.prototype.reshuffle = function () {
++	var taken = this.cs_keys.pop();
++	var idx = Math.floor(Math.random() * (this.cs_keys.length + 1));
++	this.cs_keys.splice(idx, 0, taken);
++	this.rebalance();
++};
++
++/* Stop and kill everything. */
++CueBallConnectionSet.prototype.stop = function () {
++	this.emit('stopAsserted');
++};
++
++CueBallConnectionSet.prototype.setTarget = function (target) {
++	this.cs_target = target;
++	this.rebalance();
++};
++
++CueBallConnectionSet.prototype.rebalance = function () {
++	if (this.cs_keys.length < 1)
++		return;
++
++	if (this.isInState('stopping') || this.isInState('stopped'))
++		return;
++
++	if (this.cs_rebalScheduled !== false)
++		return;
++
++	this.p_rebalScheduled = true;
++	var self = this;
++	setImmediate(function () {
++		self._rebalance();
++	});
++};
++
++/*
++ * Rebalance the set, by looking at the distribution of connections to
++ * backends amongst the "init" and "idle" queues.
++ *
++ * If the connections are not evenly distributed over the available backends,
++ * then planRebalance() will return a plan to take us back to an even
++ * distribution, which we then apply.
++ */
++CueBallConnectionSet.prototype._rebalance = function () {
++	var self = this;
++
++	if (this.cs_inRebalance !== false)
++		return;
++	this.cs_inRebalance = true;
++	this.cs_rebalScheduled = false;
++
++	var conns = {};
++	var total = 0;
++	this.cs_keys.forEach(function (k) {
++		conns[k] = [];
++	});
++	Object.keys(this.cs_fsms).forEach(function (k) {
++		conns[k] = self.cs_fsms[k].slice();
++		total += self.cs_fsms[k].length;
++	});
++
++	var plan = mod_utils.planRebalance(
++	    conns, this.cs_dead, this.cs_target, this.cs_max, true);
++
++	if (plan.remove.length > 0 || plan.add.length > 0) {
++		this.cs_log.trace('rebalancing cset, remove %d, ' +
++		    'add %d (target = %d, total = %d)',
++		    plan.remove.length, plan.add.length, this.cs_target,
++		    total);
++	}
++	plan.remove.forEach(function (fsm) {
++		var k = fsm.cf_backend.key;
++		var cks = Object.keys(self.cs_connections).filter(
++		    function (ck) {
++			return (ck.indexOf(k + '.') === 0);
++		});
++		cks.forEach(function (ck) {
++			var conn = self.cs_connections[ck];
++			delete (self.cs_connections[ck]);
++			self.emit('removed', ck, conn);
++		});
++		if (cks.length === 0) {
++			var fsmIdx = self.cs_fsms[k].indexOf(fsm);
++			if (fsmIdx > 0 || self.cs_keys.indexOf(k) === -1) {
++				fsm.close();
++				--total;
++			} else {
++				fsm.closeAfterRelease();
++			}
++		}
++	});
++	plan.add.forEach(function (k) {
++		/* Make sure we *never* exceed our socket limit. */
++		if (++total > self.cs_max)
++			return;
++		self.addConnection(k);
++	});
++
++	this.cs_inRebalance = false;
++	this.cs_lastRebalance = new Date();
++};
++
++CueBallConnectionSet.prototype.assertEmit = function () {
++	var args = arguments;
++	var event = args[0];
++	if (this.listeners(event).length < 1) {
++		throw (new Error('Event "' + event + '" on ConnectionSet ' +
++		    'must be handled'));
++	}
++	return (this.emit.apply(this, args));
++};
++
++CueBallConnectionSet.prototype.addConnection = function (key) {
++	if (this.isInState('stopping') || this.isInState('stopped'))
++		return;
++
++	var backend = this.cs_backends[key];
++	backend.key = key;
++
++	var fsm = new ConnectionFSM({
++		constructor: this.cs_constructor,
++		backend: backend,
++		log: this.cs_log,
++		pool: this,
++		recovery: this.cs_recovery,
++		doRef: false
++	});
++	if (this.cs_fsms[key] === undefined)
++		this.cs_fsms[key] = [];
++	if (this.cs_serials[key] === undefined)
++		this.cs_serials[key] = 1;
++	this.cs_fsms[key].push(fsm);
++	var serial;
++	var ckey;
++
++	var self = this;
++	fsm.on('stateChanged', function (newState) {
++		if (newState === 'idle' && fsm.isInState('idle')) {
++			if (serial === undefined) {
++				self.emit('connectedToBackend', key, fsm);
++			}
++			if (ckey !== undefined && self.cs_connections[ckey]) {
++				var conn = self.cs_connections[ckey];
++				delete (self.cs_connections[ckey]);
++				self.assertEmit('removed', ckey, conn);
++			}
++
++			conn = fsm.getConnection();
++			serial = self.cs_serials[key]++;
++			ckey = key + '.' + serial;
++			conn.cs_serial = serial;
++			fsm.cs_serial = serial;
++
++			self.cs_connections[ckey] = conn;
++			self.assertEmit('added', ckey, conn);
++
++			self.rebalance();
++			return;
++		}
++
++		if (newState === 'closed') {
++			if (self.cs_connections[ckey]) {
++				conn = self.cs_connections[ckey];
++				delete (self.cs_connections[ckey]);
++				self.assertEmit('removed', ckey, conn);
++			}
++			if (self.cs_fsms[key]) {
++				var idx = self.cs_fsms[key].indexOf(fsm);
++				self.cs_fsms[key].splice(idx, 1);
++			}
++			if (fsm.retriesExhausted()) {
++				self.cs_dead[key] = true;
++			}
++			self.emit('closedBackend', fsm);
++			self.rebalance();
++			return;
++		}
++	});
++
++	fsm.start();
++};
++
++CueBallConnectionSet.prototype.getConnections = function () {
++	var self = this;
++	return (Object.keys(this.cs_connections).map(function (k) {
++		return (self.cs_connections[k]);
++	}));
++};
++
++CueBallConnectionSet.prototype._incrCounter = function (counter) {
++	if (this.cs_counters[counter] === undefined)
++		this.cs_counters[counter] = 0;
++	++this.cs_counters[counter];
++};
+diff --git a/lib/utils.js b/lib/utils.js
+index a799d73..17588ba 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -99,8 +99,10 @@ function shuffle(array) {
+  *             a given backend is declared dead
+  * - `target` -- a Number, target number of connections we want to have
+  * - `max` -- a Number, maximum socket ceiling
++ * - `singleton` -- optional Boolean (default false), create only a single
++ *                  connection per distinct backend. used for Sets.
+  */
+-function planRebalance(inSpares, dead, target, max) {
++function planRebalance(inSpares, dead, target, max, singleton) {
+ 	var replacements = 0;
+ 	var wantedSpares = {};
+ 
+@@ -131,8 +133,15 @@ function planRebalance(inSpares, dead, target, max) {
+ 		if (wantedSpares[k] === undefined)
+ 			wantedSpares[k] = 0;
+ 		if (dead[k] !== true) {
+-			++wantedSpares[k];
+-			++done;
++			if (singleton) {
++				if (wantedSpares[k] === 0) {
++					wantedSpares[k] = 1;
++					++done;
++				}
++			} else {
++				++wantedSpares[k];
++				++done;
++			}
+ 			continue;
+ 		}
+ 		if (wantedSpares[k] === 0) {
+@@ -156,9 +165,17 @@ function planRebalance(inSpares, dead, target, max) {
+ 		if (wantedSpares[k] === undefined)
+ 			wantedSpares[k] = 0;
+ 		if (dead[k] !== true) {
+-			++wantedSpares[k];
+-			++done;
+-			continue;
++			if (singleton) {
++				if (wantedSpares[k] === 0) {
++					wantedSpares[k] = 1;
++					++done;
++					continue;
++				}
++			} else {
++				++wantedSpares[k];
++				++done;
++				continue;
++			}
+ 		}
+ 		/*
+ 		 * We can make replacements for a replacement (and so on) as
+@@ -176,9 +193,15 @@ function planRebalance(inSpares, dead, target, max) {
+ 		 */
+ 		var count = done + replacements - i;
+ 		var empties = keys.filter(function (kk) {
+-			return (dead[kk] !== true ||
+-			    wantedSpares[kk] === undefined ||
+-			    wantedSpares[kk] === 0);
++			if (singleton) {
++				return (dead[kk] !== true && (
++				    wantedSpares[kk] === undefined ||
++				    wantedSpares[kk] === 0));
++			} else {
++				return (dead[kk] !== true ||
++				    wantedSpares[kk] === undefined ||
++				    wantedSpares[kk] === 0);
++			}
+ 		});
+ 		if (count + 1 <= max) {
+ 			if (wantedSpares[k] === 0) {
+diff --git a/package.json b/package.json
+index 92efc2c..15372fb 100644
+--- a/package.json
++++ b/package.json
+@@ -9,8 +9,8 @@
+     "cmdutil": ">=1.0.0 <2.0.0",
+     "extsprintf": ">=1.3.0 <2.0.0",
+     "ipaddr.js": ">=1.1.0 <2.0.0",
+-    "mooremachine": ">=1.4.2 <2.0.0",
+-    "named-client": "git+https://github.com/arekinath/node-named-client.git#v0.3.5",
++    "mooremachine": ">=2.0.0 <3.0.0",
++    "named-client": "git+https://github.com/arekinath/node-named-client.git#v0.3.6",
+     "node-uuid": ">=1.4.7 <2.0.0",
+     "posix-getopt": ">=1.2.0 <2.0.0",
+     "restify-clients": ">=1.1.2 <2.0.0",
+diff --git a/test/cset.test.js b/test/cset.test.js
+new file mode 100644
+index 0000000..1cbc601
+--- /dev/null
++++ b/test/cset.test.js
+@@ -0,0 +1,174 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ *
++ * Copyright (c) 2016, Joyent, Inc.
++ */
++
++const mod_tape = require('tape');
++const mod_sinon = require('sinon');
++const mod_events = require('events');
++const mod_util = require('util');
++const mod_assert = require('assert-plus');
++const mod_bunyan = require('bunyan');
++
++const mod_cset = require('../lib/set');
++const mod_resolver = require('../lib/resolver');
++
++var connections = [];
++var resolver;
++var log = mod_bunyan.createLogger({
++	name: 'pool-test',
++	level: process.env.LOGLEVEL || 'debug'
++});
++var recovery = {
++	default: {timeout: 1000, retries: 3, delay: 100 }
++};
++
++function DummyResolver() {
++	resolver = this;
++	this.state = 'stopped';
++	mod_events.EventEmitter.call(this);
++	return (new mod_resolver.ResolverFSM(this, {}));
++}
++mod_util.inherits(DummyResolver, mod_events.EventEmitter);
++DummyResolver.prototype.start = function () {
++	this.state = 'running';
++};
++DummyResolver.prototype.stop = function () {
++	this.state = 'stopped';
++};
++
++function DummyConnection(backend) {
++	connections.push(this);
++	this.backend = backend.key;
++	this.backendInfo = backend;
++	this.refd = true;
++	this.connected = false;
++	this.dead = false;
++	mod_events.EventEmitter.call(this);
++}
++mod_util.inherits(DummyConnection, mod_events.EventEmitter);
++DummyConnection.prototype.connect = function () {
++	mod_assert.ok(this.dead === false);
++	mod_assert.ok(this.connected === false);
++	this.connected = true;
++	this.emit('connect');
++};
++DummyConnection.prototype.unref = function () {
++	this.refd = false;
++};
++DummyConnection.prototype.ref = function () {
++	this.refd = true;
++};
++DummyConnection.prototype.destroy = function () {
++	var idx = connections.indexOf(this);
++	mod_assert.ok(idx !== -1);
++	connections.splice(idx, 1);
++	this.connected = false;
++	this.dead = true;
++};
++
++mod_tape.test('cset with one backend', function (t) {
++	connections = [];
++	resolver = new DummyResolver();
++
++	var cset = new mod_cset.ConnectionSet({
++		log: log,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery,
++		target: 2,
++		maximum: 4,
++		resolver: resolver
++	});
++
++	cset.on('stateChanged', function (st) {
++		if (st === 'stopped')
++			t.end();
++	});
++
++	cset.on('added', function (key, conn) {
++		t.notStrictEqual(connections.indexOf(conn), -1);
++		t.strictEqual(conn.refd, true);
++		if (connections.length > 1) {
++			t.fail('more than 2 connections');
++		}
++		if (connections.length === 1) {
++			setImmediate(function () {
++				cset.stop();
++				resolver.stop();
++			});
++		}
++	});
++
++	cset.on('removed', function (key, conn) {
++		if (!cset.isInState('stopping'))
++			t.fail();
++	});
++
++	resolver.start();
++	t.strictEqual(connections.length, 0);
++
++	resolver.emit('added', 'b1', {});
++
++	setImmediate(function () {
++		connections.forEach(function (c) { c.connect(); });
++	});
++});
++
++mod_tape.test('cset with two backends', function (t) {
++	connections = [];
++	resolver = new DummyResolver();
++
++	var cset = new mod_cset.ConnectionSet({
++		log: log,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery,
++		target: 2,
++		maximum: 4,
++		resolver: resolver
++	});
++
++	cset.on('stateChanged', function (st) {
++		if (st === 'stopped')
++			t.end();
++	});
++
++	cset.on('added', function (key, conn) {
++		t.notStrictEqual(connections.indexOf(conn), -1);
++		t.strictEqual(conn.refd, true);
++		if (connections.length > 2) {
++			t.fail('more than 2 connections');
++		}
++		if (connections.length === 2) {
++			var backends = connections.map(function (c) {
++				return (c.backend);
++			}).sort();
++			t.deepEqual(backends, ['b1', 'b2']);
++			setImmediate(function () {
++				cset.stop();
++				resolver.stop();
++			});
++		}
++	});
++
++	cset.on('removed', function (key, conn) {
++		if (!cset.isInState('stopping'))
++			t.fail();
++	});
++
++	resolver.start();
++	t.strictEqual(connections.length, 0);
++
++	resolver.emit('added', 'b1', {});
++	resolver.emit('added', 'b2', {});
++
++	setImmediate(function () {
++		connections.forEach(function (c) { c.connect(); });
++	});
++});
+diff --git a/test/pool.test.js b/test/pool.test.js
+index f60cfd4..f01dba0 100644
+--- a/test/pool.test.js
++++ b/test/pool.test.js
+@@ -96,7 +96,7 @@ mod_tape.test('empty pool', function (t) {
+ 	t.strictEqual(connections.length, 0);
+ 
+ 	t.throws(function () {
+-		pool.claimSync();
++		pool.claim({errorOnEmpty: true}, function (err) { });
+ 	});
+ 
+ 	pool.claim({timeout: 100}, function (err) {
+@@ -106,7 +106,7 @@ mod_tape.test('empty pool', function (t) {
+ 	});
+ });
+ 
+-mod_tape.test('pool with one backend, claimSync', function (t) {
++mod_tape.test('pool with one backend', function (t) {
+ 	connections = [];
+ 	resolver = undefined;
+ 
+@@ -114,7 +114,7 @@ mod_tape.test('pool with one backend, claimSync', function (t) {
+ 		log: log,
+ 		domain: 'foobar',
+ 		spares: 2,
+-		maximum: 3,
++		maximum: 2,
+ 		constructor: function (backend) {
+ 			return (new DummyConnection(backend));
+ 		},
+@@ -129,35 +129,46 @@ mod_tape.test('pool with one backend, claimSync', function (t) {
+ 		t.strictEqual(connections[1].backend, 'b1');
+ 
+ 		/* The connections haven't emitted connect() yet. */
+-		t.throws(function () {
+-			pool.claimSync();
+-		});
+-		connections.forEach(function (c) {
+-			t.strictEqual(c.refd, true);
+-		});
++		pool.claim({timeout: 0}, function (err) {
++			t.ok(err);
++			t.ok(err.message.match(/timed out/i));
+ 
+-		connections[0].connect();
+-		connections[1].connect();
++			connections.forEach(function (c) {
++				t.strictEqual(c.refd, true);
++				c.connect();
++				t.strictEqual(c.refd, false);
++			});
+ 
+-		connections.forEach(function (c) {
+-			t.strictEqual(c.refd, false);
++			setImmediate(claimAgain);
+ 		});
+ 
+-		var ret = pool.claimSync();
+-		t.ok(typeof (ret) === 'object');
+-		t.ok(ret.handle);
+-		t.strictEqual(ret.connection, connections[0]);
+-		t.strictEqual(connections[0].refd, true);
+-
+-		var ret2 = pool.claimSync();
+-		t.ok(typeof (ret2) === 'object');
+-		t.strictEqual(ret2.connection, connections[1]);
++		function claimAgain() {
++			pool.claim({timeout: 0}, function (err, hdl, conn) {
++				t.error(err);
++				t.ok(hdl);
++				t.notStrictEqual(connections.indexOf(conn), -1);
++				t.strictEqual(conn.refd, true);
+ 
+-		t.throws(function () {
+-			pool.claimSync();
+-		});
++				claimOnceMore();
++			});
++		}
++
++		function claimOnceMore() {
++			pool.claim({timeout: 0}, function (err, hdl, conn) {
++				t.error(err);
++				t.ok(hdl);
++				t.notStrictEqual(connections.indexOf(conn), -1);
++				claimEmpty();
++			});
++		}
+ 
+-		t.end();
++		function claimEmpty() {
++			pool.claim({timeout: 0}, function (err) {
++				t.ok(err);
++				t.ok(err.message.match(/timed out/i));
++				t.end();
++			});
++		}
+ 	});
+ });
+ 
+diff --git a/test/resolver_static.test.js b/test/resolver_static.test.js
+index cf7b99b..e55f6bb 100644
+--- a/test/resolver_static.test.js
++++ b/test/resolver_static.test.js
+@@ -98,12 +98,14 @@ mod_tape.test('static resolver: no backends', function (t) {
+ 
+ 	nadded = 0;
+ 	resolver.on('added', function () { nadded++; });
+-	resolver.onState('running', function () {
+-		t.equal(nadded, 0);
+-		t.deepEqual(resolver.list(), {});
+-		t.equal(resolver.count(), 0);
+-		resolver.stop();
+-		t.end();
++	resolver.on('stateChanged', function (st) {
++		if (st === 'running') {
++			t.equal(nadded, 0);
++			t.deepEqual(resolver.list(), {});
++			t.equal(resolver.count(), 0);
++			resolver.stop();
++			t.end();
++		}
+ 	});
+ });
+ 
+@@ -127,33 +129,38 @@ mod_tape.test('static resolver: several backends', function (t) {
+ 
+ 	found = [];
+ 	resolver.on('added', function (key, backend) { found.push(backend); });
+-	resolver.onState('running', function () {
+-		var expected;
+-
+-		t.equal(resolver.count(), 3);
+-		t.deepEqual(found, [ {
+-		    'name': '10.0.0.3:2021',
+-		    'address': '10.0.0.3',
+-		    'port': 2021
+-		}, {
+-		    'name': '10.0.0.3:2020',
+-		    'address': '10.0.0.3',
+-		    'port': 2020
+-		}, {
+-		    'name': '10.0.0.7:2020',
+-		    'address': '10.0.0.7',
+-		    'port': 2020
+-		} ]);
+-
+-		expected = {};
+-		found.forEach(function (be) { expected[be['name']] = true; });
+-		mod_jsprim.forEachKey(resolver.list(), function (k, reported) {
+-			t.ok(expected.hasOwnProperty(reported['name']));
+-			delete (expected[reported['name']]);
+-		});
+-
+-		t.equal(Object.keys(expected).length, 0);
+-		resolver.stop();
+-		t.end();
++	resolver.on('stateChanged', function (st) {
++		if (st === 'running') {
++			var expected;
++
++			t.equal(resolver.count(), 3);
++			t.deepEqual(found, [ {
++			    'name': '10.0.0.3:2021',
++			    'address': '10.0.0.3',
++			    'port': 2021
++			}, {
++			    'name': '10.0.0.3:2020',
++			    'address': '10.0.0.3',
++			    'port': 2020
++			}, {
++			    'name': '10.0.0.7:2020',
++			    'address': '10.0.0.7',
++			    'port': 2020
++			} ]);
++
++			expected = {};
++			found.forEach(function (be) {
++				expected[be['name']] = true;
++			});
++			mod_jsprim.forEachKey(resolver.list(),
++			    function (k, reported) {
++				t.ok(expected.hasOwnProperty(reported['name']));
++				delete (expected[reported['name']]);
++			});
++
++			t.equal(Object.keys(expected).length, 0);
++			resolver.stop();
++			t.end();
++		}
+ 	});
+ });

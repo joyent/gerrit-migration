@@ -1,0 +1,677 @@
+commit 59202ef7369d5857b305e4f89beb124e78ab58ff (refs/changes/76/376/5)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-08-30T17:37:53-07:00 (3 years, 1 month ago)
+    
+    joyent/node-cueball#5 would like higher-level pool states exposed to consumers
+    joyent/node-cueball#12 constructor should throw when timeout policy could be > 1 day
+
+diff --git a/README.md b/README.md
+index 8c1a5e0..c80f132 100644
+--- a/README.md
++++ b/README.md
+@@ -75,6 +75,8 @@ Parameters
+   - `log` -- optional Object, a `bunyan`-style logger to use
+   - `spares` -- optional Number, number of spares wanted in the pool per host
+   - `maximum` -- optional Number, maximum number of connections per host
++  - `tcpKeepAliveInitialDelay` -- optional Number, if supplied, enable TCP
++    level keep-alives with the given initial delay (in milliseconds)
+   - `ping` -- optional String, URL path to use for health checking. Connection
+     is considered still viable if this URL returns a non-5xx response code.
+   - `pingInterval` -- optional Number, interval between health check pings
+@@ -125,6 +127,43 @@ Otherwise, if want to use the default DNS-based resolver, do not specify the
+ `resolver` property.  A resolver instance will be created based on the other
+ configuration properties.
+ 
++### Pool states
++
++ConnectionPool exposes the `mooremachine` FSM interface, with the following
++state graph:
++
++                                                           | (from failed)
++                                                .stop()    v
++             +--------+   connect ok   +-------+       +--------+
++    init --> |starting| +------------> |running| +---> |stopping|
++             +--------+                +-------+       +--------+
++                 +                      ^     +            +
++        resolver |                      |     |            |
++          failed |                      |     |            |
++              OR |       +------+       |     |            v
++         retries +---->  |failed| +-----+     |        +-------+
++       exhausted         +------+ connect ok  |        |stopped|
++                          +  ^                |        +-------+
++                          |  |                |
++                   .stop()|  +----------------+
++                          |   all retries exhausted
++
++Pools begin their life in the "starting" state. Once they have successfully made
++one connection to any backend, they proceed to the "running" state. Otherwise,
++if their underlying Resolver enters the "failed" state, or they exhaust their
++retry policy attempting to connect to all their backends, they enter the
++"failed" state.
++
++A "running" pool can then either be stopped by calling the `.stop()` method, at
++which point it enters the "stopping" state and begins tearing down its
++connections; or all of its connections become disconnected and it exhausts its
++retry policy, in which case it enters the "failed" state.
++
++Failed pools can re-enter the "running" state at any time if they make a
++successful connection to a backend and their underlying Resolver is no longer
++"failed". A "failed" pool can also have the `.stop()` method called, in which
++case it proceeds much as from "running".
++
+ ### `ConnectionPool#stop()`
+ 
+ Stops the connection pool and its `Resolver`, then destroys all connections.
+@@ -157,10 +196,14 @@ When a client is done with a connection, they must call `handle.release()` to
+ return it to the pool. All event handlers should be disconnected from the
+ `connection` prior to calling `release()`.
+ 
++Calling `claim()` on a Pool that is in the "stopping", "stopped" or "failed"
++states is an error and will result in the callback immediately being called.
++
+ ### `ConnectionPool#claimSync()`
+ 
+ Claims a connection from the pool, only if an idle one is immediately
+-available. Otherwise, throws an Error.
++available. Otherwise, throws an Error. Always throws an Error if called on a
++Pool that is "stopping", "stopped" or "failed".
+ 
+ Returns an Object with keys:
+  - `handle` -- Object, handle to be used to release the connection
+diff --git a/lib/agent.js b/lib/agent.js
+index 22c476a..5283839 100644
+--- a/lib/agent.js
++++ b/lib/agent.js
+@@ -30,6 +30,8 @@ function CueBallAgent(options) {
+ 	mod_assert.string(options.protocol, 'options.protocol');
+ 	mod_assert.optionalArrayOfString(options.resolvers,
+ 	    'options.resolvers');
++	mod_assert.optionalNumber(options.tcpKeepAliveInitialDelay,
++	    'options.tcpKeepAliveInitialDelay');
+ 	mod_assert.optionalObject(options.log, 'options.log');
+ 
+ 	EventEmitter.call(this);
+@@ -43,6 +45,8 @@ function CueBallAgent(options) {
+ 	this.keepAlive = true;
+ 	this.maxSockets = Infinity;
+ 
++	this.tcpKAID = options.tcpKeepAliveInitialDelay;
++
+ 	this.pools = {};
+ 	this.resolvers = options.resolvers;
+ 	this.log = options.log;
+@@ -96,11 +100,19 @@ CueBallAgent.prototype.addRequest = function (req, options) {
+ 					if (options.hasOwnProperty(k))
+ 						opts[k] = options[k];
+ 				});
++				var nsock;
+ 				if (self.protocol === 'https:') {
+-					return (mod_tls.connect(opts));
++					nsock = mod_tls.connect(opts);
+ 				} else {
+-					return (mod_net.createConnection(opts));
++					nsock = mod_net.createConnection(opts);
++				}
++				if (self.tcpKAID !== undefined) {
++					nsock.on('connect', function () {
++						nsock.setKeepAlive(true,
++						    self.tcpKAID);
++					});
+ 				}
++				return (nsock);
+ 			},
+ 			maximum: this.maximum,
+ 			spares: this.spares,
+@@ -124,7 +136,17 @@ CueBallAgent.prototype.addRequest = function (req, options) {
+ 	waiter = pool.claim(claimOpts, function (err, connh, socket) {
+ 		waiter = undefined;
+ 		if (err) {
+-			req.emit('error', err);
++			/*
++			 * addRequest has no way to give an async error back
++			 * to the rest of the http stack, except to create a
++			 * fake socket here and make it emit 'error' in the
++			 * next event loop :(
++			 */
++			var fakesock = new FakeSocket();
++			req.onSocket(fakesock);
++			setImmediate(function () {
++				fakesock.emit('error', err);
++			});
+ 			return;
+ 		}
+ 		sock = socket;
+@@ -222,6 +244,17 @@ function CueBallHttpsAgent(options) {
+ mod_util.inherits(CueBallHttpsAgent, CueBallAgent);
+ 
+ 
++function FakeSocket() {
++	EventEmitter.call(this);
++}
++mod_util.inherits(FakeSocket, EventEmitter);
++FakeSocket.prototype.read = function () {
++	return (null);
++};
++FakeSocket.prototype.destroy = function () {
++	return;
++};
++
+ 
+ function PingAgent(options) {
+ 	mod_assert.object(options, 'options');
+diff --git a/lib/errors.js b/lib/errors.js
+index 7abcfc0..8132aca 100644
+--- a/lib/errors.js
++++ b/lib/errors.js
+@@ -10,7 +10,9 @@ module.exports = {
+ 	ClaimTimeoutError: ClaimTimeoutError,
+ 	NoBackendsError: NoBackendsError,
+ 	ConnectionTimeoutError: ConnectionTimeoutError,
+-	ConnectionClosedError: ConnectionClosedError
++	ConnectionClosedError: ConnectionClosedError,
++	PoolFailedError: PoolFailedError,
++	PoolStoppingError: PoolStoppingError
+ };
+ 
+ const mod_util = require('util');
+@@ -36,6 +38,26 @@ function NoBackendsError(pool) {
+ }
+ mod_util.inherits(NoBackendsError, Error);
+ 
++function PoolFailedError(pool) {
++	if (Error.captureStackTrace)
++		Error.captureStackTrace(this, NoBackendsError);
++	this.pool = pool;
++	this.name = 'PoolFailedError';
++	this.message = 'Pool ' + pool.p_uuid + ' (' + pool.p_domain + ') ' +
++	    'has failed and cannot take new requests.';
++}
++mod_util.inherits(PoolFailedError, Error);
++
++function PoolStoppingError(pool) {
++	if (Error.captureStackTrace)
++		Error.captureStackTrace(this, NoBackendsError);
++	this.pool = pool;
++	this.name = 'PoolStoppingError';
++	this.message = 'Pool ' + pool.p_uuid + ' (' + pool.p_domain + ') ' +
++	    'is stopping and cannot take new requests.';
++}
++mod_util.inherits(PoolStoppingError, Error);
++
+ function ConnectionTimeoutError(fsm) {
+ 	if (Error.captureStackTrace)
+ 		Error.captureStackTrace(this, ConnectionTimeoutError);
+diff --git a/lib/index.js b/lib/index.js
+index f02f864..0842dbd 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -25,5 +25,7 @@ module.exports = {
+ 	ClaimTimeoutError: mod_errors.ClaimTimeoutError,
+ 	NoBackendsError: mod_errors.NoBackendsError,
+ 	ConnectionTimeoutError: mod_errors.ConnectionTimeoutError,
+-	ConnectionClosedError: mod_errors.ConnectionClosedError
++	ConnectionClosedError: mod_errors.ConnectionClosedError,
++	PoolStoppingError: mod_errors.PoolStoppingError,
++	PoolFailedError: mod_errors.PoolFailedError
+ };
+diff --git a/lib/pool-monitor.js b/lib/pool-monitor.js
+index 0f0e93d..9baa19c 100644
+--- a/lib/pool-monitor.js
++++ b/lib/pool-monitor.js
+@@ -57,6 +57,7 @@ CueBallPoolMonitor.prototype.toKangOptions = function () {
+ 		obj.last_rebalance = Math.round(
+ 		    pool.p_lastRebalance.getTime() / 1000);
+ 		obj.resolvers = pool.p_resolver.r_resolvers;
++		obj.state = pool.getState();
+ 		obj.options = {};
+ 		obj.options.domain = pool.p_resolver.r_domain;
+ 		obj.options.service = pool.p_resolver.r_service;
+diff --git a/lib/pool.js b/lib/pool.js
+index 84ef370..d414956 100644
+--- a/lib/pool.js
++++ b/lib/pool.js
+@@ -87,10 +87,35 @@ function ConnectionFSM(options) {
+ 	this.cf_timeout = initialRecov.timeout;
+ 	this.cf_maxTimeout = initialRecov.maxTimeout || Infinity;
+ 
++	/*
++	 * If our parent pool is failed, resume connection attempts with the
++	 * maximum delay and timeout. Something is going wrong, let's not
++	 * retry too aggressively and make it worse.
++	 */
++	if (this.cf_pool.getState() === 'failed') {
++		/*
++		 * We might be given an infinite maxDelay or maxTimeout. If
++		 * we are, then multiply it by 2^(retries) to get to what the
++		 * value would have been before.
++		 */
++		var mult = 1 << this.cf_retries;
++		this.cf_delay = this.cf_maxDelay;
++		if (!isFinite(this.cf_delay))
++			this.cf_delay = initialRecov.delay * mult;
++		this.cf_timeout = this.cf_maxTimeout;
++		if (!isFinite(this.cf_timeout))
++			this.cf_timeout = initialRecov.timeout * mult;
++	}
++
+ 	FSM.call(this, 'init');
+ }
+ mod_util.inherits(ConnectionFSM, FSM);
+ 
++ConnectionFSM.prototype.retriesExhausted = function () {
++	return (this.getState() === 'closed' &&
++	    this.cf_retriesLeft <= 0);
++};
++
+ /*
+  * Mark this Connection as "claimed"; in use by a particular client of the
+  * pool.
+@@ -227,6 +252,11 @@ ConnectionFSM.prototype.state_error = function (on, once, timeout) {
+ 		this.cf_shadow = undefined;
+ 	}
+ 
++	if (this.cf_closeAfter === true) {
++		this.gotoState('closed');
++		return;
++	}
++
+ 	if (this.cf_retries === Infinity || --this.cf_retriesLeft > 0) {
+ 		this.gotoState('delay');
+ 	} else {
+@@ -297,8 +327,6 @@ ConnectionFSM.prototype.state_idle = function (on, once, timeout) {
+ 	this.cf_timeout = this.cf_connectRecov.timeout;
+ 	this.cf_maxTimeout = this.cf_connectRecov.maxTimeout || Infinity;
+ 
+-	this.cf_retriesLeft = this.cf_retries;
+-
+ 	if (this.cf_closeAfter === true) {
+ 		this.cf_closeAfter = false;
+ 		this.cf_lastError = undefined;
+@@ -525,7 +553,6 @@ ConnectionHandle.prototype.closeAfterRelease = function () {
+  * to expand the pool will be queued when a claim() request comes in.
+  */
+ function CueBallConnectionPool(options) {
+-	EventEmitter.call(this);
+ 	mod_assert.object(options);
+ 
+ 	mod_assert.func(options.constructor, 'options.constructor');
+@@ -537,6 +564,7 @@ function CueBallConnectionPool(options) {
+ 	    'options.resolvers');
+ 	mod_assert.optionalObject(options.resolver, 'options.resolver');
+ 	mod_assert.string(options.domain, 'options.domain');
++	this.p_domain = options.domain;
+ 	mod_assert.optionalString(options.service, 'options.service');
+ 	mod_assert.optionalNumber(options.maxDNSConcurrency,
+ 	    'options.maxDNSConcurrency');
+@@ -571,6 +599,7 @@ function CueBallConnectionPool(options) {
+ 
+ 	this.p_lastRebalance = undefined;
+ 	this.p_inRebalance = false;
++	this.p_startedResolver = false;
+ 
+ 	this.p_idleq = new Queue();
+ 	this.p_initq = new Queue();
+@@ -593,69 +622,211 @@ function CueBallConnectionPool(options) {
+ 		this.p_resolver_custom = false;
+ 	}
+ 
+-	this.p_resolver_onadded = function (k, backend) {
+-		backend.key = k;
+-		self.p_keys.push(k);
+-		mod_utils.shuffle(self.p_keys);
+-		self.p_backends[k] = backend;
+-		self.rebalance();
+-	};
+-	this.p_resolver.on('added', this.p_resolver_onadded);
+-
+-	this.p_resolver_onremoved = function (k) {
+-		var idx = self.p_keys.indexOf(k);
+-		if (idx !== -1)
+-			self.p_keys.splice(idx, 1);
+-		delete (self.p_backends[k]);
+-		(self.p_connections[k] || []).forEach(function (fsm) {
+-			if (fsm.getState() !== 'busy')
+-				fsm.close();
+-		});
+-		delete (self.p_connections[k]);
+-		self.rebalance();
+-	};
+-	this.p_resolver.on('removed', this.p_resolver_onremoved);
+-
+ 	/*
+ 	 * Periodically rebalance() so that we catch any connections that
+ 	 * come off "busy" (we're lazy about these and don't rebalance every
+ 	 * single time they return to the pool).
+ 	 */
+-	this.p_rebalTimer = setInterval(function () {
+-		self.rebalance();
++	this.p_rebalTimer = new EventEmitter();
++	this.p_rebalTimerInst = setInterval(function () {
++		self.p_rebalTimer.emit('timeout');
+ 	}, 10000);
+-	this.p_rebalTimer.unref();
++	this.p_rebalTimerInst.unref();
++
++	FSM.call(this, 'starting');
++}
++mod_util.inherits(CueBallConnectionPool, FSM);
++
++CueBallConnectionPool.prototype.on_resolver_added = function (k, backend) {
++	backend.key = k;
++	this.p_keys.push(k);
++	mod_utils.shuffle(this.p_keys);
++	this.p_backends[k] = backend;
++	this.rebalance();
++};
++
++CueBallConnectionPool.prototype.on_resolver_removed = function (k) {
++	var idx = this.p_keys.indexOf(k);
++	if (idx !== -1)
++		this.p_keys.splice(idx, 1);
++	delete (this.p_backends[k]);
++	(this.p_connections[k] || []).forEach(function (fsm) {
++		if (fsm.getState() !== 'busy')
++			fsm.close();
++	});
++	delete (this.p_connections[k]);
++	this.rebalance();
++};
++
++CueBallConnectionPool.prototype.state_starting =
++    function (on, once, timeout, onState) {
++	mod_monitor.monitor.registerPool(this);
++
++	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
++	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
++
++	var self = this;
++	var rst = this.p_resolver.getState();
++
++	if (rst === 'failed') {
++		this.p_log.warn('pre-provided resolver has already failed, ' +
++		    'pool will start up in "failed" state');
++		this.gotoState('failed');
++		return;
++	}
++
++	onState(this.p_resolver, 'failed', function () {
++		self.p_log.warn('underlying resolver failed, moving pool ' +
++		    'to "failed" state');
++		self.gotoState('failed');
++	});
+ 
+-	if (!this.p_resolver_custom) {
++	if (rst === 'running') {
++		var backends = this.p_resolver.list();
++		Object.keys(backends).forEach(function (k) {
++			var backend = backends[k];
++			self.on_resolver_added(k, backend);
++		});
++	} else if (rst === 'stopped' && !this.p_resolver_custom) {
+ 		this.p_resolver.start();
++		this.p_startedResolver = true;
+ 	}
+ 
+-	mod_monitor.monitor.registerPool(this);
+-}
+-mod_util.inherits(CueBallConnectionPool, EventEmitter);
++	on(this, 'connectedToBackend', function () {
++		self.gotoState('running');
++	});
+ 
+-/* Stop and kill everything. */
+-CueBallConnectionPool.prototype.stop = function () {
+-	mod_monitor.monitor.unregisterPool(this);
++	var failures = 0;
++	on(this, 'closedBackend', function (fsm) {
++		if (fsm.retriesExhausted())
++			++failures;
++		if (failures >= self.p_spares) {
++			self.p_log.error(
++			    { failures: failures },
++			    'pool has exhausted all retries, now moving to ' +
++			    '"failed" state');
++			self.gotoState('failed');
++		}
++	});
++
++	on(this, 'stopAsserted', function () {
++		self.gotoState('stopping');
++	});
++};
++
++CueBallConnectionPool.prototype.state_failed = function (on) {
++	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
++	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
+ 
+-	clearInterval(this.p_rebalTimer);
+-	if (!this.p_resolver_custom) {
++	var self = this;
++	on(this, 'connectedToBackend', function () {
++		mod_assert.notStrictEqual(self.p_resolver.getState(), 'failed');
++		self.p_log.info('successfully connected to a backend, ' +
++		    'moving back to running state');
++		self.gotoState('running');
++	});
++
++	on(this, 'stopAsserted', function () {
++		self.gotoState('stopping');
++	});
++};
++
++CueBallConnectionPool.prototype.state_running = function (on) {
++	var self = this;
++	on(this.p_resolver, 'added', this.on_resolver_added.bind(this));
++	on(this.p_resolver, 'removed', this.on_resolver_removed.bind(this));
++	on(this.p_rebalTimer, 'timeout', this.rebalance.bind(this));
++
++	/*
++	 * Count the number of backends that have closed due to exhausting their
++	 * retry policy. Reset the counter whenever we have a good new
++	 * connection open. The idea is to detect the case where we've lost
++	 * all of our backends and have exhausted at least self.p_spares
++	 * new attempts to connect, to decide to go into the 'failed' state.
++	 */
++	var exhaustedSinceLastOpen = 0;
++	on(this, 'connectedToBackend', function () {
++		exhaustedSinceLastOpen = 0;
++	});
++	on(this, 'closedBackend', function (fsm) {
++		if (fsm.retriesExhausted())
++			++exhaustedSinceLastOpen;
++		var fsms = 0;
++		self.p_keys.forEach(function (k) {
++			var conns = self.p_connections[k];
++			if (conns)
++				fsms += conns.length;
++		});
++		/*
++		 * If we have no FSMs left at all, OR if all of our FSMs are
++		 * on the init queue (just starting up) and we've had at least
++		 * self.p_spares failures to connect since we last saw a
++		 * successful connect, give up and go to 'failed'.
++		 */
++		if (fsms < 1 || (fsms === self.p_initq.length &&
++		    exhaustedSinceLastOpen >= self.p_spares)) {
++			self.p_log.error(
++			    { failures: exhaustedSinceLastOpen },
++			    'pool has exhausted all retries, now moving to ' +
++			    '"failed" state');
++			self.gotoState('failed');
++		}
++	});
++
++	on(this, 'stopAsserted', function () {
++		self.gotoState('stopping');
++	});
++};
++
++CueBallConnectionPool.prototype.state_stopping =
++    function (on, once, timeout, onState) {
++	var self = this;
++	if (this.p_startedResolver) {
++		onState(this.p_resolver, 'stopped', function () {
++			self.gotoState('stopping.backends');
++		});
+ 		this.p_resolver.stop();
+-		this.p_resolver.removeListener('added',
+-		    this.p_resolver_onadded);
+-		this.p_resolver.removeListener('removed',
+-		    this.p_resolver_onremoved);
++	} else {
++		this.gotoState('stopping.backends');
+ 	}
++};
++
++CueBallConnectionPool.prototype.state_stopping.backends = function () {
+ 	var conns = this.p_connections;
++	var self = this;
++	var fsms = [];
+ 	Object.keys(conns).forEach(function (k) {
+ 		conns[k].forEach(function (fsm) {
+-			mod_assert.ok(fsm.getState() !== 'busy');
+-			fsm.close();
++			fsms.push(fsm);
+ 		});
+ 	});
++	mod_vasync.forEachParallel({
++		func: closeBackend,
++		inputs: fsms
++	}, function () {
++		self.gotoState('stopped');
++	});
++	function closeBackend(fsm, cb) {
++		if (fsm.getState() === 'busy') {
++			fsm.closeAfterRelease();
++			fsm.onState('closed', cb);
++		} else {
++			fsm.close(cb);
++		}
++	}
++};
++
++CueBallConnectionPool.prototype.state_stopped = function () {
++	mod_monitor.monitor.unregisterPool(this);
+ 	this.p_keys = [];
+ 	this.p_connections = {};
+ 	this.p_backends = {};
++	clearInterval(this.p_rebalTimerInst);
++};
++
++/* Stop and kill everything. */
++CueBallConnectionPool.prototype.stop = function () {
++	this.emit('stopAsserted');
+ };
+ 
+ /*
+@@ -672,6 +843,9 @@ CueBallConnectionPool.prototype.rebalance = function () {
+ 	if (this.p_keys.length < 1)
+ 		return;
+ 
++	if (this.getState().indexOf('stop') === 0)
++		return;
++
+ 	if (this.p_inRebalance !== false)
+ 		return;
+ 	this.p_inRebalance = true;
+@@ -722,6 +896,9 @@ CueBallConnectionPool.prototype.rebalance = function () {
+ };
+ 
+ CueBallConnectionPool.prototype.addConnection = function (key) {
++	if (this.getState().indexOf('stop') === 0)
++		return;
++
+ 	var backend = this.p_backends[key];
+ 
+ 	var fsm = new ConnectionFSM({
+@@ -752,6 +929,9 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 			 */
+ 			fsm.p_initq_node.remove();
+ 			delete (fsm.p_initq_node);
++
++			if (newState === 'idle')
++				self.emit('connectedToBackend', fsm);
+ 		}
+ 
+ 		if (newState === 'idle') {
+@@ -797,6 +977,9 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 				var idx = self.p_connections[key].indexOf(fsm);
+ 				self.p_connections[key].splice(idx, 1);
+ 			}
++
++			self.emit('closedBackend', fsm);
++			self.rebalance();
+ 		}
+ 
+ 		if (fsm.p_idleq_node) {
+@@ -808,7 +991,8 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ 			delete (fsm.p_idleq_node);
+ 
+ 			/* Also rebalance, in case we were closed or died. */
+-			self.rebalance();
++			if (newState !== 'closed')
++				self.rebalance();
+ 		}
+ 	});
+ 
+@@ -816,6 +1000,11 @@ CueBallConnectionPool.prototype.addConnection = function (key) {
+ };
+ 
+ CueBallConnectionPool.prototype.claimSync = function () {
++	if (this.getState().indexOf('stop') === 0)
++		throw (new mod_errors.PoolStoppingError(this));
++	if (this.getState() === 'failed')
++		throw (new mod_errors.PoolFailedError(this));
++
+ 	var e = {};
+ 	Error.captureStackTrace(e);
+ 
+@@ -846,6 +1035,15 @@ CueBallConnectionPool.prototype.claim = function (options, cb) {
+ 	mod_assert.optionalBool(options.errorOnEmpty, 'options.errorOnEmpty');
+ 	var errOnEmpty = options.errorOnEmpty;
+ 
++	if (this.getState().indexOf('stop') === 0) {
++		cb(new mod_errors.PoolStoppingError(this));
++		return (undefined);
++	}
++	if (this.getState() === 'failed') {
++		cb(new mod_errors.PoolFailedError(this));
++		return (undefined);
++	}
++
+ 	var e = {};
+ 	Error.captureStackTrace(e);
+ 
+diff --git a/lib/utils.js b/lib/utils.js
+index a859cc6..9695c69 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -43,6 +43,28 @@ function assertRecovery(obj, name) {
+ 	    name + '.maxDelay must be >= delay');
+ 	delete (ks.maxDelay);
+ 	mod_assert.deepEqual(Object.keys(ks), []);
++	if (obj.maxDelay === undefined) {
++		mod_assert.ok(obj.retries < 32,
++		    name + '.maxDelay is required when retries >= 32 ' +
++		    '(exponential increase becomes unreasonably large)');
++		var mult = 1 << obj.retries;
++		var maxDelay = obj.delay * mult;
++		mod_assert.ok(maxDelay < 1000 * 3600 * 24,
++		    name + '.maxDelay is required with given values of ' +
++		    'retries and delay (effective unspecified maxDelay is ' +
++		    ' > 1 day)');
++	}
++	if (obj.maxTimeout === undefined) {
++		mod_assert.ok(obj.retries < 32,
++		    name + '.maxTimeout is required when retries >= 32 ' +
++		    '(exponential increase becomes unreasonably large)');
++		var mult = 1 << obj.retries;
++		var maxTimeout = obj.timeout * mult;
++		mod_assert.ok(maxTimeout < 1000 * 3600 * 24,
++		    name + '.maxTimeout is required with given values of ' +
++		    'retries and timeout (effective unspecified maxTimeout ' +
++		    'is > 1 day)');
++	}
+ }
+ 
+ /* A Fisher-Yates shuffle. */

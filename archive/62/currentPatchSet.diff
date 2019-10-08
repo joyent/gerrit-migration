@@ -1,0 +1,997 @@
+commit 28233ce6a977b577e3baf888ab245a70f4c5bf3a (refs/changes/62/62/1)
+Author: Dave Pacheco <dap@joyent.com>
+Date:   2016-07-12T12:35:28-07:00 (3 years, 3 months ago)
+    
+    Dockerfile and supporting files for gerrit-appserver image
+    add crrestore: instantiates a new stack in staging or prod based on backup
+
+diff --git a/TODO.md b/TODO.md
+index afb51cf..26fe1e9 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -1,12 +1,12 @@
+-* Add image builds to this repository
++* Write crbackup
++* Test crbackup/crrestore to deploy a new production deployment with latest
++  changes
++* Try 2.11 (or 2.13?) to fix two bugs:
++  - firefox: copying text from browser
++  - firefox: the login bug people are hitting
++* Document crbackup and crrestore
++* Add nginx image to this repository
+ * Backup and restore scripts need cleaning up
+-* Consider building our own image instead of using the openfrontier one
+-  - theirs reconfigures every time, even though config is on data volume
+-  - theirs seems to change out from under us in incompatible ways
+-* Would be nice to have an option to avoid eliminating votes each time a new
+-  review is submitted?  This presumably needs to be optional.  Sometimes you
+-  want the votes to carry over (e.g., a commit message nit), and sometimes you
+-  don't.
+ * Would be nice to have a plugin to auto-update commit message with reviewers
+   and approved-by (without the other metadata that Gerrit likes to add)
+ * backup story for github repos?
+diff --git a/bin/crrestore b/bin/crrestore
+new file mode 100755
+index 0000000..3916cd1
+--- /dev/null
++++ b/bin/crrestore
+@@ -0,0 +1,405 @@
++#!/bin/bash
++
++#
++# crrestore: Creates a new deployment of the cr.joyent.us stack from the
++# specified backup.  See the usage message for details.
++#
++
++# Command-line options and arguments
++gr_mode=dev
++gr_backup_path=
++gr_client_id=
++gr_client_secret=
++
++# Container names: configured from command-line arguments
++gr_name_prefix=gerrit$$
++gr_name_volume_db=
++gr_name_volume_gerrit=
++gr_name_postgres=
++gr_name_appserver=
++gr_name_restore=
++gr_name_frontdoor=
++
++# CNS service short names: configured from command-line arguments
++gr_cnssvc_prefix=
++gr_cnssvc_postgres=
++gr_cnssvc_appserver=
++gr_cnssvc_frontdoor=
++
++# Configuration inferred from the environment
++gr_account_uuid=
++gr_account_login=
++gr_datacenter=
++gr_cnsfull_db=
++gr_cnsfull_app=
++gr_appserver_args=
++gr_frontdoor_name=
++
++# Container images
++gr_image_volumes="ubuntu:latest"
++gr_image_postgres="postgres:9.5.3"
++gr_image_appserver="joyentunsupported/joyent-gerrit:dev"
++# TODO when this becomes part of this repo, build under joyentunsupported/
++gr_image_frontdoor="arekinath/gerrit-nginx"
++
++# Gerrit config variables: production deployment
++gr_prod_weburl="https://cr.joyent.us"
++gr_prod_sshd_addr="cr.joyent.us"
++gr_prod_smtp_server="relay.joyent.com"
++gr_prod_httpd_listenurl="proxy-https://*:8080"
++gr_prod_user_email="no-reply@cr.joyent.us"
++gr_prod_replication="true"
++gr_prod_frontdoor_name="cr.joyent.us"
++
++# Gerrit config variables: development/staging deployments
++gr_dev_weburl="https://localhost"
++gr_dev_sshd_addr="localhost:30023"
++gr_dev_smtp_server="relay.joyent.com"
++gr_dev_httpd_listenurl="proxy-https://*:8080"
++gr_dev_user_email="no-reply@cr.joyent.us"
++gr_dev_replication="false"
++gr_dev_frontdoor_name="localhost"
++
++function usage
++{
++	cat <<EOF >&2
++usage: crrestore [-n NAME_PREFIX] -p /path/to/backup
++       crrestore [-n NAME_PREFIX] -c CLIENT_ID -s CLIENT_SECRET /path/to/backup
++
++Creates a new deployment of cr.joyent.us from the specified backup.  This can be
++used to create a complete replacement for cr.joyent.us or to create a staging
++environment that looks similar.
++
++    -c CLIENT_ID, -s CLIENT_SECRET
++
++           Override the default client ID and client secret used for GitHub
++	   authentication.  This is generally a good idea for development
++	   deployments.
++
++    -p
++
++           Create production deployment.  The hostnames used will suitable for
++	   the production cr.joyent.us deployment and replication to GitHub will
++	   be enabled.
++
++    -n NAME_PREFIX
++
++           If specified, this prefix is used for all container names.  The
++	   default is a likely unique prefix that starts with "gerrit".  You can
++	   specify a different prefix primarily for testing.
++
++You should have "docker" and "triton" on your path and configured appropriately.
++EOF
++	exit 2
++}
++
++function main
++{
++	set -o errexit
++
++	while getopts "c:n:ps:" c; do
++		case "$c" in
++		c)	gr_client_id=$OPTARG ;;
++		n)	gr_name_prefix=$OPTARG ;;
++		p)	gr_mode=prod ;;
++		s)	gr_client_secret=$OPTARG ;;
++		*)	usage ;;
++		esac
++	done
++
++	shift $(( OPTIND - 1 ))
++	if [[ $# != 1 ]]; then
++		usage
++	fi
++
++	gr_backup_path="$1"
++	gr_configure || fail "failed to configure"
++
++	echo -n "Creating database volume container ... "
++	docker run --name=$gr_name_volume_db \
++	    -v /gerrit-postgres-db-data $gr_image_volumes \
++	    echo "database volume container created." || fail "failed"
++
++	echo -n "Creating Gerrit volume container ... "
++	docker run --name=$gr_name_volume_gerrit \
++	    -v /var/gerrit/review_site $gr_image_volumes \
++	    echo "gerrit volume container created." || fail "failed"
++
++	echo -n "Creating PostgreSQL runtime container ... "
++	docker run \
++	    --name $gr_name_postgres \
++	    --label triton.cns.services=$gr_cnssvc_postgres \
++	    -e POSTGRES_USER=gerrit2 \
++	    -e POSTGRES_PASSWORD=gerrit \
++	    -e POSTGRES_DB=reviewdb \
++	    -e PGDATA=/gerrit-postgres-db-data \
++	    --volumes-from $gr_name_volume_db \
++	    --restart=always \
++	    -d $gr_image_postgres || fail "failed"
++	echo "done."
++
++	echo -n "Uploading PostgreSQL backup ... "
++	docker cp "$gr_backup_path/postgresdb" \
++	    $gr_name_postgres:/var/tmp/postgresdb || fail "failed"
++	echo "done."
++
++	echo -n "Restoring PostgreSQL backup ... "
++	docker exec $gr_name_postgres \
++	    pg_restore -U gerrit2 -d reviewdb /var/tmp/postgresdb || \
++	    fail "failed"
++	echo "done."
++
++	#
++	# TODO This is pretty awful, but we don't seem to be able to "docker cp"
++	# into a volume container, nor can we "docker run" tar(1) and redirect
++	# stdin from our tarball.  So we instantiate a container for a while,
++	# upload and unpack the tarball, and tear down the container again.
++	#
++	# We use the same image that we use for the appserver because the tar
++	# file makes reference to users and groups defined in that image, and we
++	# want to make sure they exist in the restore container.  We override
++	# the entrypoint so that we don't actually run Gerrit when we start the
++	# container.
++	#
++	echo -n "Creating restore container for Gerrit data directory ... "
++	docker run -d --volumes-from $gr_name_volume_gerrit \
++	    --name=$gr_name_restore --entrypoint="/native/usr/bin/bash" \
++	    $gr_image_appserver -c 'sleep 3600' || \
++	    fail "failed"
++
++	echo -n "Uploading backup to restore container ... "
++	docker cp "$gr_backup_path/data.tgz" $gr_name_restore:/var/tmp || \
++	    fail "failed"
++	echo "uploaded."
++
++	echo -n "Restoring backup of Gerrit data directory ... "
++	docker exec $gr_name_restore tar -C /var/gerrit -xzf /var/tmp/data.tgz \
++	    || fail "failed"
++	echo "done."
++
++	echo -n "Removing restore container ... "
++	docker rm -f $gr_name_restore || fail "failed to remove container"
++
++	echo -n "Starting Gerrit application container ... "
++	docker run -d \
++	    --name $gr_name_appserver \
++	    --label triton.cns.services=$gr_cnssvc_appserver \
++	    --volumes-from=$gr_name_volume_gerrit \
++	    --restart=always $gr_appserver_args $gr_image_appserver
++	echo "done."
++
++	echo -n "Deploying nginx frontdoor container ... "
++	docker run -d \
++	    --name=$gr_name_frontdoor \
++	    --label triton.cns.services=$gr_cnssvc_frontdoor \
++	    -e MY_NAME=$gr_frontdoor_name \
++	    -e GERRIT_HOST="$gr_cnsfull_app" \
++	    -e SSH_PORT=29418 \
++	    -e HTTP_PORT=8080 \
++	    -p 22 \
++	    -p 80 \
++	    -p 443 \
++	    -p 29418 \
++	    $gr_image_frontdoor
++	echo "done."
++}
++
++function fail
++{
++	echo "gerritrestore: $@" >&2
++	exit 1
++}
++
++function gr_configure
++{
++	local accountinfo dockerinfo sdcaccount
++
++	#
++	# Validate command-line arguments.
++	#
++	if [[ $gr_mode == "dev" ]] &&
++	   [[ -z "$gr_client_id" || -z "$gr_client_secret" ]]; then
++		fail "-c and -s options are required for dev mode"
++	fi
++
++	if [[ $gr_mode == "prod" ]] &&
++	   [[ -n "$gr_client_id" || -n "$gr_client_secret" ]]; then
++	   	echo "warn: using -p with -c or -s is not expected" >&2
++	fi
++
++	if [[ $gr_backup_path =~ : ]]; then
++		fail "backup paths with colons are unsupported"
++	fi
++
++	if [[ ! -d "$gr_backup_path" ]] ||
++	   [[ ! -f "$gr_backup_path/postgresdb" ]] ||
++	   [[ ! -f "$gr_backup_path/data.tgz" ]]; then
++		fail "does not look like a valid backup: \"$gr_backup_path\""
++	fi
++
++	#
++	# Check for the tools we need in the environment.  docker is needed for
++	# most of the deployment.  triton is needed to fetch the account uuid,
++	# which is used in internal CNS names in the Triton Cloud.
++	# TODO can we get the account uuid from "docker info"?
++	#
++	if ! type -f docker > /dev/null; then
++		fail "docker command not found on path"
++	elif ! type -f triton > /dev/null; then
++		fail "triton command not found on path"
++	fi
++
++	#
++	# Validate the environment's configuration.  Given that we're fetching
++	# information from both docker and triton, make sure they match.
++	#
++	echo -n "Determing account information using 'triton' ... "
++	accountinfo="$(triton account get --json)" || \
++	    fail "failed to fetch account info from triton"
++
++	gr_account_login="$(json login <<< "$accountinfo")"
++	gr_account_uuid="$(json id <<< "$accountinfo")"
++	if [[ -z "$gr_account_uuid" || -z "$gr_account_login" ]]; then
++		fail "failed to determine account uuid" \
++		    "and login from triton command"
++	fi
++	echo "done."
++
++	echo "   'triton' reports account $gr_account_login ($gr_account_uuid)"
++
++	echo -n "Checking Docker configuration ... "
++	dockerinfo="$(docker info 2>/dev/null)" || \
++	    fail "failed to run 'docker info'"
++	gr_datacenter="$(awk '$1 == "Name:"{ print $2 }' <<< "$dockerinfo")"
++	sdcaccount="$(awk '$1 == "SDCAccount:"{ print $2 }' <<< "$dockerinfo")"
++	if [[ "$sdcaccount" != "$gr_account_login" ]]; then
++		echo "fail"
++		fail "cannot determine account uuid for CNS name: SDC" \
++		    "account reported by 'docker info' (\"$sdcaccount\")" \
++		    "does not match 'triton account get'"
++	fi
++	echo "done."
++	echo "   'docker' reports datacenter $gr_datacenter"
++
++	if [[ $gr_mode == "prod" && "$gr_datacenter" != "us-west-1" ]]; then
++		echo "warn: deploying prod to datacenter other than" \
++		    "us-west-1" >&2
++	fi
++
++	#
++	# Configure the names of the various containers based on the prefix,
++	# which may have been overridden on the command line.
++	#
++	gr_name_volume_db=$gr_name_prefix-volume-db
++	gr_name_volume_gerrit=$gr_name_prefix-volume-gerrit
++	gr_name_postgres=$gr_name_prefix-postgres
++	gr_name_appserver=$gr_name_prefix-appserver
++	gr_name_restore=$gr_name_prefix-restore
++	gr_name_frontdoor=$gr_name_prefix-frontdoor
++
++	#
++	# Similarly, configure the CNS names based on the same prefix.
++	#
++	# Promotion to production: today, "cr.joyent.us" is a CNAME for the
++	# *externally-facing* CNS name of the front door container.
++	#
++	# In order to allow people to deploy an entire second stack before
++	# promoting it to production, we use a unique prefix for all CNS names
++	# in this particular standup.  (We actually just include this processes
++	# pid, but if that's not unique, this will fail quickly because it's
++	# also used for the container names.)
++	#
++	# To actually promote the second stack to production, one could either
++	# redirect the "cr.joyent.us" CNAME to point to the unique, public CNS
++	# name for the new front door container, or we could add a second label
++	# to the front door container that will cause it to be picked up in the
++	# external CNS name that "cr.joyent.us" already points to.  The latter
++	# is a little simpler and faster to propagate.
++	#
++	# TODO this should be documented elsewhere, with appropriate tools.
++	#
++	gr_cnssvc_prefix=$gr_name_prefix
++	gr_cnssvc_postgres=$gr_cnssvc_prefix-database
++	gr_cnssvc_appserver=$gr_cnssvc_prefix-appserver
++	gr_cnssvc_frontdoor=$gr_cnssvc_prefix
++
++	#
++	# Configure the CNS names used for internal services.
++	#
++	gr_cnsfull_db="$(gr_cnsname_internal $gr_cnssvc_postgres)"
++	gr_cnsfull_app="$(gr_cnsname_internal $gr_cnssvc_appserver)"
++
++	#
++	# Configure the app server arguments based on which mode we're in.
++	# Changes to this should instead be made to the corresponding variables
++	# defined at the top of this file.
++	#
++	if [[ $gr_mode == "dev" ]]; then
++		gr_appserver_args="-e JG_CANONICALWEBURL=$gr_dev_weburl \
++		    -e JG_JOYENT_ENABLE_REPLICATION=$gr_dev_replication \
++		    -e JG_SENDEMAIL_SMTPSERVER=$gr_dev_smtp_server \
++		    -e JG_SSHD_ADVERTISEDADDRESS=$gr_dev_sshd_addr \
++		    -e JG_HTTPD_LISTENURL=$gr_dev_httpd_listenurl \
++		    -e JG_USER_EMAIL=$gr_dev_user_email \
++		    -e JG_DATABASE_HOSTNAME=$gr_cnsfull_db"
++		gr_frontdoor_name=$gr_dev_frontdoor_name
++	else
++		gr_appserver_args="-e JG_CANONICALWEBURL=$gr_prod_weburl \
++		    -e JG_JOYENT_ENABLE_REPLICATION=$gr_prod_replication \
++		    -e JG_SENDEMAIL_SMTPSERVER=$gr_prod_smtp_server \
++		    -e JG_SSHD_ADVERTISEDADDRESS=$gr_prod_sshd_addr \
++		    -e JG_HTTPD_LISTENURL=$gr_prod_httpd_listenurl \
++		    -e JG_USER_EMAIL=$gr_prod_user_email \
++		    -e JG_DATABASE_HOSTNAME=$gr_cnsfull_db"
++		gr_frontdoor_name=$gr_prod_frontdoor_name
++	fi
++
++	if [[ -n "$gr_client_id" ]]; then
++		gr_appserver_args="$gr_appserver_args -e \
++		    JG_GITHUB_CLIENT_ID=$gr_client_id"
++	fi
++
++	if [[ -n "$gr_client_secret" ]]; then
++		gr_appserver_args="$gr_appserver_args -e \
++		    JG_GITHUB_CLIENT_SECRET=$gr_client_secret"
++	fi
++
++	gr_confirm "Are you sure you want to continue? " || \
++	    fail "aborted by user"
++}
++
++#
++# gr_cnsname_internal SVCNAME
++#
++# Generate an internal CNS name for the given service.  This uses account
++# information as well as knowledge about the datacenter we're deploying to.  CNS
++# names in private environments like staging have different top-level
++# domains and use the account's login rather than the uuid.
++# TODO is there a better way to programmatically tell which case we're in?
++#
++function gr_cnsname_internal
++{
++	local rv
++
++	printf "$1.svc."
++
++	if [[ $gr_datacenter =~ ^us- ]]; then
++		printf "$gr_account_uuid.$gr_datacenter.cns.joyent.com"
++	else
++		printf "$gr_account_login.$gr_datacenter.cns.joyent.us"
++	fi
++}
++
++#
++# gr_confirm PROMPT
++#
++# Prompts the user with the given string.  Returns whether the output appears
++# affirmative.
++#
++function gr_confirm
++{
++	read -p "$1"
++	[[ $REPLY =~ ^[Yy]$ || $REPLY == "yes" ]]
++}
++
++main "$@"
+diff --git a/docs/operator/README.md b/docs/operator/README.md
+index ab16b35..f3d5e18 100644
+--- a/docs/operator/README.md
++++ b/docs/operator/README.md
+@@ -163,7 +163,7 @@ Gerrit app container:
+         -e SMTP_SERVER=relay.joyent.com \
+         -e SMTP_CONNECT_TIMEOUT=60sec \
+         -e USER_EMAIL=no-reply@cr.joyent.us \
+-        -d joyent/joyent-gerrit:dev
++        -d joyentunsupported/joyent-gerrit:dev
+ 
+ Note: this also assumes fabrics with Docker containers.  Without it, you'll want
+ to add `--link gerrit-postgres:db -p 8080:8080 -p 29418:29418` and remove the
+diff --git a/images/appserver/Dockerfile b/images/appserver/Dockerfile
+new file mode 100644
+index 0000000..0d00b1c
+--- /dev/null
++++ b/images/appserver/Dockerfile
+@@ -0,0 +1,87 @@
++#
++# Dockerfile to build a Gerrit image.  At runtime, a volume container should be
++# mounted at $GERRIT_HOME/review_site.  Its configuration will be clobbered by
++# the configuration inside this image.
++#
++
++FROM java:jre-alpine
++
++#
++# Parameters related to fetching Gerrit, its plugins, and BouncyCastle.
++#
++ENV GERRIT_VERSION            2.12.2
++ENV GERRIT_RELEASEURL         https://gerrit-releases.storage.googleapis.com
++
++ENV PLUGIN_VERSION            stable-2.12
++ENV GERRITFORGE_URL           https://gerrit-ci.gerritforge.com
++ENV GERRITFORGE_ARTIFACT_DIR  lastSuccessfulBuild/artifact/buck-out/gen/plugins
++
++ENV BOUNCY_CASTLE_VERSION     1.54
++ENV BOUNCY_CASTLE_URL         http://central.maven.org/maven2/org/bouncycastle
++
++#
++# Parameters related to Gerrit's runtime behavior
++#
++ENV GERRIT_HOME               /var/gerrit
++ENV GERRIT_SITE               ${GERRIT_HOME}/review_site
++ENV GERRIT_WAR                ${GERRIT_HOME}/gerrit.war
++ENV GERRIT_USER               gerrit2
++ENV GERRIT_INIT_ARGS          ""
++
++#
++# We combine several of the following steps into a single "RUN" command because
++# each separate command can be a little slow.  The steps are:
++#
++#    (1) Copy the start script and entry point into the container and make it
++#        executable.
++#
++#    (2) Add the Gerrit user using the busybox "adduser" command as early as
++#        possible to make sure it gets the expected uid.
++#
++#    (3) Install packages, both necessary (e.g., git, perl) and desirable (e.g.,
++#        bash, vim, man).
++#
++#    (4) Fetch Gerrit itself and the JAR files for various plugins.
++#
++# We don't expose any ports from this image because it's deployed on Triton,
++# where we use fabric-based networking.  Users can always expose these at
++# runtime if desired.
++#
++COPY ./bin/gerrit-entrypoint.sh /
++COPY ./bin/gerrit-start.sh      /
++RUN  set -o xtrace && \
++     chmod +x /gerrit-entrypoint.sh /gerrit-start.sh && \
++     adduser -u 10000 -S -h "$GERRIT_HOME" $GERRIT_USER $GERRIT_USER && \
++     apk add --update --no-cache bash curl git git-gitweb less \
++         man openssh openssh-client openssl perl perl-cgi vim && \
++     mkdir ${GERRIT_HOME}/shipped && \
++     mkdir ${GERRIT_HOME}/shipped/plugins && \
++     mkdir ${GERRIT_HOME}/shipped/lib && \
++     wget -O $GERRIT_WAR \
++         ${GERRIT_RELEASEURL}/gerrit-${GERRIT_VERSION}.war && \
++     wget -O ${GERRIT_HOME}/shipped/plugins/delete-project.jar \
++         ${GERRITFORGE_URL}/job/plugin-delete-project-${PLUGIN_VERSION}/${GERRITFORGE_ARTIFACT_DIR}/delete-project/delete-project.jar && \
++     wget -O ${GERRIT_HOME}/shipped/plugins/events-log.jar \
++         ${GERRITFORGE_URL}/job/plugin-events-log-${PLUGIN_VERSION}/${GERRITFORGE_ARTIFACT_DIR}/events-log/events-log.jar && \
++     wget -O ${GERRIT_HOME}/shipped/plugins/gerrit-oauth-provider.jar \
++         ${GERRITFORGE_URL}/job/plugin-gerrit-oauth-provider-gh-master/${GERRITFORGE_ARTIFACT_DIR}/gerrit-oauth-provider/gerrit-oauth-provider.jar && \
++     wget -O ${GERRIT_HOME}/shipped/plugins/replication.jar \
++         ${GERRITFORGE_URL}/job/plugin-replication-${PLUGIN_VERSION}/${GERRITFORGE_ARTIFACT_DIR}/replication/replication.jar && \
++     wget -O ${GERRIT_HOME}/shipped/lib/bcprov-jdk15on-${BOUNCY_CASTLE_VERSION}.jar \
++         ${BOUNCY_CASTLE_URL}/bcprov-jdk15on/${BOUNCY_CASTLE_VERSION}/bcprov-jdk15on-${BOUNCY_CASTLE_VERSION}.jar && \
++     wget -O ${GERRIT_HOME}/shipped/lib/bcpkix-jdk15on-${BOUNCY_CASTLE_VERSION}.jar \
++         ${BOUNCY_CASTLE_URL}/bcpkix-jdk15on/${BOUNCY_CASTLE_VERSION}/bcpkix-jdk15on-${BOUNCY_CASTLE_VERSION}.jar && \
++     chown -R ${GERRIT_USER} ${GERRIT_WAR} ${GERRIT_HOME}/shipped
++
++#
++# Copy our site-specific configuration into the image.
++#
++COPY ./etc/gerrit.config.base ${GERRIT_HOME}/shipped/gerrit.config.base
++COPY ./etc/replication.config ${GERRIT_HOME}/shipped/replication.config
++
++#
++# Configure the entrypoint (which runs every time) and the default start
++# command.
++#
++ENTRYPOINT [ "/gerrit-entrypoint.sh" ]
++CMD        [ "/gerrit-start.sh" ]
+diff --git a/images/appserver/GNUmakefile b/images/appserver/GNUmakefile
+new file mode 100644
+index 0000000..fe3bda1
+--- /dev/null
++++ b/images/appserver/GNUmakefile
+@@ -0,0 +1,10 @@
++#
++# Makefile for building a Docker image for the cr.joyent.us appserver container.
++#
++
++DOCKER             ?= docker
++DOCKER_BUILD_FLAGS ?= 
++TAG                ?= joyentunsupported/joyent-gerrit:dev
++
++image:
++	docker build $(DOCKER_BUILD_FLAGS) --tag=$(TAG) .
+diff --git a/images/appserver/README.md b/images/appserver/README.md
+new file mode 100644
+index 0000000..e840ce1
+--- /dev/null
++++ b/images/appserver/README.md
+@@ -0,0 +1,69 @@
++# Docker image for Gerrit
++
++This Docker image is heavily inspired by the OpenFrontier image at
++https://github.com/openfrontier/docker-gerrit.
++
++That image is a good choice for getting started with Gerrit using Docker.
++
++Important notes about this image:
++
++* This image uses an external data volume for the actual site directory so that
++  it's easy to redeploy without losing data.  As a result, this doesn't support
++  initial setup -- it assumes you're going to mount a data directory in the
++  appropriate place.
++* That said, this image is intended to be deployed using the `crrestore` script
++  inside this repository, which deploys the entire application from a backup.
++  That script always deploys a new volume container, restores the contents from
++  the backup, and then deploys this image attached to that container.
++* Due to [DOCKER-774](https://smartos.org/bugview/DOCKER-774), this image cannot
++  currently be built on Triton.
++
++
++## Gerrit configuration
++
++This image is intended to be deployed not just for cr.joyent.us, but for staging
++and development versions.  As such, we divide configuration into three groups:
++
++- basic Gerrit configuration that is common to all deployments (i.e.,
++  preferences, policies, and the like)
++- shared secrets (e.g., private keys used to push to GitHub)
++- deployment-specific configuration (e.g., hostnames of external dependencies,
++  advertised addresses, and the like).
++
++The basic configuration is checked into this repository and built into this
++image so that it can be versioned the way software is.  In principle, we could
++use blue-green deployments for configuration changes, though Gerrit doesn't
++really support that model.
++
++Shared secrets are stored inside the volume directory.  This allows the
++repository itself to be made public (including the deployment tooling, which
++would need to specify these shared secrets if they were supplied as environment
++variables).
++
++Deployment-specific configuration is specified via environment variables when
++the container is deployed.
++
++The following runtime parameters are provided to specify deployment-specific
++configuration.  **These are automatically specified by the crrestore script.**
++You generally don't need to specify these unless you're doing dev work on the
++image or tools themselves.
++
++* `JG_DATABASE_HOSTNAME` (required): Maps directly to `database.hostname`.
++* `JG_CANONICALWEBURL` (required): Maps directly to `gerrit.canonicalWebUrl`.
++* `JG_SENDEMAIL_SMTPSERVER`: Maps directly to `sendemail.smtpServer`.
++* `JG_SSHD_ADVERTISEDADDRESS`: Maps directly to `sshd.advertisedAddress`.
++* `JG_HTTPD_LISTENURL`: Maps directly to `httpd.listenUrl`.
++* `JG_USER_EMAIL`: Maps directly to `user.email`.
++* `JG_GITHUB_CLIENT_ID`: Maps directly to
++  `plugin.gerrit-oauth-provider-github-oauth.client-id`.
++* `JG_GITHUB_CLIENT_SECRET`: Maps directly to
++  `plugin.gerrit-oauth-provider-github-oauth.client-secret`.
++* `JG_JOYENT_ENABLE_REPLICATION`: If specified, this causes the
++  `replication.config` file to be linked into place to enable replication to
++  GitHub.  If unspecified, this file will be present in the image, but not
++  linked in a way that Gerrit will use it.
++
++As mentioned above, configuration that is not deployment-specific is
++deliberately not supported through environment variables.  You have to modify
++the config in this repository, build a new image, and redeploy that in order to
++change that.
+diff --git a/images/appserver/bin/gerrit-entrypoint.sh b/images/appserver/bin/gerrit-entrypoint.sh
+new file mode 100644
+index 0000000..497e675
+--- /dev/null
++++ b/images/appserver/bin/gerrit-entrypoint.sh
+@@ -0,0 +1,249 @@
++#!/bin/bash
++
++#
++# gerrit-entrypoint.sh: start up the Gerrit container.
++#
++# This script is responsible for:
++#
++#    (1) verifying that a valid Gerrit site directory is present
++#
++#    (2) verifying that runtime parameters have been set
++#
++#    (3) synthesizing the complete Gerrit configuration based on the basic
++#        configuration supplied in this image and the runtime parameters.
++#
++#    (4) make sure that the software (gerrit.war and plugin jar files),
++#        configuration, and shared secrets are put into the right places.
++#
++
++set -o xtrace
++set -o errexit
++set -o pipefail
++
++function main
++{
++	if [[ -z "$GERRIT_USER" ]] ||
++	   [[ -z "$GERRIT_HOME" ]] ||
++	   [[ -z "$GERRIT_SITE" ]]; then
++		fail "expected GERRIT_USER, GERRIT_HOME, and GERRIT_SITE to" \
++		    "be set in the environment"
++	fi
++
++	if [[ -z "$JG_DATABASE_HOSTNAME" ]] ||
++	   [[ -z "$JG_CANONICALWEBURL" ]] ||
++	   [[ -z "$JG_JOYENT_ENABLE_REPLICATION" ]]; then
++		fail "expected Gerrit configuration parameters" \
++		    "(see image README.md)"
++	fi
++
++	if [[ -z "$JG_SENDEMAIL_SMTPSERVER" ]] ||
++	   [[ -z "$JG_SSHD_ADVERTISEDADDRESS" ]] ||
++	   [[ -z "$JG_HTTPD_LISTENURL" ]] ||
++	   [[ -z "$JG_USER_EMAIL" ]]; then
++	   	echo "warn: some Gerrit configuration parameters were" \
++		    "unspecified" >&2
++	fi
++
++	if [[ ! -d "$GERRIT_SITE" || ! -d "$GERRIT_SITE/etc" ]]; then
++		fail "does not appear to be a site: $GERRIT_SITE"
++	fi
++
++	#
++	# If we're running on SmartOS, work around OS-5498 by installing the
++	# native copies of cp(1) and cat(1) in place of the Alpine ones.  We
++	# have to be careful how we do this, since /bin/cp and /bin/cat may be
++	# symlinks to /bin/busybox in this image.
++	#
++	if [[ -f /native/usr/bin/cp ]]; then
++		if ! ln -f -s /native/usr/bin/cp /bin/cp ||
++		   ! ln -f -s /native/usr/bin/cat /bin/cat; then
++			fail "failed to workaround OS-5498"
++		fi
++	fi
++
++	#
++	# Generate our complete configuration.  Start with the configuration
++	# shipped with the image.
++	#
++	mkdir -p $GERRIT_HOME/gen
++	cp $GERRIT_HOME/shipped/gerrit.config.base \
++	    $GERRIT_HOME/gen/gerrit.config
++
++	# Apply the optional runtime configuration parameters.
++	[[ -n "$JG_SENDEMAIL_SMTPSERVER" ]] &&
++	    gerrit_set sendemail.smtpServer   "$JG_SENDEMAIL_SMTPSERVER"
++	[[ -n "$JG_SSHD_ADVERTISEDADDRESS" ]] &&
++	    gerrit_set sshd.advertisedAddress "$JG_SSHD_ADVERTISEDADDRESS"
++	[[ -n "$JG_HTTPD_LISTENURL" ]] &&
++	    gerrit_set httpd.listenUrl        "$JG_HTTPD_LISTENURL"
++	[[ -n "$JG_USER_EMAIL" ]] &&
++	    gerrit_set user.email             "$JG_USER_EMAIL"
++
++	# Apply the required runtime configuration parameters.
++	gerrit_set gerrit.canonicalWebUrl "$JG_CANONICALWEBURL"
++	gerrit_set database.hostname      "$JG_DATABASE_HOSTNAME"
++	if [[ "$JG_JOYENT_ENABLE_REPLICATION" == "true" ]]; then
++		cp $GERRIT_HOME/shipped/replication.config \
++		    $GERRIT_HOME/gen/replication.config
++	fi
++
++	chown -R gerrit2 $GERRIT_HOME/gen
++
++	#
++	# Users can specify that the secure GitHub credentials be overridden so
++	# that they can use a different GitHub configuration (e.g., for a
++	# staging environment).  This is not intended for real deployments.
++	# They will use the existing file on the shared volume that contains the
++	# production client id and secret.  This operation will change that, so
++	# it won't work to try to use the same shared volume with different
++	# sets of GitHub parameters.
++	#
++	if [[ -n "$JG_GITHUB_CLIENT_ID" ]] &&
++	   [[ -n "$JG_GITHUB_CLIENT_SECRET" ]]; then
++		echo "NOTE: Overriding GitHub client ID and secret."
++		gerrit_set_secure \
++		    plugin.gerrit-oauth-provider-github-oauth.client-id \
++		    "$JG_GITHUB_CLIENT_ID"
++		gerrit_set_secure \
++		    plugin.gerrit-oauth-provider-github-oauth.client-secret \
++		    "$JG_GITHUB_CLIENT_SECRET"
++		chown gerrit2 $GERRIT_SITE/etc/secure.config
++	fi
++
++	#
++	# Recall that:
++	#
++	#    - $GERRIT_HOME is part of the image that we've built.
++	#
++	#    - $GERRIT_SITE is part of a volume mounted in at runtime.
++	#
++	# The volume contains most of the directories and files Gerrit needs in
++	# order to run, including the copies of the Git repositories.  Ideally,
++	# the volume would not contain code, binaries, or non-shared-secret
++	# configuration.  These would come from the image, where they can be
++	# managed like software (under revision control and with repeatable
++	# builds).
++	#
++	# In general, when there's an item that Gerrit expects under
++	# $GERRIT_SITE but that we prefer to come from the image, we create a
++	# symlink under $GERRIT_SITE to a path inside the image.  We do this
++	# for:
++	#
++	#    - non-secret configuration: $GERRIT_SITE/etc/gerrit.config and
++	#      $GERRIT_SITE/etc/replication.config
++	#
++	#    - plugins: $GERRIT_SITE/plugins
++	#
++	#    - lib: $GERRIT_SITE/lib
++	#
++	# We may want to add more of these in the future.
++	#
++	# The original deployment of gerrit.joyent.us did not work this way, so
++	# we have one-time flag-day code to update it.  We don't want to throw
++	# anything away, in case this doesn't work.
++	#
++	if ! [[ -L $GERRIT_SITE/etc/gerrit.config ]] ||
++	   ! [[ -L $GERRIT_SITE/etc/replication.config ]] ||
++	   ! [[ -L $GERRIT_SITE/lib ]] ||
++	   ! [[ -L $GERRIT_SITE/plugins ]]; then
++		echo "Found non-symlinked paths.  Assuming old layout."
++		echo "Will move existing files to $GERRIT_SITE/archive."
++
++		#
++		# If our archive directory already exists, bail out.  We could
++		# make this idempotent, but to avoid clobbering data we'd want
++		# to check each individual file for differences.  It's easier to
++		# make the user resolve this unusual case.
++		#
++		if [[ -d $GERRIT_SITE/archive ]]; then
++			fail "$GERRIT_SITE/archive already exists"
++		fi
++
++		mkdir $GERRIT_SITE/archive
++
++		if ! [[ -L $GERRIT_SITE/etc/gerrit.config ]]; then
++			cp $GERRIT_SITE/etc/gerrit.config $GERRIT_SITE/archive
++			ln -f -s $GERRIT_HOME/gen/gerrit.config \
++			    $GERRIT_SITE/etc/gerrit.config
++		fi
++
++		if ! [[ -L $GERRIT_SITE/etc/replication.config ]]; then
++			cp $GERRIT_SITE/etc/replication.config \
++			    $GERRIT_SITE/archive
++			ln -f -s $GERRIT_HOME/gen/replication.config \
++			    $GERRIT_SITE/etc/replication.config
++		fi
++
++		if ! [[ -L $GERRIT_SITE/lib ]]; then
++			mv $GERRIT_SITE/lib $GERRIT_SITE/archive
++			ln -s $GERRIT_HOME/shipped/lib $GERRIT_SITE/lib
++		fi
++
++		if ! [[ -L $GERRIT_SITE/plugins ]]; then
++			mv $GERRIT_SITE/plugins $GERRIT_SITE/archive
++			ln -s $GERRIT_HOME/shipped/plugins $GERRIT_SITE/plugins
++		fi
++	fi
++
++	#
++	# There's also a case of the opposite: the .ssh directory needs to exist
++	# under $GERRIT_HOME, but its contents comes from the volume because it
++	# includes shared secrets that we don't want to build into the image.
++	# For this, we create a symlink under $GERRIT_HOME to the appropriate
++	# path inside the volume.
++	#
++	if ! [[ -L "$GERRIT_HOME/.ssh" ]]; then
++		if [[ -e "$GERRIT_HOME/.ssh" ]]; then
++			fail "unexpected $GERRIT_HOME/.ssh in the image"
++		fi
++
++		ln -s $GERRIT_SITE/ssh-joyent $GERRIT_HOME/.ssh
++	fi
++
++	#
++	# Historically, the Gerrit user's numeric uid changed across different
++	# image versions, though we've now settled on one that's encoded in the
++	# Dockerfile.  For now, make sure everything is owned by the right user.
++	# We should be able to remove this once we've backed up a site that was
++	# created with the new uid.
++	#
++	chown -R gerrit2 $GERRIT_SITE
++
++	exec "$@"
++}
++
++function fail
++{
++	echo "gerrit-entrypoint.sh: $@"
++	exit 1
++}
++
++#
++# gerrit_set KEY VALUE: set a variable in the generated Gerrit configuration
++# file.
++#
++function gerrit_set
++{
++	gerrit_set_file "${GERRIT_HOME}/gen/gerrit.config" "$1" "$2"
++}
++
++#
++# gerrit_set_file FILE KEY VALUE: set a variable in the specified configuration
++# file.
++#
++function gerrit_set_file
++{
++	git config -f "$1" "$2" "$3"
++}
++
++#
++# gerrit_set_secure KEY VALUE: set a variable in the _secure_ configuration
++# file.  Note that this is stored on the shared volume, so this will potentially
++# affect future deployments.
++#
++function gerrit_set_secure
++{
++	gerrit_set_file "${GERRIT_SITE}/etc/secure.config" "$1" "$2"
++}
++
++main "$@"
+diff --git a/images/appserver/bin/gerrit-start.sh b/images/appserver/bin/gerrit-start.sh
+new file mode 100644
+index 0000000..19a810c
+--- /dev/null
++++ b/images/appserver/bin/gerrit-start.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++
++set -o xtrace
++set -o errexit
++set -o pipefail
++
++echo "Starting Gerrit."
++exec su -s /bin/bash \
++    -c "set -o xtrace; $GERRIT_SITE/bin/gerrit.sh daemon" ${GERRIT_USER}
+diff --git a/images/appserver/etc/gerrit.config.base b/images/appserver/etc/gerrit.config.base
+new file mode 100644
+index 0000000..d1e6159
+--- /dev/null
++++ b/images/appserver/etc/gerrit.config.base
+@@ -0,0 +1,68 @@
++#
++# gerrit.config.base: This file contains configurations that would apply to any
++# deployment of a cr.joyent.us-like site, including in development and staging
++# environments.  This file is included in the public repository.  This file
++# should NOT contain hostnames or shared secrets, since those are specific to a
++# particular deployment.  See the README.md in this directory for details.
++#
++[gerrit]
++	basePath = git
++
++[database]
++	type = postgresql
++	database = reviewdb
++	port = 5432
++	username = gerrit2
++
++[index]
++	type = LUCENE
++
++[auth]
++	type = OAUTH
++
++[receive]
++	enableSignedPush = false
++
++[sendemail]
++	enable = true
++	connectTimeout = 60sec
++
++[container]
++	user = gerrit2
++	javaHome = /usr/lib/jvm/java-1.8-openjdk/jre
++
++[sshd]
++	listenAddress = *:29418
++
++[cache]
++	directory = cache
++
++[plugins]
++	allowRemoteAdmin = true
++
++[gitweb]
++	cgi = /usr/share/gitweb/gitweb.cgi
++
++#
++# As documented above, the shared secrets are specified elsewhere.
++#
++[plugin "gerrit-oauth-provider-google-oauth"]
++	link-to-existing-openid-accounts = true
++
++#
++# Configuration to auto-link ticket identifiers to the corresponding bug
++# trackers.
++#
++[commentlink "devjira"]
++	match = ([A-Z0-9]+-[0-9]+)
++	link = https://devhub.joyent.com/jira/browse/$1
++[commentlink "github"]
++	match = "([a-zA-Z0-9]+)/([-_a-zA-Z0-9]+)#([0-9]+)"
++	link = https://github.com/$1/$2/issues/$3
++
++#
++# Clarify the purpose of some of the buttons on the Change screen.
++#
++[change]
++	submitLabel = Submit change (integrate)
++	replyLabel = Leave feedback / vote
+diff --git a/images/appserver/etc/replication.config b/images/appserver/etc/replication.config
+new file mode 100644
+index 0000000..ce28a94
+--- /dev/null
++++ b/images/appserver/etc/replication.config
+@@ -0,0 +1,7 @@
++[remote "joyent"]
++	url = git@github.com:${name}.git
++	push = refs/heads/*:refs/heads/*
++	push = refs/tags/*:refs/tags/*
++	authGroup = GitHub (joyent) Replication Group
++	timeout = 30
++	projects = joyent/*

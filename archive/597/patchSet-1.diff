@@ -1,0 +1,524 @@
+commit e23220e68ad8bb74ba44741cd2c9c6f9969959ff (refs/changes/97/597/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2016-10-04T17:27:14-07:00 (3 years ago)
+    
+    joyent/node-cueball#35 backends removed from DNS may have new connections opened in rebalance
+
+diff --git a/lib/connection-fsm.js b/lib/connection-fsm.js
+index 197341d..395a21d 100644
+--- a/lib/connection-fsm.js
++++ b/lib/connection-fsm.js
+@@ -306,6 +306,15 @@ ConnectionFSM.prototype.state_error = function (S) {
+ 		return;
+ 	}
+ 
++	/*
++	 * If this backend has been removed from the Resolver, we should not
++	 * attempt any kind of reconnection. Exit now.
++	 */
++	if (!this.cf_pool.shouldRetryBackend(this.cf_backend.key)) {
++		S.gotoState('closed');
++		return;
++	}
++
+ 	if (this.cf_retries !== Infinity)
+ 		--this.cf_retriesLeft;
+ 
+diff --git a/lib/pool.js b/lib/pool.js
+index 9bc4a0b..25de239 100644
+--- a/lib/pool.js
++++ b/lib/pool.js
+@@ -168,10 +168,13 @@ CueBallConnectionPool.prototype.on_resolver_removed = function (k) {
+ 		this.p_keys.splice(idx, 1);
+ 	delete (this.p_backends[k]);
+ 	(this.p_connections[k] || []).forEach(function (fsm) {
+-		if (!fsm.isInState('busy'))
++		if (fsm.isInState('busy'))
++			fsm.closeAfterRelease();
++		else
+ 			fsm.close();
+ 	});
+ 	delete (this.p_connections[k]);
++	delete (this.p_dead[k]);
+ 	this.rebalance();
+ };
+ 
+@@ -329,6 +332,10 @@ CueBallConnectionPool.prototype.state_stopped = function (S) {
+ 	clearInterval(this.p_shuffleTimerInst);
+ };
+ 
++CueBallConnectionPool.prototype.shouldRetryBackend = function (backend) {
++	return (this.p_backends[backend] !== undefined);
++};
++
+ CueBallConnectionPool.prototype.isDeclaredDead = function (backend) {
+ 	return (this.p_dead[backend] === true);
+ };
+@@ -387,13 +394,6 @@ CueBallConnectionPool.prototype._rebalance = function () {
+ 		conns[k] = (self.p_connections[k] || []).slice();
+ 		total += conns[k].length;
+ 	});
+-	Object.keys(this.p_connections).forEach(function (k) {
+-		if (conns[k] === undefined &&
+-		    self.p_connections[k] !== undefined &&
+-		    self.p_connections[k].length > 0) {
+-			conns[k] = (self.p_connections[k] || []).slice();
+-		}
+-	});
+ 	var spares = this.p_idleq.length + this.p_initq.length -
+ 	    this.p_waiters.length;
+ 	if (spares < 0)
+diff --git a/lib/set.js b/lib/set.js
+index d5ab716..5427bc1 100644
+--- a/lib/set.js
++++ b/lib/set.js
+@@ -138,12 +138,21 @@ CueBallConnectionSet.prototype.on_resolver_removed = function (k) {
+ 		delete (self.cs_connections[ck]);
+ 		self.assertEmit('removed', ck, conn);
+ 	});
++	delete (this.cs_dead[k]);
++	var fsms = self.cs_fsms[k];
++	mod_assert.ok(fsms.length <= 1);
++	if (cks.length === 0 && fsms[0] && !fsms[0].isInState('idle'))
++		fsms[0].close();
+ };
+ 
+ CueBallConnectionSet.prototype.isDeclaredDead = function (backend) {
+ 	return (this.cs_dead[backend] === true);
+ };
+ 
++CueBallConnectionSet.prototype.shouldRetryBackend = function (backend) {
++	return (this.cs_backends[backend] !== undefined);
++};
++
+ CueBallConnectionSet.prototype.state_starting = function (S) {
+ 	S.validTransitions(['failed', 'running', 'stopping']);
+ 	mod_monitor.monitor.registerSet(this);
+@@ -243,6 +252,8 @@ CueBallConnectionSet.prototype.state_stopping = function (S) {
+ 	S.validTransitions(['stopped']);
+ 	var conns = this.cs_fsms;
+ 	var fsms = [];
++	var self = this;
++	this.cs_backends = {};
+ 	Object.keys(conns).forEach(function (k) {
+ 		conns[k].forEach(function (fsm) {
+ 			fsms.push(fsm);
+@@ -255,14 +266,28 @@ CueBallConnectionSet.prototype.state_stopping = function (S) {
+ 		S.gotoState('stopped');
+ 	});
+ 	function closeBackend(fsm, cb) {
+-		if (fsm.isInState('busy')) {
+-			fsm.closeAfterRelease();
+-			fsm.on('stateChanged', function (s) {
+-				if (s === 'closed')
+-					cb();
+-			});
++		if (fsm.isInState('closed')) {
++			cb();
++			return;
++		}
++
++		var k = fsm.cf_backend.key;
++		var cks = Object.keys(self.cs_connections).filter(
++		    function (ck) {
++			return (ck.indexOf(k + '.') === 0);
++		});
++		fsm.on('stateChanged', function (s) {
++			if (s === 'closed')
++				cb();
++		});
++		if (cks.length === 0 && !fsm.isInState('idle')) {
++			fsm.close();
+ 		} else {
+-			fsm.close(cb);
++			cks.forEach(function (ck) {
++				var conn = self.cs_connections[ck];
++				delete (self.cs_connections[ck]);
++				self.emit('removed', ck, conn);
++			});
+ 		}
+ 	}
+ };
+@@ -283,6 +308,8 @@ CueBallConnectionSet.prototype.isDeclaredDead = function (backend) {
+ };
+ 
+ CueBallConnectionSet.prototype.reshuffle = function () {
++	if (this.cs_keys.length <= 1)
++		return;
+ 	var taken = this.cs_keys.pop();
+ 	var idx = Math.floor(Math.random() * (this.cs_keys.length + 1));
+ 	this.cs_keys.splice(idx, 0, taken);
+@@ -335,11 +362,8 @@ CueBallConnectionSet.prototype._rebalance = function () {
+ 	var conns = {};
+ 	var total = 0;
+ 	this.cs_keys.forEach(function (k) {
+-		conns[k] = [];
+-	});
+-	Object.keys(this.cs_fsms).forEach(function (k) {
+-		conns[k] = self.cs_fsms[k].slice();
+-		total += self.cs_fsms[k].length;
++		conns[k] = (self.cs_fsms[k] || []).slice();
++		total += conns[k].length;
+ 	});
+ 
+ 	var plan = mod_utils.planRebalance(
+@@ -353,6 +377,10 @@ CueBallConnectionSet.prototype._rebalance = function () {
+ 	}
+ 	plan.remove.forEach(function (fsm) {
+ 		var k = fsm.cf_backend.key;
++		/*
++		 * Find any advertised connections from this FSM, and emit
++		 * 'removed' so our consumer will close them.
++		 */
+ 		var cks = Object.keys(self.cs_connections).filter(
+ 		    function (ck) {
+ 			return (ck.indexOf(k + '.') === 0);
+@@ -362,7 +390,18 @@ CueBallConnectionSet.prototype._rebalance = function () {
+ 			delete (self.cs_connections[ck]);
+ 			self.emit('removed', ck, conn);
+ 		});
+-		if (cks.length === 0) {
++		/*
++		 * We can close the FSM immediately if we aren't advertising
++		 * any connections for it, and we aren't waiting on our consumer
++		 * to close any -- i.e., the FSM is in an error state, probably
++		 * delay or connect.
++		 *
++		 * Still want to avoid doing .close() on the *last* one for a
++		 * given backend, so it has a chance to run out of retries if
++		 * the backend is in fact dead. So we do .closeAfterRelease()
++		 * instead for those.
++		 */
++		if (cks.length === 0 && !fsm.isInState('idle')) {
+ 			var fsmIdx = self.cs_fsms[k].indexOf(fsm);
+ 			if (fsmIdx > 0 || self.cs_keys.indexOf(k) === -1) {
+ 				fsm.close();
+@@ -419,6 +458,15 @@ CueBallConnectionSet.prototype.addConnection = function (key) {
+ 	var self = this;
+ 	fsm.on('stateChanged', function (newState) {
+ 		if (newState === 'idle' && fsm.isInState('idle')) {
++			/*
++			 * If the backend has been removed from the resolver,
++			 * stop now.
++			 */
++			if (self.cs_backends[key] === undefined) {
++				fsm.close();
++				return;
++			}
++
+ 			if (serial === undefined) {
+ 				self.emit('connectedToBackend', key, fsm);
+ 			}
+@@ -454,7 +502,12 @@ CueBallConnectionSet.prototype.addConnection = function (key) {
+ 				var idx = self.cs_fsms[key].indexOf(fsm);
+ 				self.cs_fsms[key].splice(idx, 1);
+ 			}
+-			if (fsm.retriesExhausted()) {
++			/*
++			 * Set the dead flag, but not on a backend that's no
++			 * longer in the resolver.
++			 */
++			if (fsm.retriesExhausted() &&
++			    self.cs_backends[key] !== undefined) {
+ 				self.cs_dead[key] = true;
+ 			}
+ 			self.emit('closedBackend', fsm);
+diff --git a/test/cset.test.js b/test/cset.test.js
+index 1cbc601..b2be088 100644
+--- a/test/cset.test.js
++++ b/test/cset.test.js
+@@ -23,9 +23,24 @@ var log = mod_bunyan.createLogger({
+ 	level: process.env.LOGLEVEL || 'debug'
+ });
+ var recovery = {
+-	default: {timeout: 1000, retries: 3, delay: 100 }
++	default: {timeout: 1000, retries: 2, delay: 100 }
+ };
+ 
++var index, counts;
++
++function summarize() {
++	index = {};
++	counts = {};
++	connections.forEach(function (c) {
++		if (index[c.backend] === undefined) {
++			index[c.backend] = [];
++			counts[c.backend] = 0;
++		}
++		index[c.backend].push(c);
++		++counts[c.backend];
++	});
++}
++
+ function DummyResolver() {
+ 	resolver = this;
+ 	this.state = 'stopped';
+@@ -63,11 +78,14 @@ DummyConnection.prototype.ref = function () {
+ 	this.refd = true;
+ };
+ DummyConnection.prototype.destroy = function () {
++	if (this.dead)
++		return;
+ 	var idx = connections.indexOf(this);
+ 	mod_assert.ok(idx !== -1);
+ 	connections.splice(idx, 1);
+ 	this.connected = false;
+ 	this.dead = true;
++	this.emit('close');
+ };
+ 
+ mod_tape.test('cset with one backend', function (t) {
+@@ -106,7 +124,8 @@ mod_tape.test('cset with one backend', function (t) {
+ 
+ 	cset.on('removed', function (key, conn) {
+ 		if (!cset.isInState('stopping'))
+-			t.fail();
++			t.fail('removed ' + key);
++		conn.destroy();
+ 	});
+ 
+ 	resolver.start();
+@@ -160,6 +179,138 @@ mod_tape.test('cset with two backends', function (t) {
+ 	cset.on('removed', function (key, conn) {
+ 		if (!cset.isInState('stopping'))
+ 			t.fail();
++		conn.destroy();
++	});
++
++	resolver.start();
++	t.strictEqual(connections.length, 0);
++
++	resolver.emit('added', 'b1', {});
++	resolver.emit('added', 'b2', {});
++
++	setImmediate(function () {
++		connections.forEach(function (c) { c.connect(); });
++	});
++});
++
++mod_tape.test('removing a backend', function (t) {
++	connections = [];
++	resolver = new DummyResolver();
++
++	var cset = new mod_cset.ConnectionSet({
++		log: log,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery,
++		target: 3,
++		maximum: 5,
++		resolver: resolver
++	});
++
++	cset.on('stateChanged', function (st) {
++		if (st === 'stopped')
++			t.end();
++	});
++
++	cset.on('added', function (key, conn) {
++	});
++
++	cset.on('removed', function (key, conn) {
++		conn.seen = true;
++		conn.destroy();
++	});
++
++	resolver.emit('added', 'b1', {});
++	resolver.emit('added', 'b2', {});
++	resolver.emit('added', 'b3', {});
++
++	setImmediate(function () {
++		t.equal(connections.length, 3);
++		summarize();
++		t.deepEqual(counts, { 'b1': 1, 'b2': 1, 'b3': 1 });
++		index.b1[0].connect();
++		index.b2[0].connect();
++
++		setTimeout(function () {
++			t.equal(connections.length, 3);
++			summarize();
++			t.deepEqual(counts, { 'b1': 1, 'b2': 1, 'b3': 1 });
++
++			var conn = index.b2[0];
++			var conn2 = index.b3[0];
++
++			resolver.emit('removed', 'b2');
++			resolver.emit('removed', 'b3');
++
++			setTimeout(function () {
++				t.ok(conn.dead);
++				t.ok(conn2.dead);
++				t.ok(conn.seen);
++				t.ok(!conn2.seen);
++				t.equal(connections.length, 1);
++				summarize();
++				t.deepEqual(counts, { 'b1': 1 });
++				cset.stop();
++				resolver.stop();
++			}, 500);
++		}, 500);
++	});
++});
++
++mod_tape.test('cset with error', function (t) {
++	connections = [];
++	resolver = new DummyResolver();
++
++	recovery.default.retries = 1;
++	var cset = new mod_cset.ConnectionSet({
++		log: log,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery,
++		target: 2,
++		maximum: 4,
++		resolver: resolver
++	});
++
++	cset.on('stateChanged', function (st) {
++		if (st === 'stopped') {
++			t.ok(errorKey === undefined);
++			t.end();
++		}
++	});
++
++	var errorKey;
++	cset.on('added', function (key, conn) {
++		t.notStrictEqual(connections.indexOf(conn), -1);
++		t.strictEqual(conn.refd, true);
++		if (connections.length > 2) {
++			t.fail('more than 2 connections');
++		}
++		if (connections.length === 2) {
++			var backends = connections.map(function (c) {
++				return (c.backend);
++			}).sort();
++			t.deepEqual(backends, ['b1', 'b2']);
++
++			errorKey = key;
++			conn.emit('error', new Error());
++		}
++	});
++
++	cset.on('removed', function (key, conn) {
++		conn.destroy();
++		if (key === errorKey) {
++			errorKey = undefined;
++			t.ok(conn.dead);
++
++			cset.stop();
++			resolver.stop();
++			return;
++		}
++		if (!cset.isInState('stopping'))
++			t.fail();
+ 	});
+ 
+ 	resolver.start();
+diff --git a/test/pool.test.js b/test/pool.test.js
+index f01dba0..d7c31ff 100644
+--- a/test/pool.test.js
++++ b/test/pool.test.js
+@@ -18,15 +18,29 @@ const mod_resolver = require('../lib/resolver');
+ 
+ var sandbox;
+ var connections = [];
++var index, counts;
+ var resolver;
+ var log = mod_bunyan.createLogger({
+ 	name: 'pool-test',
+ 	level: process.env.LOGLEVEL || 'debug'
+ });
+ var recovery = {
+-	default: {timeout: 1000, retries: 3, delay: 100 }
++	default: {timeout: 1000, retries: 1, delay: 50 }
+ };
+ 
++function summarize() {
++	index = {};
++	counts = {};
++	connections.forEach(function (c) {
++		if (index[c.backend] === undefined) {
++			index[c.backend] = [];
++			counts[c.backend] = 0;
++		}
++		index[c.backend].push(c);
++		++counts[c.backend];
++	});
++}
++
+ function DummyResolver() {
+ 	resolver = this;
+ 	this.state = 'stopped';
+@@ -305,6 +319,69 @@ mod_tape.test('error while claimed', function (t) {
+ 	});
+ });
+ 
++mod_tape.test('removing a backend', function (t) {
++	connections = [];
++	resolver = undefined;
++
++	var pool = new mod_pool.ConnectionPool({
++		log: log,
++		domain: 'foobar',
++		spares: 2,
++		maximum: 3,
++		constructor: function (backend) {
++			return (new DummyConnection(backend));
++		},
++		recovery: recovery
++	});
++	t.ok(resolver);
++
++	pool.on('stateChanged', function (st) {
++		if (st === 'stopped') {
++			t.end();
++		}
++	});
++
++	resolver.emit('added', 'b1', {});
++	resolver.emit('added', 'b2', {});
++
++	setImmediate(function () {
++		t.equal(connections.length, 2);
++		summarize();
++		t.deepEqual(counts, { 'b1': 1, 'b2': 1 });
++		index.b1[0].connect();
++
++		/* Get it to be declared dead. */
++		index.b2[0].emit('error', new Error());
++
++		setTimeout(function () {
++			t.equal(Object.keys(pool.p_dead).length, 1);
++
++			/*
++			 * The backed-off monitor FSM should be there now, in
++			 * addition to the extra one on b1.
++			 */
++			t.equal(connections.length, 3);
++			summarize();
++			t.deepEqual(counts, { 'b1': 2, 'b2': 1 });
++
++			index.b1[1].connect();
++			var conn = index.b2[0];
++
++			resolver.emit('removed', 'b2');
++
++			setTimeout(function () {
++				t.ok(conn.dead);
++				t.equal(connections.length, 2);
++				summarize();
++				t.deepEqual(counts, { 'b1': 2 });
++
++				pool.stop();
++				setTimeout(function () { }, 10000);
++			}, 500);
++		}, 500);
++	});
++});
++
+ mod_tape.test('cleanup sandbox', function (t) {
+ 	sandbox.restore();
+ 	t.end();
