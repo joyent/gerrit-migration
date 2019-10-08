@@ -1,0 +1,594 @@
+commit fd1cedb89a1d91033781d85b30c725494ecfecc9 (refs/changes/27/5427/1)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2019-01-24T17:21:25-08:00 (9 months ago)
+    
+    joyent/node-zkstream#39 ZKWatcher onStateChanged looking for wrong state
+
+diff --git a/lib/zk-session.js b/lib/zk-session.js
+index cbc86f0..11700e7 100644
+--- a/lib/zk-session.js
++++ b/lib/zk-session.js
+@@ -130,6 +130,7 @@ ZKSession.prototype.state_detached = function (S) {
+ 	S.on(this.zs_expiryTimer, 'timeout', function () {
+ 		S.gotoState('expired');
+ 	});
++	this.watchersDisconnected();
+ };
+ 
+ ZKSession.prototype.state_attaching = function (S) {
+@@ -361,6 +362,18 @@ ZKSession.prototype.state_closed = function (S) {
+ 	this.zs_log.info('ZK session closed');
+ };
+ 
++ZKSession.prototype.watchersDisconnected = function () {
++	var paths = Object.keys(this.zs_watchers);
++	var self = this;
++	paths.forEach(function (path) {
++		var w = self.zs_watchers[path];
++		var evts = w.events();
++		evts.forEach(function (event) {
++			event.disconnected();
++		});
++	});
++};
++
+ ZKSession.prototype.processNotification = function (pkt) {
+ 	var self = this;
+ 	if (pkt.state !== 'SYNC_CONNECTED') {
+@@ -390,7 +403,7 @@ ZKSession.prototype.processNotification = function (pkt) {
+ 	notifications.increment({event: evt});
+ 
+ 	if (watcher)
+-		watcher.emit(evt);
++		watcher.notify(evt);
+ };
+ 
+ ZKSession.prototype.resumeWatches = function () {
+@@ -402,11 +415,15 @@ ZKSession.prototype.resumeWatches = function () {
+ 	};
+ 	var count = 0;
+ 	var paths = Object.keys(this.zs_watchers);
++	var allEvts = [];
+ 	paths.forEach(function (path) {
+ 		var w = self.zs_watchers[path];
+-		var evts = w.eventsActive();
++		var evts = w.events();
+ 		var cod = false;
+-		evts.forEach(function (evt) {
++		evts.forEach(function (event) {
++			if (!event.isInState('resuming'))
++				return;
++			var evt = event.getEvent();
+ 			if (evt === 'created' || evt === 'deleted') {
+ 				if (cod)
+ 					return;
+@@ -420,6 +437,7 @@ ZKSession.prototype.resumeWatches = function () {
+ 				events.childrenChanged.push(path);
+ 				++count;
+ 			}
++			allEvts.push(event);
+ 		});
+ 	});
+ 	if (count < 1)
+@@ -430,7 +448,11 @@ ZKSession.prototype.resumeWatches = function () {
+ 	this.zs_conn.setWatches(events, zxid, function (err) {
+ 		if (err) {
+ 			self.emit('pingTimeout');
++			return;
+ 		}
++		allEvts.forEach(function (event) {
++			event.resume();
++		});
+ 	});
+ };
+ 
+@@ -438,122 +460,249 @@ ZKSession.prototype.watcher = function (path) {
+ 	var w = this.zs_watchers[path];
+ 	if (w)
+ 		return (w);
+-	w = new ZKWatcher(this, path);
++	w = new ZKWatcher(this, path, this.zs_log);
+ 	this.zs_watchers[path] = w;
+ 	return (w);
+ };
+ 
+-function ZKWatcher(session, path) {
+-	this.zkw_path = path;
+-	this.zkw_session = session;
+-	mod_events.EventEmitter.call(this);
++/*
++ * This FSM represents the state of an individual watch we're trying to
++ * maintain with the ZK server.
++ *
++ * It lives as long as the session does.
++ */
++function ZKWatchEvent(session, path, emitter, evt, log) {
++	this.zkwe_path = path;
++	this.zkwe_session = session;
++	this.zkwe_emitter = emitter;
++	this.zkwe_evt = evt;
++	this.zkwe_lastpkt = null;
++	this.zkwe_log = log.child({ event: evt });
++	mod_fsm.FSM.call(this, 'disarmed');
+ }
+-mod_util.inherits(ZKWatcher, mod_events.EventEmitter);
++mod_util.inherits(ZKWatchEvent, mod_fsm.FSM);
+ 
+-ZKWatcher.prototype.eventsActive = function () {
+-	var self = this;
+-	var evts = ['created', 'deleted', 'dataChanged', 'childrenChanged'];
+-	evts = evts.filter(function (evt) {
+-		return (self.listeners(evt).length > 0);
+-	});
+-	return (evts);
++ZKWatchEvent.prototype.getEvent = function () {
++	return (this.zkwe_evt);
+ };
+ 
+-ZKWatcher.prototype.once = function () {
+-	throw (new Error('ZKWatcher does not support once() (use on)'));
++/* Called by the watch emitter below when someone does .on('event', ...); */
++ZKWatchEvent.prototype.arm = function () {
++	this.emit('armAsserted');
+ };
+ 
+-ZKWatcher.prototype.on = function (evt, cb) {
+-	mod_assert.string(evt, 'event');
+-	mod_assert.func(cb, 'callback');
+-	var first = (this.listeners(evt).length < 1);
+-	mod_events.EventEmitter.prototype.on.call(this, evt, cb);
+-	if (evt !== 'error' && first)
+-		this.emit(evt);
+-	return (this);
++/*
++ * Called by the watch emitter when a notification is given to it by the
++ * ZKSession which matches this event.
++ */
++ZKWatchEvent.prototype.notify = function () {
++	this.emit('notifyAsserted');
+ };
+ 
+-ZKWatcher.prototype.emit = function (evt) {
+-	var self = this;
+-	if (this.listeners(evt).length < 1)
+-		return;
+-	if (!this.zkw_session.isInState('attached')) {
+-		function onStateChanged(st) {
+-			if (st === 'connected') {
+-				self.emit(evt);
+-				self.zkw_session.removeListener('stateChanged',
+-				    onStateChanged);
+-			}
+-		}
+-		this.zkw_session.zs_log.trace({
+-			event: evt,
+-			clientState: this.zkw_session.getState()
+-		}, 'deferring watcher refresh until after reconnect');
+-		this.zkw_session.on('stateChanged', onStateChanged);
++/*
++ * This is called by the ZKSession above to let us know that the session has
++ * become detached and we are on the list to be auto-resumed (with catch-up)
++ * after reconnection.
++ */
++ZKWatchEvent.prototype.disconnected = function () {
++	this.emit('disconnectAsserted');
++};
++/* And then the ZKSession lets us know when auto-resume is complete. */
++ZKWatchEvent.prototype.resume = function () {
++	this.emit('resumeAsserted');
++};
++
++/*
++ * We start here: the watch has not been established with the ZK server, and
++ * we're not yet ready to start trying.
++ */
++ZKWatchEvent.prototype.state_disarmed = function (S) {
++	S.on(this, 'armAsserted', function () {
++		S.gotoState('wait_session');
++	});
++};
++
++/*
++ * We can't "arm" the watcher (send the command to the ZK server with the
++ * watch flag set) until we know the session and connection are up and ready.
++ *
++ * So we go through wait_session and wait_connected first before arming.
++ */
++ZKWatchEvent.prototype.state_wait_session = function (S) {
++	if (this.zkwe_session.isInState('attached')) {
++		S.gotoState('wait_connected');
+ 		return;
+ 	}
+-	var conn = this.zkw_session.getConnection();
++	S.on(this.zkwe_session, 'stateChanged', function (state) {
++		if (state === 'attached') {
++			S.gotoState('wait_connected');
++		}
++	});
++	this.zkwe_session.zs_log.trace({
++		event: this.zkwe_evt,
++		clientState: this.zkwe_session.getState()
++	}, 'deferring watcher arm until after reconnect');
++};
++
++ZKWatchEvent.prototype.state_wait_connected = function (S) {
++	var conn = this.zkwe_session.getConnection();
+ 	if (!conn.isInState('connected')) {
+-		setImmediate(function () {
+-			self.emit(evt);
++		S.immediate(function () {
++			S.gotoState('wait_session');
+ 		});
+ 		return;
+ 	}
+-	var qpkt = this._reqPacket(evt);
++	S.gotoState('arming');
++};
++
++/*
++ * In this state we send the actual command with the watch flag set, then
++ * double-check that the zxid we're looking at has actually changed, emit
++ * events on the emitter, and transition to "armed".
++ *
++ * We also handle some errors that can occur (not all of which mean we failed
++ * to arm the watcher, for various ZK protocol reasons described below).
++ */
++ZKWatchEvent.prototype.state_arming = function (S) {
++	var conn = this.zkwe_session.getConnection();
++	var qpkt = this.toPacket();
+ 	var req = conn.request(qpkt);
+-	req.on('reply', function (pkt) {
++	var evt = this.zkwe_evt;
++	var self = this;
++	/*
++	 * In ZK to "arm" a watcher on a node and receive a notification when
++	 * it changes, you have to do an initial request for the same data you
++	 * want to watch.
++	 *
++	 * Once you get a valid reply to it (or certain kinds of errors), you
++	 * can consider the watcher "armed".
++	 */
++	S.on(req, 'reply', function (pkt) {
+ 		var args = [evt];
++		var zxid, prevZxid;
+ 		switch (evt) {
+ 		case 'created':
++			zxid = pkt.stat.czxid;
++			if (self.zkwe_lastpkt)
++				prevZxid = self.zkwe_lastpkt.stat.czxid;
+ 			args.push(pkt.stat);
+ 			break;
+ 		case 'deleted':
++			S.gotoState('armed');
+ 			return;
+ 		case 'dataChanged':
++			zxid = pkt.stat.mzxid;
++			if (self.zkwe_lastpkt)
++				prevZxid = self.zkwe_lastpkt.stat.mzxid;
+ 			args.push(pkt.data, pkt.stat);
+ 			break;
+ 		case 'childrenChanged':
++			zxid = pkt.stat.pzxid;
++			if (self.zkwe_lastpkt)
++				prevZxid = self.zkwe_lastpkt.stat.pzxid;
+ 			args.push(pkt.children, pkt.stat);
+ 			break;
+ 		default:
+ 			throw (new Error('Unknown watcher event ' + evt));
+ 		}
+-		mod_events.EventEmitter.prototype.emit.apply(self, args);
++		self.zkwe_log.trace({ zxid: zxid.toString('hex'),
++		    prevZxid: prevZxid ? prevZxid.toString('hex') : null },
++		    'got reply to arm request');
++		if (prevZxid && zxid.equals(prevZxid)) {
++			S.gotoState('armed');
++			return;
++		}
++		mod_events.EventEmitter.prototype.emit.apply(self.zkwe_emitter,
++		    args);
++		self.zkwe_lastpkt = pkt;
++		S.gotoState('armed');
+ 	});
+-	req.on('error', function (err) {
++	S.on(req, 'error', function (err) {
++		/* We lost our connection, so try again. */
+ 		if (err.code === 'PING_TIMEOUT') {
+-			self.emit(evt);
++			S.gotoState('wait_session');
+ 			return;
+ 		}
++		/*
++		 * Creation/destruction watchers are armed even if we get a
++		 * NO_NODE error.
++		 */
+ 		if (evt === 'created' && err.code === 'NO_NODE') {
++			S.gotoState('armed');
+ 			return;
+ 		}
++		/*
++		 * This is a bit backwards -- there is no actual deletion
++		 * watcher, just an existence watcher on a node that currently
++		 * exists firing when it's destroyed.
++		 *
++		 * So, if we try to start an existence watcher on a node that
++		 * doesn't exist we get NO_NODE, which actually means our
++		 * 'deleted' watcher should fire right away.
++		 *
++		 * We consider deleted watchers disarmed once they've fired.
++		 */
+ 		if (evt === 'deleted' && err.code === 'NO_NODE') {
+-			mod_events.EventEmitter.prototype.emit.call(self, evt);
++			mod_events.EventEmitter.prototype.emit.call(
++			    self.zkwe_emitter, evt);
++			S.gotoState('disarmed');
+ 			return;
+ 		}
++		/*
++		 * Other types of watchers won't attach to a node that
++		 * doesn't exist yet -- we'll have to try arming this watcher
++		 * again once the node exists.
++		 */
+ 		if (err.code === 'NO_NODE') {
+-			function onCreated() {
+-				self.removeListener('created', onCreated);
+-				self.emit(evt);
+-			}
+-			self.on('created', onCreated);
++			S.gotoState('wait_node');
+ 			return;
+ 		}
+-		setImmediate(function () {
+-			self.emit(evt);
+-		});
+-		self.zkw_session.zs_log.trace(err, 'watcher attach failure; ' +
++		self.zkwe_log.trace(err, 'watcher attach failure; ' +
+ 		    'will retry');
++		S.gotoState('wait_session');
+ 	});
+ };
+ 
+-ZKWatcher.prototype._reqPacket = function (evt) {
++ZKWatchEvent.prototype.state_wait_node = function (S) {
++	S.on(this.zkwe_emitter, 'created', function () {
++		S.gotoState('wait_session');
++	});
++};
++
++/*
++ * In the armed state, we have established our watcher with the ZK server and
++ * are waiting either for a notification to come in (in which case we re-fetch
++ * the node information and then emit the event), or a disconnect/detach.
++ */
++ZKWatchEvent.prototype.state_armed = function (S) {
++	S.on(this, 'notifyAsserted', function () {
++		S.gotoState('wait_session');
++	});
++	S.on(this, 'disconnectAsserted', function () {
++		S.gotoState('resuming');
++	});
++};
++
++/*
++ * ZKSession told us it detached due to disconnection and we are going to be
++ * auto-resumed. Sit tight until it tells us what to do next (or we get a
++ * catch-up notification).
++ */
++ZKWatchEvent.prototype.state_resuming = function (S) {
++	S.on(this, 'resumeAsserted', function () {
++		S.gotoState('armed');
++	});
++	S.on(this, 'notifyAsserted', function () {
++		S.gotoState('wait_session');
++	});
++};
++
++ZKWatchEvent.prototype.toPacket = function () {
+ 	var pkt = {
+-		path: this.zkw_path,
++		path: this.zkwe_path,
+ 		watch: true
+ 	};
+-	switch (evt) {
++	switch (this.zkwe_evt) {
+ 	case 'created':
+ 	case 'deleted':
+ 		pkt.opcode = 'EXISTS';
+@@ -565,7 +714,75 @@ ZKWatcher.prototype._reqPacket = function (evt) {
+ 		pkt.opcode = 'GET_CHILDREN2';
+ 		break;
+ 	default:
+-		throw (new Error('Unknown watcher event ' + evt));
++		throw (new Error('Unknown watcher event ' + this.zkwe_evt));
+ 	}
+ 	return (pkt);
+ };
++
++function ZKWatcher(session, path, log) {
++	this.zkw_path = path;
++	this.zkw_session = session;
++	this.zkw_events = {};
++	this.zkw_log = log.child({
++	    component: 'ZKWatcher',
++	    path: path
++	});
++	mod_events.EventEmitter.call(this);
++}
++mod_util.inherits(ZKWatcher, mod_events.EventEmitter);
++
++ZKWatcher.prototype.eventsActive = function () {
++	var self = this;
++	var evts = ['created', 'deleted', 'dataChanged', 'childrenChanged'];
++	evts = evts.filter(function (evt) {
++		return (self.listeners(evt).length > 0);
++	});
++	return (evts);
++};
++
++ZKWatcher.prototype.events = function () {
++	var self = this;
++	return (this.eventsActive().map(function (evt) {
++		return (self.zkw_events[evt]);
++	}));
++};
++
++ZKWatcher.prototype.armEvent = function (evt) {
++	if (this.zkw_events[evt] === undefined) {
++		this.zkw_events[evt] = new ZKWatchEvent(this.zkw_session,
++		    this.zkw_path, this, evt, this.zkw_log);
++	}
++	if (this.zkw_events[evt].isInState('disarmed'))
++		this.zkw_events[evt].arm();
++};
++
++ZKWatcher.prototype.once = function () {
++	throw (new Error('ZKWatcher does not support once() (use on)'));
++};
++
++ZKWatcher.prototype.notify = function (evt) {
++	var event = this.zkw_events[evt];
++	if (!event) {
++		this.zkw_log.debug('got notify for event %s but no event FSM?',
++		    evt);
++		return;
++	}
++	/*
++	 * We can get notifications before the notification resumption is
++	 * complete (these are "catch-up" notifications that happened while
++	 * we were disconnected).
++	 */
++	mod_assert.ok(event.isInState('armed') || event.isInState('resuming'),
++	    'event in bad state: ' + event.getState());
++	event.notify();
++};
++
++ZKWatcher.prototype.on = function (evt, cb) {
++	mod_assert.string(evt, 'event');
++	mod_assert.func(cb, 'callback');
++	var first = (this.listeners(evt).length < 1);
++	mod_events.EventEmitter.prototype.on.call(this, evt, cb);
++	if (evt !== 'error' && first)
++		this.armEvent(evt);
++	return (this);
++};
+diff --git a/test/basic.test.js b/test/basic.test.js
+index f74f2af..e37d3c5 100644
+--- a/test/basic.test.js
++++ b/test/basic.test.js
+@@ -919,6 +919,117 @@ mod_tape.test('session resumption with watcher', function (t) {
+ 	}
+ });
+ 
++mod_tape.test('session resumption new watcher race (#39)', function (t) {
++	var closed = 0;
++	var counts = {};
++
++	function incrCount(k) {
++		if (counts[k] === undefined)
++			counts[k] = 0;
++		++counts[k];
++	}
++
++	var zkc1 = new mod_zkc.Client({
++		log: log,
++		address: '127.0.0.1',
++		port: 2181
++	});
++
++	var zkc2 = new mod_zkc.Client({
++		log: log,
++		address: '127.0.0.1',
++		port: 2181
++	});
++
++	var ev1 = [];
++	zkc1.on('connect', ev1.push.bind(ev1, 'connect'));
++	zkc1.on('session', ev1.push.bind(ev1, 'session'));
++	zkc1.on('expire', ev1.push.bind(ev1, 'expire'));
++	zkc1.on('disconnect', ev1.push.bind(ev1, 'disconnect'));
++
++	zkc1.on('close', function () {
++		t.deepEqual(ev1,
++		    ['session', 'connect', 'disconnect', 'connect']);
++		if (++closed >= 2)
++			t.end();
++	});
++
++	zkc2.on('close', function () {
++		if (++closed >= 2)
++			t.end();
++	});
++
++	mod_vasync.waterfall([
++		function (cb) {
++			mod_vasync.parallel({
++				funcs: [
++					function (ccb) {
++						zkc1.once('connect', ccb);
++					},
++					function (ccb) {
++						zkc2.once('connect', ccb);
++					}
++				]
++			}, cb);
++		},
++		function (_, cb) {
++			zkc1.once('connect', cb);
++
++			zkc1.watcher('/race1').on('created',
++			    incrCount.bind(this, 'race1'));
++
++			var sock = zkc1.getSession().getConnection().zcf_socket;
++			t.ok(sock.listeners('error').length > 0);
++			sock.emit('error', new Error('I killed it'));
++			sock.destroy();
++
++			zkc1.watcher('/race2').on('created',
++			    incrCount.bind(this, 'race2'));
++
++			setImmediate(function () {
++				zkc1.watcher('/race3').on('created',
++				    incrCount.bind(this, 'race3'));
++			});
++		},
++		function (cb) {
++			var d = new Buffer('hi there', 'ascii');
++			mod_vasync.parallel({
++				funcs: [
++					function (ccb) {
++						zkc2.create('/race1', d,
++						    {}, ccb);
++					},
++					function (ccb) {
++						zkc2.create('/race2', d,
++						    {}, ccb);
++					},
++					function (ccb) {
++						zkc2.create('/race3', d,
++						    {}, ccb);
++					}
++				]
++			}, cb);
++		},
++		function (_, cb) {
++			wait(t, 'watchers have fired', 30000,
++			    function () {
++				return (counts.race1 == 1 &&
++				    counts.race2 == 1 &&
++				    counts.race3 == 1);
++			}, cb);
++		},
++		function (cb) {
++			t.equal(zkc1.getSession().
++			    listeners('stateChanged').length, 1);
++			zkc1.close();
++			zkc2.close();
++			cb();
++		}
++	], function (err) {
++		t.error(err);
++	});
++});
++
+ mod_tape.test('session resumption with watcher (ping timeout)', function (t) {
+ 	var connected = 0;
+ 	var closed = 0;

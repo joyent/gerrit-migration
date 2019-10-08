@@ -1,0 +1,647 @@
+commit 3732a55c23618cb44f06b91f0e356d68dc6e7d26 (refs/changes/67/3567/6)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2018-03-12T20:47:26+00:00 (1 year, 7 months ago)
+    
+    MANTA-3591 muskie throttle doesn't enforce concurrency properly
+
+diff --git a/README.md b/README.md
+index ee49b66..12631fd 100644
+--- a/README.md
++++ b/README.md
+@@ -251,28 +251,27 @@ Muskie has two dtrace providers. The first, `muskie`, has the following probes:
+   `bytes_sent` and `bytes_expected`. These parameters are only present if muskie
+   is able to determine the last request sent on this socket.
+ 
+-The second provider, `muskie-throttle`, has the following probes, which will not
+-fire if the throttle is disabled:
+-* `request_throttled`: `int`, `int`, `char *`, `char *` - slots occupied, queued
+-  requests, url, method. Fires when a request has been throttled.
+-* `request_handled`: `int`, `int`, `char *`, `char *` - slots occupied, queued
+-  requests, url, method. Fires after a request has been handled.
+-Internally, the muskie throttle is implemented with a vasync-queue. A "slot"
+-in the above description refers to one of `concurrency` possible spaces
+-allotted for concurrently scheduled request-handling callbacks. If all slots are
+-occupied, incoming requests will be "queued", which indicates that they are
+-waiting for slots to free up.
+-* `queue_enter`: `char *` - restify request uuid. This probe fires as a request
+-enters the queue.
+-* `queue_leave`: `char *` - restify request uuid. This probe fires as a request
+-is dequeued, before it is handled. The purpose of these probes is to make it
+-easy to write d scripts that measure the latency impact the throttle has on
+-individual requests.
+-
+-The script `bin/throttlestat.d` is implemented as an analog to `moraystat.d`
+-with the `queue_enter` and `queue_leave` probes. It is a good starting point for
+-gaining insight into both how actively a muskie process is being throttled and
+-how much stress it is under.
++The second provider, `muskie-throttle`, has the following probes:
++* `request_throttled: char *` - fires when a request is throttled
++* `request_handled: char *` - fires when muskie finishes processing the request
++* `request_reaped: char *` - fires if the muskie throttle finds a queue slot
++  occupied by a request that muskie has already sent a response for
++* `queue_enter: char *` - fires when a request work function enters the queue
++* `queue_leave: char *` - fires when a request work function is dispatched by
++  the queue.
++* `throttle_stats: int, int` - fires every time muskie invokes throttle
++  code in a request path which modifies the state of its request queue. This
++  probe reports the number of queued and in-flight requests respectively.
++These probes are not registered and will not fire if the muskie throttle is
++disabled. Each probe fires with the restify id of the request in question as
++its first and only argument.
++
++The script `bin/throttlestat.d N` reports statistics related to request
++throttling in a webapi zone. The parameter `N` is the number of seconds to wait
++between consecutive reports. Reports consist of the per-process average queue
++depth, average number of in-flight requests, average millisecond queueing delay,
++in addition to per-process counts of the number of requests throttled, handled,
++and reaped in the last `N` seconds.
+ 
+ The throttle probes are provided in a separate provider to prevent coupling the
+ throttle implementation with muskie itself. Future work may involve making the
+diff --git a/bin/throttlestat.d b/bin/throttlestat.d
+index 2e4e7c0..416ec3c 100755
+--- a/bin/throttlestat.d
++++ b/bin/throttlestat.d
+@@ -9,52 +9,70 @@
+  * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
++/*
++ * Reports average latency and throttle statistics for all muskie
++ * processes in the zone.
++ */
++
++
+ #pragma D option quiet
+ 
+ int latencies[char *];
+ 
++BEGIN
++{
++    lines = 0;
++}
++
++muskie-throttle*:::throttle_stats
++{
++    @queued[pid] = avg(arg0);
++    @inflight[pid] = avg(arg1);
++}
++
+ muskie-throttle*:::queue_enter
+ {
+-	latencies[copyinstr(arg0)] = timestamp;
++    latencies[copyinstr(arg0)] = timestamp;
+ }
+ 
+ muskie-throttle*:::queue_leave
+ /latencies[copyinstr(arg0)]/
+ {
+-	latencies[copyinstr(arg0)] = timestamp - latencies[copyinstr(arg0)];
+-	@avg_latency[pid] = avg(latencies[copyinstr(arg0)] / 1000000);
+-	latencies[copyinstr(arg0)] = 0;
++    latencies[copyinstr(arg0)] = timestamp - latencies[copyinstr(arg0)];
++    @latency[pid] = avg(latencies[copyinstr(arg0)] / 1000000);
++    latencies[copyinstr(arg0)] = 0;
+ }
+ 
+ muskie-throttle*:::request_throttled
+ {
+-	@throttled[pid] = count();
++    @throttled[pid] = count();
+ }
+ 
+ muskie-throttle*:::request_handled
+ {
+-	@qlen[pid] = max(arg1);
+-	@qrunning[pid] = max(arg0);
++    @handled[pid] = count();
++}
++
++muskie-throttle*:::request_reaped
++{
++    @reaped[pid] = count();
+ }
+ 
+ profile:::tick-1sec
+ /lines < 1/
+ {
+-	printf("THROTTLED-PER-SEC | AVG-LATENCY-MS | MAX-QLEN | MAX-RUNNING\n");
+-	printf("------------------+----------------+----------+------------\n");
+-	lines = 5;
++    lines = 5;
++    printf("PID      QDEPTH    INFLIGHT    QDELAY    HANDLED    THROTTLED    REAPED\n");
+ }
+ 
+-
+ profile:::tick-1sec
+-/lines > 0/
+ {
+-	lines -= 1;
+-	printa("%@4u              %@4u            %@4u       %@4u\n", @throttled,
+-            @avg_latency, @qlen, @qrunning);
++    lines -= 1;
++    printa("%-8d %@4u      %@4u        %@4u       %@4u      %@4u        %@4u\n", @queued, @inflight,
++            @latency, @handled, @throttled, @reaped);
+ 
+-	clear(@throttled);
+-	clear(@avg_latency);
+-	clear(@qlen);
+-	clear(@qrunning);
++    /* Clear per-time-interval stats */
++    clear(@throttled);
++    clear(@handled);
++    clear(@reaped);
+ }
+diff --git a/etc/config.coal.json b/etc/config.coal.json
+index 9b075c4..d4589c5 100644
+--- a/etc/config.coal.json
++++ b/etc/config.coal.json
+@@ -9,8 +9,9 @@
+     },
+     "throttle": {
+         "enabled": false,
+-        "concurrency": 50,
+-        "queueTolerance": 25
++        "concurrency": 128,
++        "queueTolerance": 32,
++        "reapInterval": 5000
+     },
+     "maxObjectCopies": 6,
+     "maxRequestAge": 600,
+diff --git a/lib/server.js b/lib/server.js
+index df6a1d1..b81962d 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -212,6 +212,16 @@ function createServer(options, clients, name) {
+     server.use(auth.checkIfPresigned);
+     server.use(common.enforceSSLHandler(options));
+ 
++    if (options.throttle.enabled) {
++        options.throttle.log = options.log;
++        options.throttle.server = server;
++
++        server.throttle = throttle.createThrottle(options.throttle);
++        server.use(server.throttle.throttlePreHandler());
++        log.info('registered throttle \'pre\' handler');
++    }
++
++
+     server.use(function ensureDependencies(req, res, next) {
+         var ok = true;
+         var errors = [];
+@@ -246,11 +256,6 @@ function createServer(options, clients, name) {
+         }
+     });
+ 
+-    if (options.throttle.enabled) {
+-        options.throttle.log = options.log;
+-        var throttleHandle = throttle.createThrottle(options.throttle);
+-        server.use(throttle.throttleHandler(throttleHandle));
+-    }
+     server.use(auth.authenticationHandler({
+         log: log,
+         mahi: clients.mahi,
+@@ -484,6 +489,13 @@ function createServer(options, clients, name) {
+         }
+     });
+ 
++    if (options.throttle.enabled) {
++        server.on('uncaughtException', server.throttle.throttleAfterHandler());
++        server.on('after', server.throttle.throttleAfterHandler());
++        log.info('registered throttle \'after\' and \'uncaughtException\' ' +
++            'handlers');
++    }
++
+     return (server);
+ }
+ 
+diff --git a/lib/throttle.js b/lib/throttle.js
+index 82cd5b4..946396f 100644
+--- a/lib/throttle.js
++++ b/lib/throttle.js
+@@ -11,7 +11,8 @@
+ var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var vasync = require('vasync');
+-var uuid = require('node-uuid');
++var libuuid = require('libuuid');
++var once = require('once');
+ var util = require('util');
+ var mod_url = require('url');
+ var fs = require('fs');
+@@ -23,84 +24,59 @@ var VError = require('verror');
+ require('./errors');
+ 
+ /*
+- * High Level Operation
++ * Request Throttling
+  *
+- * This module exports a 'wait' method, which serves as the entry point
+- * to all throttling operations the module provides. Users of the module
+- * simply call the 'wait' function in a request-processing code path,
+- * passing in a callback representing the work required to handle the
+- * request. Currently, 'req' and 'res' arguments are also supplied
+- * because the throttle is plugged in as restify middleware in muskie.
+- * Future iterations of this throttle will aim to be generic across all
+- * communication protocols, requiring only an argumentless work function
+- * as input.
++ * This module implements a coarse request throttle with a vasync worker
++ * queue. Requests enter the queue in throttlePreHandler, and are removed
++ * throttleAfterHandler. Between the time that a request is pushed into
++ * the queue and the time that its vasync callback is invoked, it will
++ * go through two stages.
+  *
+- * The operation of wait() can be summarized as follows:
+- *  - If the number of queued requests exceeds 'queueTolerance' and
+- *    the throttle is enabled, throttle the incoming request and
+- *    return.
+- *  - If the throttle is enabled, put the incoming request-processing
+- *    function on the request queue. This will result in either the
+- *    request callback being scheduled immediately or, if all slots
+- *    are occupied, being put on the request queue.
+- *  - If the throttle is disabled, simply call the request-processing
+- *    work function.
++ * (1) A recently pushed request will be queued for dispatch. This means
++ *     the remainder of its restify handler chain is paused.
++ * (2) If the requestQueue has an open slot, the request will be dispatched,
++ *     resuming the remainder of its restify handler chain.
+  *
+- * Overview of Tunables and Tradeoffs
++ * The vasync work queue itself accepts a 'concurrency' parameter. This
++ * determines the number of requests that can be in stage (2). The throttle
++ * has an additional parameter: 'queueTolerance'. This determines the
++ * number of requests which are allowed to be in stage (1). While 'concurrency'
++ * is enforced by the vasync work queue logic, the 'queueTolerance' is enforced
++ * by the logic in this module.
+  *
+- * The following parameters are implemented as SAPI tunables. Muskie
+- * restart is required for any tunable modification to take effect.
++ * Requests enter stage (1) because the throttlePreHandler is installed as
++ * a 'use' handler via the restify server API for each incoming request.
++ * Request enter stage (2) once the vasync queue finds a slot. Requests leave
++ * stage (2) in one of two ways:
+  *
+- * queueTolerance - the number of requests the throttle can queue before
+- * it starts sending indications that requests have been throttled to
+- * clients. There is one 'global' queue to which incoming request are
+- * added if all 'concurrency' slots in a vasync queue are occupied.
++ * (1) The server emits either an 'after' or 'uncaughtException' event for
++ *     the request. Since the throttleAfterHandler is installed as a listener
++ *     for both of these events, the corresponding requests queue slot will
++ *     be cleared once its vasync callback is invoked.
+  *
+- * Higher 'queueTolerance' values make it less likely that the throttle
+- * will reject incoming requests and will increase muskies memory footprint
+- * during period of high load. Lower 'queueTolerance' values make it more
+- * likely that muskie will reject incoming requests.
++ * (2) Muskie sends a response with res.send API without invoking the restify
++ *     `next` function in the last handler of the route and the request lies
++ *     dormant in the queue for a configurable time interval. At this point
++ *     the `_reapStaleRequests` function will find that a response has been
++ *     sent out for the request and invoked its vasync callback. The
++ *     'reapInterval' configuration parameter controls how frequently muskie
++ *     checks for stale entries in the request queue.
+  *
+- * concurrency - the number of slots the request queue has for scheduling
+- * request-handling worker callbacks concurrently. When all the slots are
+- * filled, the throttle will queue up to 'queueTolerance' callbacks before
+- * throttling requests.
++ * Under load, a muskie throttle with high concurrency and low queueTolerance
++ * will allow muskie to process more requests at once while maintaining a lower
++ * memory footprint. Such a configuration should be used when CPU resources
++ * are not limited.
+  *
+- * Higher 'concurrency' values allow Manta to handle more requests
+- * concurrently and also makes it less likely that requests will spend time in
+- * the queue and/or be throttled. Lower 'concurrency' values restrict
+- * the number of requests manta can handle at once and make it more likely
+- * that requests will spend time in the queue and/or be throttled.
++ * Under load, a muskie throttle with low concurrency and high queue tolerance
++ * will limit the number of concurrency requests and potentially lead to longer
++ * queuing delays. Such a configuration can result in a lower muskie CPU
++ * utilization at the cost of request latency.
+  *
+- * To prevent dropping incoming traffic needlessly, it is recommended that
+- * lower 'concurrency' values be accompanied by proportionally higher
+- * 'queueTolerance' values. Higher 'concurrency' values will result in
+- * more requests be handled concurrently, and thus fewer requests being
+- * queued (assuming the same load as in the previous scenario). This is
+- * effectively a CPU/memory trade-off.
+- *
+- * enabled - a boolean value describing whether the throttle should queue
+- * and throttle requests as designed.
+- *
+- * If enabled is false, the throttle will invoke the request-processing
+- * callback immediately. The operation of muskie with 'enabled' set to
+- * false is identical to the operation of muskie prior to the change
+- * introducing this throttle.
+- *
+- * If enabled is true, the throttle will queue and throttle requests as
+- * necessary.
++ * Throttling is disabled by default.
+  */
+ 
+-// Used for nanosecond to second conversion
+-const NANOSEC_PER_SEC = Math.pow(10, 9);
++var DEFAULT_REAP_INTERVAL_MS = 5000;
+ 
+-/*
+- * The throttle object maintains all the state used by the throttle. This state
+- * consists of the tunables described above in addition to dtrace probes that
+- * help to describe the runtime operation of the throttle. Structuring the
+- * throttle as an object allows us to potentially instantiate multiple
+- * throttles for different communication abstractions in the same service.
+- */
+ function Throttle(options) {
+     assert.number(options.concurrency, 'options.concurrency');
+     assert.ok(options.concurrency > 0, 'concurrency must be positive');
+@@ -108,23 +84,29 @@ function Throttle(options) {
+     assert.ok(options.log, 'options.log');
+     assert.number(options.queueTolerance, 'options.queueTolerance');
+     assert.ok(options.queueTolerance > 0, 'queueTolerance must be positive');
++    assert.ok(options.server, 'restify server');
+ 
+-    this.log = options.log.child({ component: 'throttle'}, true);
++    this.log = options.log.child({
++        component: 'Throttle'
++    });
++
++    this.server = options.server;
++    this.requestMap = {};
+ 
+     this.dtp = dtrace.createDTraceProvider('muskie-throttle');
+     this.throttle_probes = {
+-        // number of occupied slots, number of queued requests,
+-        // request rate, url, method
+-        request_throttled: this.dtp.addProbe('request_throttled', 'int', 'int',
+-                'char *', 'char *'),
+-        // number of occupied slots, number of queued requests
+-        request_handled: this.dtp.addProbe('request_handled', 'int', 'int',
+-                'char *', 'char *'),
++        // request id
++        request_throttled: this.dtp.addProbe('request_throttled', 'char *'),
++        // request id
++        request_handled: this.dtp.addProbe('request_handled', 'char *'),
++        // request id
++        request_reaped: this.dtp.addProbe('request_reaped', 'char *'),
+         // request id
+         queue_enter: this.dtp.addProbe('queue_enter', 'char *'),
+         // request id
+-        queue_leave: this.dtp.addProbe('queue_leave', 'char *')
+-
++        queue_leave: this.dtp.addProbe('queue_leave', 'char *'),
++        // num queued, num in-flight
++        throttle_stats: this.dtp.addProbe('throttle_stats', 'int', 'int')
+     };
+     this.dtp.enable();
+ 
+@@ -132,58 +114,197 @@ function Throttle(options) {
+     this.concurrency = options.concurrency;
+     this.queueTolerance = options.queueTolerance;
+ 
++    /*
++     * 'task' is a request handling function, the callback is a
++     * hook back into the vasync code that will be called once
++     * the request has been processed.
++     */
+     this.requestQueue = vasync.queue(function (task, callback) {
+         task(callback);
+     }, this.concurrency);
++
++    this.reapInterval = options.reapInterval || DEFAULT_REAP_INTERVAL_MS;
++    this._reapStaleRequests();
+ }
+ 
+-Throttle.prototype.wait = function wait(req, res, next) {
++/*
++ * It is not known whether all muskie routes correctly invoke next()
++ * in their last handlers. This implies that we may not be able to
++ * rely on the 'after' or 'uncaughtException' events for all incoming
++ * requests. To cope with this, we periodically check the requestMap
++ * for requests for which we've sent responses, and clear the requestQueue
++ * slot for such requests.
++ */
++Throttle.prototype._reapStaleRequests = function reap() {
++
++    function hrtimeToMS(hrtime) {
++        return (hrtime[0]*1e3) + (hrtime[0]/1e6);
++    }
++
+     var self = this;
+ 
+-    if (self.requestQueue.length() >= self.queueTolerance) {
+-        self.throttle_probes.request_throttled.fire(function () {
+-            return ([self.requestQueue.npending, self.requestQueue.length(),
+-                req.url, req.method]);
++    self.log.debug({
++        numreqs: Object.keys(self.requestMap).length
++    }, 'checking for stale requests');
++
++    Object.keys(self.requestMap).forEach(function (key) {
++        var value = self.requestMap[key];
++
++        var req = value.req;
++        var res = value.res;
++        var cb = value.cb;
++
++        if (res.finished) {
++            self.log.debug({
++                reqid: req.getId()
++            }, 'reaping stale request slot');
++
++            self.throttle_probes.request_reaped.fire(function () {
++                return ([req.getId()]);
++            });
++
++            delete (self.requestMap[key]);
++
++            cb();
++        }
++    });
++
++    setTimeout(self._reapStaleRequests.bind(self), self.reapInterval);
++};
++
++
++/*
++ * Returns a restify handler function which pauses incoming request
++ * routes or throttles them if there are 'concurrency' requests already
++ * dispatched and 'queueTolerance' requests already waiting for those
++ * slots.
++ */
++Throttle.prototype.throttlePreHandler = function preHandler() {
++    var self = this;
++
++    function wait(req, res, next) {
++        self.log.debug({
++            reqid: req.getId()
++        }, 'throttlePreHandler: enter');
++
++        req._throttleId = libuuid.create();
++
++        if (self.requestQueue.length() >= self.queueTolerance) {
++            self.throttle_probes.request_throttled.fire(function () {
++                return ([req.getId()]);
++            });
++
++            next(new VError(new ThrottledError(), 'request %s throttled ' +
++                '(queued = %d, in-flight = %d)', req.getId(),
++                self.requestQueue.length(), self.requestQueue.npending));
++            return;
++        }
++
++        assert.ok(Object.keys(self.requestMap).length <= self.concurrency,
++                'fewer than concurrency callbacks');
++
++        self.throttle_probes.queue_enter.fire(function () {
++            return ([req.getId()]);
++        });
++
++        function startRoute(cb) {
++            assert.ok(!self.requestMap[req._throttleId],
++                'attempting to register throttle handler twice');
++
++            /*
++             * The callback 'cb' is wrapped in a 'once' because once a request
++             * enters the map, there are two ways it can leave:
++             *  (1) _reapStaleRequests
++             *  (2) server callback for either the 'after' or
++             *  'uncaughtException' event
++             */
++            self.requestMap[req._throttleId] = {
++                req: req,
++                res: res,
++                cb: once(cb)
++            };
++
++            self.log.debug({
++                reqid: req.getId(),
++                numreqs: Object.keys(self.requestMap).length
++            }, 'throttle request map insert');
++
++            self.throttle_probes.queue_leave.fire(function () {
++                return ([req.getId()]);
++            });
++            next();
++        }
++
++        self.requestQueue.push(startRoute);
++
++        self.throttle_probes.throttle_stats.fire(function () {
++            return ([self.requestQueue.length(), self.requestQueue.npending]);
+         });
+-        /*
+-         * Wrap the ThrottledError in a VError so that the relevant fields
+-         * appear in the audit entry of the throttled request. We translate the
+-         * error to its cause before sending the response, as we don't want to
+-         * expose the queue length or the queue tolerance of the throttle to end
+-         * users.
+-         */
+-        var state = {
+-            queuedRequests: self.requestQueue.npending,
+-            inFlightRequests: self.requestQueue.length()
+-        };
+-        var cfg = {
+-            queueTolerance: self.queueTolerance,
+-            concurrency: self.concurrency
+-        };
+-        next(new VError(new ThrottledError(), 'muskie throttled this ' +
+-                    'request. observed: %j, configured with: %j', state,
+-                    cfg));
+-        return;
++
++        self.log.debug({
++            reqid: req.getId()
++        }, 'throttlePreHandler: done');
+     }
+ 
+-    var req_id = req.getId();
++    return (wait);
++};
+ 
+-    self.throttle_probes.queue_enter.fire(function () {
+-        return ([req_id]);
+-    });
++/*
++ * Returns a function to be called when either the 'after' or
++ * 'uncaughException' event is emitted by the restify server. This
++ * function is responsible for cleaning up all metadata the throttle
++ * stores for a given request.
++ */
++Throttle.prototype.throttleAfterHandler = function afterHandler() {
++    var self = this;
+ 
+-    self.requestQueue.push(function (cb) {
+-        self.throttle_probes.queue_leave.fire(function () {
+-            return ([req_id]);
++    function clearQueueSlot(req, _) {
++        self.log.debug({
++            reqid: req.getId()
++        }, 'throttleAfterHandler: enter');
++
++        if (!req._throttleId) {
++            self.log.error({
++                reqid: req.getId()
++            }, 'throttleAfterHandler: missing _throttleId');
++            return;
++        }
++        var value = self.requestMap[req._throttleId];
++        if (!value) {
++            self.log.debug({
++                reqid: req.getId()
++            }, 'missing request map entry, assuming reaped');
++            return;
++        }
++
++        assert.object(value.req, 'value.req');
++        assert.object(value.res, 'value.res');
++        assert.func(value.cb, 'value.cb');
++
++        self.log.debug({
++            reqid: req.getId(),
++            numreqs: Object.keys(self.requestMap).length
++        }, 'throttle request map remove');
++
++        delete (self.requestMap[req._throttleId]);
++
++        self.throttle_probes.request_handled.fire(function () {
++            return ([req.getId()]);
+         });
+-        next();
+-        cb();
+-    });
+ 
+-    self.throttle_probes.request_handled.fire(function () {
+-        return ([self.requestQueue.npending, self.requestQueue.length(),
+-            req.url, req.method]);
+-    });
++        value.cb();
++
++        self.throttle_probes.throttle_stats.fire(function () {
++            return ([self.requestQueue.length(), self.requestQueue.npending]);
++        });
++
++
++        self.log.debug({
++            reqid: req.getId()
++        }, 'throttleAfterHandler: done');
++    }
++
++    return (clearQueueSlot);
+ };
+ 
+ 
+@@ -193,13 +314,6 @@ module.exports = {
+ 
+     createThrottle: function createThrottle(options) {
+         return (new Throttle(options));
+-    },
+-
+-    throttleHandler: function (throttle) {
+-        function throttleRequest(req, res, next) {
+-            throttle.wait(req, res, next);
+-        }
+-        return (throttleRequest);
+     }
+ 
+ };

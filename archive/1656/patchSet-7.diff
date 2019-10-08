@@ -1,0 +1,1535 @@
+commit 447e4437a3d90e47d3ccd3b80e62e5ee9cb260ff (refs/changes/56/1656/7)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2017-05-17T01:43:39-07:00 (2 years, 5 months ago)
+    
+    CNAPI-697 CNAPI should be able to accept websocket connections from cn-agent as per RFD-61
+
+diff --git a/lib/apis/moray.js b/lib/apis/moray.js
+index ce2681e..9d9a363 100644
+--- a/lib/apis/moray.js
++++ b/lib/apis/moray.js
+@@ -13,7 +13,6 @@
+  */
+ 
+ var moray_client = require('moray');
+-var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var async = require('async');
+ var VError = require('verror');
+@@ -86,6 +85,16 @@ var BUCKETS = {
+                 last_heartbeat: { type: 'string' }
+             }
+         }
++    },
++    roster_authority: {
++        name: 'cnapi_roster_authority',
++        bucket: {
++            index: {
++                server_uuid: { type: 'string', unique: true },
++                cnapi_uuid: { type: 'string' },
++                last_modified: { type: 'string' }
++            }
++        }
+     }
+ };
+ 
+diff --git a/lib/app.js b/lib/app.js
+index 618679c..dc85a11 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -15,6 +15,7 @@
+ 
+ var assert = require('assert-plus');
+ var async = require('async');
++var vasync = require('vasync');
+ var crypto = require('crypto');
+ var deepEqual = require('deep-equal');
+ var execFile = require('child_process').execFile;
+@@ -50,6 +51,7 @@ var Workflow = require('./apis/workflow');
+ var TASK_CLEANUP_MAX_AGE = 30 * 24 * 60 * 60;
+ var TASK_CLEANUP_PERIOD = 60 * 60;
+ var SYSINFO_PERIOD = 60;
++var DURATION_LIVENESS_CHECK_MS = 1000;
+ 
+ 
+ 
+@@ -105,6 +107,7 @@ function App(config) {
+     Designation.init(self);
+ 
+     self.statusTimeouts = {};
++    self.heartbeatTimeouts = {};
+ }
+ 
+ 
+@@ -150,7 +153,7 @@ App.prototype.start = function () {
+                         wfcb(error);
+                         return;
+                     }
+-                    self.uuid = stdout.toString();
++                    self.uuid = stdout.toString().trim();
+                     wfcb();
+                 });
+         },
+@@ -310,7 +313,7 @@ App.prototype.initializeConnections = function (callback) {
+     self.setupMorayClient();
+     self.setupWorkflowClient();
+     self.setupWaitlistDirector();
+-    self.setupServerHeartbeatTimeouts();
++    self.setupRosterAuthorityTargets();
+ 
+     self.setupAmqpClient();
+     self.startSysinfoChecker();
+@@ -373,22 +376,6 @@ App.prototype.setupServerHeartbeatTimeouts = function () {
+ };
+ 
+ 
+-/**
+- * For a given server, this clears and refreshes to the maximum duration the
+- * timeout which amongst other things marks a server's status as "unknown".
+- */
+-
+-App.prototype.refreshServerHeartbeatTimeout = function (uuid) {
+-    var self = this;
+-
+-    clearTimeout(self.statusTimeouts[uuid]);
+-    self.statusTimeouts[uuid] = setTimeout(function () {
+-        var server = new ModelServer(uuid);
+-        server.onHeartbeatTimeoutExpired();
+-    }, common.HEARTBEATER_PERIOD * 2 * 1000);
+-};
+-
+-
+ App.prototype.setupWaitlistDirector = function () {
+     var self = this;
+ 
+@@ -411,6 +398,33 @@ App.prototype.setupWaitlistDirector = function () {
+ };
+ 
+ 
++/*
++ * Waits for our moray client to connect to moray, then looks up all the
++ * servers in the datacenter and requests that some fraction of them begin to
++ * send their heartbeats to us instead. The number of compute nodes which will
++ * switch to sending us heartbeats will be (num-compute nodes)/(num-cnapis
++ * including us), such that after the roster authority switch happens, each
++ * CNAPI roughly has the same number of compute nodes talking to it.
++ */
++
++App.prototype.setupRosterAuthorityTargets = function () {
++    var self = this;
++
++    async.until(function () {
++        return self.moray.connected;
++    },
++    function (cb) {
++        setTimeout(cb, 1000);
++    },
++    function () {
++        self.log.info(
++            'taking roster authority over our share of the compute nodes');
++        self.takeRosterAuthority();
++    });
++};
++
++
++
+ App.prototype.setupAmqpClient = function () {
+     var self = this;
+     var connection = self.amqpConnection
+@@ -503,6 +517,128 @@ App.prototype.setupMorayClient = function () {
+ };
+ 
+ 
++
++/**
++ * Looks up all compute nodes in moray, looks up CNAPI instances, then after
++ * selecting a proportional fraction of all compute ndoes, sends to a request
++ * for them to create their hearbeat connection with us.
++ */
++
++App.prototype.takeRosterAuthority = function () {
++    var self = this;
++
++    var picked = [];
++    var cnapiUuids = [];
++    var serverUuids = [];
++
++    vasync.waterfall([
++        /*
++         * Get all compute nodes in datanceter.
++         */
++        getServers,
++
++        /*
++         * Identify CNAPI instances.
++         */
++        getRosterAuthorityRecords,
++
++        /*
++         * Based on the number of CNAPI instances and known servers, select
++         * a portion of the total number of servers.
++         */
++        pickServers,
++
++        /*
++         * Send a request so the picked compute nodes will initiate heartbeat
++         * connections with us.
++         */
++        changeServerHeartbeatTargets
++    ],
++    function (err) {
++        if (err) {
++            self.log.error({ err: err }, 'error taking roster authority');
++            return;
++        }
++        self.log.info('finished taking roster authority');
++    });
++
++    function getServers(next) {
++        ModelServer.list({}, function (err, servers) {
++            if (err) {
++                next(err);
++                return;
++            }
++            servers.forEach(function (server) {
++                serverUuids.push(server.uuid);
++            });
++            next();
++        });
++    }
++
++    function getRosterAuthorityRecords(next) {
++        self.log.warn('getting roster authority records');
++        ModelServer.listRosterAuthority(function (err, records) {
++            if (err) {
++                next(err);
++                return;
++            }
++
++            records.forEach(function (record) {
++                cnapiUuids.push(record.cnapi_uuid);
++            });
++
++            // remove duplicates
++            cnapiUuids = cnapiUuids.sort().filter(function (item, i, a) {
++                return !i || item !== a[i-1];
++            });
++            next();
++        });
++    }
++
++    function pickServers(next) {
++        self.log.warn('picking roster authority servers');
++        var numCnapis = cnapiUuids.length || 1;
++        var toSwitchCount = Math.floor(serverUuids.length / numCnapis);
++
++        // randomly pick an amount of servers equal to `toSwitch`
++        var idx;
++        for (var i = 0; i < toSwitchCount; i++) {
++            idx = Math.floor(Math.random() * serverUuids.length);
++            picked.push(serverUuids.splice(idx, idx+1, 1)[0]);
++        }
++
++        self.log.info('taking roster authority over %d servers', toSwitchCount);
++
++        next();
++    }
++
++    function changeServerHeartbeatTargets(next) {
++        async.forEach(
++            picked,
++            function (uuid, feNext) {
++
++                var server = new ModelServer(uuid);
++
++                server.sendRequest({
++                    method: 'post',
++                    path: '/roster-authority',
++                    params: { cnapi_url: self.config.cnapi.url },
++                }, function (err) {
++                    if (err) {
++                        feNext(new restify.InternalError(err));
++                        return;
++                    }
++                    feNext();
++                });
++
++            },
++            function (err) {
++                next(err);
++            });
++    }
++};
++
++
+ App.prototype.onVmsUpdate = function (uuid, heartbeat, callback) {
+     var self = this;
+ 
+@@ -1393,4 +1529,9 @@ App.prototype.getLog = function (callback) {
+ };
+ 
+ 
++App.prototype.getUuid = function AppGetUuid() {
++    return this.uuid;
++};
++
++
+ module.exports = App;
+diff --git a/lib/common.js b/lib/common.js
+index 7fd600c..0bd92f7 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -14,6 +14,7 @@ var qs = require('querystring');
+ 
+ 
+ var HEARTBEATER_PERIOD = 5;
++var HEARTBEATER_PERIOD_MS = HEARTBEATER_PERIOD * 1000;
+ 
+ /**
+  * RFC 2254 Escaping of filter strings
+@@ -152,5 +153,6 @@ module.exports = {
+     filterEscape: filterEscape,
+     randSort: randSort,
+     orderedKVString: orderedKVString,
+-    HEARTBEATER_PERIOD: HEARTBEATER_PERIOD
++    HEARTBEATER_PERIOD: HEARTBEATER_PERIOD,
++    HEARTBEATER_PERIOD_MS: HEARTBEATER_PERIOD_MS
+ };
+diff --git a/lib/endpoints/servers.js b/lib/endpoints/servers.js
+index 489c0c1..4d8316f 100644
+--- a/lib/endpoints/servers.js
++++ b/lib/endpoints/servers.js
+@@ -15,20 +15,20 @@
+  */
+ 
+ var async = require('async');
+-var fs = require('fs');
++var vasync = require('vasync');
+ var qs = require('querystring');
+ var restify = require('restify');
+ var sprintf = require('sprintf').sprintf;
+-var util = require('util');
++var once = require('once');
+ var VError = require('verror');
++var Watershed = require('watershed').Watershed;
+ 
+-var common = require('../common');
+-var datasetEndpoints = require('./zfs');
+ var Designation = require('../designation');
+ var ModelPlatform = require('../models/platform');
+ var ModelServer = require('../models/server');
+ var validation = require('../validation/endpoints');
+ 
++var ws = new Watershed();
+ 
+ function Server() {}
+ 
+@@ -127,7 +127,7 @@ Server.list = function handlerSeverList(req, res, next) {
+ 
+             // Set up extras
+             if (req.params.extras) {
+-                var extras = { status: true, last_heartbeat: true };
++                var extras = { status: true };
+                 options.extras = extras;
+ 
+                 req.params.extras.split(',').forEach(function (f) {
+@@ -146,7 +146,7 @@ Server.list = function handlerSeverList(req, res, next) {
+                 options.extras = {
+                     vms: false, memory: false,
+                     disk: false, status: true,
+-                    sysinfo: false, last_heartbeat: false,
++                    sysinfo: false,
+                     agents: false
+                 };
+             }
+@@ -248,7 +248,6 @@ Server.get = function handlerServerGet(req, res, next) {
+             vms: true,
+             disk: true,
+             agents: true,
+-            last_heartbeat: true,
+             memory: true
+         },
+         function (error, server) {
+@@ -924,6 +923,20 @@ Server.resumeCnAgent = function handlerResumeCnAgent(req, res, next) {
+     });
+ };
+ 
++
++/* BEGIN JSSTYLED */
++/**
++ * Indicate that this server is alive.
++ *
++ * @name ServerEventHeartbeat
++ * @endpoint GET /servers/:server_uuid/events/heartbeat
++ * @section Server API
++ *
++ * @response 204 No Content on success
++ * @response 500 Error Could not process request
++ */
++/* END JSSTYLED */
++
+ Server.eventHeartbeat = function handlerServerEventHeartbeat(req, res, next) {
+     var rules = {
+         'server_uuid': ['isStringType']
+@@ -933,12 +946,14 @@ Server.eventHeartbeat = function handlerServerEventHeartbeat(req, res, next) {
+         next();
+         return;
+     }
+-    var server = new ModelServer(req.params.server_uuid);
+-    server.onHeartbeat();
++
++    req.stash.server.onHeartbeat();
++
+     res.send(204);
+     next();
+ };
+ 
++
+ Server.eventVmsUpdate = function handlerServerEventVmsUpdate(req, res, next) {
+     ModelServer.getApp().onVmsUpdate(
+         req.params.server_uuid, req.params,
+@@ -1044,6 +1059,40 @@ Server.nop = function handlerServerNop(req, res, next) {
+ };
+ 
+ 
++Server.rosterConnection =
++function handlerRosterConnection(req, res, next) {
++    var upgrade;
++    var wsc;
++
++    if (!res.claimUpgrade) {
++        ModelServer.listRosterAuthority(
++            function onListRosterAuthority(err, list) {
++                if (err) {
++                    next(err);
++                    return;
++                }
++
++                res.send(list);
++                next();
++            });
++        return;
++    }
++
++    upgrade = res.claimUpgrade();
++    req.log.info('server %s claimed upgrade', req.stash.server.uuid);
++
++    try {
++        wsc = ws.accept(req, upgrade.socket, upgrade.head);
++    } catch (e) {
++        req.log.error('roster watershed error: ' + e.message);
++        return;
++    }
++
++    // XXX what if server doesn't exist yet?
++    req.stash.server.handleRosterConnection({}, wsc);
++};
++
++
+ function attachTo(http, app) {
+     var ensure = require('../endpoints').ensure;
+ 
+@@ -1209,8 +1258,8 @@ function attachTo(http, app) {
+         ensure({
+             connectionTimeoutSeconds: 60 * 60,
+             app: app,
+-            prepopulate: [],
+-            connected: []
++            prepopulate: ['server'],
++            connected: ['moray']
+         }),
+         Server.eventHeartbeat);
+ 
+@@ -1225,6 +1274,17 @@ function attachTo(http, app) {
+         }),
+         Server.eventVmsUpdate);
+ 
++    http.get({
++        path: '/servers/:server_uuid/roster',
++        name: 'ServerRosterConnection' },
++        ensure({
++            connectionTimeoutSeconds: 60 * 60,
++            app: app,
++            prepopulate: ['server'],
++            connected: ['moray']
++        }),
++        Server.rosterConnection);
++
+     /**
+      *
+      * Misc
+diff --git a/lib/models/server.js b/lib/models/server.js
+index 12716bb..331a9b7 100644
+--- a/lib/models/server.js
++++ b/lib/models/server.js
+@@ -15,12 +15,12 @@
+  */
+ 
+ var async = require('async');
++var vasync = require('vasync');
+ var assert = require('assert-plus');
+ var dns = require('dns');
+ var qs = require('querystring');
+ var restify = require('restify');
+ var sprintf = require('sprintf').sprintf;
+-var util = require('util');
+ var VError = require('verror');
+ var once = require('once');
+ 
+@@ -29,7 +29,6 @@ var common = require('../common');
+ var ModelBase = require('./base');
+ var ModelVM = require('./vm');
+ var ModelWaitlist = require('./waitlist');
+-var ModelPlatform = require('./platform');
+ 
+ var MEMORY_USAGE_KEYS = [
+     'memory_available_bytes',
+@@ -74,6 +73,7 @@ function ModelServer(uuid) {
+     this.log = ModelServer.getLog();
+ }
+ 
++
+ ModelServer.prototype.getValue = function () {
+     return clone(this.value);
+ };
+@@ -93,7 +93,7 @@ ModelServer.init = function (app) {
+ 
+     ModelServer.tasks = {};
+     ModelServer.log = app.getLog();
+-    ModelServer.heartbeatByServerUuid = {};
++    ModelServer.heartbeatTimeouts = {};
+ };
+ 
+ 
+@@ -138,7 +138,7 @@ ModelServer.list = function (params, callback) {
+     var uuid = params.uuid;
+     callback = once(callback);
+ 
+-    var extras = params.extras || { status: true, last_heartbeat: true };
++    var extras = params.extras || { status: true };
+ 
+     this.log.debug(params, 'Listing servers');
+ 
+@@ -211,8 +211,6 @@ ModelServer.list = function (params, callback) {
+     });
+ 
+     var servers = [];
+-    var serverStatus = {};
+-
+ 
+     async.parallel([
+         // Get all server records
+@@ -234,33 +232,6 @@ ModelServer.list = function (params, callback) {
+             function onRecord(server) {
+                 servers.push(server.value);
+             }
+-        },
+-
+-        // Get all server record last_heartbeat data
+-        function (next) {
+-            // XXX write me a getAllServerStatuses function that can return >
+-            // 1000 results
+-            if (extras.last_heartbeat === false) {
+-                next();
+-                return;
+-            }
+-
+-            var req = moray.findObjects(
+-                buckets.status.name, '(server_uuid=*)', {});
+-
+-            req.on('error', onError);
+-            req.on('record', onRecord);
+-            req.on('end', next);
+-
+-            function onError(error) {
+-                self.log.error(error, 'error retriving last_heartbeats');
+-                next(error);
+-            }
+-
+-            function onRecord(status) {
+-                serverStatus[status.value.server_uuid] =
+-                    status.value;
+-            }
+         }
+     ], function (err) {
+         processResults(err);
+@@ -280,11 +251,6 @@ ModelServer.list = function (params, callback) {
+             function (server, cb) {
+                 var serverModel = new ModelServer(server.uuid);
+ 
+-                if (serverStatus.hasOwnProperty(server.uuid)) {
+-                    server.last_heartbeat =
+-                        serverStatus[server.uuid].last_heartbeat;
+-                }
+-
+                 serverModel.setRaw(server);
+ 
+                 serverModel.getFinal(extras, function (error, s) {
+@@ -585,14 +551,6 @@ ModelServer.prototype.filterFields = function (fields, callback) {
+     }
+ 
+     async.parallel([
+-        function (cb) {
+-            if (skip('last_heartbeat', fields)) {
+-                delete server.last_heartbeat;
+-                cb();
+-                return;
+-            }
+-            cb();
+-        },
+         function (cb) {
+             if (skip('status', fields)) {
+                 delete server.status;
+@@ -682,7 +640,7 @@ function (heartbeat, callback) {
+     });
+ 
+     function getServer(cb) {
+-        self.getRaw(function (err, so, s) {
++        self.getRaw(function (err, so) {
+             if (err) {
+                 cb(new VError(err, 'retrieving server on heartbeat'));
+                 return;
+@@ -800,7 +758,6 @@ function (heartbeat, callback) {
+ 
+     function updateStatus(cb) {
+         serverobj.status = 'running';
+-        serverobj.last_heartbeat = (new Date()).toISOString();
+         cb();
+     }
+ 
+@@ -865,41 +822,7 @@ ModelServer.prototype.getRaw = function (extras, callback) {
+                 server = clone(obj.value);
+                 self.value = obj.value;
+ 
+-
+-                if (extras.last_heartbeat) {
+-                    ModelServer.getMoray().getObject(
+-                        buckets.status.name,
+-                        uuid,
+-                        function (getStatusError, statusObj) {
+-                            if (getStatusError &&
+-                                VError.hasCauseWithName(getStatusError,
+-                                                        'ObjectNotFoundError'))
+-                            {
+-                                self.log.error(
+-                                    'last_heartbeat for %s not found in moray',
+-                                    uuid);
+-
+-                                self.value.last_heartbeat =
+-                                    server.last_heartbeat =
+-                                    null;
+-
+-                                callback(null, server);
+-                                return;
+-                            } else if (getStatusError) {
+-                                self.log.error(getStatusError,
+-                                    'Error fetching last heartbeat from moray');
+-                                callback(error);
+-                                return;
+-                            }
+-
+-                            self.value.last_heartbeat =
+-                                server.last_heartbeat =
+-                                statusObj.value.last_heartbeat;
+-                            callback(null, server);
+-                        });
+-                } else {
+-                    callback(null, server);
+-                }
++                callback(null, server);
+             });
+     }
+ };
+@@ -1108,260 +1031,6 @@ ModelServer.prototype.modify = function (server, callback) {
+ 
+ 
+ 
+-/**
+- * This function is invoked whenever a heartbeat is received from a compute
+- * node. It takes care of refreshing two timeouts:
+- *
+- *     1) the timeout responsible for changing status => running/unknown.
+- *
+- *     2) the timeout responsible for throttling incoming heartbeats to prevent
+- *        overly taxing moray with heartbeats which are already out of date.
+- *
+- *
+- * It is also is responsible for writing `last_heartbeat` to a server's
+- * `cnapi_status` bucket in moray.
+- *
+- * The goal of this is to accept new heartbeats and if we receive a heartbeat
+- * while another is being written out to moray for the same server, stage it,
+- * and then write it out when the original heartbeat write operation returns,
+- * or a timeout is exhausted.
+- */
+-
+-ModelServer.prototype.onHeartbeat = function () {
+-    var self = this;
+-    var uuid = self.uuid;
+-
+-    ModelServer.getApp().refreshServerHeartbeatTimeout(self.uuid);
+-
+-    if (!ModelServer.getApp().collectedGlobalSysinfo) {
+-        return;
+-    }
+-
+-    if (!ModelServer.getMoray().connected) {
+-        self.log.warn(
+-            'cannot refresh server from heartbeat: cannot reach moray');
+-        return;
+-    }
+-
+-
+-    if (!ModelServer.heartbeatByServerUuid) {
+-        ModelServer.heartbeatByServerUuid = {};
+-    }
+-
+-    if (!ModelServer.heartbeatByServerUuid[uuid]) {
+-        ModelServer.heartbeatByServerUuid[uuid] = {};
+-    }
+-
+-    var heartbeat = {
+-        server_uuid: uuid,
+-        last_heartbeat: (new Date()).toISOString()
+-    };
+-
+-    // Check if we are still processing a heartbeat for this server: When we
+-    // begin processing a heartbeat we check if this value is set. If it is, we
+-    // override the `next` value and return. In this way we avoid having
+-    // multiple concurrent writes to moray for single server.
+-
+-    if (ModelServer.heartbeatByServerUuid[uuid].current) {
+-        ModelServer.heartbeatByServerUuid[uuid].next = heartbeat;
+-        self.log.warn('already writing heartbeat from %s @ %s', uuid,
+-        ModelServer.heartbeatByServerUuid[uuid].current.last_heartbeat);
+-
+-        if (ModelServer.heartbeatByServerUuid[uuid].timeout) {
+-            clearTimeout(ModelServer.heartbeatByServerUuid[uuid].timeout);
+-            writeNext();
+-        } else {
+-            resetTimeout();
+-        }
+-
+-        return;
+-    } else {
+-        ModelServer.heartbeatByServerUuid[uuid] = {
+-            current: heartbeat
+-        };
+-    }
+-
+-    // Set a timeout to clear the `current` value. If it is not set, we set a
+-    // timeout to clear it. The reason for the timeout is do not end up stuck
+-    // in this state (and end up ignoring future heartbeats).
+-    resetTimeout();
+-
+-    doPut();
+-
+-    function doPut() {
+-        ModelServer.getMoray().putObject(
+-            buckets.status.name,
+-            self.uuid,
+-            heartbeat,
+-            function (error) {
+-                if (error) {
+-                    self.log.error(error, 'modifying server last_heartbeat');
+-                }
+-
+-                // If `.next` is set for this server once we've written the
+-                // value to moray, it means we have a new heartbeat staged for
+-                // writing into moray. If not set, do nothing, wait for next
+-                // heartbeat to come in as usual.
+-                if (ModelServer.heartbeatByServerUuid[uuid].next) {
+-                    writeNext();
+-                    return;
+-                } else {
+-                    clearTimeout(
+-                        ModelServer.heartbeatByServerUuid[uuid].timeout);
+-                    ModelServer.heartbeatByServerUuid[uuid] = {};
+-                }
+-            });
+-    }
+-
+-
+-    return;
+-
+-    function resetTimeout() {
+-        clearTimeout(ModelServer.heartbeatByServerUuid[uuid].timeout);
+-        ModelServer.heartbeatByServerUuid[uuid].timeout =
+-            setTimeout(function () {
+-                self.log.warn('firing heartbeatByServer timeout for %s');
+-                // write the "next" heartbeat
+-                writeNext();
+-            }, common.HEARTBEATER_PERIOD * 2 * 1000);
+-    }
+-
+-    function writeNext() {
+-        if (!ModelServer.heartbeatByServerUuid[uuid].next) {
+-            self.log.warn('onHeartbeat/writeNext called but .next not set');
+-            return;
+-        }
+-
+-        var nextHb = ModelServer.heartbeatByServerUuid[uuid].next;
+-        delete ModelServer.heartbeatByServerUuid[uuid].next;
+-        ModelServer.heartbeatByServerUuid[uuid].current = nextHb;
+-        doPut();
+-    }
+-};
+-
+-
+-/**
+- * Fetch from moray the stored `last_heartbeat` value for a given compute node.
+- */
+-
+-ModelServer.prototype.getLastHeartbeat =
+-function Server$getLastHeartbeat(callback) {
+-    var self = this;
+-    var uuid = this.uuid;
+-
+-    ModelServer.getMoray().getObject(
+-        buckets.status.name,
+-        uuid,
+-        onGetObject);
+-
+-    function onGetObject(error, obj) {
+-        if (error && VError.hasCauseWithName(error, 'ObjectNotFoundError')) {
+-            self.log.error(
+-                'last_heartbeat for %s not found in moray', uuid);
+-            callback();
+-            return;
+-        } else if (error) {
+-            self.log.error(
+-                error, 'error fetching last_heartbeat from moray');
+-            callback(error);
+-            return;
+-        }
+-
+-        callback(null, obj.value.last_heartbeat);
+-    }
+-};
+-
+-
+-/**
+- * This is called when we have determined that the sime since last heartbeat
+- * for a given compute has exceeded the threshold for us to consider it
+- * reachable.
+- */
+-ModelServer.prototype.onHeartbeatTimeoutExpired = function () {
+-    var self = this;
+-
+-    self.log.warn('server %s heartbeat timeout', self.uuid);
+-
+-    var uuid = self.uuid;
+-    var lasthb;
+-    var server, serverobj;
+-
+-    clearTimeout(ModelServer.getApp().statusTimeouts[uuid]);
+-    ModelServer.getApp().statusTimeouts[uuid] = null;
+-
+-    // Get server
+-    // Get last_heartbeat
+-    // modify server status if last_heartbeat is not within range
+-
+-    async.waterfall([
+-        getLastHeartbeat,
+-        getServer,
+-        function (next) {
+-            if (!serverobj) {
+-                self.log.info(
+-                    { uuid: uuid },
+-                    'could not find server');
+-                return next();
+-            }
+-            var now = Date.now();
+-            var then = new Date(lasthb).valueOf();
+-            var timeout = common.HEARTBEATER_PERIOD;
+-
+-            if ((now - then) > timeout * 2 * 1000) {
+-                server.modify({ status: 'unknown' }, function (err) {
+-                    if (err) {
+-                        self.log.error(err);
+-                    }
+-                    self.log.warn(
+-                        { uuid: uuid },
+-                        'no heartbeat from server in %d ' +
+-                        'seconds, status => unknown',
+-                        common.HEARTBEATER_PERIOD);
+-                });
+-            } else {
+-                // It we got here it me means we didn't receive a heartbeat
+-                // from that server before our timeout, but when we checked
+-                // the server the last_heartbeat timestamp appears to have
+-                // been updated by another cnapi instance. Everything is
+-                // okay.
+-                self.log.info(
+-                    { uuid: uuid },
+-                    'no heartbeat from server but last_heartbeat looks ' +
+-                    'ok (now=%d then=%d d=%d)',
+-                    now, then, now-then);
+-            }
+-        }
+-    ],
+-    function (err) {
+-        if (err) {
+-            self.log.error(err,
+-                'writing status after server heartbeat timeout exceeeded');
+-        }
+-    });
+-
+-    function getLastHeartbeat(next) {
+-        self.getLastHeartbeat(function (err, hb) {
+-            if (err) {
+-                return next(err);
+-            }
+-            lasthb = hb;
+-            next();
+-        });
+-    }
+-
+-    function getServer(next) {
+-        ModelServer.get(uuid, function (err, s, so) {
+-            if (err) {
+-                self.log.error(
+-                    err,
+-                    'error looking up server with expired heartbeat timer');
+-            }
+-            server = s;
+-            serverobj = so;
+-            next();
+-        });
+-    }
+-};
+ 
+ 
+ 
+@@ -1383,7 +1052,7 @@ ModelServer.get = function (uuid, callback) {
+     server.getRaw({
+         vms: true, memory: true,
+         disk: true, status: true,
+-        sysinfo: true, last_heartbeat: true,
++        sysinfo: true,
+         agents: true
+     }, function (err, serverobj) {
+         callback(err, server, serverobj);
+@@ -1424,7 +1093,7 @@ ModelServer.prototype.getFinal = function (/* extras, */ callback) {
+     var extrasDefaults = {
+         vms: false, memory: false,
+         disk: false, status: true,
+-        sysinfo: false, last_heartbeat: false,
++        sysinfo: false,
+         agents: false
+     };
+ 
+@@ -1438,7 +1107,7 @@ ModelServer.prototype.getFinal = function (/* extras, */ callback) {
+             extras = {
+                 vms: true, memory: true,
+                 disk: true, sysinfo: true,
+-                status: true, last_heartbeat: true,
++                status: true,
+                 agents: true
+             };
+         } else {
+@@ -2426,4 +2095,487 @@ function firstAdminIp(sysinfo) {
+ }
+ 
+ 
++/**
++ *
++ * Every time we receive a heartbeat we want to make sure we create a timer
++ * object (or recreate an existing one) to let us know if we do not receive the
++ * next heartbeat in time. We store this timer as a property on an object,
++ * keyed off of the UUID of the sending server.
++ *
++ * If we have already set a heartbeat timeout object for this server, we clear
++ * it (since we've gotten a heartbeat) and then create a new one which expires
++ * at a future time equal to double the heartbeate period (5s) from "now".
++ *
++ * Every time we receive a new heartbeat for a server for which we do not have
++ * a timer object, we record in the CNAPI authority moray bucket that we are
++ * the CNAPI responsible (at this point in time) for receiving heartbeats for
++ * this server.
++ *
++ * Every time the heartbeater timeout expires, we check the roster authority
++ * bucket for this server. If we are still the "roster authority" for this
++ * server, we can mark it as status = 'unknown', and update the last_modified
++ * in the CNAPI authority bucket. If we are no longer the roster authority we
++ * "stand down", since it means some other CNAPI instance is now responsible
++ * for tracking that server's heartbeats.
++ *
++ */
++
++ModelServer.prototype.onHeartbeat = function () {
++    var self = this;
++
++    if (!ModelServer.getApp().collectedGlobalSysinfo) {
++        self.log.warn(
++            'ignoring heartbeat from %s,'
++            + ' havent completed global sysinfo request',
++            self.uuid);
++        return;
++    }
++
++    if (!ModelServer.getMoray().connected) {
++        self.log.warn(
++            'cannot refresh server from heartbeat: cannot reach moray');
++        return;
++    }
++
++    var timeout = ModelServer.heartbeatTimeouts[self.uuid];
++
++    if (timeout) {
++        self.refreshServerHeartbeatTimeout();
++        return;
++    } else {
++        self.refreshServerHeartbeatTimeout();
++        self.recordRosterAuthority({}, onRecordRosterAuthority);
++    }
++
++    function onRecordRosterAuthority(err) {
++        if (err) {
++            self.log.error(err, 'could not record agent relationship for %s',
++                    self.uuid);
++            return;
++        }
++
++        self.log.info('recorded agent relationship for %s', self.uuid);
++        self.refreshServerHeartbeatTimeout();
++    }
++};
++
++
++ModelServer.prototype.handleRosterConnection =
++function ModelServerHandleRosterConnection(opts, wsc) {
++    var self = this;
++
++    var WATERSHED_PING_PERIOD_MS = 5000;
++    var pingTimeout;
++    var pongTimeout;
++    var pingBuffer = new Buffer('');
++
++    vasync.waterfall([
++        handleConnection,
++        recordRosterAuthority
++    ], function _onDone(err) {
++        if (err) {
++            self.log.error({ err: err }, 'roster connection error');
++        }
++        return;
++    });
++
++    function handleConnection(cb) {
++        var onDisconnect = once(onConnectionLoss);
++
++        self.log.warn('roster connection initated to %s',
++            self.uuid);
++
++        wsc.on('pong', function _onPong() {
++            self.log.warn('watershed pong');
++            schedulePing();
++        });
++
++        wsc.on('end', function _onWscEnd() {
++            self.log.warn({ args: arguments }, 'watershed end');
++            onDisconnect();
++        });
++
++        wsc.on('error', function _onWscError() {
++            self.log.warn({ args: arguments }, 'watershed error');
++        });
++
++        wsc.on('connectionReset', function _onWscConnectionReset() {
++            self.log.warn({ args: arguments },
++                'watershed connection reset');
++            onDisconnect();
++        });
++
++        schedulePing();
++
++        cb();
++    }
++
++    function schedulePing() {
++        clearTimeout(pongTimeout);
++
++        pingTimeout = setTimeout(function _onPingTimeout() {
++            self.log.warn('sending out ping');
++            wsc._ws_writePing(pingBuffer);
++
++            pongTimeout = setTimeout(function _onPongTimeout() {
++                self.log.error(
++                    'timed out waiting for server to respond to ping');
++            }, WATERSHED_PING_PERIOD_MS);
++        }, WATERSHED_PING_PERIOD_MS);
++    }
++
++    function onConnectionLoss() {
++        clearTimeout(pingTimeout);
++        clearTimeout(pongTimeout);
++
++        self.log.error(
++            'server %s has disconnected', self.uuid);
++
++        updateServerStatusUnknown(function (err) {
++            if (err) {
++                self.log.error(err, 'could not update server status');
++            }
++        });
++    }
++
++    function recordRosterAuthority(cb) {
++        self.recordRosterAuthority({}, cb);
++    }
++
++    // Do in a batch?
++    function updateServerStatusUnknown(next) {
++        self.modify({ status: 'unknown' }, next);
++    }
++};
++
++
++ModelServer.prototype.recordRosterAuthority =
++function ModelServerRecordRosterAuthority(opts, callback) {
++    var self = this;
++    var newRecord;
++    var etag;
++
++    assert.object(opts, 'opts');
++
++    /**
++     *
++     * Steps on connection:
++     *
++     * - (accept connection)
++     * - read cnapi_roster_authority bucket for this compute node (incl. ETag)
++     * - create new payload with this CNAPI's UUID, the compute node's UUID and
++     *   a timestamp
++     * - write to moray the payload into bucket identified by compute node uuid
++     *   (using etag from before)
++     * - if there is an etag conflict, issue a warning
++     *
++     */
++
++
++    vasync.waterfall([
++        fetchPreviousAuthorityRecord,
++        createAuthorityRecordpayload,
++        writeAuthorityRecord,
++        updateServerStatusRunning
++    ], function onAuthorityRecordWritten(err) {
++        if (err) {
++            callback(err);
++            return;
++        }
++        callback();
++    });
++
++    function fetchPreviousAuthorityRecord(next) {
++        ModelServer.getMoray().getObject(buckets.roster_authority.name,
++            self.uuid,
++            function onGetObject(error, res) {
++                if (error &&
++                    VError.hasCauseWithName(error, 'ObjectNotFoundError')) {
++                    self.log.info({ server_uuid: self.uuid },
++                        'server %s not found in roster authority bucket, ');
++                    next();
++                    return;
++                } else if (error) {
++                    next(error);
++                    return;
++                }
++                etag = res._etag;
++                next();
++            });
++    }
++
++    function createAuthorityRecordpayload(next) {
++        newRecord = {
++            server_uuid: self.uuid,
++            cnapi_uuid: ModelServer.getApp().uuid,
++            last_modified: (new Date()).toISOString()
++        };
++        next();
++    }
++
++    function writeAuthorityRecord(next) {
++        var putOpts = {};
++
++        if (etag) {
++            opts.etag = etag;
++        }
++
++        ModelServer.getMoray().putObject(
++            buckets.roster_authority.name,
++            self.uuid,
++            newRecord,
++            putOpts,
++            function _onPut(err) {
++                if (err && VError.hasCauseWithName(err, 'EtagConflictError')) {
++                    self.log.warn({ err: err, server_uuid: self.uuid },
++                        'etag conflict writing roster authority record, ' +
++                        'roster authority over server has likely changed ' +
++                        'to another CNAPI instance');
++                } else if (err) {
++                    self.log.error('could not update roster authority');
++                    next(
++                        VError(err, 'could not update roster authority'));
++                    return;
++                }
++                next();
++            });
++    }
++
++    // Do in a batch?
++    function updateServerStatusRunning(next) {
++        self.log.info('server status for %s => %s', self.uuid, 'running');
++        self.modify({ status: 'running' }, next);
++//         next();
++    }
++};
++
++
++/**
++ * Fetch a list of all roster authority records stored in moray.
++ */
++
++ModelServer.listRosterAuthority =
++function ModelServerListRosterAuthority(callback) {
++    var self = this;
++    var records = [];
++    var cb = once(callback);
++    var findOpts = {
++        sort: {
++            attribute: 'cnapi_uuid',
++            order: 'ASC'
++        }
++    };
++    var req = ModelServer.getMoray().findObjects(
++            buckets.roster_authority.name,
++            '(server_uuid=*)',
++            findOpts);
++
++
++    req.on('error', onError);
++    req.on('record', onRecord);
++    req.on('end', onEnd);
++
++
++    function onError(error) {
++        self.log.error(error, 'error retriving servers');
++        cb(error);
++    }
++
++    function onRecord(record) {
++        records.push(record.value);
++    }
++
++    function onEnd() {
++        cb(null, records);
++    }
++};
++
++
++/**
++ * Gets the roster-authority record for this server. Value will contain the
++ * UUID of the responsible CNAPI, the server_uuid and the time it was last
++ * updated.
++ */
++
++ModelServer.prototype.getRosterAuthority = function (callback) {
++    var self = this;
++
++    ModelServer.getMoray().getObject(
++        buckets.roster_authority.name,
++        self.uuid,
++        function (getErr, res) {
++            if (getErr) {
++                callback(getErr);
++                return;
++            }
++            callback(null, { value: res.value, etag: res._etag });
++        });
++};
++
++
++/**
++ * Clears and recreates the timer responsible for actions to be done when a
++ * heartbeat has not been received from a server within the acceptable window
++ * of time since the last.
++ */
++
++ModelServer.prototype.refreshServerHeartbeatTimeout =
++function ModelServerRefreshServerHeartbeatTimeout() {
++    var self = this;
++
++    var timeoutMs = common.HEARTBEATER_PERIOD_MS * 2;
++    clearTimeout(ModelServer.heartbeatTimeouts[self.uuid]);
++
++    ModelServer.heartbeatTimeouts[self.uuid] = setTimeout(
++        function () {
++            self.log.warn('heartbeat not received from %s in %s seconds',
++                self.uuid, timeoutMs/1000);
++            self.onLegacyHeartbeatTimeout();
++        }, timeoutMs);
++};
++
++
++/**
++ *
++ * When the heartbeat timer (which we set/reset on every incoming heartbeat)
++ * for one our servers expires, we need to check if another CNAPI instance has
++ * taken "roster authority" over that server. We do this avoid multiple CNAPI
++ * instances clobbering each others' updates.
++ *
++ * When a timer expires and another CNAPI instance has roster authority for a
++ * sever, that means that even though we used to have control over recording
++ * the status for that server, we should now back off since there's nothing
++ * left for "us" to do. The other CNAPI instance is now recording the status
++ * for that server now.
++ *
++ * If we are still the "roster authority" for that server, then we can update
++ * the "status" value for that server with confidence knowing we are
++ * responsible for updating its status and no one else will overwrite our
++ * status.
++ *
++ * We perform this update as a moray 'batch' after first getting the etag
++ * value. If we see an etag mismatch error, it means someone has updated the
++ * roster authority before us.
++ *
++ */
++
++ModelServer.prototype.onLegacyHeartbeatTimeout =
++function ModelServerOnLegacyHeartbeatTimeout() {
++    var self = this;
++
++    var authority;
++    var authorityEtag;
++    var server;
++    var serverEtag;
++
++    // Get rid of the expired heartbeat timer object
++    delete ModelServer.heartbeatTimeouts[self.uuid];
++
++    vasync.waterfall([
++        getAuthority,
++        getServer,
++        batchUpdate
++    ],
++    function _onWaterfallDone(err) {
++        if (err) {
++            self.log.error(err, 'could not fetch roster relationship');
++            return;
++        }
++    });
++
++    function getAuthority(next) {
++        self.getRosterAuthority(function _onGet(err, obj) {
++            if (err) {
++                next(err);
++                return;
++            }
++            authority = obj.value;
++            authorityEtag = obj.etag;
++            authority.last_modified = (new Date()).toISOString();
++            next();
++        });
++    }
++
++    function getServer(next) {
++        ModelServer.getMoray().getObject(
++            buckets.servers.name,
++            self.uuid,
++            function _onGetObject(error, res) {
++                if (error &&
++                    VError.hasCauseWithName(error, 'ObjectNotFoundError'))
++                {
++                    self.exists = false;
++                    self.log.error('Server %s not found in moray',
++                        self.uuid);
++
++                    next();
++                    return;
++                } else if (error) {
++                    self.log.error(error, 'Error fetching server from moray');
++                    next(error);
++                    return;
++                }
++                server = res.value;
++                serverEtag = res._etag;
++                server.status = 'unknown';
++
++                next();
++            });
++    }
++
++    function batchUpdate(next) {
++        var payload = [
++            {
++                bucket: buckets.servers.name,
++                key: self.uuid,
++                value: server,
++                options: {
++                    etag: serverEtag
++                }
++            },
++            {
++                bucket: buckets.roster_authority.name,
++                key: self.uuid,
++                value: authority,
++                options: {
++                    etag: authorityEtag
++                }
++            }
++        ];
++
++        ModelServer.getMoray().batch(
++            payload,
++            function _onBatch(err, meta) {
++                if (err && VError.hasCauseWithName(err, 'EtagConflictError')) {
++                    /**
++                     * In this situation, it usually means that even though the
++                     * heartbeat timeout has expired for us, another CNAPI
++                     * instance has acquired roster authority over this server,
++                     * so there's not actually anything for us to do.
++                     *
++                     * Questions:
++                     *
++                     *     - What if it is the `cnapi_servers` bucket put which
++                     *       returned the etag error?
++                     */
++
++                    assertRosterAuthorityHasShifted(next);
++
++                } else if (err) {
++                    self.log.error({ err: err, meta: meta },
++                        'error batch updating on legacy heartbeat timeout');
++                    next(err);
++                    return;
++                }
++                self.log.warn({ meta: meta }, 'XXX meta', meta);
++                next();
++            });
++    }
++
++    function assertRosterAuthorityHasShifted(callback) {
++        callback();
++    }
++};
++
++
+ module.exports = ModelServer;
+diff --git a/lib/server.js b/lib/server.js
+index aed3911..539fe3b 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -14,16 +14,19 @@ var restifyValidator = require('restify-validator');
+ var trace_event = require('trace-event');
+ var formatJSON = require('restify/lib/formatters/json');
+ var jsprim = require('jsprim');
++var Watershed = require('watershed').Watershed;
+ 
+ var endpoints = require('./endpoints/index');
+ var request_seq_id = 0;
+ 
+ 
+ function createServer(options) {
++    var log = options.log;
++
+     var cnapi = restify.createServer({
+         name: 'Compute Node API',
+-        log: options.log,
+-        handleUpgrades: true
++        handleUpgrades: true,
++        log: log
+     });
+ 
+     cnapi.use(restify.requestLogger());
+@@ -65,7 +68,9 @@ function createServer(options) {
+     // Add a default timeout of one hour
+     cnapi.use(function setDefaultTimeouts(req, res, next) {
+         req.connection.setTimeout(3600 * 1000);
+-        res.connection.setTimeout(3600 * 1000);
++        if (res && res.connection) {
++            res.connection.setTimeout(3600 * 1000);
++        }
+         next();
+     });
+ 
+diff --git a/package.json b/package.json
+index 37e6a7d..2bdb09a 100644
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,7 @@
+   "private": true,
+   "dependencies": {
+     "amqp": "0.2.6",
+-    "assert-plus": "1.0.0",
++    "assert-plus": "^1.0.0",
+     "async": "1.5.2",
+     "bunyan": "1.8.5",
+     "dapi": "git+https://github.com/joyent/sdc-designation.git#f66ba1897f0eafcc3439d0af39555a3bdaebce4c",
+@@ -14,17 +14,18 @@
+     "dox": "0.4.1",
+     "effluent-logger": "git+https://github.com/joshwilsdon/effluent-logger.git#d662f161a07f94045ad2afb45442931511c40e51",
+     "jsprim": "1.3.1",
+-    "moray": "2.0.1",
+     "libuuid": "0.2.1",
+     "nodeunit": "0.11.0",
++    "moray": "2.0.1",
+     "once": "1.4.0",
+-    "restify": "4.3.0",
++    "restify": "^4.3.0",
+     "restify-validator": "0.3.1",
+     "sdc-clients": "10.0.3",
+     "sprintf": "0.1.5",
+     "trace-event": "1.3.0",
+     "vasync": "1.6.4",
+     "verror": "1.9.0",
++    "watershed": "^0.3.3",
+     "wf-client": "0.2.1",
+     "wf-shared": "git+https://github.com/joyent/sdc-wf-shared.git#9aed2e8"
+   },
+diff --git a/tools/rsync-to b/tools/rsync-to
+index f17bb3e..797b3a7 100755
+--- a/tools/rsync-to
++++ b/tools/rsync-to
+@@ -13,17 +13,24 @@
+ # Rsync the master in this working copy to the install on the given HN.
+ #
+ 
+-#set -o xtrace
++set -o xtrace
+ set -o errexit
+ 
+ TOP=$(cd $(dirname $0)/../; pwd)
+ NODE=$1
+ ROLE=cnapi
+ 
++# in case we have multiple cnapi and we want to update a specific one
++INSTANCE=$2
++
++if [[ -z "$INSTANCE" ]]; then
++    INSTANCE=0
++fi
++
+ if [[ -z "$ZONE" ]]; then
+     ZONE=$(ssh $NODE "/opt/smartdc/bin/sdc-vmapi /vms" 2>/dev/null \
+         | json -H -c "this.tags && this.tags.smartdc_role === '$ROLE'" \
+-            -c 'this.state === "running"' 0.uuid)
++            -c 'this.state === "running"' $INSTANCE.uuid)
+ fi
+ echo "ZONE: $ZONE"
+ 
+@@ -42,12 +49,12 @@ rsync -av ${TOP}/ \
+     --exclude /config/config.json \
+     --exclude /deps/ \
+     --exclude /docs/ \
+-    --exclude /node_modules/ \
+     --exclude /scripts/ \
+     --exclude /boot/ \
+     --exclude /smf/ \
+     --exclude /tools/ \
+-    --exclude /tmp/
++    --exclude /tmp/ \
++#    --exclude /node_modules/ \
+ 
+ state=$(ssh ${NODE} svcs -z ${ZONE} -H -o state $ROLE)
+ 

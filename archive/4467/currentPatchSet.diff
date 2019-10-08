@@ -1,0 +1,555 @@
+commit 2c9bc5ae0592a56cc85331b7f279aa035d65581f (refs/changes/67/4467/1)
+Author: Jason King <jason.king@joyent.com>
+Date:   2018-07-02T15:36:09-05:00 (1 year, 3 months ago)
+    
+    OS-6818 Have vmadm(1M) utilize route -z for lx zones
+
+diff --git a/src/Makefile b/src/Makefile
+index eb0c4abf..892e8fc6 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -10,7 +10,7 @@
+ #
+ 
+ #
+-# Copyright (c) 2017, Joyent, Inc.
++# Copyright (c) 2018, Joyent, Inc.
+ #
+ 
+ include Makefile.defs
+@@ -110,6 +110,7 @@ JS_CHECK_TARGETS=\
+ 	vm/tests/test-openonerrlogger.js \
+ 	vm/tests/test-reboot.js \
+ 	vm/tests/test-reprovision.js \
++	vm/tests/test-routes-lx.js \
+ 	vm/tests/test-snapshots.js \
+ 	vm/tests/test-spoof-opts.js \
+ 	vm/tests/test-tmpfs.js \
+diff --git a/src/vm/node_modules/VM.js b/src/vm/node_modules/VM.js
+index ac43db55..bfb07991 100644
+--- a/src/vm/node_modules/VM.js
++++ b/src/vm/node_modules/VM.js
+@@ -114,6 +114,9 @@ var UPDATABLE_DISK_PROPS = properties.UPDATABLE_DISK_PROPS;
+ var UPDATABLE_NIC_PROPS = properties.UPDATABLE_NIC_PROPS;
+ var UPDATABLE_PCI_DEVICE_PROPS = properties.UPDATABLE_PCI_DEVICE_PROPS;
+ 
++var MACS_RE = /^macs\[(.+)\]$/;
++var NICS_RE = /^nics\[(\d+)\]$/;
++
+ // re-export these
+ exports.BHYVE_MEM_OVERHEAD = BHYVE_MEM_OVERHEAD;
+ exports.FLATTENABLE_ARRAYS = FLATTENABLE_ARRAYS;
+@@ -2997,12 +3000,57 @@ function saveMetadata(payload, log, callback)
+     updateMetadata(protovm, payload, log, callback);
+ }
+ 
++function getGatewayIp(gw, vmobj)
++{
++    var e;
++    var index;
++    var macAddress;
++    var macMatch = gw.match(MACS_RE);
++    var nicMatch = gw.match(NICS_RE);
++    var nicIdx = null;
++
++    if (macMatch) {
++        try {
++            macAddress = macaddr.parse(macMatch[1]);
++        } catch (parseErr) {
++            e = new Error('failed to parse mac \'' + macMatch[1] + '\'');
++            return { 'error': e };
++        }
++
++        for (index = 0; index < vmobj.nics.length; index++) {
++            if (vmobj.nics[index].mac === macAddress.toString()) {
++                nicIdx = index;
++                break;
++            }
++        }
++
++        if (nicIdx === null) {
++            e = new Error('mac \'' + macAddress.toString() + '\' not found');
++            return { 'error': e };
++        }
++    } else if (nicMatch) {
++        nicIdx = nicMatch[1];
++        if (nicIdx > vmobj.nics.length) {
++            e = new Error('nic expression \'' + gw + '\' out of range');
++            return { 'error' : e };
++        }
++    }
++
++    if (nicIdx !== null) {
++        return { 'ip': vmobj.nics[nicIdx].ip, 'ifroute': true };
++    }
++
++    return { 'ip': gw, 'ifroute': false};
++}
++
+ // writes a zone's metadata JSON to /zones/<uuid>/config/routes.json
+-function updateRoutes(vmobj, payload, log, callback)
++function updateRoutes(vmobj, payload, isUpdate, log, callback)
+ {
+     var filename;
++    var gw;
+     var key;
+     var needUpdate = false;
++    var routeCmds = [];
+     var routes = {};
+     var tracers_obj;
+     var zonepath;
+@@ -3049,9 +3097,24 @@ function updateRoutes(vmobj, payload, log, callback)
+     for (key in vmobj.routes) {
+         if (vmobj.routes.hasOwnProperty(key)) {
+             routes[key] = vmobj.routes[key];
++
+             if (payload.hasOwnProperty('remove_routes')
+                 && payload.remove_routes.indexOf(key) !== -1) {
+ 
++                if (isUpdate) {
++                    gw = getGatewayIp(vmobj.routes[key], vmobj);
++                    if (gw.hasOwnProperty('error')) {
++                        callback(gw.error);
++                        return;
++                    }
++                    routeCmds.push({
++                        'cmd': 'delete',
++                        'destination': key,
++                        'gateway': gw.ip,
++                        'ifroute': gw.ifroute
++                    });
++                }
++
+                 // in the remove_* list, don't load it.
+                 delete routes[key];
+             }
+@@ -3061,15 +3124,59 @@ function updateRoutes(vmobj, payload, log, callback)
+     for (key in payload.set_routes) {
+         if (payload.set_routes.hasOwnProperty(key)) {
+             routes[key] = payload.set_routes[key];
++
++            if (isUpdate) {
++                // We currently don't support multiple gateways for the same
++                // destination, so if we are adding an destination that already
++                // exists, we are replacing the destination and must first
++                // delete the old entry
++                gw = getGatewayIp(routes[key], vmobj);
++                if (gw.hasOwnProperty('error')) {
++                    callback(gw.error);
++                    return;
++                }
++
++                if (vmobj.routes.hasOwnProperty(key)) {
++                    routeCmds.push({
++                        'cmd': 'delete',
++                        'destination': key,
++                        'gateway': gw.ip,
++                        'ifroute': gw.ifroute
++                    });
++                }
++
++                routeCmds.push({
++                        'cmd': 'add',
++                        'destination': key,
++                        'gateway': gw.ip,
++                        'ifroute': gw.ifroute
++                });
++            }
+         }
+     }
+ 
+-    fs.writeFile(filename, JSON.stringify(routes, null, 2),
+-        function (err) {
++    vasync.pipeline({
++        'arg': {
++            'log': log,
++            'routeCmds': routeCmds,
++            'vmobj': vmobj,
++            'zonename': vmobj.zonename,
++            'undo': false
++        },
++        'funcs': [
++            function _writeRoutes(_, cb) {
++                fs.writeFile(filename, JSON.stringify(routes, null, 2), cb);
++            },
++            function _logWriteRoutes(_, cb) {
++                log.debug('wrote results to ' + filename);
++                cb();
++            },
++            updateZoneRoutes
++        ]},
++        function updateRoutesCb(err, results) {
+             if (err) {
+                 callback(err);
+             } else {
+-                log.debug('wrote routes to ' + filename);
+                 callback();
+             }
+         });
+@@ -3106,7 +3213,116 @@ function saveRoutes(payload, log, callback)
+         delete payload.routes;
+     }
+ 
+-    updateRoutes(protovm, payload, log, callback);
++    updateRoutes(protovm, payload, false, log, callback);
++}
++
++// Update the routing table of a running zone
++function updateZoneRoutes(args, callback)
++{
++    var cmds;
++    var log;
++    var tracers_obj;
++    var vmobj;
++    var zonename;
++
++    assert(args, 'no args passed to updateZoneRoutes()');
++    assert(args.log, 'no args.log passed to updateZoneRoutes()');
++    assert(args.routeCmds, 'no args.routeCmds passed to updateZoneRoutes()');
++    assert(args.vmobj, 'no args.vmobj passed to updateZoneRoutes()');
++    assert(args.zonename, 'no args.zonename passed to updateZoneRoutes()');
++
++    cmds = args.routeCmds;
++    log = args.log;
++    vmobj = args.vmobj;
++    zonename = args.zonename;
++
++    if (process.env.EXPERIMENTAL_VMJS_TRACING) {
++        tracers_obj = traceUntilCallback('update-zone-routes', args.log,
++            callback);
++        callback = tracers_obj.callback;
++        log = tracers_obj.log;
++    }
++
++    if (cmds.length === 0 || vmobj.state !== 'running'
++        || !BRAND_OPTIONS[vmobj.brand].features.route_refresh) {
++        callback();
++        return;
++    }
++
++    vasync.forEachPipeline({
++        'inputs': cmds,
++        'func': function doUpdateZoneRoutes(uArgs, uCb) {
++            var routeCmd = [ '-z', zonename ];
++
++            routeCmd.push(uArgs.cmd);
++            routeCmd.push(uArgs.destination);
++            routeCmd.push(uArgs.gateway);
++
++            // '-interface' is only needed when adding routes.  It is always
++            // included with a route command however so if we are deleting
++            // an interface route, but fail as part of an update, we can
++            // re-add it (to undo the update operation) successfully
++            if (uArgs.cmd === 'add' && uArgs.ifroute) {
++                routeCmd.push('-interface');
++            }
++
++            route(routeCmd, log, function routeCmdCb(err, res) {
++                var routeErr;
++                if (err) {
++                    // route(1m) prints errors to stdout.. sigh
++                    if (res.stdout.match(/entry exists/)) {
++                        // If the entry already exists, we ignore the error
++                        // and also don't want to undo the existing entry if
++                        // we hit a subsequent failure
++                        uCb();
++                        return;
++                    }
++
++                    // XXX: Is the zonename redundant here?
++                    routeErr = new Error('Route command failed: '
++                    + 'route -z ' + zonename + ' ' + res.stdout);
++                    log.error(routeErr);
++                    uCb(routeErr);
++                    return;
++                }
++                uCb(null, uArgs);
++            });
++        }
++    }, function _updateZoneRoutes(err, result) {
++        if (err) {
++            // XXX: Maybe a deepCopy here?
++            var undoCmds = result.successes;
++
++            log.info('live update of zone routes failed, attempting to undo');
++
++            // If we hit a failure in the middle of adding routes to the,
++            // live zone, try to undo things and leave them as they were
++            // before the update, and pass the failing route back up.
++            //
++            // To undo the route changes that were successful (we stop on
++            // the first failure), reverse the order of the successful routes
++            // and swap 'add' and 'delete', then rerun route(1m).
++            undoCmds.reverse();
++            undoCmds.forEach(function (c) {
++                c[0] = (c[0] === 'add') ? 'delete' : 'add';
++            });
++
++            updateZoneRoutes({
++                'log': log,
++                'routeCmds': undoCmds,
++                'vmobj': vmobj,
++                'zonename': zonename,
++                'undo': true
++            }, function _undoUpdateZoneRoutesCb(undoErr, undoResult) {
++                // Just propagate back the original error
++                callback(err);
++            });
++
++            return;
++        }
++
++        callback();
++    });
+ }
+ 
+ function createVM(payload, log, callback)
+@@ -3577,6 +3793,46 @@ function writeZoneconfig(payload, log, callback)
+     }
+ }
+ 
++function route(args, log, callback)
++{
++    var cmd = '/usr/sbin/route';
++    var evtname = 'route';
++    var nextIsOptArg = false;
++
++    assert(log, 'no logger passed to route()');
++
++    // We don't care about the return value of some, but just want to
++    // stop iterating after we reach the first non-option
++
++    args.some(function (arg) {
++        if (arg.charAt(0) === '-') {
++            // If we have route -xxxR /path or -z zone ..., skip the option
++            // argument
++            var lastChar = arg.charAt(arg.length - 1);
++            if (lastChar === 'R' || lastChar === 'z') {
++                nextIsOptArg = true;
++            }
++            return false;
++        }
++
++        if (nextIsOptArg) {
++            nextIsOptArg = false;
++            return false;
++        }
++
++        evtname = evtname + '-' + arg;
++        return true;
++    });
++
++    traceExecFile(cmd, args, log, evtname, function (error, stdout, stderr) {
++        if (error) {
++            callback(error, {'stdout': stdout, 'stderr': stderr});
++        } else {
++            callback(null, {'stdout': stdout, 'stderr': stderr});
++        }
++    });
++}
++
+ function zoneadm(args, log, callback)
+ {
+     var cmd = '/usr/sbin/zoneadm';
+@@ -4411,7 +4667,7 @@ function checkPayloadProperties(payload, vmobj, log, callback)
+     var prop;
+     var props;
+     var ram;
+-    var route;
++    var routeEntry;
+     var routes_result = {};
+     var tracers_obj;
+     var update_nic;
+@@ -4637,8 +4893,8 @@ function checkPayloadProperties(payload, vmobj, log, callback)
+ 
+         // Keep track of route additions / deletions, to make sure that
+         // we're not setting link-local routes against nics that don't exist
+-        for (route in vmobj.routes) {
+-            routes_result[route] = vmobj.routes[route];
++        for (routeEntry in vmobj.routes) {
++            routes_result[routeEntry] = vmobj.routes[routeEntry];
+         }
+     }
+ 
+@@ -5117,9 +5373,9 @@ function checkPayloadProperties(payload, vmobj, log, callback)
+     function validLocalRoute(r) {
+         var index;
+         var macAddress;
+-        var macMatch = r.match(/^macs\[(.+)\]$/);
++        var macMatch = r.match(MACS_RE);
+         var nicIdx = null;
+-        var nicMatch = r.match(/^nics\[(\d+)\]$/);
++        var nicMatch = r.match(NICS_RE);
+ 
+         if (macMatch) {
+             try {
+@@ -13860,7 +14116,7 @@ exports.update = function (uuid, payload, options, callback)
+                 cb(e);
+             });
+         }, function (cb) {
+-            updateRoutes(vmobj, payload, log, function (e) {
++            updateRoutes(vmobj, payload, true, log, function (e) {
+                 cb(e);
+             });
+         }, function (cb) {
+diff --git a/src/vm/node_modules/proptable.js b/src/vm/node_modules/proptable.js
+index ef8ec240..9bd32c03 100644
+--- a/src/vm/node_modules/proptable.js
++++ b/src/vm/node_modules/proptable.js
+@@ -2140,6 +2140,7 @@ exports.properties = {
+  *                    mdata:fetch service to update properties in the zone
+  * 'min_memory_overhead' -- (integer) minimum delta between ram + max_physical
+  * 'model_required' -- (boolean) whether a .model is required on nics and disks
++ * 'route_refresh' -- (boolean) if route -z is needed to refresh routes
+  * 'runtime_info' -- (boolean) whether this zone supports the 'info' command
+  * 'serial_console' -- (boolean) whether this zone uses serial console
+  * 'type' -- the type of the VM (OS or KVM), all brands should include this
+@@ -2232,6 +2233,7 @@ exports.brand_options = {
+             'use_tmpfs': true,
+             'write_zone_netfiles': false,
+             'zlogin_console': true,
++            'route_refresh': true,
+             'zoneroot_image_types': ['docker', 'lx-dataset']
+         }
+     }
+diff --git a/src/vm/tests/test-routes-lx.js b/src/vm/tests/test-routes-lx.js
+index b838e2b5..625255ed 100644
+--- a/src/vm/tests/test-routes-lx.js
++++ b/src/vm/tests/test-routes-lx.js
+@@ -20,11 +20,38 @@ var PAYLOAD_TEMPLATE = {
+     kernel_version: '3.13.0'
+ };
+ 
+-test('setting custom static routes for LX branded zones', function(t) {
++function checkRoutes(t, state, expectedRoutes, cb) {
++    cp.exec(format('/usr/sbin/zlogin %s /bin/netstat -rn |'
++        + 'egrep -v \'Destination|routing\' | awk \'{ print $1,$2 }\'',
++        state.uuid), function checkRoutesCb(err, stdout, stderr) {
++            if (err) {
++                cb(err);
++                return;
++            }
++
++            var actualRoutes = {};
++            stdout.split(/\n/g).forEach(function (line) {
++                var parts = line.split(' ');
++                if (parts[0] === '' || parts[0] === '127.0.0.1') {
++                    return;
++                }
++
++                actualRoutes[parts[0]] = parts[1];
++            });
++
++            t.deepEqual(actualRoutes, expectedRoutes,
++                'routes in zone should be '
++                + JSON.stringify(expectedRoutes)
++                + ' and are: ' + JSON.stringify(actualRoutes));
++
++            cb();
++        });
++}
++
++test('setting custom static routes for LX branded zones', function (t) {
+     var state = {
+         brand: 'lx'
+     };
+-    var vm;
+ 
+     var routes = {
+         '172.20.42.0/24': '172.19.1.1',
+@@ -42,8 +69,8 @@ test('setting custom static routes for LX branded zones', function(t) {
+         autoboot: true,
+         nics: [
+             { nic_tag: 'admin',
+-              ip: '172.19.1.2',
+-              netmask: '255.255.255.0' }
++                ip: '172.19.1.2',
++                netmask: '255.255.255.0' }
+         ],
+         maintain_resolvers: true,
+         nowait: false,
+@@ -68,11 +95,10 @@ test('setting custom static routes for LX branded zones', function(t) {
+                     t.ifError(loadErr,
+                         'loading VM after create should succeed');
+                     if (vmObj && vmObj.state === 'running') {
+-                        vm = vmObj;
+                         cb();
+-                    } else if (vmObj.state === 'failed' ||
+-                        vmObj.state === 'destroyed') {
+-                        cb(new Error('test VM in state ' + vmObj.state))
++                    } else if (vmObj.state === 'failed'
++                        || vmObj.state === 'destroyed') {
++                        cb(new Error('test VM in state ' + vmObj.state));
+                     } else {
+                         if (nbTries >= MAX_NB_TRIES) {
+                             cb(new Error('Reached max number of retries'));
+@@ -84,33 +110,46 @@ test('setting custom static routes for LX branded zones', function(t) {
+             }, RETRY_PERIOD_MS);
+         },
+ 
+-        function checkRoutes(cb) {
+-            cp.exec(format('/usr/sbin/zlogin %s /bin/netstat -rn |' +
+-                'egrep -v \'Destination|routing\' | awk \'{ print $1,$2 }\'',
+-                    vm.uuid), function (err, stdout, stderr) {
+-                        if (err) {
+-                            cb(err);
+-                            return;
+-                        }
++        checkRoutes.bind(null, t, state, expectedRoutesInZone),
+ 
+-                        var actualRoutes = {};
+-                        stdout.split(/\n/g).forEach(function (line) {
+-                            var parts = line.split(' ');
+-                            if (parts[0] == "" || parts[0] == "127.0.0.1") {
+-                                return;
+-                            }
++        function addAdditionalRoutes(cb) {
++            var updatePayload = {
++                set_routes: {
++                    '172.21.12.0/24': '172.19.1.1',
++                    '172.67.68.0/24': '172.19.1.1'
++                }
++            };
+ 
+-                            actualRoutes[parts[0]] = parts[1];
+-                        });
++            expectedRoutesInZone['172.21.12.0'] = '172.19.1.1';
++            expectedRoutesInZone['172.67.68.0'] = '172.19.1.1';
+ 
+-                        t.deepEqual(actualRoutes, expectedRoutesInZone,
+-                            'routes in zone should be ' +
+-                                JSON.stringify(expectedRoutesInZone) +
+-                                ' and are: ' + JSON.stringify(actualRoutes));
++            VM.update(state.uuid, updatePayload,
++                function addAdditionalRoutesCb(err) {
++                    t.ifError(err, 'Updating VM ' + state.uuid
++                        + ' with additional routes');
++                    cb(err);
++                });
++        },
+ 
+-                        cb();
+-                    });
+-        }
++        checkRoutes.bind(null, t, state, expectedRoutesInZone),
++
++        function delAdditionalRoutes(cb) {
++            var delPayload = {
++                remove_routes: [ '172.21.12.0/24', '172.67.68.0/24' ]
++            };
++
++            delete expectedRoutesInZone['172.21.12.0'];
++            delete expectedRoutesInZone['172.67.68.0'];
++
++            VM.update(state.uuid, delPayload,
++                function delAdditionalRoutesCb(err) {
++                    t.ifError(err, 'Updating VM ' + state.uuid
++                        + ' removing additonal routes');
++                    cb(err);
++                });
++        },
++
++        checkRoutes.bind(null, t, state, expectedRoutesInZone)
+ 
+     ], function (err) {
+         t.ifError(err, 'test should not have encountered any error');

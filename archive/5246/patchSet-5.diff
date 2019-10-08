@@ -1,0 +1,389 @@
+commit cf3400bf172159d2acfbe0e78694bfcca3045d72 (refs/changes/46/5246/5)
+Author: Alex Wilson <alex.wilson@joyent.com>
+Date:   2018-12-21T15:31:59-08:00 (10 months ago)
+    
+    TRITON-1044 cns should use newer redis server and client, paginate AXFRs
+
+diff --git a/Makefile b/Makefile
+index e9a4438..fa319f0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -16,8 +16,8 @@
+ 
+ NAME			:= cns
+ NODE_PREBUILT_TAG	 = zone
+-NODE_PREBUILT_VERSION	:= v0.12.9
+-NODE_PREBUILT_IMAGE	 = b4bdc598-8939-11e3-bea4-8341f6861379
++NODE_PREBUILT_VERSION	:= v4.9.0
++NODE_PREBUILT_IMAGE	 = 18b094b0-eb01-11e5-80c1-175dac7ddf02
+ 
+ #
+ # Tools
+diff --git a/bin/cnsadm b/bin/cnsadm
+index c1e0a56..ebc7a40 100755
+--- a/bin/cnsadm
++++ b/bin/cnsadm
+@@ -15,7 +15,6 @@ var cmdUtils = require('../lib/cmd-utils');
+ var child = require('child_process');
+ var sprintf = require('sprintf-js').sprintf;
+ var vasync = require('vasync');
+-var deepEquals = require('deep-equal');
+ var jsprim = require('jsprim');
+ var restify = require('restify-clients');
+ 
+@@ -144,7 +143,7 @@ sapi.get('/configs/' + zoneName, function (err, req, res, obj) {
+ 
+ 	Object.keys(config).forEach(function (k) {
+ 		if (obj.metadata.hasOwnProperty(k)) {
+-			if (!deepEquals(config[k], obj.metadata[k]))
++			if (!jsprim.deepEquals(config[k], obj.metadata[k]))
+ 				waiting[k] = true;
+ 			config[k] = obj.metadata[k];
+ 		}
+diff --git a/lib/api-server.js b/lib/api-server.js
+index b9b1887..e8ea993 100644
+--- a/lib/api-server.js
++++ b/lib/api-server.js
+@@ -19,6 +19,7 @@ var net = require('net');
+ var dns = require('dns');
+ var consts = require('./consts');
+ var restify = require('restify');
++var jsprim = require('jsprim');
+ var restifyClients = require('restify-clients');
+ var child_process = require('child_process');
+ var fs = require('fs');
+@@ -326,7 +327,8 @@ function getVM_v1(req, res, next) {
+ 			next(e);
+ 			return;
+ 		}
+-		if (val === null || typeof (val.last_recs) !== 'string') {
++		if (val === null || jsprim.isEmpty(val) ||
++		    typeof (val.last_recs) !== 'string') {
+ 			e = new Error('VM not found');
+ 			e.statusCode = 404;
+ 			next(e);
+@@ -385,7 +387,7 @@ function getPeer_v1(req, res, next) {
+ 				cb(rerr);
+ 				return;
+ 			}
+-			if (serials === null || serials === {}) {
++			if (serials === null || jsprim.isEmpty(serials)) {
+ 				rerr = new Error('Peer not found');
+ 				rerr.statusCode = 404;
+ 				cb(rerr);
+diff --git a/lib/cmd-utils.js b/lib/cmd-utils.js
+index 53ef3c7..57b398c 100644
+--- a/lib/cmd-utils.js
++++ b/lib/cmd-utils.js
+@@ -7,7 +7,7 @@
+  */
+ 
+ var assert = require('assert-plus');
+-var deepEquals = require('deep-equal');
++var jsprim = require('jsprim');
+ var sprintf = require('sprintf-js').sprintf;
+ var vsprintf = require('sprintf-js').vsprintf;
+ 
+@@ -102,7 +102,8 @@ function parseModifiers(args, oldObj, schema) {
+ 			for (i = 0; i < orig.length; ++i) {
+ 				var add = true;
+ 				for (var j = 0; j < val.length; ++j) {
+-					if (deepEquals(orig[i], val[j])) {
++					if (jsprim.deepEquals(
++					    orig[i], val[j])) {
+ 						add = false;
+ 						break;
+ 					}
+diff --git a/lib/dns-server.js b/lib/dns-server.js
+index 7a0b064..1de7d17 100644
+--- a/lib/dns-server.js
++++ b/lib/dns-server.js
+@@ -20,6 +20,7 @@ var ipaddr = require('ipaddr.js');
+ var dns = require('dns');
+ var crypto = require('crypto');
+ var dgram = require('dgram');
++var jsprim = require('jsprim');
+ var net = require('net');
+ var os = require('os');
+ 
+@@ -30,10 +31,31 @@ var META_SUFFIX = '._cns_meta';
+ var TTL = consts.TTL;
+ var NS_TTL = consts.NS_TTL;
+ var VERSION = consts.VERSION;
++
++/*
++ * Max number of times we get no response or error on sending NOTIFY before
++ * we blacklist the peer (and no longer send them NOTIFY).
++ */
+ var MAX_NOTIFY_FAILURES = 5;
+ 
++/*
++ * Maximum number of answer records we will try to put in one DNS message
++ * during AXFR/IXFR (where splitting it up is fine).
++ */
+ var MAX_ANS_PER_MSG = 500;
+ 
++/*
++ * The 'COUNT' argument we give to 'SCAN' family commands on redis. Note that
++ * per the redis documentation, the default here is 10 and this is a hint, not
++ * a requirement or demand (the redis server can often return more or less
++ * than the amount).
++ *
++ * We use 50 because 10 generally results in too much redis traffic, but going
++ * to 100 or more seems to make our operations less interruptible (just by
++ * experiment).
++ */
++var REDIS_SCAN_COUNT = 50;
++
+ function DNSServer(opts) {
+ 	assert.object(opts, 'options');
+ 
+@@ -971,7 +993,7 @@ DNSServer.prototype.getPeerSerials = function (r, cb) {
+ 					scb(err3);
+ 					return;
+ 				}
+-				if (obj !== null) {
++				if (obj !== null && !jsprim.isEmpty(obj)) {
+ 					var host = parts[1];
+ 					Object.keys(obj).forEach(function (k) {
+ 						obj[k] = parseInt(obj[k], 10);
+@@ -1230,34 +1252,51 @@ DNSServer.prototype.handleTransfer = function (q, z, cb) {
+ 				q.addAnswer(z, ns[i], NS_TTL);
+ 				pushed++;
+ 			}
+-			r.hgetall('zone:' + z, function (err2, zrecs) {
+-				if (err2 || zrecs === null) {
+-					finish();
+-					return;
+-				}
+-				var names = Object.keys(zrecs);
+-				for (i = 0; i < names.length; ++i) {
+-					var name = names[i];
+-					var recs = JSON.parse(zrecs[name]);
+-					assert.arrayOfObject(recs);
+-					var trecs;
+-					while (recs.length > 0) {
+-						trecs = recs.slice(0, 20);
+-						recs = recs.slice(20);
+-						self.addAnswers(q, trecs,
+-						    name + '.' + z);
+-						pushed += trecs.length;
+-						if (pushed > MAX_ANS_PER_MSG) {
+-							if (!q.send()) {
+-								finish();
+-								return;
+-							}
+-							pushed = 0;
+-						}
++			var cursor = '0';
++			var key = 'zone:' + z;
++			function scanNext() {
++				r.hscan(key, cursor, 'COUNT', REDIS_SCAN_COUNT,
++				    function (err2, scanres) {
++					if (err2 || scanres === null) {
++						finish();
++						return;
++					}
++					cursor = scanres[0];
++					var zrecs = scanres[1];
++					if (!processAxfrZrecs(zrecs)) {
++						finish();
++						return;
++					}
++					if (cursor === '0') {
++						finish();
++						return;
++					}
++					scanNext();
++				});
++			}
++			scanNext();
++		}
++
++		function processAxfrZrecs(zrecs) {
++			for (i = 0; i < zrecs.length; i += 2) {
++				var name = zrecs[i];
++				var recs = JSON.parse(zrecs[i + 1]);
++				assert.arrayOfObject(recs);
++				var trecs;
++				while (recs.length > 0) {
++					trecs = recs.slice(0, 20);
++					recs = recs.slice(20);
++					self.addAnswers(q, trecs,
++					    name + '.' + z);
++					pushed += trecs.length;
++					if (pushed > MAX_ANS_PER_MSG) {
++						if (!q.send())
++							return (false);
++						pushed = 0;
+ 					}
+ 				}
+-				finish();
+-			});
++			}
++			return (true);
+ 		}
+ 	});
+ };
+diff --git a/lib/reaper-stream.js b/lib/reaper-stream.js
+index a998189..58443ea 100644
+--- a/lib/reaper-stream.js
++++ b/lib/reaper-stream.js
+@@ -76,6 +76,7 @@ function ReaperFSM(strm, opts) {
+ 	this.sleep = 100;
+ 	this.maxSleep = 10000;
+ 	this.reapTime = DEFAULT_REAP_TIME;
++	this.listCursor = '0';
+ 
+ 	this.client = restify.createJsonClient(utils.getRestifyClientOptions({
+ 		url: 'http://' + opts.config.vmapi_opts.address,
+@@ -108,6 +109,7 @@ ReaperFSM.prototype.wake = function () {
+ };
+ 
+ ReaperFSM.prototype.state_idle = function (S) {
++	this.listCursor = '0';
+ 	S.on(this, 'startAsserted', function () {
+ 		S.gotoState('listVms');
+ 	});
+@@ -126,28 +128,39 @@ ReaperFSM.prototype.state_listVms = function (S) {
+ 		S.gotoState('listError');
+ 	});
+ 
+-	this.redis.keys('vm:*', S.callback(function (err, keys) {
++	this.redis.scan(this.listCursor, 'COUNT', 50, 'MATCH', 'vm:*',
++	    S.callback(function (err, resp) {
+ 		if (err) {
+ 			self.lastError = err;
+ 			S.gotoState('listError');
+ 			return;
+ 		}
++		self.listCursor = resp[0];
++		var keys = resp[1];
++		var pushed = 0;
+ 
+ 		for (var i = 0; i < keys.length; ++i) {
+ 			var parts = keys[i].split(':');
+ 			if (parts.length === 2 && parts[0] === 'vm') {
+ 				self.remaining.push(parts[1]);
++				++pushed;
+ 			}
+ 		}
+ 
+-		self.log.debug('pushed %d candidates for reaping',
++		self.log.debug('pushed %d candidates for reaping (out of %d ' +
++		    'keys, %d total on queue)', pushed, keys.length,
+ 		    self.remaining.length);
+ 
+-		S.gotoState('next');
++		if (self.listCursor === '0') {
++			S.gotoState('next');
++		} else {
++			S.gotoState('listVms');
++		}
+ 	}));
+ };
+ 
+ ReaperFSM.prototype.state_listError = function (S) {
++	this.listCursor = '0';
+ 	this.log.error(this.lastError,
+ 	    'error while listing VMs in redis, retry in 1s');
+ 	S.timeout(1000, function () {
+diff --git a/package.json b/package.json
+index 8521ef6..6d10884 100644
+--- a/package.json
++++ b/package.json
+@@ -23,26 +23,25 @@
+     "tape": "^4.2.1"
+   },
+   "dependencies": {
+-    "assert-plus": "0.1.5",
+-    "bunyan": "1.5.1",
+-    "changefeed": "1.2.0",
+-    "cueball": "2.2.6",
++    "assert-plus": "1.0.0",
++    "bunyan": "1.8.12",
++    "changefeed": "1.4.0",
++    "cueball": "2.9.0",
+     "dashdash": "1.10.1",
+-    "deep-equal": "1.0.1",
+     "ipaddr.js": "1.0.3",
+-    "jsprim": "1.2.2",
+-    "ldapjs": "1.0.0",
++    "jsprim": "2.0.0",
++    "ldapjs": "1.0.2",
+     "lru-cache": "4.1.5",
+-    "mooremachine": "2.1.0",
+-    "mname": "1.3.5",
+-    "redis": "2.1.0",
++    "mooremachine": "2.2.1",
++    "mname": "1.5.0",
++    "ioredis": "3.2.2",
+     "restify": "4.3.0",
+     "restify-clients": "1.6.0",
+     "restify-errors": "4.3.0",
+     "sdc-scripts": "git+https://github.com/joyent/sdc-scripts.git#deefaef587ed3bee2706cb6e53ee3468e682932e",
+     "sprintf-js": "1.0.3",
+     "triton-tags": "1.2.2",
+-    "uuid": "2.0.1",
+-    "vasync": "1.6.3"
++    "uuid": "3.3.2",
++    "vasync": "2.2.0"
+   }
+ }
+diff --git a/sapi_manifests/cns/template b/sapi_manifests/cns/template
+index 9497a1d..5c527fc 100644
+--- a/sapi_manifests/cns/template
++++ b/sapi_manifests/cns/template
+@@ -48,7 +48,9 @@
+ 	"min_notify_interval": {{{min_notify_interval}}},
+ {{/min_notify_interval}}
+ 
+-	"redis_opts": {},
++	"redis_opts": {
++		"dropBufferSupport": true
++	},
+ 
+ 	"binder_domain": "binder.{{{datacenter_name}}}.{{{dns_domain}}}",
+ 
+diff --git a/server.js b/server.js
+index 84be232..783d177 100644
+--- a/server.js
++++ b/server.js
+@@ -6,7 +6,7 @@
+  * Copyright (c) 2015, Joyent, Inc.
+  */
+ 
+-var redis = require('redis');
++var redis = require('ioredis');
+ var bunyan = require('bunyan');
+ var config = require('./lib/config');
+ var DNSServer = require('./lib/dns-server');
+@@ -52,8 +52,9 @@ var redisPool = new cueball.ConnectionPool({
+ 		var c = redis.createClient({
+ 			host: backend.address,
+ 			port: backend.port,
+-			enable_offline_queue: false,
+-			max_attempts: 1
++			enableOfflineQueue: false,
++			connectTimeout: 30000,
++			dropBufferSupport: true
+ 		});
+ 		c.destroy = function () {
+ 			c.end(false);
+diff --git a/updater.js b/updater.js
+index 279db67..2d8d1d0 100644
+--- a/updater.js
++++ b/updater.js
+@@ -3,10 +3,10 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+  *
+- * Copyright (c) 2015, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+-var redis = require('redis');
++var redis = require('ioredis');
+ var bunyan = require('bunyan');
+ var cueball = require('cueball');
+ var util = require('util');

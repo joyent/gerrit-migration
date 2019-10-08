@@ -1,0 +1,558 @@
+commit 5d2434ac30e7496468731c88726bb6c5553716b6 (refs/changes/44/3644/25)
+Author: Rui Loura <rui@joyent.com>
+Date:   2018-06-12T14:54:16+00:00 (1 year, 4 months ago)
+    
+    NET-390 portolan should support intra-DC cross vnet routing
+    Reviewed by:
+    Approved by:
+
+diff --git a/Makefile b/Makefile
+index 96443ee..52e8aa4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,7 +5,7 @@
+ #
+ 
+ #
+-# Copyright 2016, Joyent, Inc.
++# Copyright 2018, Joyent, Inc.
+ #
+ 
+ #
+@@ -51,7 +51,7 @@ $(ESLINT): | $(NPM_EXEC)
+ $(TAPE):
+ 	$(NPM) install
+ 
+-CLEAN_FILES += $(TAP) ./node_modules/tap
++CLEAN_FILES += ./node_modules/
+ 
+ .PHONY: test
+ test: $(TAPE)
+diff --git a/lib/buckets.js b/lib/buckets.js
+index 739267e..0962bcf 100644
+--- a/lib/buckets.js
++++ b/lib/buckets.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -86,6 +86,57 @@ var BUCKETS = {
+                 version: 0
+             }
+         }
++    },
++
++    /*
++     * Key:  vnet_id,vlan_id,subnet,r_subnet
++     */
++    vnet_routes: {
++        desc: 'local to remote vnet mapping',
++        name: 'portolan_vnet_routes',
++        schema: {
++            index: {
++                net_uuid: {
++                    type: 'string'
++                },
++                vnet_id: {
++                    type: 'number'
++                },
++                vlan_id: {
++                    type: 'number'
++                },
++                subnet: {
++                    type: 'subnet'
++                },
++                r_dc_id: {
++                    type: 'number'
++                },
++                r_net_uuid: {
++                    type: 'string'
++                },
++                r_vnet_id: {
++                    type: 'number'
++                },
++                r_vlan_id: {
++                    type: 'number'
++                },
++                r_subnet: {
++                    type: 'subnet'
++                },
++                r_send_mac: {
++                    type: 'number'
++                },
++                version: {
++                    type: 'number'
++                },
++                deleted: {
++                    type: 'boolean'
++                }
++            },
++            options: {
++                version: 0
++            }
++        }
+     }
+ };
+ var NAMES = {};
+diff --git a/lib/common.js b/lib/common.js
+index f7e6e41..b2f1899 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -27,8 +27,19 @@ function vnetMacIPkey(ip, vid) {
+     return [ip, vid].join(',');
+ }
+ 
+-
++/*
++ * Returns a key for the vnet_routes table
++ */
++function vnetRouteKey(opts) {
++    return [
++        opts.vnet_id,
++        opts.vlan_id,
++        opts.subnet,
++        opts.r_subnet
++    ].join(',');
++}
+ 
+ module.exports = {
+-    vnetMacIPkey: vnetMacIPkey
++    vnetMacIPkey: vnetMacIPkey,
++    vnetRouteKey: vnetRouteKey
+ };
+diff --git a/lib/consumer.js b/lib/consumer.js
+index 84695be..392376d 100644
+--- a/lib/consumer.js
++++ b/lib/consumer.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2017, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -19,6 +19,7 @@ var fmt = require('util').format;
+ var mod_bucket = require('./buckets');
+ var mod_common = require('./common');
+ var mod_errors = require('./errors');
++var mod_lomstream = require('lomstream');
+ var mod_lru = require('lru-cache');
+ var VError = require('verror');
+ 
+@@ -365,6 +366,125 @@ function logRm(opts, callback) {
+     });
+ }
+ 
++function vnetRouteLookup(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.object(opts.moray, 'opts.moray');
++    assert.number(opts.src_vnet_id, 'opts.src_vnet_id');
++    assert.number(opts.src_vlan_id, 'opts.src_vlan_id');
++    assert.string(opts.src_ip, 'opts.src_ip');
++    assert.string(opts.remote_ip, 'opts.remote_ip');
++
++    var vnet_id = opts.src_vnet_id;
++    var vlan_id = opts.src_vlan_id;
++    var src_ip = opts.src_ip;
++    var remote_ip = opts.remote_ip;
++
++    /*
++     * There should only be one matching record.  If there is more than one we
++     * log a warning and let the caller handle it.
++     */
++    var filter = fmt('&(vnet_id=%d)(vlan_id=%d)(subnet:contains:=%s)'
++        + '(r_subnet:contains:=%s)', vnet_id, vlan_id, src_ip, remote_ip);
++    var searchOpts = {
++        limit: opts.limit || 2,
++        sort: {
++            attribute: '_mtime'
++        }
++    };
++
++    var routes = [];
++
++    var req = opts.moray.findObjects(NAMES.vnet_routes, filter, searchOpts);
++
++    req.once('error', function searchError(err) {
++        opts.log.error(err, 'vnetRoute search error');
++        callback(err);
++    });
++
++    req.on('record', function onRecord(obj) {
++        if (obj.value.deleted) {
++            return;
++        }
++        routes.push(obj.value);
++        if (routes.length > 1) {
++            opts.log.warn('Multiple vnet route matches for filter: %s', filter);
++        }
++    });
++
++    req.once('end', function onEnd() {
++        opts.log.debug({ routes: routes }, 'consumer.vnetRouteLookup records');
++        callback(null, routes);
++    });
++}
++
++function vnetRouteList(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.log, 'opts.log');
++    assert.object(opts.moray, 'opts.moray');
++    assert.string(opts.net_uuid, 'opts.net_uuid');
++
++    var net_uuid = opts.net_uuid;
++    var output = [];
++
++    /* eslint no-unused-vars: ["error", {"args": "after-used"}] */
++    function _fetch(arg, limitobj, datacb, donecb) {
++        var routes = [];
++        var record_count = 0;
++        var limit = limitobj.limit;
++        var offset = limitobj.offset;
++        var filter = fmt('&(net_uuid=%s)', net_uuid);
++
++        var searchOpts = {
++            limit: limitobj.limit,
++            offset: offset,
++            sort: {
++                attribute: '_mtime'
++            }
++        };
++
++        var req = opts.moray.findObjects(NAMES.vnet_routes, filter, searchOpts);
++
++        req.once('error', function searchError(err) {
++            opts.log.error(err, 'vnetRoute search error');
++            donecb(err);
++        });
++
++        req.on('record', function onRecord(obj) {
++            record_count++;
++            if (obj.value.deleted) {
++                return;
++            }
++            routes.push(obj.value);
++        });
++
++        req.once('end', function onEnd() {
++            opts.log.debug({ routes: routes },
++                'consumer.vnetRouteList records');
++
++            var done = (record_count < limit);
++            donecb(null,  {done: done, results: routes});
++        });
++    }
++
++    var s = new mod_lomstream.LOMStream({
++        fetch: _fetch,
++        limit: opts.limit || 1000,
++        offset: true
++    });
++
++    s.on('data', function (datum) {
++        output.push(datum);
++    });
++
++    s.on('error', function (err) {
++        callback(err);
++    });
++
++    s.on('end', function () {
++        callback(null, output);
++    });
++}
+ 
+ module.exports = {
+     underlayLookup: underlayLookup,
+@@ -374,5 +494,7 @@ module.exports = {
+     vl2LookupCns: vl2LookupCns,
+     vl3Lookup: vl3Lookup,
+     logReq: logReq,
+-    logRm: logRm
++    logRm: logRm,
++    vnetRouteLookup: vnetRouteLookup,
++    vnetRouteList: vnetRouteList
+ };
+diff --git a/lib/producer.js b/lib/producer.js
+index f59f406..12a947b 100644
+--- a/lib/producer.js
++++ b/lib/producer.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2017, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -48,6 +48,25 @@ function overlayMapRecord(opts) {
+     };
+ }
+ 
++function vnetRouteMapRecord(opts) {
++    return {
++        key: mod_common.vnetRouteKey(opts),
++        value: {
++            net_uuid: opts.net_uuid,
++            vnet_id: opts.vnet_id,
++            vlan_id: opts.vlan_id,
++            subnet: opts.subnet,
++            r_dc_id: opts.r_dc_id,
++            r_net_uuid: opts.r_net_uuid,
++            r_vnet_id: opts.r_vnet_id,
++            r_vlan_id: opts.r_vlan_id,
++            r_subnet: opts.r_subnet,
++            r_send_mac: opts.r_send_mac,
++            version: opts.version || VERSION,
++            deleted: opts.deleted || false
++        }
++    };
++}
+ 
+ 
+ // --- Exports
+@@ -244,6 +263,119 @@ function removeUnderlayMapping(opts, cb) {
+     client.delObject(NAMES.underlay, key, cb);
+ }
+ 
++function addVnetRouteMapping(opts, callback) {
++    assert.object(opts, 'opts');
++    assert.object(opts.moray, 'opts.moray');
++    assert.number(opts.vnet_id, 'opts.vnet_id');
++    assert.number(opts.vlan_id, 'opts.vlan_id');
++    assert.string(opts.subnet, 'opts.subnet');
++    assert.number(opts.r_dc_id, 'opts.r_dc_id');
++    assert.number(opts.r_vnet_id, 'opts.r_vnet_id');
++    assert.number(opts.r_vlan_id, 'opts.r_vlan_id');
++    assert.string(opts.r_subnet, 'opts.r_subnet');
++    assert.number(opts.r_send_mac, 'opts.r_send_mac');
++    assert.optionalNumber(opts.version, 'opts.version');
++    assert.optionalBool(opts.deleted, 'opts.deleted');
++    assert.func(callback, 'callback');
++
++    var client = opts.moray;
++    var rec = vnetRouteMapRecord(opts);
++
++    client.putObject(NAMES.vnet_routes, rec.key, rec.value, callback);
++}
++
++function vnetRouteMappingBatch(opts) {
++    var rec = vnetRouteMapRecord(opts);
++
++    return {
++        bucket: NAMES.vnet_routes,
++        key: rec.key,
++        operation: 'put',
++        value: rec.value
++    };
++}
++
++function vnetRouteMappingDelBatch(opts) {
++    var rec = vnetRouteMapRecord(opts);
++
++    return {
++        bucket: NAMES.vnet_routes,
++        key: rec.key,
++        operation: 'delete'
++    };
++}
++
++/*
++ * XXX: UNUSED, for future use by NAPI.
++ */
++function updateVnetRouteMapping(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.moray, 'opts.moray');
++    assert.number(opts.vnet_id, 'opts.vnet_id');
++    assert.number(opts.vlan_id, 'opts.vlan_id');
++    assert.string(opts.subnet, 'opts.subnet');
++    assert.number(opts.r_dc_id, 'opts.r_dc_id');
++    assert.number(opts.r_vnet_id, 'opts.r_vnet_id');
++    assert.number(opts.r_vlan_id, 'opts.r_vlan_id');
++    assert.string(opts.r_subnet, 'opts.r_subnet');
++    assert.number(opts.r_send_mac, 'opts.r_send_mac');
++    assert.optionalNumber(opts.version, 'opts.version');
++    assert.optionalBool(opts.deleted, 'opts.deleted');
++    assert.func(cb, 'callback');
++
++    var client = opts.moray;
++    var key = mod_common.vnetRouteKey(opts);
++
++    client.getObject(NAMES.vnet_routes, key, function onUpdateGet(err, obj) {
++        if (err) {
++            cb(err);
++            return;
++        }
++
++        var rec_val = {
++            vnet_id: opts.vnet_id,
++            vlan_id: opts.vlan_id,
++            subnet: opts.subnet,
++            r_dc_id: opts.r_dc_id || obj.r_dc_id,
++            r_vnet_id: opts.r_vnet_id || obj.r_vnet_id,
++            r_vlan_id: opts.r_vlan_id || obj.r_vlan_id,
++            r_subnet: opts.r_subnet,
++            r_send_mac: opts.r_send_mac || obj.r_send_mac,
++            version: opts.version || obj.version || VERSION,
++            deleted: opts.deleted || obj.deleted || false
++        };
++
++        var putOpts = {
++            etag: obj._etag
++        };
++
++        client.putObject(NAMES.vnet_routes, key, rec_val, putOpts,
++            function onUpdatePut(putErr, data) {
++
++            if (putErr) {
++               cb(putErr);
++               return;
++            }
++
++            cb(null, data);
++        });
++    });
++}
++
++function removeVnetRouteMapping(opts, cb) {
++    assert.object(opts, 'opts');
++    assert.object(opts.moray, 'opts.moray');
++    assert.number(opts.vnet_id, 'opts.vnet_id');
++    assert.number(opts.vlan_id, 'opts.vlan_id');
++    assert.string(opts.subnet, 'opts.subnet');
++    assert.string(opts.r_subnet, 'opts.r_subnet');
++
++    var client = opts.moray;
++    var key = mod_common.vnetRouteKey(opts);
++
++    client.delObject(NAMES.vnet_routes, key, cb);
++}
++
+ /*
+  * Produces a moray-batchable set of SVP VL2 logs, indicating that a shootdown
+  * is required. These are required when an IP:MAC mapping is deleted (which
+@@ -326,6 +458,58 @@ function vl3CnEventBatch(opts) {
+     return batch;
+ }
+ 
++/*
++ * Produce a moray-batchable set of SVP ROUTE logs, indicating that a an
++ * overlay mapping needs to be updated or removed.  This is triggered when a
++ * network's attached networks array has been updated.
++ */
++function vnetRouteEventBatch(opts) {
++    assert.object(opts, 'opts');
++    assert.object(opts.vnetCns, 'opts.vnetCns');
++    assert.number(opts.src_vnet_id, 'opts.src_vnet_id');
++    assert.number(opts.dst_vnet_id, 'opts.dst_vnet_id');
++    assert.number(opts.dcid, 'opts.dcid');
++    assert.string(opts.srcip, 'opts.srcip');
++    assert.string(opts.dstip, 'opts.dstip');
++    assert.number(opts.src_vlan_id, 'opts.src_vlan_id');
++    assert.number(opts.dst_vlan_id, 'opts.src_vlan_id');
++    assert.number(opts.src_prefixlen, 'opts.src_prefixlen');
++    assert.number(opts.dst_prefixlen, 'opts.dst_prefixlen');
++    assert.optionalNumber(opts.version, 'opts.version');
++
++    var batch = [];
++    batch = opts.vnetCns.map(function vnetCnsMapOne(cn) {
++        var uuid = mod_uuid.v4();
++        return {
++            bucket: NAMES.net_events,
++            key: uuid,
++            operation: 'put',
++            options: {
++                etag: null
++            },
++            value: {
++                cn_uuid: cn,
++                vnet_id: opts.src_vnet_id,
++                version: opts.version || VERSION,
++                record: {
++                    type: 'SVP_LOG_ROUTE',
++                    src_vnet_id: opts.src_vnet_id,
++                    dst_vnet_id: opts.dst_vnet_id,
++                    dcid: opts.dcid,
++                    srcip: opts.srcip,
++                    dstip: opts.dstip,
++                    src_vlan_id: opts.src_vlan_id,
++                    dst_vlan_id: opts.dst_vlan_id,
++                    src_prefixlen: opts.src_prefixlen,
++                    dst_prefixlen: opts.dst_prefixlen
++                }
++            }
++        };
++    });
++
++    return batch;
++}
++
+ module.exports = {
+     addOverlayMapping: addOverlayMapping,
+     overlayMappingBatch: overlayMappingBatch,
+@@ -339,5 +523,12 @@ module.exports = {
+     removeUnderlayMapping: removeUnderlayMapping,
+ 
+     vl2CnEventBatch: vl2CnEventBatch,
+-    vl3CnEventBatch: vl3CnEventBatch
++    vl3CnEventBatch: vl3CnEventBatch,
++    vnetRouteEventBatch: vnetRouteEventBatch,
++
++    addVnetRouteMapping: addVnetRouteMapping,
++    vnetRouteMappingBatch: vnetRouteMappingBatch,
++    vnetRouteMappingDelBatch: vnetRouteMappingDelBatch,
++    updateVnetRouteMapping: updateVnetRouteMapping,
++    removeVnetRouteMapping: removeVnetRouteMapping
+ };
+diff --git a/package.json b/package.json
+index 48c48aa..3bdc6d3 100644
+--- a/package.json
++++ b/package.json
+@@ -8,6 +8,7 @@
+   "dependencies": {
+     "assert-plus": "1.0.0",
+     "lru-cache": "2.5.0",
++    "lomstream": "^1.1.0",
+     "uuid": "3.0.0",
+     "verror": "1.9.0"
+   },
+diff --git a/test/api.test.js b/test/api.test.js
+index da4f8cd..ef758ed 100644
+--- a/test/api.test.js
++++ b/test/api.test.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2018, Joyent, Inc.
+  */
+ 
+ /*
+@@ -25,7 +25,7 @@ var test = require('tape');
+ 
+ test('buckets exposed', function (t) {
+     t.ok(mod_pm.buckets, 'buckets exposed');
+-    [ 'mac_ip', 'underlay', 'net_events' ].forEach(function (b) {
++    [ 'mac_ip', 'underlay', 'net_events', 'vnet_routes' ].forEach(function (b) {
+         t.ok(mod_pm.buckets[b], b + ' bucket');
+     });
+ 

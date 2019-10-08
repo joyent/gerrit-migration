@@ -1,0 +1,1628 @@
+commit 1fc58ed1a1d82c7c00fabc2f90ab77ef336ccd18 (refs/changes/12/5212/9)
+Author: Mohamed Khalfella <mohamed.khalfella@joyent.com>
+Date:   2019-01-15T14:09:30+00:00 (9 months ago)
+    
+    MANTA-4019 Want the storage job to process moray dumps in parallel and compress intermediate objects
+
+diff --git a/assets/bin/storage-fanout b/assets/bin/storage-fanout
+new file mode 100755
+index 0000000..4041dd8
+--- /dev/null
++++ b/assets/bin/storage-fanout
+@@ -0,0 +1,9 @@
++#!/bin/bash
++# Copyright (c) 2018, Joyent, Inc. All rights reserved.
++
++set -o pipefail
++
++dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
++NODE=$dir/../build/node/bin/node
++
++$PIGZZ | $NODE $dir/../lib/storage-fanout.js -u -n $NUM_REDUCERS
+diff --git a/assets/bin/storage-map b/assets/bin/storage-map
+index eecdc4c..694b9e4 100755
+--- a/assets/bin/storage-map
++++ b/assets/bin/storage-map
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+-# Copyright (c) 2013, Joyent, Inc. All rights reserved.
++# Copyright (c) 2018, Joyent, Inc. All rights reserved.
+ 
+ set -o pipefail
+ 
+@@ -7,5 +7,4 @@ dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ NODE=$dir/../build/node/bin/node
+ 
+ $ZCAT \
+-| $NODE $dir/../lib/storage-map.js \
+-| msplit -j -n $NUM_REDUCERS -f owner,type,objectId
++| $NODE $dir/../lib/storage-map.js -u -n $NUM_REDUCERS -s owner,type,objectId
+diff --git a/assets/bin/storage-reduce1 b/assets/bin/storage-reduce1
+index 51076a7..9316337 100755
+--- a/assets/bin/storage-reduce1
++++ b/assets/bin/storage-reduce1
+@@ -26,5 +26,6 @@ NODE=$dir/../build/node/bin/node
+ # that can easily spill to disk; e.g., by using a SQLite or other disk-based
+ # database.
+ #
+-$NODE --max_old_space_size=1300 $dir/../lib/storage-reduce1.js \
++$ZCAT \
++| $NODE --max_old_space_size=1300 $dir/../lib/storage-reduce1.js \
+ | msplit -j -n $NUM_REDUCERS -f owner,namespace
+diff --git a/assets/lib/muploader.js b/assets/lib/muploader.js
+new file mode 100755
+index 0000000..726b91b
+--- /dev/null
++++ b/assets/lib/muploader.js
+@@ -0,0 +1,173 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++
++
++/*
++ * The number of concurrent upstream connections should be less than the maximum
++ * number that Manta allows from a single task before queueing them.  This is
++ * part of Marlin's configuration, but it's not exposed to user tasks, so we
++ * hardcode the default number here.  A better approach would be to have the
++ * server issue a 429 "Too Many Requests" response (instead of queueing them)
++ * and have the client back off when this happens.
++ */
++var msConcurrency = 25;
++
++/*
++ * Configure maxSockets based on our desired concurrency.  We have to do this
++ * here, before pulling in "restify-clients" (via "manta"), because
++ * "restify-clients" reads these from the top-level.
++ */
++var mod_http = require('http');
++mod_http.globalAgent.maxSockets = msConcurrency;
++
++var mod_manta = require('manta');
++var mod_vasync = require('vasync');
++var mod_retry = require('retry');
++var mod_path = require('path');
++var mod_fs = require('fs');
++
++function MUploader(log) {
++        this._log = log;
++}
++
++function createMantaDirectory(client, dir, cb) {
++        client.mkdirp(dir, function (err) {
++                // Do not treat this as an error if the directory
++                // already exists.
++                if (err && err.name != 'DirectoryExistsError') {
++                        cb(err);
++                        return;
++                }
++                cb();
++        });
++}
++
++function doUploadReducerStream(args, cb) {
++        var options = {
++                size: args.size,
++                // Manta recognize those headers and adds the uploaded
++                // object as input to the next phase reducer.
++                headers:  {
++                        'x-manta-stream': 'stdout',
++                        'x-manta-reducer': args.idx
++                }
++        };
++
++        var client = args.client;
++        var objectName = args.objectName;
++        var istream = args.istream;
++
++        client.put(objectName, istream, options, function (err) {
++                cb(err);
++        });
++}
++
++function doUploadReducerFile(args, cb) {
++        var client = args.client;
++        var dir = mod_path.dirname(args.objectName);
++        var fileName = args.fileName;
++
++        // Create the directory in manta if it doesn't already exist.
++        createMantaDirectory(client, dir, function (err1) {
++                if (err1) {
++                        cb(err1);
++                        return;
++                }
++
++                mod_fs.stat(fileName, function (err2, stat) {
++                        if (err2) {
++                                cb(err2);
++                                return;
++                        }
++                        args.size = stat.size;
++                        var istream = mod_fs.createReadStream(fileName);
++
++                        istream.on('error', function (error) {
++                                cb(error);
++                        });
++                        // When the file is opened, upload the
++                        // stream to manta.
++                        istream.on('open', function () {
++                                args.istream = istream;
++                                doUploadReducerStream(args, cb);
++                        });
++                });
++        });
++}
++
++function uploadReducerFile(args, cb) {
++
++        var operation = mod_retry.operation({
++                'retries': 2,
++                'factor': 2,
++                'minTimeout': 1000,
++                'maxTimeout': 3000
++        });
++
++
++        /*
++         * A failure in doUploadReducerFile() - or any other function it
++         * calls - is not fatal to the process. We retry uploading reducer
++         * files two times before we bail out.
++         */
++        operation.attempt(function (_currentAttempt) {
++                doUploadReducerFile(args, function (err) {
++                        // Retry uploading the file when possible.
++                        if (operation.retry(err)) {
++                                return;
++                        }
++                        cb(err ? operation.mainError() : null);
++                });
++        });
++}
++
++MUploader.prototype.uploadReducerFiles = function (fileNames, objectNames, cb) {
++        var client = mod_manta.createBinClient({
++                'log': this._log
++        });
++
++        var queue = mod_vasync.queuev({
++            'concurrency': msConcurrency,
++            'worker': function (args, qcb) {
++                uploadReducerFile(args, function (err) {
++                        // Failed to upload the file to manta.
++                        // Kill the other tasks in the queue
++                        // and return the error down stack.
++                        if (err) {
++                                queue.kill();
++                                cb(err);
++                                return;
++                        }
++
++                        // Continue to process the next task
++                        // in the queue.
++                        qcb();
++                });
++            }
++        });
++
++        fileNames.forEach(function (fileName, idx) {
++                queue.push({
++                        idx: idx,
++                        fileName: fileName,
++                        objectName: objectNames[idx],
++                        client: client
++                });
++        });
++
++        queue.drain = function () {
++                // Done uploading all the files to manta.
++                client.close();
++                cb();
++        };
++};
++
++module.exports = MUploader;
+diff --git a/assets/lib/storage-fanout.js b/assets/lib/storage-fanout.js
+new file mode 100755
+index 0000000..18e3f81
+--- /dev/null
++++ b/assets/lib/storage-fanout.js
+@@ -0,0 +1,321 @@
++#!/usr/node/bin/node
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++/*
++ * The purpose of this phase is to fanout the input objects to multipe
++ * reducers. In order to do this without breaking the next phase, we
++ * need to preserve two things:
++ *  - Each line, which is a js object, needs to go to exactly one
++ *    reducer. A line can't be split between two reducers.
++ *  - The first line, which contains header information, needs to go
++ *    to all the reducers. This is necessary becuase the next phase
++ *    expects this line in order to interpret the rest of its input.
++ *
++ * We use streams to process buffers in parallel to maximize the throughput.
++ *
++ *
++ *                       .-------------.
++ *     +                 |             |
++ *     |                 |             |
++ *     |                 |   stdin     |
++ *     |                 |             |
++ *     |                 |   Buffer    |
++ *     |                 |   chunks    |
++ *     |                 |             |
++ *     v                 |             |
++ *                       |             |
++ *                     /                '\
++ *                   /'-------------------'\
++ *                  |                       |
++ *                  --.-------------------.--
++ *                    |    Multi-Line     |
++ *                    |      Stream       |
++ *                    |                   |
++ *                    | Sequence of Lines |
++ *                    |      Buffer       |
++ *                    |      chunk        |
++ *                   /'-------------------'\
++ *                  |                       |
++ *                  --.-------------------.--
++ *                    | Detach-First-Line |
++ *                    |      Stream       |
++ *                    |                   |
++ *                    |     Seperate      |
++ *                    |      first        |
++ *                    |      line         |
++ *                    |      chunk        |
++ *                   / -------------------'\
++ *     .-----------/                         \--------------.
++ *     |                                                    |
++ *     |---|------------------------------------------------'
++ *     |   |  |   |       |   |
++ *     |   |  |   |       |   |
++ *     |   |  |   |       |   |
++ *     |   |  |   |       |   |
++ *     | R |  | R |       | R |  <---- Reducer streams
++ *     | e |  | e |       | e |
++ *     | d |  | d |       | d |
++ *     | u |  | u |       | u |
++ *     | c |  | c |       | c |
++ *     | e |  | e |       | e |
++ *     | r |  | r |       | r |
++ *     |   |  |   |       |   |
++ *     |   |  |   |       |   |
++ *     '---'  '---'      /'---'\
++ *                      /       \
++ *                     |         |
++ *                     `---------`
++ *                        | G |
++ *                        | Z |  <---- Compress
++ *                        | I |         reducer
++ *                        | P |          file
++ *                       /'---'\
++ *                      /       \
++ *                     |         |
++ *                     `---------`
++ *                        | F |
++ *                        | i |
++ *                        | l |  <---- Store
++ *                        | e |       to disk
++ *                        -   -
++ *                      _.-----._
++ *                    .-         -.
++ *                    |-_       _-|
++ *                    |  ~-----~  |
++ *                    |           |
++ *                    `._       _.'
++ *                       "-----"
++ *
++ *
++ */
++
++
++/*
++ * By default, at least in this version of node (0.10.40), 'events'
++ * module prints a warning message when the number of registered
++ * event listeners exceeds 10. To silence this warning message, we
++ * set the default max to 128 - which - as of now - the maximum number
++ * of reducers in a manta job.
++ */
++
++require('events').EventEmitter.prototype._maxListeners = 108;
++
++
++
++var mod_bunyan = require('bunyan');
++var mod_es = require('event-stream');
++var mod_fs = require('fs');
++var mod_uuid = require('node-uuid');
++var mod_getopt = require('posix-getopt');
++var mod_stream = require('stream');
++var mod_zlib = require('zlib');
++
++var MUploader = require('./muploader');
++var StringDecoder = require('string_decoder').StringDecoder;
++
++function fatal(message)
++{
++        console.error('storage-fanout: ' + message);
++        process.exit(1);
++}
++
++function uploadFiles(mu, fileNames, objectNames) {
++        mu.uploadReducerFiles(fileNames, objectNames, function (err) {
++                if (err) {
++                        fatal('Error uploading the files' + err.toString());
++                        return;
++                }
++                //done.
++        });
++}
++
++function main() {
++
++        var opts = {
++            directUpload: false,
++            nReducers: 0
++        };
++
++        var parser = new mod_getopt.BasicParser('n:u', process.argv);
++
++        var option;
++        while ((option = parser.getopt()) !== undefined) {
++                switch (option.option) {
++                case 'n':
++                        opts.nReducers = parseInt(option.optarg, 10);
++                        if (isNaN(opts.nReducers) || opts.nReducers < 1) {
++                                fatal('invalid number of reducers ' +
++                                    option.optarg);
++                        }
++                        break;
++                case 'u':
++                        opts.directUpload = true;
++                        break;
++                default:
++                        /* error message already emitted by getopt */
++                        fatal('Invalid option');
++                        break;
++                }
++        }
++
++        if ((opts.directUpload && !opts.nReducers) ||
++            (!opts.directUpload && opts.nReducers)) {
++                fatal('Setting the number of reducers is required ' +
++                    'when choosing direct upload, and vice versa');
++        }
++
++        if (opts.directUpload && !process.env['MANTA_OUTPUT_BASE']) {
++                fatal('Setting MANTA_OUTPUT_BASE is required ' +
++                    'when choosing direct upload');
++        }
++
++        // Pipe stdin to stdout when not doing direct upload
++        if (!opts.directUpload) {
++                process.stdin.pipe(process.stdout);
++                return;
++        }
++
++        var log = new mod_bunyan({
++            'name': 'storage-fanout',
++            'level': 'fatal',
++            'stream': process.stderr
++        });
++
++        var mu = new MUploader(log);
++
++        var objectPrefix = process.env['MANTA_OUTPUT_BASE'] +
++            mod_uuid.v4() + '.';
++        var objectNames = [];
++        var fileNames = [];
++
++        var openFiles = 0;
++        var closedFiles = 0;
++
++        // pause stdin while we do the plumbing.
++        process.stdin.pause();
++
++        // Multi-line stream - Transforms buffers read from stdin into
++        // chunks of strings. We make sure that each string is sequence
++        // of complete lines.
++        var mls = new mod_stream.Transform({objectMode: true});
++        mls.decoder = new StringDecoder();  // Our string decoder.
++        mls.savedString = null;             // last incomplete line saved.
++        mls._transform = function (chunk, enc, cb) {
++                // prepend the saved line to the decoded chunk
++                var str = this.savedString === null ? '' : this.savedString;
++                str += this.decoder.write(chunk);
++                var idx = str.lastIndexOf('\n');
++
++                // If all what we have is an incomplete line, then
++                // we save it and push nothing down stream.
++                if (idx === -1) {
++                        this.savedString = str;
++                        cb();
++                        return;
++                }
++
++                // Otherwise, we save the last incomplete line
++                // and push rest downstream.
++                this.savedString = str.slice(idx + 1);
++                this.push(str.slice(0, idx + 1));
++                cb();
++        };
++
++        mls._flush = function (cb) {
++                 // In the case of empty input
++                if (this.savedString === null) {
++                        cb();
++                        return;
++                }
++                var lastLine = this.savedString + this.decoder.end();
++                if (lastLine !== '') {
++                        // Push the last incomplete line
++                        this.push(lastLine + '\n');
++                }
++                cb();
++        };
++
++        // Pipe stdin into mls.
++        process.stdin.pipe(mls);
++
++        // We need to give special treatment to the first line because it
++        // contains header information. We push it in seperate chunk so that
++        // all the reducers recognize it.
++        var detachFirstLine = new mod_stream.Transform({objectMode: true});
++        mls.pipe(detachFirstLine);
++        detachFirstLine.firstLine = true;
++        detachFirstLine._transform = function (str, encoding, done) {
++                // Extract the first line and push it seperately.
++                if (this.firstLine) {
++                        var idx = str.indexOf('\n');
++                        this.push(str.slice(0, idx + 1));
++                        this.push(str.slice(idx + 1));
++                        this.firstLine = false;
++                        done();
++                        return;
++                }
++
++                // The rest of the lines pass-through.
++                this.push(str);
++                done();
++        };
++
++        for (var n = 0; n < opts.nReducers; n++) {
++
++                var rs = new mod_stream.Transform({objectMode: true});
++                detachFirstLine.pipe(rs);
++                // Chunk counter is set to -1 initially so that all reducers
++                // recognize and push the first line downstream.
++                rs.counter = -1;
++                rs.index = n;
++                rs.nReducers = opts.nReducers;
++                rs._transform = function (str, encoding, done) {
++                        // If this the first line or a chunk that needs to be
++                        // processed by this reducer, then push downstream.
++                        if (this.counter == -1 ||
++                            this.counter % this.nReducers == this.index) {
++                                this.push(str);
++                        }
++                        // Advance the chunk counter in all cases.
++                        this.counter++;
++                        done();
++                };
++
++                // To compress reducer's data.
++                var zs = mod_zlib.createGzip();
++                rs.pipe(zs);
++
++                // Reducer's object path in manta.
++                objectNames.push(objectPrefix + n);
++                // Reducer's temporary file path.
++                fileNames.push('/var/tmp/part' + n);
++                var ws = mod_fs.createWriteStream(fileNames[n]);
++                zs.pipe(ws);
++
++                ws.on('open', function () {
++                        // Resume stdin when all the underlying reducers'
++                        // files are ready to take input.
++                        if (++openFiles == opts.nReducers) {
++                                process.stdin.resume();
++                        }
++                });
++                ws.on('close', function () {
++                        // Upload the reducers' files to manta when all the data
++                        // has been fushed to disk.
++                        if (++closedFiles == opts.nReducers) {
++                                uploadFiles(mu, fileNames, objectNames);
++                        }
++                });
++        }
++}
++
++// Execution starts here
++main();
+diff --git a/assets/lib/storage-map.js b/assets/lib/storage-map.js
+index e501af8..6b0f842 100755
+--- a/assets/lib/storage-map.js
++++ b/assets/lib/storage-map.js
+@@ -6,24 +6,35 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.
++ * Copyright (c) 2018, Joyent, Inc.
+  */
+ 
+-var mod_carrier = require('carrier');
++var mod_stream = require('stream');
++var mod_getopt = require('posix-getopt');
++var mod_es = require('event-stream');
++var mod_uuid = require('node-uuid');
++
++var ZSplitter = require('./zsplitter');
++var MUploader = require('./muploader');
++
+ var lookupPath = process.env['LOOKUP_FILE'] || '../etc/lookup.json';
+ var lookup = require(lookupPath); // maps uuid->login
+-var ERROR = false;
+ var COUNT_UNAPPROVED_USERS = process.env['COUNT_UNAPPROVED_USERS'] === 'true';
+ 
+-var LOG = require('bunyan').createLogger({
++var log = require('bunyan').createLogger({
+         name: 'storage-map.js',
+         stream: process.stderr,
+         level: process.env['LOG_LEVEL'] || 'info'
+ });
+ 
++
++var index;
++var lineCount = 0;
++var process_line;
++
+ function validSchema(obj) {
+-        var fields =
+-                ['key', 'owner', 'type'];
++        var fields = ['key', 'owner', 'type'];
++
+         for (var i = 0; i < fields.length; i++) {
+                 if (!obj[fields[i]]) {
+                         return (false);
+@@ -32,79 +43,197 @@ function validSchema(obj) {
+         return (true);
+ }
+ 
++function fatal(message)
++{
++        console.error('storage-map: ' + message);
++        process.exit(1);
++}
+ 
+-function main() {
+-        var carry = mod_carrier.carry(process.openStdin());
+-        var index;
+-        var lineCount = 0;
+-
+-        function onLine(line) {
+-                lineCount++;
+-                try {
+-                        var record = JSON.parse(line);
+-                } catch (e) {
+-                        LOG.error(e, 'Error on line ' + lineCount);
+-                        ERROR = true;
+-                        return;
+-                }
++function processLine(zs, line, opts, cb) {
++        lineCount++;
++        try {
++                var record = JSON.parse(line);
++        } catch (e) {
++                fatal('Error on line: ' + lineCount);
++        }
+ 
+-                if (!record.entry || !record.entry[index]) {
+-                        LOG.error(line, 'unrecognized line ' + lineCount);
+-                        ERROR = true;
+-                        return;
+-                }
++        if (record.name === 'manta' && Array.isArray(record.keys)) {
++                /* This is a header record. It is safe to skip it */
++                cb();
++                return;
++        }
+ 
+-                try {
+-                        var value = JSON.parse(record.entry[index]);
+-                        if (!validSchema(value)) {
+-                                LOG.error(line, 'invalid line ' + lineCount);
+-                                ERROR = true;
+-                                return;
+-                        }
+-                } catch (e) {
+-                        LOG.error(e, 'Error on line ' + lineCount);
+-                        ERROR = true;
+-                        return;
++        if (!record.entry || !record.entry[index]) {
++                fatal('Unrecognized line: ' + lineCount);
++        }
++
++        try {
++                var value = JSON.parse(record.entry[index]);
++                if (!validSchema(value)) {
++                        fatal('Invalid line: ' + lineCount);
+                 }
++        } catch (e) {
++                fatal('Error on line: ' + lineCount);
++        }
+ 
+-                if (!COUNT_UNAPPROVED_USERS) {
+-                        if (!lookup[value.owner]) {
+-                                LOG.error(record, 'No login found for UUID ' +
+-                                        value.owner);
+-                                ERROR = true;
+-                                return;
+-                        }
++        if (!COUNT_UNAPPROVED_USERS) {
++                if (!lookup[value.owner]) {
++                        fatal('No login found for UUID: ' + value.owner);
++                }
+ 
+-                        if (!lookup[value.owner].approved) {
+-                                LOG.warn(record, value.owner +
+-                                        ' not approved for provisioning. ' +
+-                                        'Skipping...');
++                if (!lookup[value.owner].approved) {
++                        log.warn(record, value.owner +
++                            ' not approved for provisioning. ' +
++                            'Skipping...');
++                                cb();
+                                 return;
+-                        }
+                 }
++        }
+ 
++        if (!opts.directUpload) {
+                 console.log(JSON.stringify(value));
++                cb();
++                return;
+         }
+ 
+-        carry.once('line', function firstLine(line) {
+-                lineCount++;
+-                try {
+-                        index = JSON.parse(line).keys.indexOf('_value');
+-                } catch (e) {
+-                        LOG.fatal(e, line, 'error parsing schema');
+-                        ERROR = true;
++        // Construct the split key
++        var splitKey = '';
++        opts.splitKeys.forEach(function (key) {
++                splitKey = splitKey + value[key];
++        });
++
++        // Write to splitter specifying the split key.
++        zs.write(JSON.stringify(value) + '\n', splitKey, cb);
++}
++
++function processFirstLine(zs, line, opts, cb) {
++
++        process_line = processLine;
++        lineCount++;
++        try {
++                index = JSON.parse(line).keys.indexOf('_value');
++        } catch (e) {
++                fatal('Error parsing schema');
++        }
++        cb();
++}
++
++function processStdin(zs, opts) {
++
++        var transform = new mod_stream.Transform({ objectMode: true });
++        process_line = processFirstLine;
++
++        transform._transform = function (chunk, encoding, done) {
++                // By default mod_es.split() pushes a trailing empty line
++                // when the last line has '\n' at the end. We need to skip it
++                if (chunk.length === 0) {
++                        done();
+                         return;
+                 }
+-                carry.on('line', onLine);
+-        });
++                process_line(zs, chunk + '\n', opts, done);
++        };
++
++        // In the case of direct upload, we need to tell all the reducers
++        // we are done. Otherwise, we will be waiting for the 'close' event
++        // to be fired forever.
++        if (opts.directUpload) {
++                transform._flush = function (done) {
++                        for (var r = 0; r < opts.nReducers; r++)
++                                zs.end(r);
++                        done();
++                };
++        }
+ 
++        // Start processing stdin
++        process.stdin.pipe(mod_es.split()).pipe(transform);
+ }
+ 
+-if (require.main === module) {
++function uploadFiles(mu, fileNames, objectNames) {
++        mu.uploadReducerFiles(fileNames, objectNames, function (err) {
++                if (err) {
++                        fatal('Error uploading the files' + err.toString());
++                        return;
++                }
++                //done
++        });
++}
++
++function main() {
+ 
+-        process.on('exit', function onExit() {
+-                process.exit(ERROR);
++        var opts = {
++                directUpload: false,
++                nReducers: 0,
++                splitKeys: ['']
++        };
++
++        var parser = new mod_getopt.BasicParser('n:s:u', process.argv);
++
++        var option;
++        while ((option = parser.getopt()) !== undefined) {
++                switch (option.option) {
++                case 'n':
++                        opts.nReducers = parseInt(option.optarg, 10);
++                        if (isNaN(opts.nReducers) || opts.nReducers < 1) {
++                                fatal('invalid number of reducers ' +
++                                    option.optarg);
++                        }
++                        break;
++                case 's':
++                        opts.splitKeys = option.optarg.split(',');
++                        break;
++                case 'u':
++                        opts.directUpload = true;
++                        break;
++                default:
++                        fatal('Invalid option: ' + option.option);
++                        break;
++                }
++        }
++
++        if ((opts.directUpload && !opts.nReducers) ||
++            (!opts.directUpload && opts.nReducers)) {
++                fatal('Setting the number of reducers is required ' +
++                    'when choosing direct upload, and vice versa');
++        }
++
++        if (opts.directUpload && !process.env['MANTA_OUTPUT_BASE']) {
++                fatal('Setting MANTA_OUTPUT_BASE is required ' +
++                    'when choosing direct upload');
++        }
++
++        if (opts.nReducers > 1 && opts.splitKeys.length == 1 &&
++            opts.splitKeys[0] === '') {
++                fatal('Please specifiy one of more split keys when ' +
++                    'setting the number of reducers to more than one');
++        }
++
++        if (!opts.directUpload) {
++                processStdin(null, opts);
++                return;
++        }
++
++        var zs = new ZSplitter('/var/tmp', opts.nReducers,
++            {gzip: true, log: log});
++
++        // Start processing stdin when the splitter is ready.
++        zs.on('open', processStdin.bind(null, zs, opts));
++        zs.on('error', function (err) {
++                fatal(err.toString());
+         });
+ 
+-        main();
++        // Upload the files when we are done.
++        zs.on('close', function () {
++                var n;
++                var mu = new MUploader(log);
++                var objectPrefix = process.env['MANTA_OUTPUT_BASE'] +
++                    mod_uuid.v4() + '.';
++                var objectNames = [];
++                for (n = 0; n < opts.nReducers; n++) {
++                        objectNames.push(objectPrefix + n);
++                }
++
++                uploadFiles(mu, zs.getFileNames(), objectNames);
++        });
+ }
++
++main();
+diff --git a/assets/lib/zsplitter.js b/assets/lib/zsplitter.js
+new file mode 100755
+index 0000000..54e227b
+--- /dev/null
++++ b/assets/lib/zsplitter.js
+@@ -0,0 +1,183 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2018, Joyent, Inc.
++ */
++
++var mod_assert = require('assert-plus');
++var mod_crypto = require('crypto');
++var mod_fs = require('fs');
++var mod_util = require('util');
++var EventEmitter = require('events').EventEmitter;
++var mod_zlib = require('zlib');
++
++var MAX_BUFFER_SIZE = 128 * 1024; //128 KB
++
++function ZSplitter(dir, nFiles, opts) {
++        mod_assert.string(dir, 'dir');
++        mod_assert.number(nFiles, 'nFiles');
++        mod_assert.object(opts, 'opts');
++        mod_assert.object(opts.log, 'opts.log');
++        mod_assert.optionalBool(opts.gzip, 'opts.gzip');
++
++        this._nFiles = nFiles;
++        this._gzip = (opts.gzip === true);
++
++        //Check the number of files to be a positive integer.
++        if (nFiles <= 0 || nFiles % 1 != 0) {
++                opts.log.error('Invalid number of files: ' + nFiles);
++                return;
++        }
++
++        var stat;
++        if (!(stat = mod_fs.statSync(dir)) || !stat.isDirectory()) {
++                opts.log.error('Invalid output directory path: ' + dir);
++                return;
++        }
++
++        //Emit all errors we get from gzip and file streams
++        var onError = function (err) {
++                this.emit('error', err);
++        }.bind(this);
++
++        var n;
++        this._fileNames = [];           //Temorary fileNames
++        this._fileStreams = [];         // FileStreams
++        this._fileOutStreams = [];      // Gzip or fileStreams
++
++        this._nReadyStreams = 0;
++        this._nClosedStreams = 0;
++
++        for (n = 0; n < nFiles; n++) {
++                var fileName = dir + '/part' + n;
++                var fileStream = mod_fs.createWriteStream(fileName);
++                fileStream.on('error', onError);
++
++                fileStream.on('open', function () {
++                        // Emit 'open' when all the underlying
++                        // files are open. This tells the user
++                        // We are ready to receive writes.
++                        if (++this._nReadyStreams == nFiles) {
++                                this.emit('open');
++                        }
++                }.bind(this));
++
++                fileStream.on('close', function () {
++                        // Emit close when all the outputfiles
++                        // are closed. Only then, the user can
++                        // use the split files.
++                        if (++this._nClosedStreams == nFiles) {
++                                this.emit('close');
++                        }
++                }.bind(this));
++
++                var fileOutStream = fileStream;
++
++                // If compression is enabled, create a Gzip stream
++                // and pipe it into the fileStream.
++                if (this._gzip) {
++                        fileOutStream = mod_zlib.createGzip();
++                        fileOutStream.on('error', onError);
++                        fileOutStream.pipe(fileStream);
++                }
++
++                fileOutStream.idx = n;
++                fileOutStream.buffer = '';
++                fileOutStream.bufferLength = 0;
++
++                this._fileNames.push(fileName);
++                this._fileStreams.push(fileStream);
++                this._fileOutStreams.push(fileOutStream);
++        }
++}
++
++mod_util.inherits(ZSplitter, EventEmitter);
++
++// Writes 'data' to a reducer based on 'splitKey' hash value.
++ZSplitter.prototype.write = function (data, splitKey, cb) {
++        mod_assert.string(data);
++        mod_assert.string(splitKey);
++        mod_assert.func(cb);
++
++        var digest = mod_crypto.createHash('md5')
++            .update(splitKey).digest('hex');
++        var fileNumber = parseInt(digest.substr(0, 8), 16) % this._nFiles;
++
++        this.writeToReducer(data, fileNumber, cb);
++};
++
++// Writes 'data' to the reducer specified by 'fileNumber'
++ZSplitter.prototype.writeToReducer = function (data, fileNumber, cb) {
++        mod_assert.string(data);
++        mod_assert.number(fileNumber);
++        mod_assert.func(cb);
++
++        if (fileNumber >= this._nFiles) {
++                cb(new Error('fileNumber is out of range: ' + fileNumber));
++                return;
++        }
++
++        var out = this._fileOutStreams[fileNumber];
++
++        // Buffer the data if there is a room for it.
++        if (out.bufferLength < MAX_BUFFER_SIZE) {
++                out.buffer += data;
++                out.bufferLength += data.length;
++                cb();
++                return;
++        }
++
++        // If there is no room to buffer the data
++        // and the stream is ready to receive writes,
++        // then write both the buffer content and the
++        // new data.
++        if (out.writable) {
++                out.write(out.buffer + data);
++                out.buffer = '';
++                out.bufferLength = 0;
++                cb();
++                return;
++        }
++
++        // Otherwise, wait for the stream to drain
++        // before writing the all the data;
++        out.once('drain', function () {
++                out.write(out.buffer + data);
++                out.buffer = '';
++                out.bufferLength = 0;
++                cb();
++        });
++};
++
++
++ZSplitter.prototype.end = function (fileNumber) {
++        mod_assert.number(fileNumber);
++
++        if (fileNumber >= this._nFiles) {
++                this.emit('error', 'fileNumber is out of range:' + fileNumber);
++                return;
++        }
++
++        var out = this._fileOutStreams[fileNumber];
++
++        if (!out.writable) {
++                out.once('drain', function () {
++                        out.end(out.buffer);
++                });
++                return;
++        }
++
++        out.end(out.buffer);
++};
++
++ZSplitter.prototype.getFileNames = function () {
++        // Return a copy of the array to protect
++        // the integrity of private members.
++        return (this._fileNames.slice(0));
++};
++
++module.exports = ZSplitter;
+diff --git a/etc/jobs.json b/etc/jobs.json
+index 7e4ef58..25824d4 100644
+--- a/etc/jobs.json
++++ b/etc/jobs.json
+@@ -14,16 +14,33 @@
+           {
+             "type": "map",
+             "memory": 2048,
+-            "disk": 32,
++            "disk": 128,
++            "assets": [
++              "assets/bin/init",
++              "assets/bin/storage-fanout",
++              "assets/lib/storage-fanout.js",
++              "assets/lib/muploader.js",
++              "assets/node_modules.tar"
++            ],
++            "init": "assets/bin/init",
++            "exec": "assets/bin/storage-fanout"
++          },
++          {
++            "type": "reduce",
++            "memory": 2048,
++            "disk": 128,
+             "assets": [
+               "assets/bin/init",
+               "assets/bin/storage-map",
+               "assets/etc/lookup.json",
+               "assets/lib/storage-map.js",
++              "assets/lib/zsplitter.js",
++              "assets/lib/muploader.js",
+               "assets/node_modules.tar"
+             ],
+             "init": "assets/bin/init",
+-            "exec": "assets/bin/storage-map"
++            "exec": "assets/bin/storage-map",
++            "count": 25
+           },
+           {
+             "type": "reduce",
+@@ -84,7 +101,8 @@
+         "NAMESPACES": "stor public jobs reports",
+         "USER_DEST": "/reports/usage/storage/$year/$month/$day/$hour/h$hour.json",
+         "USER_LINK": "/reports/usage/storage/latest",
+-        "ZCAT": "gzcat -f"
++        "ZCAT": "gzcat -f",
++        "PIGZZ": "pigz -d -c -"
+       }
+     },
+ 
+diff --git a/package.json b/package.json
+index 8cc2e00..dd483ea 100644
+--- a/package.json
++++ b/package.json
+@@ -11,16 +11,19 @@
+                 "backoff": "1.2.0",
+                 "bunyan": "0.21.1",
+                 "carrier": "0.1.10",
++                "event-stream": "4.0.1",
+                 "ipaddr.js": "0.1.1",
+                 "jsprim": "0.5.0",
+-                "libmanta": "git+ssh://git@github.com:joyent/node-libmanta.git#master",
+-                "marlin": "git+ssh://git@github.com:joyent/manta-marlin.git#master",
+-                "manta": "git+ssh://git@github.com:joyent/node-manta.git#master",
+-                "manta-compute-bin": "git+ssh://git@github.com:joyent/manta-compute-bin.git#master",
++                "libmanta": "git+https://github.com/joyent/node-libmanta.git#master",
++                "marlin": "git+https://github.com/joyent/manta-marlin.git#master",
++                "manta": "git+https://github.com/joyent/node-manta.git#master",
++                "manta-compute-bin": "git+https://github.com/joyent/manta-compute-bin.git#master",
+                 "once": "1.1.1",
+                 "readable-stream": "0.3.1",
+                 "posix-getopt": "1.0.0",
++                "retry": "0.12.0",
+                 "screener": "0.0.5",
++                "node-uuid": "1.4.8",
+                 "vasync": "1.3.3"
+         },
+         "devDependencies": {
+diff --git a/test/storagefanout.test.js b/test/storagefanout.test.js
+new file mode 100644
+index 0000000..4953af6
+--- /dev/null
++++ b/test/storagefanout.test.js
+@@ -0,0 +1,188 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2014, Joyent, Inc.
++ */
++
++var mod_fs = require('fs');
++var mod_child_process = require('child_process');
++var mod_http = require('http');
++var mod_path = require('path');
++var mod_stream = require('stream');
++var mod_vasync = require('vasync');
++var mod_zlib = require('zlib');
++
++var mod_bunyan = require('bunyan');
++var helper = require('./helper.js');
++
++var storagefanout = mod_path.resolve(__dirname,
++        '../assets/lib/storage-fanout.js');
++
++var log = new mod_bunyan({
++        'name': 'storagefanout.test.js',
++        'level': process.env['LOG_LEVEL'] || 'debug'
++});
++
++var test = helper.test;
++var before = helper.before;
++var after = helper.after;
++
++
++var PORT = 9876;
++var SERVER = null;
++var MANTA_URL = 'http://localhost:' + PORT;
++var MANTA_OUTPUT_BASE = '/MANTA_USER/jobs/jobid/stor/reduce.1.';
++var LOOKUP_FILE = '../../test/test_data/lookup.json';
++var LOOKUP = require('./test_data/lookup.json');
++
++function generateLines(numberOfLines) {
++        var str = '';
++        var ret = '';
++
++        /* TODO: Find a better way to do this */
++        for (var i = 0; i < 910; i++) str += '-';
++
++        for (var n = 0; n <= numberOfLines; n++) {
++                var prefix  = (n === 0) ? '0000000' : '' + (1000000 + n);
++                ret += prefix + ' ' + str + '\n';
++        }
++
++        return (ret);
++}
++
++function runTest(opts, cb) {
++        opts.opts = opts.opts || [];
++        opts.env = opts.env || {};
++        opts.env['LOOKUP_FILE'] = LOOKUP_FILE;
++        var spawn = mod_child_process.spawn(storagefanout, opts.opts, opts);
++
++        var stdout = '';
++        var stderr = '';
++        var error;
++
++        spawn.stdout.on('data', function (data) {
++                stdout += data;
++        });
++
++        spawn.stderr.on('data', function (data) {
++                stderr += data;
++        });
++
++        spawn.on('error', function (err) {
++                error = err;
++        });
++
++        spawn.stdin.on('error', function (err) {
++                error = err;
++        });
++
++        spawn.on('close', function (code) {
++                var result = {
++                        stdin: opts.stdin,
++                        stdout: stdout,
++                        stderr: stderr,
++                        code: code,
++                        error: error
++                };
++                if (opts.debug) {
++                        console.log(result);
++                }
++                cb(result);
++        });
++
++        process.nextTick(function () {
++                spawn.stdin.write(opts.stdin || '');
++                spawn.stdin.end();
++        });
++}
++
++before(function (cb) {
++        SERVER = mod_http.createServer(function (req, res) {
++                var body = new Buffer(0);
++                req.on('data', function (data) {
++                        body = Buffer.concat([body, data]);
++                });
++                req.on('end', function () {
++                        req.body = body;
++                        SERVER.requests.push(req);
++                        res.writeHead(204);
++                        res.end();
++                });
++        });
++
++        SERVER.listen(PORT, function (err) {
++                cb(err);
++        });
++
++        SERVER.requests = [];
++});
++
++after(function (cb) {
++        SERVER.close(function (err) {
++                SERVER = null;
++                cb();
++        });
++});
++
++test('output is being sent to stdout', function (t) {
++        t.expect(3);
++        var lines = '1\n2\n3\n4\n5';
++
++        runTest({
++                stdin: lines
++        }, function (result) {
++                t.ok(result.code === 0);
++                t.ok(result.stdout === lines);
++                t.ok(result.stderr === '');
++                t.done();
++        });
++});
++
++
++test('fanout test', function (t) {
++        t.expect(5);
++
++        var input = generateLines(100000);
++        var nReducers = 5;
++        runTest({
++                stdin: input,
++                env : {
++                        'MANTA_URL': MANTA_URL,
++                        'MANTA_OUTPUT_BASE': MANTA_OUTPUT_BASE,
++                        'MANTA_NO_AUTH': true
++                },
++                opts: ['-u', '-n', '' + nReducers]
++        }, function (result) {
++                t.ok(result.code === 0);
++                t.ok(result.stdout === '');
++                t.ok(result.stderr === '');
++                t.ok(SERVER.requests.length == nReducers);
++                var r = SERVER.requests.map(function (req) {
++                        return (req.body);
++                });
++
++                mod_vasync.forEachParallel({
++                        'func': mod_zlib.gunzip,
++                        'inputs': r
++                }, function (err, results) {
++                        var out = results.successes.map(function (res) {
++                                return (res.toString());
++                        });
++
++                        out = out.join('').slice(0, -1)
++                                 .split('\n').sort().join('\n');
++                        var expectedOutput = input;
++                        for (var i = 0; i < nReducers - 1; i++) {
++                                expectedOutput = input.split('\n')[0] + '\n' +
++                                        expectedOutput;
++                        }
++
++                        t.ok(out === expectedOutput.slice(0, -1));
++                        t.done();
++                });
++        });
++});
+diff --git a/test/storagemap.test.js b/test/storagemap.test.js
+index 08d0c82..115e21b 100644
+--- a/test/storagemap.test.js
++++ b/test/storagemap.test.js
+@@ -10,7 +10,9 @@
+ 
+ var mod_fs = require('fs');
+ var mod_child_process = require('child_process');
++var mod_http = require('http');
+ var mod_path = require('path');
++var mod_zlib = require('zlib');
+ 
+ var mod_bunyan = require('bunyan');
+ var helper = require('./helper.js');
+@@ -23,7 +25,14 @@ var log = new mod_bunyan({
+ });
+ 
+ var test = helper.test;
++var before = helper.before;
++var after = helper.after;
+ 
++
++var PORT = 9876;
++var SERVER = null;
++var MANTA_URL = 'http://localhost:' + PORT;
++var MANTA_OUTPUT_BASE = '/MANTA_USER/jobs/jobid/stor/reduce.1.';
+ var LOOKUP_FILE = '../../test/test_data/lookup.json';
+ var LOOKUP = require('./test_data/lookup.json');
+ 
+@@ -73,6 +82,34 @@ function runTest(opts, cb) {
+         });
+ }
+ 
++before(function (cb) {
++        SERVER = mod_http.createServer(function (req, res) {
++                var body = new Buffer(0);
++                req.on('data', function (data) {
++                        body = Buffer.concat([body, data]);
++                });
++                req.on('end', function () {
++                        req.body = body;
++                        SERVER.requests.push(req);
++                        res.writeHead(204);
++                        res.end();
++                });
++        });
++
++        SERVER.listen(PORT, function (err) {
++                cb(err);
++        });
++
++        SERVER.requests = [];
++});
++
++after(function (cb) {
++        SERVER.close(function (err) {
++                SERVER = null;
++                cb();
++        });
++});
++
+ test('basic', function (t) {
+         t.expect(2);
+         var schema = {
+@@ -356,3 +393,218 @@ test('count unapproved users', function (t) {
+                 t.done();
+         });
+ });
++
++test('don\'t upload without specifying the number of reducers', function (t) {
++        t.expect(3);
++
++        runTest({
++                stdin: '',
++                opts: ['-u']
++        }, function (result) {
++                t.ok(result.stderr.length > 0);
++                t.ok(result.stdout.length === 0);
++                t.equal(1, result.code);
++                t.done();
++        });
++});
++
++test('don\'t upload without specifying MANTA_OUTPUT_BASE in env', function (t) {
++        t.expect(3);
++
++        runTest({
++                stdin: '',
++                opts: ['-u', '-n', '2']
++        }, function (result) {
++                t.ok(result.stderr.length > 0);
++                t.ok(result.stdout.length === 0);
++                t.equal(1, result.code);
++                t.done();
++        });
++});
++
++test('basic upload', function (t) {
++        t.expect(7);
++        var schema = {
++                'name': 'manta',
++                'keys': [
++                        '_id',
++                        '_key',
++                        '_value',
++                        '_etag',
++                        '_mtime',
++                        'dirname',
++                        'owner',
++                        'objectid'
++                ]
++        };
++
++        var _value = {
++                'dirname': '/fred/stor/test1',
++                'key': '/fred/stor/test1/filea',
++                'mtime': 1347493502898,
++                'owner': '83081c10-1b9c-44b3-9c5c-36fc2a5218a0',
++                'type': 'object',
++                'contentLength': 14,
++                'contentMD5': 'RWJGkh2n/L4XhjDn2a5rgA==',
++                'contentType': 'application/x-www-form-urlencoded',
++                'etag': '456246921da7fcbe178630e7d9ae6b80',
++                'objectId': 'bd83468a-ae70-4d96-80cc-8fc49068caca',
++                'sharks': [
++                        {
++                                'url': 'url1',
++                                'server_uuid': 'server1',
++                                'zone_uuid': 'zone1'
++                        },
++                        {
++                                'url': 'url2',
++                                'server_uuid': 'server2',
++                                'zone_uuid': 'zone2'
++                        }
++                ]
++        };
++
++        var record = {
++                'entry': [
++                        '1',
++                        '/fred/stor/test1/filea',
++                        JSON.stringify(_value),
++                        '456246921da7fcbe178630e7d9ae6b80',
++                        '1347493502898',
++                        '/fred/stor/test1',
++                        'fred',
++                        'bd83468a-ae70-4d96-80cc-8fc49068caca'
++                ]
++        };
++
++        runTest({
++                stdin: JSON.stringify(schema) + '\n' + JSON.stringify(record),
++                env : {
++                        'MANTA_URL': MANTA_URL,
++                        'MANTA_OUTPUT_BASE': MANTA_OUTPUT_BASE,
++                        'MANTA_NO_AUTH': true
++                },
++                opts: ['-u', '-n', '2', '-s', 'owner,type,objectId']
++        }, function (result) {
++                t.equal(0, result.code);
++                t.ok(result.stderr.length === 0);
++                t.ok(result.stdout.length === 0);
++                t.ok(SERVER.requests.length === 2);
++                var r = SERVER.requests.map(function (req) {
++                        return (req.body);
++                }).sort(function (b1, b2) {
++                        return (b1.length - b2.length);
++                });
++                t.ok(r[0].length < r[1].length);
++                mod_zlib.gunzip(r[0], function (err1, r0) {
++                        mod_zlib.gunzip(r[1], function (err2, r1) {
++                                t.ok(r0.length === 0);
++                                t.deepEqual(JSON.parse(r1.toString()), _value);
++                                t.done();
++                        });
++                });
++        });
++});
++
++test('upload two objects', function (t) {
++        t.expect(7);
++        var schema = {
++                'name': 'manta',
++                'keys': [
++                        '_id',
++                        '_key',
++                        '_value',
++                        '_etag',
++                        '_mtime',
++                        'dirname',
++                        'owner',
++                        'objectid'
++                ]
++        };
++
++        var owners = [
++                {
++                        uuid: 'af90b338-1547-11e9-9320-cfb29fdb5c76',
++                        name: 'bob'
++                },
++                {
++                        uuid: 'b23bb9c0-1547-11e9-b50c-73acb1a54911',
++                        name: 'saly'
++                }
++        ];
++
++        var _values = owners.map(function (o) {
++                return {
++                        'dirname': '/' + o.name + '/stor/test1',
++                        'key': '/' + o.name + '/stor/test1/filea',
++                        'mtime': 1347493502898,
++                        'owner': o.uuid,
++                        'type': 'object',
++                        'contentLength': 14,
++                        'contentMD5': 'RWJGkh2n/L4XhjDn2a5rgA==',
++                        'contentType': 'application/x-www-form-urlencoded',
++                        'etag': '456246921da7fcbe178630e7d9ae6b80',
++                        'objectId': 'bd83468a-ae70-4d96-80cc-8fc49068caca',
++                        'sharks': [
++                                {
++                                        'url': 'url1',
++                                        'server_uuid': 'server1',
++                                        'zone_uuid': 'zone1'
++                                },
++                                {
++                                        'url': 'url2',
++                                        'server_uuid': 'server2',
++                                        'zone_uuid': 'zone2'
++                                }
++                        ]
++                };
++        });
++
++        var records = _values.map(function (v) {
++                return {
++                        'entry': [
++                                '1',
++                                v.key,
++                                JSON.stringify(v),
++                                v.objectId,
++                                '1347493502898',
++                                v.dirname,
++                                'user',
++                                'bd83468a-ae70-4d96-80cc-8fc49068caca'
++                        ]
++                };
++        });
++
++        var input = JSON.stringify(schema) + '\n' +
++            JSON.stringify(records[0]) + '\n' +
++            JSON.stringify(records[1]);
++
++        runTest({
++                stdin: input,
++                env : {
++                        'MANTA_URL': MANTA_URL,
++                        'MANTA_OUTPUT_BASE': MANTA_OUTPUT_BASE,
++                        'MANTA_NO_AUTH': true
++                },
++                opts: ['-u', '-n', '2', '-s', 'owner,type,objectId']
++        }, function (result) {
++                t.equal(0, result.code);
++                t.ok(result.stderr.length === 0);
++                t.ok(result.stdout.length === 0);
++                t.ok(SERVER.requests.length === 2);
++                var r = SERVER.requests.map(function (req) {
++                        return (req.body);
++                }).sort(function (b1, b2) {
++                        return (b1.length - b2.length);
++                });
++                t.ok(r[0].length < r[1].length);
++                mod_zlib.gunzip(r[0], function (err1, r0) {
++                        mod_zlib.gunzip(r[1], function (err2, r1) {
++                                t.deepEqual(JSON.parse(r0.toString()),
++                                    _values[0]);
++                                t.deepEqual(JSON.parse(r1.toString()),
++                                    _values[1]);
++                                t.done();
++                        });
++                });
++        });
++});
+diff --git a/test/test_data/lookup.json b/test/test_data/lookup.json
+index c6f60bf..7bde137 100644
+--- a/test/test_data/lookup.json
++++ b/test/test_data/lookup.json
+@@ -1 +1,22 @@
+-{"c8c25da6-b89b-cdd8-f148-b29474411502":{"login":"poseidon","approved":false},"83081c10-1b9c-44b3-9c5c-36fc2a5218a0":{"login":"macktest","approved":true},"ed5fa8da-fd61-42bb-a24a-515b56c6d581":{"login":"macktest2","approved":false}}
++{
++  "c8c25da6-b89b-cdd8-f148-b29474411502": {
++    "login": "poseidon",
++    "approved": false
++  },
++  "83081c10-1b9c-44b3-9c5c-36fc2a5218a0": {
++    "login": "macktest",
++    "approved": true
++  },
++  "ed5fa8da-fd61-42bb-a24a-515b56c6d581": {
++    "login": "macktest2",
++    "approved": false
++  },
++  "af90b338-1547-11e9-9320-cfb29fdb5c76": {
++    "login": "bob",
++    "approved": true
++  },
++  "b23bb9c0-1547-11e9-b50c-73acb1a54911": {
++    "login": "saly",
++    "approved": true
++  }
++}

@@ -1,0 +1,176 @@
+commit 8e7006466935cec205ef804c88e2463e795afb56 (refs/changes/58/5258/2)
+Author: Jan Wyszynski <jan.wyszynski@joyent.com>
+Date:   2018-12-19T23:37:17+00:00 (10 months ago)
+    
+    MANTA-3779 Add 'singlePath' field to new object metadata
+
+diff --git a/lib/common.js b/lib/common.js
+index 5df530b..41e68d8 100644
+--- a/lib/common.js
++++ b/lib/common.js
+@@ -248,6 +248,7 @@ function createMetadata(req, type, cb) {
+         } else { // Take from the prev is for things like mchattr
+             md.sharks = (prev.sharks || []);
+         }
++        md.singlePath = (req.singlePathEnabled) ? true : undefined;
+         break;
+ 
+     default:
+@@ -1009,6 +1010,9 @@ module.exports = {
+                 mpuPrefixDirLen: options.multipartUpload.prefixDirLen
+             };
+             req.accountsSnaplinksDisabled = options.accountsSnaplinksDisabled;
++            req.singlePathEnabled =
++                (options.hasOwnProperty('enableSinglePath')) ?
++                options.enableSinglePath : false;
+ 
+             var _opts = {
+                 account: req.owner.account,
+diff --git a/lib/link.js b/lib/link.js
+index 537577c..5e4e751 100644
+--- a/lib/link.js
++++ b/lib/link.js
+@@ -205,6 +205,69 @@ function checkAccess(req, res, next) {
+ }
+ 
+ 
++/*
++ * Since the integration of accelerated garbage-collection, new objects in
++ * Manta have a boolean marker field called `singlePath` in their metadata
++ * records. This field's presence indicates that the object has only ever
++ * had a single reference in the metadata tier. If the object we are
++ * attempting to link to has the `singlePath` field, we must clear it before
++ * writing out the 'link' metadata so that inbound deletes to this object
++ * do not default to accelerated garbage-collection.
++ *
++ * It is critical that Muskie update this field on the source object metadata
++ * before writing out the link metadata. If Muskie cleared the field after
++ * writing out the link metadata, a delete for the source object occuring after
++ * Muskie writes out the link metadata, but before Muskie clears the
++ * `singlePath` field on the source object metadata, would result in the source
++ * object being incorrectly garbage-collected with accelerated
++ * garbage-collection. Accelerated garbage-collection is not snaplink-aware,
++ * therefore the 'link' metadata created by this request would become a dangling
++ * reference.
++ *
++ * The disadvantage of clearing the `singlePath` field on the source object
++ * before writing out the 'link' metadata is that Muskie may subsequently fail
++ * while writing out the 'link' metadata. In this case we've cleared the
++ * `singlePath` field on an object that still only has one reference in the
++ * metadata-tier, making the source object ineligible for accelerated
++ * garbage-collection unnecessarily.
++ */
++function clearSinglePathFieldIfPresent(req, res, next) {
++    var log = req.log;
++    var singlePath = 'singlePath';
++    var sourceMetadata = req.link.metadata;
++
++    if (!sourceMetadata.hasOwnProperty(singlePath) ||
++        !sourceMetadata.singlePath) {
++        next();
++        return;
++    }
++
++    /*
++     * For future debugging purposes, we set this field to false instead of
++     * deleting it. This way, we can distinguish between objects that have never
++     * had the `singlePath` field and objects that did, at one point, have it.
++     */
++    sourceMetadata.singlePath = false;
++    sourceMetadata.requestId = req.getId();
++
++    /*
++     * If the client sent 'if-match' or 'if-none-match' headers, make sure that
++     * the source metadata does not change before we clear the `singlePath`
++     * field. This way, the source record is included as part of the data that
++     * is protected from lost updates.
++     */
++    sourceMetadata._etag = req.isConditional() ? req.link.metadata._etag :
++        undefined;
++
++    log.debug(sourceMetadata, 'clearSinglePathIfPresent: entered');
++    req.moray.putMetadata(sourceMetadata, function (err) {
++        if (err)
++            log.debug(err, 'clearSinglePathIfPresent: failed');
++        next(err);
++    });
++}
++
++
+ function saveMetadata(req, res, next) {
+     var log = req.log;
+     common.createMetadata(req, 'link', function (err, opts) {
+@@ -251,6 +314,7 @@ module.exports = {
+             resolveSource,
+             checkAccess,
+             restify.conditionalRequest(),
++            clearSinglePathFieldIfPresent,
+             saveMetadata
+         ];
+         return (chain);
+diff --git a/lib/obj.js b/lib/obj.js
+index 7d82bb9..f82a40b 100644
+--- a/lib/obj.js
++++ b/lib/obj.js
+@@ -14,7 +14,7 @@
+ // below is some context on what we need to do.
+ //
+ // Recall that the contract of PUT object is that by default muskie will stream
+-// data to 2 backend ZFS hosts in two discreet datacenters (assuming there
++// data to 2 backend ZFS hosts in two discrete datacenters (assuming there
+ // exists > 1 datacenter).  In addition, muskie offers test/set semantics on
+ // etag, so we need to factor that in as part of this sequence as well.  First,
+ // let's list the set of steps that happen (in english):
+@@ -933,8 +933,23 @@ function deletePointer(req, res, next) {
+      */
+     var uuid = req.owner.account.uuid;
+     common.checkAccountSnaplinksEnabled(req, uuid, function (enabled) {
+-        // Pass in a special header if they are not enabled
+-        if (!enabled) {
++        /*
++         * Muskie only processes an object with accelerated garbage-collection
++         * if it can be sure that the object only has one reference in the
++         * metadata tier. Muskie can decide this in one of two ways:
++         *
++         * 1. The creator of the object has snaplinks disabled.
++         * 2. The object being deleted has `singlePath` field set.
++         *
++         * (1) is a contract that states all objects owned by a particular
++         * account have no snaplinks. (2) is a field that all new objects are
++         * born with set to to true. Link metadata for an object can only be
++         * written out if the snaplink request was first able to set
++         * `singlePath` to false on the source object. If a delete for an object
++         * races with a snaplink request with that object as the source, only
++         * one will succeed due to Moray's etag semantics.
++         */
++        if (!enabled || req.metadata.singlePath === true) {
+             log.debug({
+                 link: req.link,
+                 owner: req.owner.account
+diff --git a/package.json b/package.json
+index a0e9332..7978476 100644
+--- a/package.json
++++ b/package.json
+@@ -27,7 +27,7 @@
+         "kang": "1.1.0",
+         "keep-alive-agent": "0.0.1",
+         "keyapi": "git+https://github.com/joyent/keyapi.git#e14b3d58",
+-        "libmanta": "git+https://github.com/joyent/node-libmanta.git#v1.1.1",
++        "libmanta": "git+https://github.com/joyent/node-libmanta.git#6052cbc5",
+         "libuuid": "0.1.2",
+         "lru-cache": "4.1.5",
+         "lstream": "0.0.4",
+diff --git a/sapi_manifests/muskie/template b/sapi_manifests/muskie/template
+index 1d5827f..d4704fb 100644
+--- a/sapi_manifests/muskie/template
++++ b/sapi_manifests/muskie/template
+@@ -179,6 +179,9 @@
+     "maximum": 2000
+   },
+ 
++  {{#SINGLE_PATH_ENABLE}}
++  "enableSinglePath": {{SINGLE_PATH_ENABLE}},
++  {{/SINGLE_PATH_ENABLE}}
+   {{#MPU_ENABLE}}
+   "enableMPU": true,
+ 

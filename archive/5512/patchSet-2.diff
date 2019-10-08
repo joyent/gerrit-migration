@@ -1,0 +1,481 @@
+commit 05582ec798ead424ee527ecefd090cc845344ea0 (refs/changes/12/5512/2)
+Author: Cody Peter Mello <cody.mello@joyent.com>
+Date:   2019-02-08T22:42:29+00:00 (8 months ago)
+    
+    TRITON-1193 net-agent gets stuck repeatedly attempting to set "model" to undefined on HVM NICs
+    TRITON-1089 net-agent does not update routes on CNs running vminfod
+    TRITON-730 net-agent causes provision job failure by modifying VM while it's provisioning
+    TRITON-698 net-agent 'make check' should work on systems w/o prebuilt binaries
+
+diff --git a/Makefile b/Makefile
+index 1e17000..d9345a3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -33,20 +33,22 @@ JSSTYLE_FILES =		$(JS_FILES)
+ JSSTYLE_FLAGS =		-o indent=4,doxygen,unparenthesized-return=0
+ ESLINT_FILES =		$(JS_FILES)
+ 
+-NODE_PREBUILT_VERSION =	v4.6.1
+ 
+ ifeq ($(shell uname -s),SunOS)
+-NODE_PREBUILT_TAG =	gz
+-# sdc-minimal-multiarch-lts 15.4.1
+-NODE_PREBUILT_IMAGE =	18b094b0-eb01-11e5-80c1-175dac7ddf02
++	NODE_PREBUILT_VERSION =	v4.6.1
++	NODE_PREBUILT_TAG =	gz
++	# sdc-minimal-multiarch-lts 15.4.1
++	NODE_PREBUILT_IMAGE =	18b094b0-eb01-11e5-80c1-175dac7ddf02
+ endif
+ 
+ # Included definitions
+ include ./tools/mk/Makefile.defs
+ ifeq ($(shell uname -s),SunOS)
+-include ./tools/mk/Makefile.node_prebuilt.defs
++	include ./tools/mk/Makefile.node_prebuilt.defs
+ else
+-include ./tools/mk/Makefile.node.defs
++	NODE := node
++	NPM := $(shell which npm)
++	NPM_EXEC= $(NPM)
+ endif
+ include ./tools/mk/Makefile.node_deps.defs
+ include ./tools/mk/Makefile.smf.defs
+diff --git a/lib/inst-fsm.js b/lib/inst-fsm.js
+index 222a0d8..03159d9 100644
+--- a/lib/inst-fsm.js
++++ b/lib/inst-fsm.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018 Joyent, Inc.
++ * Copyright (c) 2019 Joyent, Inc.
+  */
+ 
+ 'use strict';
+@@ -34,6 +34,14 @@ var NAPI_FIELDS = [
+     'vlan_id'
+ ];
+ 
++/*
++ * We only attempt to update VMs when they are in these states, so that we
++ * avoid touching (re)provisioning VMs.
++ */
++var UPDATE_STATES = [
++    'running',
++    'stopped'
++];
+ 
+ // --- Exports
+ 
+@@ -88,9 +96,18 @@ InstanceFSM.prototype.state_waiting = function (S) {
+ };
+ 
+ InstanceFSM.prototype.state_update = function (S) {
+-    S.on(this, 'updateAsserted', function () {
+-        S.gotoState('update');
+-    });
++    if (UPDATE_STATES.indexOf(this.vm.state) === -1) {
++        /*
++         * If the VM isn't in one of the states in which it's okay for us
++         * to update it (e.g., "provisioning"), then we return to state
++         * "waiting" until the VM is safe to update.
++         */
++        this.log.debug({
++            state: this.vm.state
++        }, 'Skipping updating VM in state %j', this.vm.state);
++        S.gotoState('waiting');
++        return;
++    }
+ 
+     S.on(this, 'removeAsserted', function () {
+         S.gotoState('remove');
+@@ -124,6 +141,10 @@ InstanceFSM.prototype.state_update.wait = function (S) {
+         return;
+     }
+ 
++    S.on(this, 'updateAsserted', function () {
++        S.gotoState('update');
++    });
++
+     S.on(pending, 'stateChanged', function onStateChange() {
+         if (pending.remote === null) {
+             return;
+@@ -135,6 +156,7 @@ InstanceFSM.prototype.state_update.wait = function (S) {
+ 
+ InstanceFSM.prototype.state_update.vm = function (S) {
+     var self = this;
++    var updated = false;
+ 
+     var current = Object.assign({}, this.vm.routes);
+     var resolvers = [];
+@@ -173,13 +195,25 @@ InstanceFSM.prototype.state_update.vm = function (S) {
+         return;
+     }
+ 
++    S.on(self, 'updateAsserted', function () {
++        /*
++         * Wait until our `vmadm update' finishes running, so that our updates
++         * are always ordered one after the other.
++         */
++        updated = true;
++    });
++
+     function afterUpdate(err) {
+         if (err) {
+             self.log.error(err, 'Failed to update networking info for VM');
+             self.app.watcher.refresh();
+         }
+ 
+-        S.gotoState('waiting');
++        if (updated) {
++            S.gotoState('update');
++        } else {
++            S.gotoState('waiting');
++        }
+     }
+ 
+     var payload = {
+@@ -293,6 +327,12 @@ InstanceFSM.prototype.update = function (vm) {
+     });
+ };
+ 
++/**
++ * Since instance data is tracked collectively, and not individually, we need
++ * to ask the watcher to handle the refresh for us to make sure we have the
++ * latest information. This will then make us pass through the "update" state,
++ * and compare the system's data with our expectations.
++ */
+ InstanceFSM.prototype.refresh = function () {
+     this.app.watcher.refresh();
+ };
+diff --git a/lib/net-agent.js b/lib/net-agent.js
+index dbfab48..c7a2795 100644
+--- a/lib/net-agent.js
++++ b/lib/net-agent.js
+@@ -304,7 +304,6 @@ NetAgent.prototype.state_init.determineEventSource = function (S) {
+         log: self.log,
+         vmadm: self.vmadm
+     }, function determinedEventSource(err, eventSource) {
+-
+         if (err) {
+             self.log.error(err, 'error determining event source');
+             S.timeout(1000, function () {
+diff --git a/lib/nic-fsm.js b/lib/nic-fsm.js
+index 3f0301f..a128fda 100644
+--- a/lib/nic-fsm.js
++++ b/lib/nic-fsm.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018 Joyent, Inc.
++ * Copyright (c) 2019 Joyent, Inc.
+  */
+ 
+ 'use strict';
+@@ -82,7 +82,7 @@ function getDifferences(fields, cur, old) {
+             return;
+         }
+ 
+-        if (cur[field] !== old[field]) {
++        if (cur[field] !== old[field] && cur[field] !== undefined) {
+             update[field] = cur[field];
+         }
+     });
+@@ -419,12 +419,18 @@ NicFSM.prototype.state_update.local = function (S) {
+         return;
+     }
+ 
+-    if (needNicUpdate) {
+-        owner.updateNIC(self.mac, locupdate, S.callback(afterUpdate));
+-    } else {
++    if (!needNicUpdate) {
++        /*
++         * While the NIC doesn't need to be updated, VM_FIELDS properties
++         * have changed, so the owner will want to refresh and update its
++         * configuration if needed.
++         */
+         owner.refresh();
+         S.gotoState('update.napi');
++        return;
+     }
++
++    owner.updateNIC(self.mac, locupdate, S.callback(afterUpdate));
+ };
+ 
+ NicFSM.prototype.state_update.napi = function (S) {
+diff --git a/lib/server-fsm.js b/lib/server-fsm.js
+index ae3cb4e..f4b6f04 100644
+--- a/lib/server-fsm.js
++++ b/lib/server-fsm.js
+@@ -235,7 +235,7 @@ ServerFSM.prototype._fmtvnic = function (name, nic) {
+     }
+ 
+     if (mod_jsprim.hasKey(nic, 'VLAN')) {
+-        o.vlan_id = nic['VLAN'];
++        o.vlan_id = Number(nic['VLAN']);
+     } else {
+         o.vlan_id = 0;
+     }
+diff --git a/lib/utils.js b/lib/utils.js
+new file mode 100644
+index 0000000..0697d1c
+--- /dev/null
++++ b/lib/utils.js
+@@ -0,0 +1,30 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++
++/*
++ * Copyright (c) 2019 Joyent, Inc.
++ */
++
++'use strict';
++
++/*
++ * Get monotonic time in milliseconds.
++ *
++ * Note that this is *not* the same as Date.now(), which returns the current
++ * wall clock time in milliseconds.
++ */
++function currentMillis() {
++    var time = process.hrtime();
++    var secs2ms = time[0] * 1000;
++    var ns2ms = time[1] / 1000000;
++
++    return (secs2ms + ns2ms);
++}
++
++
++module.exports = {
++    currentMillis: currentMillis
++};
+diff --git a/lib/vmadm-watcher-fsm.js b/lib/vmadm-watcher-fsm.js
+index 25bdbe3..cf45ed8 100644
+--- a/lib/vmadm-watcher-fsm.js
++++ b/lib/vmadm-watcher-fsm.js
+@@ -5,7 +5,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2018 Joyent, Inc.
++ * Copyright (c) 2019 Joyent, Inc.
+  */
+ 
+ 'use strict';
+@@ -14,6 +14,18 @@ var assert = require('assert-plus');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+ 
++var currentMillis = require('./utils').currentMillis;
++
++// --- Globals
++
++/*
++ * We delay emitting the "vms-update" event by up to 5 seconds when we would
++ * otherwise do it right on the heels of the previous one. This helps us avoid
++ * repeatedly checking configurations while we're updating multiple VMs (e.g.,
++ * after a popular network has changed).
++ */
++var UPDATE_DELAY = 5 * 1000;
++
+ var WATCHED_FIELDS = [
+     'resolvers',
+     'nics',
+@@ -23,6 +35,8 @@ var WATCHED_FIELDS = [
+ ];
+ 
+ 
++// --- Internal helpers
++
+ /**
+  * The VmadmEventsFSM is responsible for collecting and managing information
+  * on VMs using `vmadm events` (vminfod).
+@@ -44,10 +58,21 @@ function VmadmEventsFSM(opts) {
+     self.stopWatcher = null;
+     self.vmadm = opts.vmadm;
+ 
+-    mod_mooremachine.FSM.call(self, 'init');
++    self.lastUpdate = 0;
++    self.pending = {
++        vmsUpdate: false
++    };
++
++    mod_mooremachine.FSM.call(self, 'waiting');
+ }
+ mod_util.inherits(VmadmEventsFSM, mod_mooremachine.FSM);
+ 
++VmadmEventsFSM.prototype.state_waiting = function (S) {
++    S.on(this, 'startAsserted', function () {
++        S.gotoState('init');
++    });
++};
++
+ /*
+  * Create the `vmadm events` watcher which gets events for any VM change on the
+  * system using vminfod.
+@@ -133,7 +158,7 @@ VmadmEventsFSM.prototype.state_init = function (S) {
+             delete self.ignore[ev.zonename];
+             break;
+         default:
+-            assert(false, 'unknown vmadm event type: ' + ev.type);
++            assert.fail('unknown vmadm event type: ' + ev.type);
+             break;
+         }
+ 
+@@ -220,7 +245,7 @@ VmadmEventsFSM.prototype.stop = function () {
+     self.emit('stopAsserted');
+ };
+ 
+-VmadmEventsFSM.prototype._emitUpdate = function () {
++VmadmEventsFSM.prototype.getCurrentVMs = function () {
+     var self = this;
+ 
+     var vms = Object.keys(self.vms).map(function (uuid) {
+@@ -229,9 +254,34 @@ VmadmEventsFSM.prototype._emitUpdate = function () {
+         return !vm.do_not_inventory;
+     });
+ 
+-    self.emit('vms-update', vms);
++    return vms;
+ };
+ 
++VmadmEventsFSM.prototype._emitUpdate = function () {
++    var self = this;
++    var wait = 0;
++
++    if (self.pending.vmsUpdate) {
++        return;
++    }
++
++    var now = currentMillis();
++    var next = self.lastUpdate + UPDATE_DELAY;
++    if (next > now) {
++        wait = next - now;
++    }
++
++    self.pending.vmsUpdate = true;
++    setTimeout(function () {
++        self.lastUpdate = currentMillis();
++        self.pending.vmsUpdate = false;
++        self.emit('vms-update');
++    }, wait);
++};
++
++
++// --- Exports
++
+ function VmadmWatcherFSM(opts) {
+     var self = this;
+ 
+@@ -245,6 +295,15 @@ function VmadmWatcherFSM(opts) {
+     }, true);
+     self.vmadm = opts.vmadm;
+ 
++    self.vmadmevents = new VmadmEventsFSM({
++        log: self.log,
++        vmadm: self.vmadm
++    });
++
++    self.pending = {
++        refresh: false
++    };
++
+     mod_mooremachine.FSM.call(self, 'init');
+ }
+ mod_util.inherits(VmadmWatcherFSM, mod_mooremachine.FSM);
+@@ -260,11 +319,15 @@ VmadmWatcherFSM.prototype.state_init = function (S) {
+ VmadmWatcherFSM.prototype.state_running = function (S) {
+     var self = this;
+ 
+-    self.vmadmevents = new VmadmEventsFSM({log: self.log, vmadm: self.vmadm});
++    function updateVMs() {
++        self.app.updateVMs(self.vmadmevents.getCurrentVMs());
++    }
+ 
+-    S.on(self.vmadmevents, 'vms-update', function (vms) {
+-        self.app.updateVMs(vms);
+-    });
++    S.on(self.vmadmevents, 'vms-update', updateVMs);
++
++    S.on(self, 'refreshAsserted', updateVMs);
++
++    self.vmadmevents.start();
+ };
+ 
+ VmadmWatcherFSM.prototype.start = function () {
+@@ -280,7 +343,17 @@ VmadmWatcherFSM.prototype.stop = function () {
+ };
+ 
+ VmadmWatcherFSM.prototype.refresh = function () {
+-    // nop
++    var self = this;
++
++    if (self.pending.refresh) {
++        return;
++    }
++
++    self.pending.refresh = true;
++    setImmediate(function () {
++        self.pending.refresh = false;
++        self.emit('refreshAsserted');
++    });
+ };
+ 
+ module.exports = VmadmWatcherFSM;
+diff --git a/lib/watcher-fsm.js b/lib/watcher-fsm.js
+index 9b00490..8975b39 100644
+--- a/lib/watcher-fsm.js
++++ b/lib/watcher-fsm.js
+@@ -17,6 +17,7 @@ var mod_jsprim = require('jsprim');
+ var mod_mooremachine = require('mooremachine');
+ var mod_util = require('util');
+ 
++var currentMillis = require('./utils').currentMillis;
+ var LineStream = require('lstream');
+ 
+ // --- Globals
+@@ -53,17 +54,6 @@ var WATCH_EVENTS = {
+ 
+ // --- Internal helpers
+ 
+-/*
+- * Get monotonic time in milliseconds.
+- */
+-function currentMillis() {
+-    var time = process.hrtime();
+-    var secs2ms = time[0] * 1000;
+-    var ns2ms = time[1] / 1000000;
+-
+-    return (secs2ms + ns2ms);
+-}
+-
+ /*
+  * The ZoneEventFSM is responsible for tracking the zoneevent process, and
+  * restarting it when needed. When the process emits events to stdout, it
+diff --git a/package.json b/package.json
+index 048bea1..d51cffb 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+     "name": "net-agent",
+     "description": "Triton Network Agent",
+-    "version": "2.2.2",
++    "version": "2.2.3",
+     "author": "Joyent (joyent.com)",
+     "private": true,
+     "dependencies": {
+@@ -28,7 +28,7 @@
+     },
+     "devDependencies": {
+         "eslint": "^4.13.1",
+-        "eslint-plugin-joyent": "~2.0.0"
++        "eslint-plugin-joyent": "~2.1.0"
+     },
+     "scripts": {
+         "postinstall": "npm/postinstall.sh",

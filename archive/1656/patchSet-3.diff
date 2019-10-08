@@ -1,0 +1,373 @@
+commit 6c2108d3e57f1bb3c203d19f8278896ba5a20c24 (refs/changes/56/1656/3)
+Author: Orlando Vazquez <ovazquez@gmail.com>
+Date:   2017-03-17T11:18:23-07:00 (2 years, 7 months ago)
+    
+    CNAPI-697 CNAPI should be able to accept websocket connections from cn-agent as per RFD-61
+
+diff --git a/lib/apis/moray.js b/lib/apis/moray.js
+index ce2681e..dae1f86 100644
+--- a/lib/apis/moray.js
++++ b/lib/apis/moray.js
+@@ -13,7 +13,6 @@
+  */
+ 
+ var moray_client = require('moray');
+-var assert = require('assert-plus');
+ var bunyan = require('bunyan');
+ var async = require('async');
+ var VError = require('verror');
+@@ -86,7 +85,18 @@ var BUCKETS = {
+                 last_heartbeat: { type: 'string' }
+             }
+         }
++    },
++    roster_authority: {
++        name: 'cnapi_roster_authority',
++        bucket: {
++            index: {
++                server_uuid: { type: 'string', unique: true },
++                cnapi_uuid: { type: 'string', unique: true }
++            }
++        }
+     }
++
++
+ };
+ 
+ 
+diff --git a/lib/app.js b/lib/app.js
+index 618679c..d56d3ef 100644
+--- a/lib/app.js
++++ b/lib/app.js
+@@ -50,6 +50,7 @@ var Workflow = require('./apis/workflow');
+ var TASK_CLEANUP_MAX_AGE = 30 * 24 * 60 * 60;
+ var TASK_CLEANUP_PERIOD = 60 * 60;
+ var SYSINFO_PERIOD = 60;
++var DURATION_LIVENESS_CHECK_MS = 1000;
+ 
+ 
+ 
+@@ -311,6 +312,7 @@ App.prototype.initializeConnections = function (callback) {
+     self.setupWorkflowClient();
+     self.setupWaitlistDirector();
+     self.setupServerHeartbeatTimeouts();
++    self.setupServerRosterChecking();
+ 
+     self.setupAmqpClient();
+     self.startSysinfoChecker();
+@@ -372,6 +374,35 @@ App.prototype.setupServerHeartbeatTimeouts = function () {
+     }
+ };
+ 
++/**
++ * Starts JS interval which compares, every second, the last timestamp for each
++ * roster heartbeat. If any of these exceed the expected period * 1.5, then we
++ * mark the server as having status 'unknown' and remove them from the roster.
++ */
++
++App.prototype.setupServerRosterChecking = function () {
++    var self = this;
++    self.rosterCheckInterval = setInterval(function () {
++        var now = new Date();
++        Object.keys(ModelServer.rosterTimestamps).forEach(
++            function (serverUuid) {
++                var isoDate = ModelServer.rosterTimestamps[serverUuid];
++
++                var timestamp = new Date(isoDate);
++                var delta = now - timestamp;
++
++                self.log.warn('checking server %s (delta = %d)', serverUuid,
++                        delta);
++
++                if (delta > DURATION_LIVENESS_CHECK_MS * 1.5) {
++                    self.log.warn(
++                        'no server roster heartbeat received in %d seconds',
++                        delta / 1000);
++                }
++        });
++    }, DURATION_LIVENESS_CHECK_MS);
++};
++
+ 
+ /**
+  * For a given server, this clears and refreshes to the maximum duration the
+@@ -1393,4 +1424,9 @@ App.prototype.getLog = function (callback) {
+ };
+ 
+ 
++App.prototype.getUuid = function AppGetUuid() {
++    return this.uuid;
++};
++
++
+ module.exports = App;
+diff --git a/lib/endpoints/index.js b/lib/endpoints/index.js
+index 6f36a1f..f5283eb 100644
+--- a/lib/endpoints/index.js
++++ b/lib/endpoints/index.js
+@@ -377,6 +377,7 @@ function attachTo(http, app) {
+ 
+ 
+         send.taskCallbacks = taskCallbacks;
++        send.rosterTimestamps = ModelServer.rosterTimestamps;
+ 
+         res.send(send);
+     });
+diff --git a/lib/endpoints/servers.js b/lib/endpoints/servers.js
+index 489c0c1..962d0ab 100644
+--- a/lib/endpoints/servers.js
++++ b/lib/endpoints/servers.js
+@@ -15,20 +15,19 @@
+  */
+ 
+ var async = require('async');
+-var fs = require('fs');
++var vasync = require('vasync');
+ var qs = require('querystring');
+ var restify = require('restify');
+ var sprintf = require('sprintf').sprintf;
+-var util = require('util');
+ var VError = require('verror');
++var Watershed = require('watershed').Watershed;
+ 
+-var common = require('../common');
+-var datasetEndpoints = require('./zfs');
+ var Designation = require('../designation');
+ var ModelPlatform = require('../models/platform');
+ var ModelServer = require('../models/server');
+ var validation = require('../validation/endpoints');
+ 
++var ws = new Watershed();
+ 
+ function Server() {}
+ 
+@@ -1044,6 +1043,67 @@ Server.nop = function handlerServerNop(req, res, next) {
+ };
+ 
+ 
++Server.rosterConnection =
++function handlerRosterConnection(req, res, next) {
++    var self = this;
++    var upgrade;
++
++    if (!res.claimUpgrade) {
++        next(new Error('connection must upgrade for websockets'));
++        return;
++    }
++
++    upgrade = res.claimUpgrade();
++
++    vasync.waterfall([
++        acceptConnection,
++        recordAgentRelationship
++    ], function _onDone(err) {
++        if (err) {
++            req.log.error({ err: err }, 'roster connection error');
++        }
++        next(false);
++        return;
++    });
++
++    function acceptConnection(cb) {
++        var shed;
++
++        try {
++            shed = ws.accept(req, upgrade.socket, upgrade.head);
++        } catch (e) {
++            req.log.error('roster watershed error: ' + e.message);
++            return;
++        }
++
++        self.log.warn('roster connection initated to %s',
++            req.params.server_uuid);
++
++        shed.on('text', function _onShedText(msg) {
++            self.log.warn('received heartbeat: ' + msg);
++            ModelServer.refreshServerRosterTimestamp(
++                req.params.server_uuid, (new Date()).toISOString());
++        });
++
++        shed.on('end', function _onShedEnd() {
++            self.log.warn({ args: arguments }, 'watershed end');
++        });
++
++        shed.on('error', function _onShedError() {
++            self.log.warn({ args: arguments }, 'watershed error');
++        });
++
++        cb();
++    }
++
++    function recordAgentRelationship(cb) {
++        req.server.recordAgentRelationship({
++            cnapiUuid: ModelServer.getApp().getUuid()
++        });
++    }
++};
++
++
+ function attachTo(http, app) {
+     var ensure = require('../endpoints').ensure;
+ 
+@@ -1225,6 +1285,17 @@ function attachTo(http, app) {
+         }),
+         Server.eventVmsUpdate);
+ 
++    http.get({
++        path: '/servers/:server_uuid/roster-connection',
++        name: 'ServerRosterConnection' },
++        ensure({
++            connectionTimeoutSeconds: 60 * 60,
++            app: app,
++            prepopulate: ['server'],
++            connected: ['moray']
++        }),
++        Server.rosterConnection);
++
+     /**
+      *
+      * Misc
+diff --git a/lib/models/server.js b/lib/models/server.js
+index 12716bb..5b2e315 100644
+--- a/lib/models/server.js
++++ b/lib/models/server.js
+@@ -91,6 +91,7 @@ ModelServer.init = function (app) {
+         ModelServer[p] = ModelBase.staticFn[p];
+     });
+ 
++    ModelServer.rosterTimestamps = {};
+     ModelServer.tasks = {};
+     ModelServer.log = app.getLog();
+     ModelServer.heartbeatByServerUuid = {};
+@@ -2426,4 +2427,41 @@ function firstAdminIp(sysinfo) {
+ }
+ 
+ 
++/**
++ * Refresh a timestamp recording when a heartbeat was last received from a
++ * compute node.
++ */
++
++ModelServer.refreshServerRosterTimestamp = function (serverUuid, timestamp) {
++    assert.uuid(serverUuid, 'serverUuid');
++    ModelServer.rosterTimestamps[serverUuid] = timestamp;
++};
++
++
++ModelServer.prototype.recordAgentRelationship =
++function ModelServerRecordServerRelationship(opts, callback) {
++    var self = this;
++
++    assert.object(opts, 'opts');
++    assert.string(opts.cnapiUuid, 'opts.cnapiUuid');
++
++    ModelServer.getMoray().putObject(
++        buckets.roster_authority.name,
++        self.uuid,
++        {
++            server_uuid: self.uuid,
++            cnapi_uuid: opts.cnapiUuid
++        },
++        function _onPut(putError) {
++            if (putError) {
++                self.log.error('could not update roster authority');
++                callback(
++                    VError(putError, 'could not update roster authority'));
++                return;
++            }
++            callback();
++        });
++};
++
++
+ module.exports = ModelServer;
+diff --git a/lib/server.js b/lib/server.js
+index a6137c9..eb802fe 100644
+--- a/lib/server.js
++++ b/lib/server.js
+@@ -14,16 +14,19 @@ var restifyValidator = require('restify-validator');
+ var trace_event = require('trace-event');
+ var formatJSON = require('restify/lib/formatters/json');
+ var jsprim = require('jsprim');
++var Watershed = require('watershed').Watershed;
+ 
+ var endpoints = require('./endpoints/index');
+ var request_seq_id = 0;
+ 
+ 
+ function createServer(options) {
++    var log = options.log;
++
+     var cnapi = restify.createServer({
+         name: 'Compute Node API',
+-        log: options.log,
+-        handleUpgrades: true
++        handleUpgrades: true,
++        log: log
+     });
+ 
+     cnapi.use(restify.requestLogger());
+@@ -65,7 +68,9 @@ function createServer(options) {
+     // Add a default timeout of one hour
+     cnapi.use(function setDefaultTimeouts(req, res, next) {
+         req.connection.setTimeout(3600 * 1000);
+-        res.connection.setTimeout(3600 * 1000);
++        if (res && res.connection) {
++            res.connection.setTimeout(3600 * 1000);
++        }
+         next();
+     });
+ 
+diff --git a/package.json b/package.json
+index f4efff1..725d5a6 100644
+--- a/package.json
++++ b/package.json
+@@ -6,7 +6,7 @@
+   "private": true,
+   "dependencies": {
+     "amqp": "0.2.6",
+-    "assert-plus": "1.0.0",
++    "assert-plus": "^1.0.0",
+     "async": "1.5.2",
+     "bunyan": "1.8.5",
+     "dapi": "git+https://github.com/joyent/sdc-designation.git#2fbeb8d3ba939ab952c52f389c910a46f44b3094",
+@@ -14,17 +14,18 @@
+     "dox": "0.4.1",
+     "effluent-logger": "git+https://github.com/joshwilsdon/effluent-logger.git#d662f161a07f94045ad2afb45442931511c40e51",
+     "jsprim": "1.3.1",
+-    "moray": "2.0.1",
+     "libuuid": "0.2.1",
++    "moray": "2.0.1",
+     "nodeunit": "0.10.2",
+     "once": "1.4.0",
+-    "restify": "4.3.0",
++    "restify": "^4.3.0",
+     "restify-validator": "0.3.1",
+     "sdc-clients": "10.0.3",
+     "sprintf": "0.1.5",
+     "trace-event": "1.3.0",
+     "vasync": "1.6.4",
+     "verror": "1.9.0",
++    "watershed": "^0.3.3",
+     "wf-client": "0.2.1",
+     "wf-shared": "git+https://github.com/joyent/sdc-wf-shared.git#9aed2e8"
+   },
+diff --git a/tools/rsync-to b/tools/rsync-to
+index f17bb3e..4fc3faf 100755
+--- a/tools/rsync-to
++++ b/tools/rsync-to
+@@ -42,12 +42,12 @@ rsync -av ${TOP}/ \
+     --exclude /config/config.json \
+     --exclude /deps/ \
+     --exclude /docs/ \
+-    --exclude /node_modules/ \
+     --exclude /scripts/ \
+     --exclude /boot/ \
+     --exclude /smf/ \
+     --exclude /tools/ \
+-    --exclude /tmp/
++    --exclude /tmp/ \
++#    --exclude /node_modules/ \
+ 
+ state=$(ssh ${NODE} svcs -z ${ZONE} -H -o state $ROLE)
+ 
