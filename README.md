@@ -123,3 +123,72 @@ Gerrit CR as a GitHub PR.
         git clone https://github.com/joyent/gerrit-migration.git
 
 2.  XXX
+
+
+
+
+## How to update the cr.joyent.us archive
+
+0. If you are making huge updates to the archives (e.g. starting from an
+   empty archive), then you'll want to prefetch all the repos from cr.joyent.us
+   via:
+
+    ```
+    ssh cr gerrit ls-projects | sed 1d > archive/all-projects.txt
+    export CACHE_DIR=/var/cr.joyent.us-archive/repos
+    cat archive/all-projects.txt | while read p; do
+        if [[ "$p" == "joyent/postgres" ]]; then
+            echo "";
+            echo "# skip $p (broken clone from cr.joyent.us)"
+        elif [[ ! -d $CACHE_DIR/$p.git ]]; then
+            echo "";
+            echo "# clone $p";
+            dir=$CACHE_DIR/$(dirname $p);
+            mkdir -p $dir;
+            (cd $dir && git clone --mirror trentm@cr.joyent.us:$p.git);
+        fi;
+    done
+    ```
+
+1. Get a clone of this repo:
+
+    ```
+    git clone git@github.com:joyent/gerrit-migration.git
+    cd gerrit-migration
+    ```
+
+2. Run the archive script:
+
+    ```
+    ./bin/cr.joyent.us-archive ./archive/
+    ```
+
+    However cr.joyent.us is flaky. It will (a) times out or crashes in SSH API
+    requests and (b) hang on "git clone" and "git fetch" frequently. I've
+    settled on running the following and watching for hangs. When it
+    hangs, hit `Ctrl+C` to abort and have it retry:
+
+    ```
+    # First edit the file and set this in the "globals/config" section:
+    #      regenerateAllChanges = False
+    vi bin/cr.joyent.us-archive
+
+    # Then run this:
+    while true; do
+        echo ""; echo ""; echo "";
+        ./bin/cr.joyent.us-archive ./archive/;
+        echo ""; echo "";
+        echo "# will retry in 5 seconds"; sleep 5;
+    done
+
+    # Then remember to undo your script change.
+    vi bin/cr.joyent.us-archive
+    ```
+
+3. Git add and commit the updates:
+
+    ```
+    git add ./archive
+    git commit archive -m "MANTA-4595: update cr.joyent.us archive to latest"
+    git push origin master
+    ```
