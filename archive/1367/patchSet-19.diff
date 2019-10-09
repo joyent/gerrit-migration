@@ -1,0 +1,2789 @@
+From dda1f9a81f5e81013b6df1dd838f8a23774ed0b5 Mon Sep 17 00:00:00 2001
+From: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date: Wed, 22 Feb 2017 22:08:23 +0000
+Subject: [PATCH] OS-5845 lx aio performance improvements and move into kernel
+ Reviewed by: Patrick Mooney <patrick.mooney@joyent.com> Reviewed by: Bryan
+ Cantrill <bryan@joyent.com> Approved by: Patrick Mooney
+ <patrick.mooney@joyent.com>
+
+---
+ usr/src/lib/brand/lx/lx_brand/Makefile.com    |    5 +-
+ usr/src/lib/brand/lx/lx_brand/common/aio.c    |  612 ---------
+ .../lib/brand/lx/lx_brand/common/lx_brand.c   |   27 +-
+ usr/src/lib/brand/lx/lx_brand/common/misc.c   |   11 +-
+ usr/src/lib/brand/lx/lx_brand/sys/lx_aio.h    |   80 --
+ .../lib/brand/lx/lx_brand/sys/lx_syscall.h    |    3 +-
+ usr/src/uts/common/brand/lx/os/lx_brand.c     |   20 +-
+ usr/src/uts/common/brand/lx/os/lx_misc.c      |    8 +
+ usr/src/uts/common/brand/lx/os/lx_syscall.c   |   18 +-
+ usr/src/uts/common/brand/lx/procfs/lx_proc.h  |    4 +-
+ .../uts/common/brand/lx/procfs/lx_prvnops.c   |  104 +-
+ usr/src/uts/common/brand/lx/sys/lx_brand.h    |   14 +-
+ usr/src/uts/common/brand/lx/sys/lx_syscalls.h |    6 +-
+ usr/src/uts/common/brand/lx/syscall/lx_aio.c  | 1140 ++++++++++++++++-
+ .../uts/common/brand/lx/syscall/lx_close.c    |   31 +-
+ usr/src/uts/common/brand/lx/syscall/lx_rw.c   |   40 +-
+ usr/src/uts/common/brand/sn1/sn1_brand.c      |    5 +-
+ .../uts/common/brand/solaris10/s10_brand.c    |    5 +-
+ usr/src/uts/common/fs/proc/prsubr.c           |    7 +-
+ usr/src/uts/common/os/fio.c                   |    4 +-
+ usr/src/uts/common/os/lwp.c                   |    5 +-
+ usr/src/uts/common/sys/brand.h                |    4 +-
+ usr/src/uts/common/sys/file.h                 |    3 +-
+ usr/src/uts/common/sys/thread.h               |    3 +-
+ 24 files changed, 1350 insertions(+), 809 deletions(-)
+ delete mode 100644 usr/src/lib/brand/lx/lx_brand/common/aio.c
+ delete mode 100644 usr/src/lib/brand/lx/lx_brand/sys/lx_aio.h
+
+diff --git a/usr/src/lib/brand/lx/lx_brand/Makefile.com b/usr/src/lib/brand/lx/lx_brand/Makefile.com
+index 262356884f..a959ae604a 100644
+--- a/usr/src/lib/brand/lx/lx_brand/Makefile.com
++++ b/usr/src/lib/brand/lx/lx_brand/Makefile.com
+@@ -21,15 +21,14 @@
+ #
+ # Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
+ # Use is subject to license terms.
+-# Copyright 2016 Joyent, Inc.
++# Copyright 2017 Joyent, Inc.
+ #
+ 
+ LX_CMN  =	$(SRC)/common/brand/lx
+ 
+ LIBRARY =	lx_brand.a
+ VERS	=	.1
+-COBJS	=	aio.o			\
+-		capabilities.o		\
++COBJS	=	capabilities.o		\
+ 		clock.o			\
+ 		clone.o			\
+ 		debug.o			\
+diff --git a/usr/src/lib/brand/lx/lx_brand/common/aio.c b/usr/src/lib/brand/lx/lx_brand/common/aio.c
+deleted file mode 100644
+index e757c5426b..0000000000
+--- a/usr/src/lib/brand/lx/lx_brand/common/aio.c
++++ /dev/null
+@@ -1,612 +0,0 @@
+-/*
+- * This file and its contents are supplied under the terms of the
+- * Common Development and Distribution License ("CDDL"), version 1.0.
+- * You may only use this file in accordance with the terms of version
+- * 1.0 of the CDDL.
+- *
+- * A full copy of the text of the CDDL should have accompanied this
+- * source.  A copy of the CDDL is also available via the Internet at
+- * http://www.illumos.org/license/CDDL.
+- */
+-
+-/*
+- * Copyright 2017 Joyent, Inc.
+- */
+-
+-#include <sys/syscall.h>
+-#include <sys/types.h>
+-#include <sys/errno.h>
+-#include <sys/mman.h>
+-#include <thread.h>
+-#include <synch.h>
+-#include <port.h>
+-#include <aio.h>
+-#include <assert.h>
+-#include <errno.h>
+-#include <limits.h>
+-#include <strings.h>
+-#include <stdlib.h>
+-#include <sys/lx_types.h>
+-#include <sys/lx_debug.h>
+-#include <sys/lx_syscall.h>
+-#include <sys/lx_misc.h>
+-#include <sys/lx_aio.h>
+-
+-/*
+- * We implement the Linux asynchronous I/O system calls by using the POSIX
+- * asynchronous I/O facilities together with event port notification.  This
+- * approach allows us to broadly approximate Linux semantics, but see
+- * lx_io_cancel() for some limitations.
+- *
+- * NOTE:
+- * The Linux implementation of the io_* syscalls is not exposed via glibc.
+- * These syscalls are documented to use an aio_context_t for the context
+- * parameter. On Linux this is a ulong_t. On Linux the contexts live in the
+- * kernel address space and are looked up using the aio_context_t parameter.
+- * The Linux libaio interface uses a different type for the context_t parameter.
+- *
+- * Our implementation assumes the lx_aio_context_t can be treated as a
+- * pointer. This works fortuitously because a ulong_t is the same size as a
+- * pointer. Our implementation maps the contexts into the program's address
+- * space so the aio_context_t we pass back and forth will be valid as a
+- * pointer for the program. This is similar to the native aio implementation.
+- */
+-
+-typedef struct lx_aiocb {
+-	struct aiocb	lxaiocb_cb;		/* POSIX AIO control block */
+-	struct lx_aiocb *lxaiocb_next;		/* next outstanding/free I/O */
+-	struct lx_aiocb	*lxaiocb_prev;		/* prev outstanding I/O */
+-	uintptr_t	lxaiocb_iocbp;		/* pointer to lx_iocb_t */
+-	uintptr_t	lxaiocb_data;		/* data payload */
+-} lx_aiocb_t;
+-
+-typedef struct lx_aio_ctxt {
+-	mutex_t		lxaio_lock;		/* lock protecting context */
+-	boolean_t	lxaio_destroying;	/* boolean: being destroyed */
+-	cond_t		lxaio_destroyer;	/* destroyer's condvar */
+-	int		lxaio_waiters;		/* number of waiters */
+-	size_t		lxaio_size;		/* total size of mapping */
+-	int		lxaio_port;		/* port for completion */
+-	lx_aiocb_t	*lxaio_outstanding;	/* outstanding I/O */
+-	lx_aiocb_t	*lxaio_free;		/* free I/O control blocks */
+-	int		lxaio_nevents;		/* max number of events */
+-} lx_aio_ctxt_t;
+-
+-int lx_aio_max_nr = 65536;
+-
+-/* Perform some basic validation on the context */
+-#define	INVALID_CTX(C)	(C == NULL || (long)C == -1 || \
+-			(C->lxaio_size == 0 && C->lxaio_nevents == 0) || \
+-			C->lxaio_nevents > lx_aio_max_nr)
+-
+-long
+-lx_io_setup(unsigned int nr_events, lx_aio_context_t *cidp)
+-{
+-	lx_aio_ctxt_t *ctx;
+-	intptr_t tp;
+-	lx_aiocb_t *lxcbs;
+-	uintptr_t check;
+-	size_t size;
+-	int i;
+-
+-	if (uucopy(cidp, &check, sizeof (cidp)) != 0)
+-		return (-EFAULT);
+-
+-	if (check != NULL || nr_events == 0 || nr_events > lx_aio_max_nr)
+-		return (-EINVAL);
+-
+-	/*
+-	 * We're saved from complexity in no small measure by the fact that the
+-	 * cap on the number of concurrent events must be specified a priori;
+-	 * we use that to determine the amount of memory we need and mmap() it
+-	 * upfront.
+-	 */
+-	size = sizeof (lx_aio_ctxt_t) + nr_events * sizeof (lx_aiocb_t);
+-
+-	if ((tp = (intptr_t)mmap(0, size, PROT_READ | PROT_WRITE,
+-	    MAP_PRIVATE | MAP_ANON, -1, 0)) == -1) {
+-		return (-ENOMEM);
+-	}
+-	ctx = (lx_aio_ctxt_t *)tp;
+-
+-	ctx->lxaio_size = size;
+-	ctx->lxaio_nevents = nr_events;
+-
+-	if ((ctx->lxaio_port = port_create()) == -1) {
+-		(void) munmap((caddr_t)ctx, ctx->lxaio_size);
+-		return (-EAGAIN);
+-	}
+-
+-	(void) mutex_init(&ctx->lxaio_lock, USYNC_THREAD|LOCK_ERRORCHECK, NULL);
+-
+-	/*
+-	 * Link up the free list.
+-	 */
+-	lxcbs = (lx_aiocb_t *)((uintptr_t)ctx + sizeof (lx_aio_ctxt_t));
+-
+-	for (i = 0; i < nr_events - 1; i++)
+-		lxcbs[i].lxaiocb_next = &lxcbs[i + 1];
+-
+-	ctx->lxaio_free = &lxcbs[0];
+-
+-	if (uucopy(&ctx, cidp, sizeof (cidp)) != 0) {
+-		(void) close(ctx->lxaio_port);
+-		(void) munmap((caddr_t)ctx, ctx->lxaio_size);
+-		return (-EFAULT);
+-	}
+-
+-	return (0);
+-}
+-
+-long
+-lx_io_submit(lx_aio_context_t cid, long nr, uintptr_t **bpp)
+-{
+-	int processed = 0, err = 0, i;
+-	port_notify_t notify;
+-	lx_aiocb_t *lxcb;
+-	lx_iocb_t **iocbpp, iocb, *iocbp = &iocb;
+-	struct aiocb *aiocb;
+-	lx_aio_ctxt_t *ctx = (lx_aio_ctxt_t *)cid;
+-
+-	/*
+-	 * To accomodate LTP tests we have to check in a specific order.
+-	 * Linux checks for invalid context first, then passes if nr == 0.
+-	 */
+-	if (INVALID_CTX(ctx))
+-		return (-EINVAL);
+-
+-	if (nr == 0)
+-		return (0);
+-
+-	if (nr < 0)
+-		return (-EINVAL);
+-
+-	if ((iocbpp = (lx_iocb_t **)malloc(nr * sizeof (uintptr_t))) == NULL)
+-		return (-EAGAIN);
+-
+-	if (uucopy(bpp, iocbpp, nr * sizeof (uintptr_t)) != 0) {
+-		free(iocbpp);
+-		return (-EFAULT);
+-	}
+-
+-	mutex_enter(&ctx->lxaio_lock);
+-
+-	for (i = 0; i < nr; i++) {
+-		if ((lxcb = ctx->lxaio_free) == NULL) {
+-			err = EAGAIN;
+-			break;
+-		}
+-
+-		if (uucopy(iocbpp[i], &iocb, sizeof (iocb)) != 0) {
+-			err = EFAULT;
+-			break;
+-		}
+-
+-		lxcb->lxaiocb_iocbp = (uintptr_t)iocbpp[i];
+-		lxcb->lxaiocb_data = iocbp->lxiocb_data;
+-
+-		/*
+-		 * We don't currently support eventfd-based notification.
+-		 */
+-		if (iocbp->lxiocb_flags & LX_IOCB_FLAG_RESFD) {
+-			err = ENOSYS;
+-			break;
+-		}
+-
+-		notify.portnfy_port = ctx->lxaio_port;
+-		notify.portnfy_user = lxcb;
+-
+-		aiocb = &lxcb->lxaiocb_cb;
+-		aiocb->aio_fildes = iocbp->lxiocb_fd;
+-		aiocb->aio_sigevent.sigev_notify = SIGEV_PORT;
+-		aiocb->aio_sigevent.sigev_value.sival_ptr = &notify;
+-
+-		switch (iocbp->lxiocb_op) {
+-		case LX_IOCB_CMD_FSYNC:
+-		case LX_IOCB_CMD_FDSYNC:
+-			err = aio_fsync(iocbp->lxiocb_op == LX_IOCB_CMD_FSYNC ?
+-			    O_SYNC : O_DSYNC, aiocb);
+-			break;
+-
+-		case LX_IOCB_CMD_PREAD:
+-		case LX_IOCB_CMD_PWRITE:
+-			aiocb->aio_offset = iocbp->lxiocb_offset;
+-
+-			if (aiocb->aio_nbytes > LONG_MAX) {
+-				err = EINVAL;
+-				break;
+-			}
+-
+-			aiocb->aio_nbytes = iocbp->lxiocb_nbytes;
+-
+-			if ((uintptr_t)iocbp->lxiocb_buf > ULONG_MAX) {
+-				err = EINVAL;
+-				break;
+-			}
+-
+-			aiocb->aio_buf = (void *)(uintptr_t)iocbp->lxiocb_buf;
+-			aiocb->aio_reqprio = 0;
+-
+-			if (iocbp->lxiocb_op == LX_IOCB_CMD_PREAD) {
+-				err = aio_read(aiocb);
+-			} else {
+-				err = aio_write(aiocb);
+-			}
+-
+-			break;
+-
+-		case LX_IOCB_CMD_NOOP:
+-			/*
+-			 * Yet another whodunit in Adventure Playground: why
+-			 * does Linux define an operation -- IOCB_CMD_NOOP --
+-			 * for which it always returns EINVAL?!  And what
+-			 * could a "no-op" possibly mean for asynchronous I/O
+-			 * anyway?! Do nothing... later?!
+-			 */
+-			err = EINVAL;
+-			break;
+-
+-		case LX_IOCB_CMD_PREADV:
+-		case LX_IOCB_CMD_PWRITEV:
+-			/*
+-			 * We don't support asynchronous preadv and pwritev
+-			 * (an asynchronous scatter/gather being a somewhat odd
+-			 * notion to begin with); we return EINVAL in this
+-			 * case, which the caller should be able to deal with.
+-			 */
+-			err = EINVAL;
+-			break;
+-
+-		default:
+-			err = EINVAL;
+-			break;
+-		}
+-
+-		if (err == -1)
+-			err = errno;
+-
+-		if (err != 0)
+-			break;
+-
+-		/*
+-		 * We successfully enqueued I/O.  Take our control block off
+-		 * of the free list and transition it to our list of
+-		 * outstanding I/O.
+-		 */
+-		ctx->lxaio_free = lxcb->lxaiocb_next;
+-		lxcb->lxaiocb_next = ctx->lxaio_outstanding;
+-
+-		if (ctx->lxaio_outstanding != NULL)
+-			ctx->lxaio_outstanding->lxaiocb_prev = lxcb;
+-
+-		ctx->lxaio_outstanding = lxcb;
+-		processed++;
+-	}
+-
+-	mutex_exit(&ctx->lxaio_lock);
+-
+-	free(iocbpp);
+-	if (processed == 0)
+-		return (-err);
+-
+-	return (processed);
+-}
+-
+-long
+-lx_io_getevents(lx_aio_context_t cid, long min_nr, long nr,
+-    lx_io_event_t *events, struct timespec *timeoutp)
+-{
+-	port_event_t *list;
+-	lx_io_event_t *out;
+-	uint_t nget, max;
+-	int rval, i, err;
+-	lx_aio_ctxt_t *ctx = (lx_aio_ctxt_t *)cid;
+-	struct timespec timeout, *tp;
+-
+-	if (INVALID_CTX(ctx))
+-		return (-EINVAL);
+-
+-	if (min_nr < 0 || min_nr > ctx->lxaio_nevents ||
+-	    nr < 0 || nr > ctx->lxaio_nevents)
+-		return (-EINVAL);
+-
+-	if (events == NULL)
+-		return (-EFAULT);
+-
+-	if (timeoutp == NULL) {
+-		tp = NULL;
+-	} else if (uucopy(timeoutp, &timeout, sizeof (struct timespec)) != 0) {
+-		return (-EFAULT);
+-	} else {
+-		/* A timeout of 0:0 should behave like a NULL timeout */
+-		if (timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
+-			tp = NULL;
+-		} else {
+-			tp = &timeout;
+-		}
+-	}
+-
+-	/*
+-	 * We can't return ENOMEM from this syscall so EINTR is the closest
+-	 * we can come.
+-	 */
+-	if ((list = malloc(nr * sizeof (port_event_t))) == NULL)
+-		return (-EINTR);
+-
+-	/*
+-	 * For Linux, the io_getevents() min_nr argument specifies *at least*
+-	 * that number of events, but for illumos the port_getn() nget argument
+-	 * specifies the *desired* numbers of events. Some applications pass 0
+-	 * for min_nr. This will cause port_getn to short-circuit and return
+-	 * immediately, so we use a value of 1 in this case. The port_getn()
+-	 * function can still return up to max events when nget == 1.
+-	 */
+-	nget = (min_nr == 0 ? 1 : min_nr);
+-
+-	max = nr;
+-
+-	/*
+-	 * Grab the lock associated with the context to bump the number of
+-	 * waiters.  This is needed in case this context is destroyed while
+-	 * we're still waiting on it.
+-	 */
+-	mutex_enter(&ctx->lxaio_lock);
+-
+-	if (ctx->lxaio_destroying) {
+-		mutex_exit(&ctx->lxaio_lock);
+-		free(list);
+-		return (-EINVAL);
+-	}
+-
+-	ctx->lxaio_waiters++;
+-	mutex_exit(&ctx->lxaio_lock);
+-
+-	rval = port_getn(ctx->lxaio_port, list, max, &nget, tp);
+-	err = errno;
+-
+-	mutex_enter(&ctx->lxaio_lock);
+-
+-	assert(ctx->lxaio_waiters > 0);
+-	ctx->lxaio_waiters--;
+-
+-	if ((rval == -1 && err != ETIME) || nget == 0 ||
+-	    (nget == 1 && list[0].portev_source == PORT_SOURCE_ALERT)) {
+-		/*
+-		 * If we're being destroyed, kick our waiter and clear out with
+-		 * EINVAL -- this is effectively an application-level race.
+-		 */
+-		if (ctx->lxaio_destroying) {
+-			(void) cond_signal(&ctx->lxaio_destroyer);
+-			err = EINVAL;
+-		}
+-
+-		mutex_exit(&ctx->lxaio_lock);
+-
+-		free(list);
+-		return (nget == 0 ? 0 : -err);
+-	}
+-
+-	if ((out = malloc(nget * sizeof (lx_io_event_t))) == NULL) {
+-		mutex_exit(&ctx->lxaio_lock);
+-		free(list);
+-		return (-EINTR);
+-	}
+-
+-	/*
+-	 * For each returned event, translate it into the Linux event in our
+-	 * stack-based buffer.  As we're doing this, we also free the lxcb by
+-	 * moving it from the outstanding list to the free list.
+-	 */
+-	for (i = 0; i < nget; i++) {
+-		port_event_t *pe = &list[i];
+-		lx_io_event_t *lxe = &out[i];
+-		struct aiocb *aiocb;
+-		lx_aiocb_t *lxcb;
+-
+-		lxcb = pe->portev_user;
+-		aiocb = (struct aiocb *)pe->portev_object;
+-
+-		assert(pe->portev_source == PORT_SOURCE_AIO);
+-		assert(aiocb == &lxcb->lxaiocb_cb);
+-
+-		lxe->lxioe_data = lxcb->lxaiocb_data;
+-		lxe->lxioe_object = lxcb->lxaiocb_iocbp;
+-		lxe->lxioe_res = aio_return(aiocb);
+-		lxe->lxioe_res2 = 0;
+-
+-		if (lxcb->lxaiocb_next != NULL)
+-			lxcb->lxaiocb_next->lxaiocb_prev = lxcb->lxaiocb_prev;
+-
+-		if (lxcb->lxaiocb_prev != NULL) {
+-			lxcb->lxaiocb_prev->lxaiocb_next = lxcb->lxaiocb_next;
+-		} else {
+-			assert(ctx->lxaio_outstanding == lxcb);
+-			ctx->lxaio_outstanding = lxcb->lxaiocb_next;
+-		}
+-
+-		lxcb->lxaiocb_prev = NULL;
+-		lxcb->lxaiocb_next = ctx->lxaio_free;
+-		ctx->lxaio_free = lxcb;
+-	}
+-
+-	free(list);
+-
+-	/*
+-	 * Perform one final check for a shutdown -- it's possible that we
+-	 * raced with the port transitioning into alert mode, in which case we
+-	 * have a blocked destroyer that we need to kick.  (Note that we do
+-	 * this after having properly cleaned up the completed I/O.)
+-	 */
+-	if (ctx->lxaio_destroying) {
+-		(void) cond_signal(&ctx->lxaio_destroyer);
+-		mutex_exit(&ctx->lxaio_lock);
+-		free(out);
+-		return (-EINVAL);
+-	}
+-
+-	mutex_exit(&ctx->lxaio_lock);
+-
+-	if (uucopy(out, events, nget * sizeof (lx_io_event_t)) != 0) {
+-		free(out);
+-		return (-EFAULT);
+-	}
+-
+-	free(out);
+-	return (nget);
+-}
+-
+-/*
+- * Cancellation is unfortunately problematic for us as the POSIX semantics for
+- * AIO cancellation differ slightly from the Linux semantics: on Linux,
+- * io_cancel() regrettably does not use the same mechanism for event
+- * consumption (that is, as an event retrievable via io_getevents()), but
+- * rather returns the cancellation event directly from io_cancel().  This is
+- * in contrast to POSIX AIO cancellation, which does not actually alter the
+- * notification mechanism:  the cancellation is still received via its
+- * specified notification (i.e., an event port or signal).  The unfortunate
+- * Linux semantics leave us with several (suboptimal) choices:
+- *
+- * (1) Cancel the I/O via aio_cancel(), and then somehow attempt to block on
+- *     the asynchronous cancellation notification without otherwise disturbing
+- *     other events that may be pending.
+- *
+- * (2) Cancel the I/O via aio_cancel() but ignore (and later, discard) the
+- *     asynchronous cancellation notification.
+- *
+- * (3) Explicitly fail to cancel any asynchronous I/O by having io_cancel()
+- *     always return EAGAIN.
+- *
+- * While the third option is the least satisfying from an engineering
+- * perspective, it is also entirely within the rights of the interface (which
+- * may return EAGAIN to merely denote that the specified I/O "was not
+- * canceled") and has the added advantage of being entirely honest.  (This is
+- * in stark contrast to the first two options, each of which tries to tell
+- * small lies that seem to sure to end in elaborate webs of deceit.)  Honesty
+- * is the best policy; after checking that the specified I/O is outstanding,
+- * we fail with EAGAIN.
+- */
+-/*ARGSUSED*/
+-long
+-lx_io_cancel(lx_aio_context_t cid, lx_iocb_t *iocbp, lx_io_event_t *result)
+-{
+-	lx_iocb_t iocb;
+-	lx_aiocb_t *lxcb;
+-	lx_aio_ctxt_t *ctx = (lx_aio_ctxt_t *)cid;
+-
+-	/* This is in a specific order for LTP */
+-	if (uucopy(iocbp, &iocb, sizeof (lx_iocb_t)) != 0)
+-		return (-EFAULT);
+-
+-	if (INVALID_CTX(ctx))
+-		return (-EINVAL);
+-
+-	mutex_enter(&ctx->lxaio_lock);
+-
+-	if (ctx->lxaio_destroying) {
+-		mutex_exit(&ctx->lxaio_lock);
+-		return (-EINVAL);
+-	}
+-
+-	for (lxcb = ctx->lxaio_outstanding; lxcb != NULL &&
+-	    lxcb->lxaiocb_iocbp != (uintptr_t)iocbp; lxcb = lxcb->lxaiocb_next)
+-		continue;
+-
+-	mutex_exit(&ctx->lxaio_lock);
+-
+-	if (lxcb == NULL)
+-		return (-EINVAL);
+-
+-	/*
+-	 * Congratulations on your hard-won EAGAIN!
+-	 */
+-	return (-EAGAIN);
+-}
+-
+-/*
+- * As is often the case, the destruction case makes everything a lot more
+- * complicated.  In this case, io_destroy() is defined to block on the
+- * completion of all outstanding operations.  To effect this, we throw the
+- * event port into the rarely-used alert mode -- invented long ago for just
+- * this purpose -- thereby kicking any waiters out of their port_get().
+- */
+-long
+-lx_io_destroy(lx_aio_context_t cid)
+-{
+-	lx_aiocb_t *lxcb;
+-	unsigned int nget = 0, i;
+-	int port;
+-	lx_aio_ctxt_t *ctx = (lx_aio_ctxt_t *)cid;
+-
+-	if (INVALID_CTX(ctx))
+-		return (-EINVAL);
+-
+-	port = ctx->lxaio_port;
+-	mutex_enter(&ctx->lxaio_lock);
+-
+-	if (ctx->lxaio_destroying) {
+-		mutex_exit(&ctx->lxaio_lock);
+-		return (-EINVAL);
+-	}
+-
+-	ctx->lxaio_destroying = B_TRUE;
+-
+-	if (ctx->lxaio_waiters) {
+-		/*
+-		 * If we have waiters, put the port into alert mode.
+-		 */
+-		(void) port_alert(port, PORT_ALERT_SET, B_TRUE, NULL);
+-
+-		while (ctx->lxaio_waiters) {
+-			(void) cond_wait(&ctx->lxaio_destroyer,
+-			    &ctx->lxaio_lock);
+-		}
+-
+-		/*
+-		 * Transition the port out of alert mode:  we will need to
+-		 * block on the port ourselves for any outstanding I/O.
+-		 */
+-		(void) port_alert(port, PORT_ALERT_SET, B_FALSE, NULL);
+-	}
+-
+-	/*
+-	 * We have no waiters and we never will again -- we can be assured
+-	 * that our list of outstanding I/Os is now completely static and it's
+-	 * now safe to iterate over our outstanding I/Os and aio_cancel() them.
+-	 */
+-	for (lxcb = ctx->lxaio_outstanding; lxcb != NULL;
+-	    lxcb = lxcb->lxaiocb_next) {
+-		struct aiocb *aiocb = &lxcb->lxaiocb_cb;
+-
+-		/*
+-		 * Surely a new bureaucratic low even for POSIX that we must
+-		 * specify both the file descriptor and the structure that
+-		 * must contain the file desctiptor...
+-		 */
+-		(void) aio_cancel(aiocb->aio_fildes, aiocb);
+-		nget++;
+-	}
+-
+-	/*
+-	 * Drain one at a time using port_get (vs. port_getn) so that we don't
+-	 * have to malloc a port_event list, which might fail.
+-	 */
+-	for (i = 0; i < nget; i++) {
+-		port_event_t pe;
+-		int rval;
+-
+-		do {
+-			rval = port_get(port, &pe, NULL);
+-		} while (rval == -1 && errno == EINTR);
+-
+-		assert(rval == 0);
+-	}
+-
+-	/*
+-	 * I/Os are either cancelled or completed.  We can safely close our
+-	 * port and nuke the mapping that contains our context.
+-	 */
+-	(void) close(ctx->lxaio_port);
+-	(void) munmap((caddr_t)ctx, ctx->lxaio_size);
+-
+-	return (0);
+-}
+diff --git a/usr/src/lib/brand/lx/lx_brand/common/lx_brand.c b/usr/src/lib/brand/lx/lx_brand/common/lx_brand.c
+index c027cfed5e..45166cb63f 100644
+--- a/usr/src/lib/brand/lx/lx_brand/common/lx_brand.c
++++ b/usr/src/lib/brand/lx/lx_brand/common/lx_brand.c
+@@ -25,7 +25,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <sys/types.h>
+@@ -72,7 +72,6 @@
+ #include <sys/lx_signal.h>
+ #include <sys/lx_syscall.h>
+ #include <sys/lx_thread.h>
+-#include <sys/lx_aio.h>
+ #include <lx_auxv.h>
+ 
+ /*
+@@ -1014,7 +1013,7 @@ static lx_syscall_handler_t lx_handlers[] = {
+ 	NULL,				/*   0: read */
+ 	NULL,				/*   1: write */
+ 	NULL,				/*   2: open */
+-	lx_close,			/*   3: close */
++	NULL,				/*   3: close */
+ 	NULL,				/*   4: stat */
+ 	NULL,				/*   5: fstat */
+ 	NULL,				/*   6: lstat */
+@@ -1217,11 +1216,11 @@ static lx_syscall_handler_t lx_handlers[] = {
+ 	NULL,				/* 203: sched_setaffinity */
+ 	NULL,				/* 204: sched_getaffinity */
+ 	NULL,				/* 205: set_thread_area */
+-	lx_io_setup,			/* 206: io_setup */
+-	lx_io_destroy,			/* 207: io_destroy */
+-	lx_io_getevents,		/* 208: io_getevents */
+-	lx_io_submit,			/* 209: io_submit */
+-	lx_io_cancel,			/* 210: io_cancel */
++	NULL,				/* 206: io_setup */
++	NULL,				/* 207: io_destroy */
++	NULL,				/* 208: io_getevents */
++	NULL,				/* 209: io_submit */
++	NULL,				/* 210: io_cancel */
+ 	NULL,				/* 211: get_thread_area */
+ 	NULL,				/* 212: lookup_dcookie */
+ 	NULL,				/* 213: epoll_create */
+@@ -1348,7 +1347,7 @@ static lx_syscall_handler_t lx_handlers[] = {
+ 	NULL,				/*   3: read */
+ 	NULL,				/*   4: write */
+ 	NULL,				/*   5: open */
+-	lx_close,			/*   6: close */
++	NULL,				/*   6: close */
+ 	NULL,				/*   7: waitpid */
+ 	NULL,				/*   8: creat */
+ 	NULL,				/*   9: link */
+@@ -1587,11 +1586,11 @@ static lx_syscall_handler_t lx_handlers[] = {
+ 	NULL,				/* 242: sched_getaffinity */
+ 	NULL,				/* 243: set_thread_area */
+ 	NULL,				/* 244: get_thread_area */
+-	lx_io_setup,			/* 245: io_setup */
+-	lx_io_destroy,			/* 246: io_destroy */
+-	lx_io_getevents,		/* 247: io_getevents */
+-	lx_io_submit,			/* 248: io_submit */
+-	lx_io_cancel,			/* 249: io_cancel */
++	NULL,				/* 245: io_setup */
++	NULL,				/* 246: io_destroy */
++	NULL,				/* 247: io_getevents */
++	NULL,				/* 248: io_submit */
++	NULL,				/* 249: io_cancel */
+ 	NULL,				/* 250: fadvise64 */
+ 	NULL,				/* 251: nosys */
+ 	lx_group_exit,			/* 252: group_exit */
+diff --git a/usr/src/lib/brand/lx/lx_brand/common/misc.c b/usr/src/lib/brand/lx/lx_brand/common/misc.c
+index 1969ac250c..9c73ac5b4b 100644
+--- a/usr/src/lib/brand/lx/lx_brand/common/misc.c
++++ b/usr/src/lib/brand/lx/lx_brand/common/misc.c
+@@ -21,7 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <stdlib.h>
+@@ -295,15 +295,6 @@ lx_setgroups(uintptr_t p1, uintptr_t p2)
+ 	return ((r == -1) ? -errno : r);
+ }
+ 
+-long
+-lx_close(int fildes)
+-{
+-	int r;
+-
+-	r = close(fildes);
+-	return ((r == -1) ? -errno : r);
+-}
+-
+ long
+ lx_getgroups(int gidsetsize, gid_t *grouplist)
+ {
+diff --git a/usr/src/lib/brand/lx/lx_brand/sys/lx_aio.h b/usr/src/lib/brand/lx/lx_brand/sys/lx_aio.h
+deleted file mode 100644
+index 825447c79f..0000000000
+--- a/usr/src/lib/brand/lx/lx_brand/sys/lx_aio.h
++++ /dev/null
+@@ -1,80 +0,0 @@
+-/*
+- * This file and its contents are supplied under the terms of the
+- * Common Development and Distribution License ("CDDL"), version 1.0.
+- * You may only use this file in accordance with the terms of version
+- * 1.0 of the CDDL.
+- *
+- * A full copy of the text of the CDDL should have accompanied this
+- * source.  A copy of the CDDL is also available via the Internet at
+- * http://www.illumos.org/license/CDDL.
+- */
+-
+-/*
+- * Copyright 2016 Joyent, Inc.
+- */
+-
+-#ifndef _SYS_LX_AIO_H
+-#define	_SYS_LX_AIO_H
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-
+-#define	LX_IOCB_FLAG_RESFD		0x0001
+-
+-#define	LX_IOCB_CMD_PREAD		0
+-#define	LX_IOCB_CMD_PWRITE		1
+-#define	LX_IOCB_CMD_FSYNC		2
+-#define	LX_IOCB_CMD_FDSYNC		3
+-#define	LX_IOCB_CMD_PREADX		4
+-#define	LX_IOCB_CMD_POLL		5
+-#define	LX_IOCB_CMD_NOOP		6
+-#define	LX_IOCB_CMD_PREADV		7
+-#define	LX_IOCB_CMD_PWRITEV		8
+-
+-#define	LX_KIOCB_KEY			0
+-
+-typedef struct lx_io_event lx_io_event_t;
+-typedef struct lx_iocb lx_iocb_t;
+-typedef ulong_t lx_aio_context_t;
+-
+-/*
+- * Linux binary definition of an I/O event.
+- */
+-struct lx_io_event {
+-	uint64_t	lxioe_data;	/* data payload */
+-	uint64_t	lxioe_object;	/* object of origin */
+-	int64_t		lxioe_res;	/* result code */
+-	int64_t		lxioe_res2;	/* "secondary" result (WTF?) */
+-};
+-
+-/*
+- * Linux binary definition of an I/O control block.
+- */
+-struct lx_iocb {
+-	uint64_t	lxiocb_data;		/* data payload */
+-	uint32_t	lxiocb_key;		/* must be LX_KIOCB_KEY (!) */
+-	uint32_t	lxiocb_reserved1;
+-	uint16_t	lxiocb_op;		/* operation */
+-	int16_t		lxiocb_reqprio;		/* request priority */
+-	uint32_t	lxiocb_fd;		/* file descriptor */
+-	uint64_t	lxiocb_buf;		/* data buffer */
+-	uint64_t	lxiocb_nbytes;		/* number of bytes */
+-	int64_t		lxiocb_offset;		/* offset in file */
+-	uint64_t	lxiocb_reserved2;
+-	uint32_t	lxiocb_flags;		/* LX_IOCB_FLAG_* flags */
+-	uint32_t	lxiocb_resfd;		/* eventfd fd, if any */
+-};
+-
+-extern long lx_io_setup(unsigned int, lx_aio_context_t *);
+-extern long lx_io_submit(lx_aio_context_t, long nr, uintptr_t **);
+-extern long lx_io_getevents(lx_aio_context_t, long, long,
+-    lx_io_event_t *, struct timespec *);
+-extern long lx_io_cancel(lx_aio_context_t, lx_iocb_t *, lx_io_event_t *);
+-extern long lx_io_destroy(lx_aio_context_t);
+-
+-#ifdef	__cplusplus
+-}
+-#endif
+-
+-#endif	/* _SYS_LX_AIO_H */
+diff --git a/usr/src/lib/brand/lx/lx_brand/sys/lx_syscall.h b/usr/src/lib/brand/lx/lx_brand/sys/lx_syscall.h
+index e26ff7333c..c04b1d2d47 100644
+--- a/usr/src/lib/brand/lx/lx_brand/sys/lx_syscall.h
++++ b/usr/src/lib/brand/lx/lx_brand/sys/lx_syscall.h
+@@ -25,7 +25,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_LX_SYSCALL_H
+@@ -177,7 +177,6 @@ extern long lx_shmget(key_t, size_t, int);
+ extern long lx_shmat(int, void *, int);
+ extern long lx_shmctl(int, int, void *);
+ 
+-extern long lx_close(int);
+ extern long lx_eventfd(unsigned int);
+ extern long lx_eventfd2(unsigned int, int);
+ extern long lx_getgroups(int, gid_t *);
+diff --git a/usr/src/uts/common/brand/lx/os/lx_brand.c b/usr/src/uts/common/brand/lx/os/lx_brand.c
+index 839ff9219a..71a416ab7b 100644
+--- a/usr/src/uts/common/brand/lx/os/lx_brand.c
++++ b/usr/src/uts/common/brand/lx/os/lx_brand.c
+@@ -200,6 +200,10 @@ extern int zvol_create_minor(const char *);
+ 
+ extern void lx_proc_exit(proc_t *);
+ extern int lx_sched_affinity(int, uintptr_t, int, uintptr_t, int64_t *);
++extern void lx_exitlwps(proc_t *, int);
++
++extern void lx_io_clear(lx_proc_data_t *);
++extern void lx_io_cleanup();
+ 
+ extern void lx_ioctl_init();
+ extern void lx_ioctl_fini();
+@@ -300,7 +304,8 @@ struct brand_ops lx_brops = {
+ 	NULL,
+ #endif
+ 	B_FALSE,			/* b_intp_parse_arg */
+-	lx_clearbrand			/* b_clearbrand */
++	lx_clearbrand,			/* b_clearbrand */
++	lx_exitlwps			/* b_exitlwps */
+ };
+ 
+ struct brand_mach_ops lx_mops = {
+@@ -362,6 +367,16 @@ lx_proc_exit(proc_t *p)
+ 	mutex_exit(&pidlock);
+ }
+ 
++/* ARGSUSED */
++void
++lx_exitlwps(proc_t *p, int coredump)
++{
++	VERIFY(ptolxproc(p) != NULL);
++
++	/* Cleanup any outstanding aio contexts */
++	lx_io_cleanup();
++}
++
+ void
+ lx_setbrand(proc_t *p)
+ {
+@@ -1880,6 +1895,9 @@ lx_copy_procdata(proc_t *cp, proc_t *pp)
+ 	bcopy(ppd, cpd, sizeof (lx_proc_data_t));
+ 	mutex_exit(&pp->p_lock);
+ 
++	/* Clear any aio contexts from child */
++	lx_io_clear(cpd);
++
+ 	/*
+ 	 * The l_ptrace count is normally manipulated only while under holding
+ 	 * p_lock.  Since this is a freshly created process, it's safe to zero
+diff --git a/usr/src/uts/common/brand/lx/os/lx_misc.c b/usr/src/uts/common/brand/lx/os/lx_misc.c
+index 0025a1f105..4a512f09af 100644
+--- a/usr/src/uts/common/brand/lx/os/lx_misc.c
++++ b/usr/src/uts/common/brand/lx/os/lx_misc.c
+@@ -162,6 +162,14 @@ lx_cleanlwp(klwp_t *lwp, proc_t *p)
+ 		lx_ptrace_exit(p, lwp);
+ 	}
+ 
++	/*
++	 * While we have p_lock, clear the TP_KTHREAD flag. This is needed
++	 * to prevent races within lx procfs. It's fine for prchoose() to pick
++	 * this thread now since it is exiting and no longer blocked in the
++	 * kernel.
++	 */
++	lwptot(lwp)->t_proc_flag &= ~TP_KTHREAD;
++
+ 	/*
+ 	 * While we have p_lock, safely grab any robust_list references and
+ 	 * clear the lwp field.
+diff --git a/usr/src/uts/common/brand/lx/os/lx_syscall.c b/usr/src/uts/common/brand/lx/os/lx_syscall.c
+index c8824e6783..2cf514dc68 100644
+--- a/usr/src/uts/common/brand/lx/os/lx_syscall.c
++++ b/usr/src/uts/common/brand/lx/os/lx_syscall.c
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <sys/kmem.h>
+@@ -765,10 +765,10 @@ lx_sysent_t lx_sysent32[] = {
+ 	{"set_thread_area", lx_set_thread_area,	0,		1}, /* 243 */
+ 	{"get_thread_area", lx_get_thread_area,	0,		1}, /* 244 */
+ 	{"io_setup",	lx_io_setup,		0,		2}, /* 245 */
+-	{"io_destroy",	NULL,			0,		1}, /* 246 */
+-	{"io_getevents", NULL,			0,		5}, /* 247 */
+-	{"io_submit",	NULL,			0,		3}, /* 248 */
+-	{"io_cancel",	NULL,			0,		3}, /* 249 */
++	{"io_destroy",	lx_io_destroy,		0,		1}, /* 246 */
++	{"io_getevents", lx_io_getevents,	0,		5}, /* 247 */
++	{"io_submit",	lx_io_submit,		0,		3}, /* 248 */
++	{"io_cancel",	lx_io_cancel,		0,		3}, /* 249 */
+ 	{"fadvise64",	lx_fadvise64_32,	0,		5}, /* 250 */
+ 	{"nosys",	NULL,			0,		0}, /* 251 */
+ 	{"group_exit",	NULL,			0,		1}, /* 252 */
+@@ -1097,10 +1097,10 @@ lx_sysent_t lx_sysent64[] = {
+ 	{"sched_getaffinity", lx_sched_getaffinity,	0,	3}, /* 204 */
+ 	{"set_thread_area", lx_set_thread_area, 0,		1}, /* 205 */
+ 	{"io_setup",	lx_io_setup,		0,		2}, /* 206 */
+-	{"io_destroy",	NULL,			0,		1}, /* 207 */
+-	{"io_getevents", NULL,			0,		5}, /* 208 */
+-	{"io_submit",	NULL,			0,		3}, /* 209 */
+-	{"io_cancel",	NULL,			0,		3}, /* 210 */
++	{"io_destroy",	lx_io_destroy,		0,		1}, /* 207 */
++	{"io_getevents", lx_io_getevents,	0,		5}, /* 208 */
++	{"io_submit",	lx_io_submit,		0,		3}, /* 209 */
++	{"io_cancel",	lx_io_cancel,		0,		3}, /* 210 */
+ 	{"get_thread_area", lx_get_thread_area,	0,		1}, /* 211 */
+ 	{"lookup_dcookie", NULL,		NOSYS_NO_EQUIV,	0}, /* 212 */
+ 	{"epoll_create", lx_epoll_create,	0,		1}, /* 213 */
+diff --git a/usr/src/uts/common/brand/lx/procfs/lx_proc.h b/usr/src/uts/common/brand/lx/procfs/lx_proc.h
+index 67988e4aab..255f23e32a 100644
+--- a/usr/src/uts/common/brand/lx/procfs/lx_proc.h
++++ b/usr/src/uts/common/brand/lx/procfs/lx_proc.h
+@@ -21,7 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef	_LX_PROC_H
+@@ -199,6 +199,8 @@ typedef enum lxpr_nodetype {
+ 	LXPR_SWAPS,		/* /proc/swaps		*/
+ 	LXPR_SYSDIR,		/* /proc/sys/		*/
+ 	LXPR_SYS_FSDIR,		/* /proc/sys/fs/	*/
++	LXPR_SYS_FS_AIO_MAX_NR,	/* /proc/sys/fs/aio-max-nr */
++	LXPR_SYS_FS_AIO_NR,	/* /proc/sys/fs/aio-nr	*/
+ 	LXPR_SYS_FS_FILEMAX,	/* /proc/sys/fs/file-max */
+ 	LXPR_SYS_FS_INOTIFYDIR,	/* /proc/sys/fs/inotify	*/
+ 	LXPR_SYS_FS_INOTIFY_MAX_QUEUED_EVENTS,	/* inotify/max_queued_events */
+diff --git a/usr/src/uts/common/brand/lx/procfs/lx_prvnops.c b/usr/src/uts/common/brand/lx/procfs/lx_prvnops.c
+index 14b14c585c..57c22690d4 100644
+--- a/usr/src/uts/common/brand/lx/procfs/lx_prvnops.c
++++ b/usr/src/uts/common/brand/lx/procfs/lx_prvnops.c
+@@ -216,6 +216,8 @@ static void lxpr_read_net_tcp6(lxpr_node_t *, lxpr_uiobuf_t *);
+ static void lxpr_read_net_udp(lxpr_node_t *, lxpr_uiobuf_t *);
+ static void lxpr_read_net_udp6(lxpr_node_t *, lxpr_uiobuf_t *);
+ static void lxpr_read_net_unix(lxpr_node_t *, lxpr_uiobuf_t *);
++static void lxpr_read_sys_fs_aiomax(lxpr_node_t *, lxpr_uiobuf_t *);
++static void lxpr_read_sys_fs_aionr(lxpr_node_t *, lxpr_uiobuf_t *);
+ static void lxpr_read_sys_fs_filemax(lxpr_node_t *, lxpr_uiobuf_t *);
+ static void lxpr_read_sys_fs_inotify_max_queued_events(lxpr_node_t *,
+     lxpr_uiobuf_t *);
+@@ -495,6 +497,8 @@ static lxpr_dirent_t sysdir[] = {
+  * contents of /proc/sys/fs directory
+  */
+ static lxpr_dirent_t sys_fsdir[] = {
++	{ LXPR_SYS_FS_AIO_MAX_NR,	"aio-max-nr" },
++	{ LXPR_SYS_FS_AIO_NR,		"aio-nr" },
+ 	{ LXPR_SYS_FS_FILEMAX,		"file-max" },
+ 	{ LXPR_SYS_FS_INOTIFYDIR,	"inotify" },
+ };
+@@ -826,6 +830,8 @@ static void (*lxpr_read_function[LXPR_NFILES])() = {
+ 	lxpr_read_swaps,		/* /proc/swaps		*/
+ 	lxpr_read_invalid,		/* /proc/sys		*/
+ 	lxpr_read_invalid,		/* /proc/sys/fs		*/
++	lxpr_read_sys_fs_aiomax,	/* /proc/sys/fs/aio-max-nr */
++	lxpr_read_sys_fs_aionr,		/* /proc/sys/fs/aio-nr */
+ 	lxpr_read_sys_fs_filemax,	/* /proc/sys/fs/file-max */
+ 	lxpr_read_invalid,		/* /proc/sys/fs/inotify	*/
+ 	lxpr_read_sys_fs_inotify_max_queued_events, /* max_queued_events */
+@@ -966,6 +972,8 @@ static vnode_t *(*lxpr_lookup_function[LXPR_NFILES])() = {
+ 	lxpr_lookup_not_a_dir,		/* /proc/swaps		*/
+ 	lxpr_lookup_sysdir,		/* /proc/sys		*/
+ 	lxpr_lookup_sys_fsdir,		/* /proc/sys/fs		*/
++	lxpr_lookup_not_a_dir,		/* /proc/sys/fs/aio-max-nr */
++	lxpr_lookup_not_a_dir,		/* /proc/sys/fs/aio-nr */
+ 	lxpr_lookup_not_a_dir,		/* /proc/sys/fs/file-max */
+ 	lxpr_lookup_sys_fs_inotifydir,	/* /proc/sys/fs/inotify	*/
+ 	lxpr_lookup_not_a_dir,		/* .../inotify/max_queued_events */
+@@ -1106,6 +1114,8 @@ static int (*lxpr_readdir_function[LXPR_NFILES])() = {
+ 	lxpr_readdir_not_a_dir,		/* /proc/swaps		*/
+ 	lxpr_readdir_sysdir,		/* /proc/sys		*/
+ 	lxpr_readdir_sys_fsdir,		/* /proc/sys/fs		*/
++	lxpr_readdir_not_a_dir,		/* /proc/sys/fs/aio-max-nr */
++	lxpr_readdir_not_a_dir,		/* /proc/sys/fs/aio-nr */
+ 	lxpr_readdir_not_a_dir,		/* /proc/sys/fs/file-max */
+ 	lxpr_readdir_sys_fs_inotifydir,	/* /proc/sys/fs/inotify	*/
+ 	lxpr_readdir_not_a_dir,		/* .../inotify/max_queued_events */
+@@ -2093,6 +2103,40 @@ lxpr_read_pid_statm(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+ 	    vsize, rss, 0l, rss, 0l, 0l, 0l);
+ }
+ 
++/*
++ * Determine number of LWPs visible in the process. In particular we want to
++ * ignore aio in-kernel threads.
++ */
++static uint_t
++lxpr_count_tasks(proc_t *p)
++{
++	uint_t cnt = 0;
++	kthread_t *t;
++
++	if ((p->p_stat == SZOMB) || (p->p_flag & (SSYS | SEXITING)) ||
++	    (p->p_as == &kas)) {
++		return (0);
++	}
++
++	if (p->p_brand != &lx_brand || (t = p->p_tlist) == NULL) {
++		cnt = p->p_lwpcnt;
++	} else {
++		do {
++			lx_lwp_data_t *lwpd = ttolxlwp(t);
++			/* Don't count aio kernel worker threads */
++			if ((t->t_proc_flag & TP_KTHREAD) != 0 &&
++			    lwpd != NULL &&
++			    (lwpd->br_lwp_flags & BR_AIO_LWP) == 0) {
++				cnt++;
++			}
++
++			t = t->t_forw;
++		} while (t != p->p_tlist);
++	}
++
++	return (cnt);
++}
++
+ /*
+  * pid/tid common code to read status file
+  */
+@@ -2173,7 +2217,7 @@ lxpr_read_status_common(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf,
+ 
+ 	(void) strlcpy(buf_comm, up->u_comm, sizeof (buf_comm));
+ 	fdlim = p->p_fno_ctl;
+-	lwpcnt = p->p_lwpcnt;
++	lwpcnt = lxpr_count_tasks(p);
+ 
+ 	/*
+ 	 * Gather memory information
+@@ -2474,7 +2518,7 @@ lxpr_read_pid_tid_stat(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+ 	}
+ 	cutime = p->p_cutime;
+ 	cstime = p->p_cstime;
+-	lwpcnt = p->p_lwpcnt;
++	lwpcnt = lxpr_count_tasks(p);
+ 	vmem_ctl = p->p_vmem_ctl;
+ 	(void) strlcpy(buf_comm, p->p_user.u_comm, sizeof (buf_comm));
+ 	ticks = p->p_user.u_ticks;	/* lbolt at process start */
+@@ -4246,6 +4290,32 @@ lxpr_read_swaps(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
+ 	    "/dev/swap", "partition", totswap, usedswap, -1);
+ }
+ 
++/* ARGSUSED */
++static void
++lxpr_read_sys_fs_aiomax(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
++{
++	ASSERT(lxpnp->lxpr_type == LXPR_SYS_FS_AIO_MAX_NR);
++	lxpr_uiobuf_printf(uiobuf, "%llu\n", LX_AIO_MAX_NR);
++}
++
++/* ARGSUSED */
++static void
++lxpr_read_sys_fs_aionr(lxpr_node_t *lxpnp, lxpr_uiobuf_t *uiobuf)
++{
++	zone_t *zone = LXPTOZ(lxpnp);
++	lx_zone_data_t *lxzd = ztolxzd(zone);
++	uint64_t curr;
++
++	ASSERT(lxpnp->lxpr_type == LXPR_SYS_FS_AIO_NR);
++	ASSERT(zone->zone_brand == &lx_brand);
++	ASSERT(lxzd != NULL);
++
++	mutex_enter(&lxzd->lxzd_lock);
++	curr = (uint64_t)(lxzd->lxzd_aio_nr);
++	mutex_exit(&lxzd->lxzd_lock);
++	lxpr_uiobuf_printf(uiobuf, "%llu\n", curr);
++}
++
+ /*
+  * lxpr_read_sys_fs_filemax():
+  *
+@@ -5422,14 +5492,8 @@ lxpr_count_taskdir(lxpr_node_t *lxpnp)
+ 	if (p == NULL)
+ 		return (0);
+ 
+-	/* Just count "." and ".." for system processes and zombies. */
+-	if ((p->p_stat == SZOMB) || (p->p_flag & (SSYS | SEXITING)) ||
+-	    (p->p_as == &kas)) {
+-		lxpr_unlock(p);
+-		return (2);
+-	}
++	cnt = lxpr_count_tasks(p);
+ 
+-	cnt = p->p_lwpcnt;
+ 	lxpr_unlock(p);
+ 
+ 	/* Add the fixed entries ("." & "..") */
+@@ -5791,7 +5855,24 @@ lxpr_lookup_taskdir(vnode_t *dp, char *comp)
+ 		if (tid != p->p_pid || t == NULL) {
+ 			t = NULL;
+ 		}
++	} else if (t != NULL) {
++		/*
++		 * Disallow any access to aio in-kernel worker threads.
++		 * To prevent a potential race while looking at the lwp data
++		 * for an exiting thread, we clear the TP_KTHREAD bit in
++		 * lx_cleanlwp() while the p_lock is held.
++		 */
++		if ((t->t_proc_flag & TP_KTHREAD) != 0) {
++			lx_lwp_data_t *lwpd;
++
++			VERIFY((lwpd = ttolxlwp(t)) != NULL);
++			if ((lwpd->br_lwp_flags & BR_AIO_LWP) != 0) {
++				lxpr_unlock(p);
++				return (NULL);
++			}
++		}
+ 	}
++
+ 	if (t == NULL) {
+ 		lxpr_unlock(p);
+ 		return (NULL);
+@@ -6407,6 +6488,11 @@ lxpr_readdir_taskdir(lxpr_node_t *lxpnp, uio_t *uiop, int *eofp)
+ 			if ((lwpd = ttolxlwp(t)) == NULL) {
+ 				goto next;
+ 			}
++			/* Don't show aio kernel worker threads */
++			if ((t->t_proc_flag & TP_KTHREAD) != 0 &&
++			    (lwpd->br_lwp_flags & BR_AIO_LWP) != 0) {
++				goto next;
++			}
+ 			emul_tid = lwpd->br_pid;
+ 			/*
+ 			 * Convert pid to Linux default of 1 if we're the
+diff --git a/usr/src/uts/common/brand/lx/sys/lx_brand.h b/usr/src/uts/common/brand/lx/sys/lx_brand.h
+index 147e8961f2..2e69858664 100644
+--- a/usr/src/uts/common/brand/lx/sys/lx_brand.h
++++ b/usr/src/uts/common/brand/lx/sys/lx_brand.h
+@@ -262,8 +262,7 @@ typedef enum lx_proc_flags {
+ 	LX_PROC_STRICT_MODE	= 0x02,
+ 	/* internal flags */
+ 	LX_PROC_CHILD_DEATHSIG	= 0x04,
+-	LX_PROC_AIO_USED	= 0x08,
+-	LX_PROC_NO_DUMP		= 0x10	/* for lx_prctl LX_PR_[GS]ET_DUMPABLE */
++	LX_PROC_NO_DUMP		= 0x08	/* for lx_prctl LX_PR_[GS]ET_DUMPABLE */
+ } lx_proc_flags_t;
+ 
+ #define	LX_PROC_ALL	(LX_PROC_INSTALL_MODE | LX_PROC_STRICT_MODE)
+@@ -329,6 +328,11 @@ typedef struct lx_proc_data {
+ 
+ 	lx_rlimit64_t l_fake_limits[LX_RLFAKE_NLIMITS];
+ 
++	kmutex_t l_io_ctx_lock; /* protects the following members */
++	uintptr_t l_io_ctxpage;
++	kcondvar_t l_io_destroy_cv;
++	struct lx_io_ctx  **l_io_ctxs;
++
+ 	/* original start/end bounds of arg/env string data */
+ 	uintptr_t l_args_start;
+ 	uintptr_t l_envs_start;
+@@ -366,6 +370,9 @@ typedef struct lx_proc_data {
+ #define	LX_PER_SUNOS	(0x06 | LX_PER_STICKY_TIMEOUTS)
+ #define	LX_PER_MASK	0xff
+ 
++/* max. number of aio control blocks (see lx_io_setup) allowed across zone */
++#define	LX_AIO_MAX_NR	65536
++
+ /*
+  * A data type big enough to bitmap all Linux possible cpus.
+  * The bitmap size is defined as 1024 cpus in the Linux 2.4 and 2.6 man pages
+@@ -611,9 +618,12 @@ typedef struct lx_zone_data {
+ 	vfs_t *lxzd_cgroup;			/* cgroup for this zone */
+ 	list_t *lxzd_vdisks;			/* virtual disks (zvols) */
+ 	dev_t lxzd_zfs_dev;			/* major num for zfs */
++	uint_t lxzd_aio_nr;			/* see lx_aio.c */
+ } lx_zone_data_t;
+ 
++/* LWP br_lwp_flags values */
+ #define	BR_CPU_BOUND	0x0001
++#define	BR_AIO_LWP	0x0002			/* aio kernel worker thread */
+ 
+ #define	ttolxlwp(t)	((struct lx_lwp_data *)ttolwpbrand(t))
+ #define	lwptolxlwp(l)	((struct lx_lwp_data *)lwptolwpbrand(l))
+diff --git a/usr/src/uts/common/brand/lx/sys/lx_syscalls.h b/usr/src/uts/common/brand/lx/sys/lx_syscalls.h
+index 2784ed6919..63a01d9da5 100644
+--- a/usr/src/uts/common/brand/lx/sys/lx_syscalls.h
++++ b/usr/src/uts/common/brand/lx/sys/lx_syscalls.h
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright 2006 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_LINUX_SYSCALLS_H
+@@ -117,7 +117,11 @@ extern long lx_gettimeofday();
+ extern long lx_getuid();
+ extern long lx_getuid16();
+ extern long lx_getxattr();
++extern long lx_io_cancel();
++extern long lx_io_destroy();
++extern long lx_io_getevents();
+ extern long lx_io_setup();
++extern long lx_io_submit();
+ extern long lx_ioctl();
+ extern long lx_ioprio_get();
+ extern long lx_ioprio_set();
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_aio.c b/usr/src/uts/common/brand/lx/syscall/lx_aio.c
+index 12f37ea4c7..c0be40974e 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_aio.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_aio.c
+@@ -10,36 +10,1146 @@
+  */
+ 
+ /*
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
++ */
++
++/*
++ * Linux aio syscall support.
++ *
++ * The Linux story around the io_* syscalls is very confusing. The io_* syscalls
++ * are not exposed via glibc and in fact, glibc seems to implement its own aio
++ * without using the io_* syscalls at all. However, there is the libaio library
++ * which uses the io_* syscalls, although its implementation of the io_*
++ * functions (with the same names!) is different from the syscalls themselves,
++ * and it uses different definitions for some of the structures involved.
++ *
++ * These syscalls are documented to use an aio_context_t for the context
++ * parameter. On Linux this is a ulong_t. The contexts live in the kernel
++ * address space and are looked up using the aio_context_t parameter. However,
++ * the Linux libaio library, which is a consumer of the io_* syscalls, abuses
++ * the context by assuming it can be used as a pointer into memory that is
++ * mapped into the process. To accomodate this abomination we map a page of
++ * anonymous memory and expose the context to user-land as a pointer offset
++ * into that page. The page itself is never used by our code and our internal
++ * context ID is simply an integer we calculate based on the page pointer
++ * offset.
++ *
++ * Most applications never use aio, so we don't want an implementation that
++ * adds overhead to every process, but on the other hand, when an application is
++ * using aio, it is for performance reasons and we want to be as efficient as
++ * possible. In particular, we don't want to dynamically allocate resources
++ * in the paths that enqueue I/O. Instead, we pre-allocate the resources
++ * we may need when the application performs the io_setup call and keep the
++ * io_submit and io_getevents calls streamlined.
++ *
++ * The general approach here is inspired by the native aio support provided by
++ * libc in user-land. We have worker threads that pick up pending work from
++ * the context "lxioctx_pending" list and synchronously issue the operation in
++ * the control block. When the operation completes, the thread places the
++ * control block into the context "lxioctx_done" list for later consumption by
++ * io_getevents. The thread will then attempt to service another pending
++ * operation or wait for more work to arrive.
++ *
++ * The control blocks on the pending or done lists are referenced by an
++ * lx_io_elem_t struct. This simply holds a pointer to the user-land control
++ * block and the result of the operation. These elements are pre-allocated at
++ * io_setup time and stored on the context "lxioctx_free" list.
++ *
++ * io_submit pulls elements off of the free list, places them on the pending
++ * list and kicks a worker thread to run. io_getevents pulls elements off of
++ * the done list, sets up an event to return, and places the elements back
++ * onto the free list.
++ *
++ * The worker threads are pre-allocated at io_setup time. These are LWP's
++ * that are part of the process, but never leave the kernel. The number of
++ * LWP's is allocated based on the nr_events argument to io_setup. Because
++ * this argument can theoretically be large (up to LX_AIO_MAX_NR), we want to
++ * pre-allocate enough threads to get good I/O concurrency, but not overdo it.
++ * For a small nr_events (<= lx_aio_base_workers) we pre-allocate as many
++ * threads as nr_events so that all of the the I/O can run in parallel. Once
++ * we exceed lx_aio_base_workers, we scale up the number of threads by 2, until
++ * we hit the maximum at lx_aio_max_workers. See the code in io_setup for more
++ * information.
++ *
++ * It is hard to make any generalized statements about how the aio syscalls
++ * are used in production. mysql is one of the more popular consumers of aio
++ * and in the default configuration it will create 10 contexts with a capacity
++ * of 256 I/Os (io_setup nr_events) and 1 context with a capacity of 100 I/Os.
++ * Another application we've seen will create 8 contexts, each with a capacity
++ * of 128 I/Os. In practice 1-7 was the typical number of in-flight I/Os.
++ *
++ * According to www.kernel.org/doc/Documentation/sysctl/fs.txt, the
++ * /proc/sys/fs entries for aio are:
++ * - aio-nr: The total of all nr_events values specified on the io_setup
++ *           call for every active context.
++ * - aio-max-nr: The upper limit for aio-nr
++ * aio-nr is tracked as a zone-wide value. We keep aio-max-nr limited to
++ * LX_AIO_MAX_NR, which matches Linux and provides plenty of headroom for the
++ * zone.
+  */
+ 
+ #include <sys/systm.h>
+ #include <sys/mutex.h>
++#include <sys/time.h>
+ #include <sys/brand.h>
++#include <sys/sysmacros.h>
++#include <sys/sdt.h>
+ 
+ #include <sys/lx_brand.h>
+ #include <sys/lx_syscalls.h>
++#include <lx_errno.h>
+ 
++/* These constants match Linux */
++#define	LX_IOCB_FLAG_RESFD		0x0001
++#define	LX_IOCB_CMD_PREAD		0
++#define	LX_IOCB_CMD_PWRITE		1
++#define	LX_IOCB_CMD_FSYNC		2
++#define	LX_IOCB_CMD_FDSYNC		3
++#define	LX_IOCB_CMD_PREADX		4
++#define	LX_IOCB_CMD_POLL		5
++#define	LX_IOCB_CMD_NOOP		6
++#define	LX_IOCB_CMD_PREADV		7
++#define	LX_IOCB_CMD_PWRITEV		8
+ 
+-long
+-lx_io_setup(unsigned int nr_events, void **ctxp)
++#define	LX_KIOCB_KEY			0
++
++/*
++ * Max. number of contexts/process. Note that we currently map one page to
++ * manage the user-level context ID, so that code must be adjusted if this
++ * value is ever enlarged to exceed a page.
++ */
++#define	LX_MAX_IO_CTX	32
++
++/*
++ * Max number of control block pointers, or lx_io_event_t's, to allocate on the
++ * stack in io_submit or io_getevents.
++ */
++#define	MAX_ALLOC_ON_STACK	128
++#define	alloca(x)		__builtin_alloca(x)
++extern void *__builtin_alloca(size_t);
++
++/* The context is an offset within the ctxpage we mapped */
++#define	CTXID_TO_PTR(L, I)	((L)->l_io_ctxpage + ((I) * sizeof (uintptr_t)))
++#define	PTR_TO_CTXID(L, P)	((int)((uintptr_t)(P) - (L)->l_io_ctxpage) / \
++				sizeof (uintptr_t))
++
++typedef ulong_t lx_aio_context_t;
++
++uint_t	lx_aio_base_workers = 16;	/* num threads/context before scaling */
++uint_t	lx_aio_max_workers = 32;	/* upper limit on threads/context */
++
++/*
++ * Internal representation of an aio context.
++ */
++typedef struct lx_io_ctx {
++	boolean_t	lxioctx_shutdown;	/* context is being destroyed */
++	uint_t		lxioctx_maxn;		/* nr_events from io_setup */
++	uint_t		lxioctx_in_use;		/* reference counter */
++	kmutex_t	lxioctx_f_lock;		/* free list lock */
++	uint_t		lxioctx_free_cnt;	/* num. elements in free list */
++	list_t		lxioctx_free;		/* free list */
++	kmutex_t	lxioctx_p_lock;		/* pending list lock */
++	kcondvar_t	lxioctx_pending_cv;	/* pending list cv */
++	list_t		lxioctx_pending;	/* pending list */
++	kmutex_t	lxioctx_d_lock;		/* done list lock */
++	kcondvar_t	lxioctx_done_cv;	/* done list cv */
++	uint_t		lxioctx_done_cnt;	/* num. elements in done list */
++	list_t		lxioctx_done;		/* done list */
++} lx_io_ctx_t;
++
++/*
++ * Linux binary definition of an I/O event.
++ */
++typedef struct lx_io_event {
++	uint64_t	lxioe_data;	/* data payload */
++	uint64_t	lxioe_object;	/* object of origin */
++	int64_t		lxioe_res;	/* result code */
++	int64_t		lxioe_res2;	/* "secondary" result (WTF?) */
++} lx_io_event_t;
++
++/*
++ * Linux binary definition of an I/O control block.
++ */
++typedef struct lx_iocb {
++	uint64_t	lxiocb_data;		/* data payload */
++	uint32_t	lxiocb_key;		/* must be LX_KIOCB_KEY (!) */
++	uint32_t	lxiocb_reserved1;
++	uint16_t	lxiocb_op;		/* operation */
++	int16_t		lxiocb_reqprio;		/* request priority */
++	uint32_t	lxiocb_fd;		/* file descriptor */
++	uint64_t	lxiocb_buf;		/* data buffer */
++	uint64_t	lxiocb_nbytes;		/* number of bytes */
++	int64_t		lxiocb_offset;		/* offset in file */
++	uint64_t	lxiocb_reserved2;
++	uint32_t	lxiocb_flags;		/* LX_IOCB_FLAG_* flags */
++	uint32_t	lxiocb_resfd;		/* eventfd fd, if any */
++} lx_iocb_t;
++
++typedef struct lx_io_elem {
++	list_node_t	lxioelem_link;
++	uint16_t	lxioelem_op;		/* operation */
++	uint32_t	lxioelem_fd;		/* file descriptor */
++	file_t		*lxioelem_fp;		/* getf() file pointer */
++	void		*lxioelem_buf;		/* data buffer */
++	uint64_t	lxioelem_nbytes;	/* number of bytes */
++	int64_t		lxioelem_offset;	/* offset in file */
++	uint64_t	lxioelem_data;
++	ssize_t		lxioelem_res;
++	lx_iocb_t	*lxioelem_cbp;
++} lx_io_elem_t;
++
++/* From lx_rw.c */
++extern ssize_t lx_pread_fp(file_t *, void *, size_t, off64_t);
++extern ssize_t lx_pwrite_fp(file_t *, void *, size_t, off64_t);
++
++/* From common/syscall/rw.c */
++extern int fdsync(int, int);
++/* From common/os/grow.c */
++extern caddr_t smmap64(caddr_t, size_t, int, int, int, off_t);
++
++/*
++ * Given an aio_context ID, return our internal context pointer with an
++ * additional ref. count, or NULL if cp not found.
++ */
++static lx_io_ctx_t *
++lx_io_cp_hold(lx_aio_context_t cid)
++{
++	int id;
++	lx_proc_data_t *lxpd = ptolxproc(curproc);
++	lx_io_ctx_t *cp;
++
++	mutex_enter(&lxpd->l_io_ctx_lock);
++
++	if (lxpd->l_io_ctxs == NULL) {
++		ASSERT(lxpd->l_io_ctxpage == NULL);
++		goto bad;
++	}
++
++	id = PTR_TO_CTXID(lxpd, cid);
++	if (id < 0 || id >= LX_MAX_IO_CTX)
++		goto bad;
++
++	if ((cp = lxpd->l_io_ctxs[id]) == NULL)
++		goto bad;
++
++	if (cp->lxioctx_shutdown)
++		goto bad;
++
++	atomic_inc_32(&cp->lxioctx_in_use);
++	mutex_exit(&lxpd->l_io_ctx_lock);
++	return (cp);
++
++bad:
++	mutex_exit(&lxpd->l_io_ctx_lock);
++	return (NULL);
++}
++
++/*
++ * Release a hold on the context and clean up the context if it was the last
++ * hold.
++ */
++static void
++lx_io_cp_rele(lx_io_ctx_t *cp)
+ {
+ 	lx_proc_data_t *lxpd = ptolxproc(curproc);
+-	uintptr_t uargs[2] = {(uintptr_t)nr_events, (uintptr_t)ctxp};
++	int i;
++	lx_io_elem_t *ep;
++
++	mutex_enter(&lxpd->l_io_ctx_lock);
++	ASSERT(cp->lxioctx_in_use >= 1);
++	if (cp->lxioctx_in_use > 1) {
++		atomic_dec_32(&cp->lxioctx_in_use);
++		/* wake all threads waiting on context rele */
++		cv_broadcast(&lxpd->l_io_destroy_cv);
++		mutex_exit(&lxpd->l_io_ctx_lock);
++		return;
++	}
++
++	/*
++	 * We hold the last ref.
++	 */
++	for (i = 0; i < LX_MAX_IO_CTX; i++) {
++		if (lxpd->l_io_ctxs[i] == cp) {
++			lxpd->l_io_ctxs[i] = NULL;
++			break;
++		}
++	}
++	ASSERT(i < LX_MAX_IO_CTX);
++	/* wake all threads waiting on context destruction */
++	cv_broadcast(&lxpd->l_io_destroy_cv);
++	mutex_exit(&lxpd->l_io_ctx_lock);
++
++	/*
++	 * We have the only pointer to the context now. Free all
++	 * elements from all three queues and the context itself.
++	 */
++	while ((ep = list_remove_head(&cp->lxioctx_free)) != NULL) {
++		kmem_free(ep, sizeof (lx_io_elem_t));
++	}
++
++	/*
++	 * During io_submit() we use getf() to get/validate the file pointer
++	 * for the file descriptor in each control block. We do not releasef()
++	 * the fd, but instead pass along the fd and file pointer to the worker
++	 * threads. In order to manage this hand-off we use clear_active_fd()
++	 * in the syscall path and then in our thread which takes over the file
++	 * descriptor, we use a combination of set_active_fd() and releasef().
++	 * Because our thread that is taking ownership of the fd has not called
++	 * getf(), we first call set_active_fd(-1) to reserve a slot in the
++	 * active fd array for ourselves.
++	 */
++	set_active_fd(-1);
++	while ((ep = list_remove_head(&cp->lxioctx_pending)) != NULL) {
++		set_active_fd(ep->lxioelem_fd);
++		releasef(ep->lxioelem_fd);
++		kmem_free(ep, sizeof (lx_io_elem_t));
++	}
++
++	while ((ep = list_remove_head(&cp->lxioctx_done)) != NULL) {
++		kmem_free(ep, sizeof (lx_io_elem_t));
++	}
+ 
++	ASSERT(list_is_empty(&cp->lxioctx_free));
++	list_destroy(&cp->lxioctx_free);
++	ASSERT(list_is_empty(&cp->lxioctx_pending));
++	list_destroy(&cp->lxioctx_pending);
++	ASSERT(list_is_empty(&cp->lxioctx_done));
++	list_destroy(&cp->lxioctx_done);
++
++	kmem_free(cp, sizeof (lx_io_ctx_t));
++}
++
++/*
++ * Called by a worker thread to perform the operation specified in the control
++ * block.
++ *
++ * Linux returns a negative errno in the event "lxioelem_res" field as the
++ * result of a failed operation. We do the same.
++ */
++static void
++lx_io_do_op(lx_io_elem_t *ep)
++{
++	int err;
++	int64_t res = 0;
++
++	set_active_fd(ep->lxioelem_fd);
++
++	ttolwp(curthread)->lwp_errno = 0;
++	switch (ep->lxioelem_op) {
++	case LX_IOCB_CMD_FSYNC:
++	case LX_IOCB_CMD_FDSYNC:
++		/*
++		 * Note that Linux always returns EINVAL for these two
++		 * operations. This is apparently because nothing in Linux
++		 * defines the 'aio_fsync' function. Thus, it is unlikely any
++		 * application will actually submit these.
++		 *
++		 * This is basically fdsync(), but we already have the fp.
++		 */
++		err = VOP_FSYNC(ep->lxioelem_fp->f_vnode,
++		    (ep->lxioelem_op == LX_IOCB_CMD_FSYNC) ?  FSYNC : FDSYNC,
++		    ep->lxioelem_fp->f_cred, NULL);
++		if (err != 0) {
++			(void) set_errno(err);
++		}
++
++		break;
++
++	case LX_IOCB_CMD_PREAD:
++		res = lx_pread_fp(ep->lxioelem_fp, ep->lxioelem_buf,
++		    ep->lxioelem_nbytes, ep->lxioelem_offset);
++		break;
++
++	case LX_IOCB_CMD_PWRITE:
++		res = lx_pwrite_fp(ep->lxioelem_fp, ep->lxioelem_buf,
++		    ep->lxioelem_nbytes, ep->lxioelem_offset);
++		break;
++
++	default:
++		/* We validated the op at io_submit syscall time */
++		VERIFY(0);
++		break;
++	}
++	if (ttolwp(curthread)->lwp_errno != 0)
++		res = -lx_errno(ttolwp(curthread)->lwp_errno, EINVAL);
++
++	ep->lxioelem_res = res;
++
++	releasef(ep->lxioelem_fd);
++	ep->lxioelem_fd = 0;
++	ep->lxioelem_fp = NULL;
++}
++
++/*
++ * Worker thread - pull work off the pending queue, perform the operation and
++ * place the result on the done queue. Do this as long as work is pending, then
++ * wait for more.
++ */
++static void
++lx_io_worker(void *a)
++{
++	lx_io_ctx_t *cp = (lx_io_ctx_t *)a;
++	lx_io_elem_t *ep;
++
++	set_active_fd(-1);	/* See comment in lx_io_cp_rele */
++
++	while (!cp->lxioctx_shutdown) {
++		mutex_enter(&cp->lxioctx_p_lock);
++		if (list_is_empty(&cp->lxioctx_pending)) {
++			cv_wait(&cp->lxioctx_pending_cv, &cp->lxioctx_p_lock);
++			if (cp->lxioctx_shutdown) {
++				mutex_exit(&cp->lxioctx_p_lock);
++				break;
++			}
++		}
++
++		ep = list_remove_head(&cp->lxioctx_pending);
++		mutex_exit(&cp->lxioctx_p_lock);
++
++		while (ep != NULL) {
++			lx_io_do_op(ep);
++
++			mutex_enter(&cp->lxioctx_d_lock);
++			list_insert_tail(&cp->lxioctx_done, ep);
++			cp->lxioctx_done_cnt++;
++			cv_signal(&cp->lxioctx_done_cv);
++			mutex_exit(&cp->lxioctx_d_lock);
++
++			if (cp->lxioctx_shutdown)
++				break;
++
++			mutex_enter(&cp->lxioctx_p_lock);
++			ep = list_remove_head(&cp->lxioctx_pending);
++			mutex_exit(&cp->lxioctx_p_lock);
++		}
++	}
++
++	lx_io_cp_rele(cp);
++
++	ASSERT(curthread->t_lwp != NULL);
+ 	mutex_enter(&curproc->p_lock);
+-	lxpd->l_flags |= LX_PROC_AIO_USED;
+-	mutex_exit(&curproc->p_lock);
+-
+-	ttolxlwp(curthread)->br_eosys = JUSTRETURN;
+-#if defined(_LP64)
+-	if (get_udatamodel() != DATAMODEL_NATIVE) {
+-		lx_emulate_user32(ttolwp(curthread), LX_SYS32_io_setup, uargs);
+-	} else
++	lwp_exit();
++}
++
++/*
++ * LTP passes -1 for nr_events but we're limited by LX_AIO_MAX_NR anyway.
++ */
++long
++lx_io_setup(uint_t nr_events, void *ctxp)
++{
++	int i, slot;
++	proc_t *p = curproc;
++	lx_proc_data_t *lxpd = ptolxproc(p);
++	lx_zone_data_t *lxzd = ztolxzd(p->p_zone);
++	lx_io_ctx_t *cp;
++	lx_io_elem_t *ep;
++	uintptr_t cid;
++	uint_t nworkers;
++
++	if (copyin(ctxp, &cid, sizeof (cid)) != 0)
++		return (set_errno(EFAULT));
++
++	/* The cid in user-land must be NULL to start */
++	if (cid != NULL || nr_events > LX_AIO_MAX_NR)
++		return (set_errno(EINVAL));
++
++	mutex_enter(&lxzd->lxzd_lock);
++	if ((nr_events + lxzd->lxzd_aio_nr) > LX_AIO_MAX_NR) {
++		mutex_exit(&lxzd->lxzd_lock);
++		return (set_errno(EAGAIN));
++	}
++	lxzd->lxzd_aio_nr += nr_events;
++	mutex_exit(&lxzd->lxzd_lock);
++
++	/* Find a free slot */
++	mutex_enter(&lxpd->l_io_ctx_lock);
++	if (lxpd->l_io_ctxs == NULL) {
++		/*
++		 * First use of aio, allocate a context array and a page
++		 * in our address space to use for context ID handling.
++		 */
++		uintptr_t ctxpage;
++
++		ASSERT(lxpd->l_io_ctxpage == NULL);
++		/*CONSTCOND*/
++		VERIFY(PAGESIZE >= (LX_MAX_IO_CTX * sizeof (lx_io_ctx_t *)));
++		ttolwp(curthread)->lwp_errno = 0;
++		ctxpage = (uintptr_t)smmap64(0, PAGESIZE, PROT_READ,
++		    MAP_SHARED | MAP_ANON, -1, 0);
++		if (ttolwp(curthread)->lwp_errno != 0) {
++			mutex_exit(&lxpd->l_io_ctx_lock);
++			return (set_errno(ENOMEM));
++		}
++
++		lxpd->l_io_ctxpage = ctxpage;
++		lxpd->l_io_ctxs = kmem_zalloc(LX_MAX_IO_CTX *
++		    sizeof (lx_io_ctx_t *), KM_SLEEP);
++		slot = 0;
++	} else {
++		for (slot = 0; slot < LX_MAX_IO_CTX; slot++) {
++			if (lxpd->l_io_ctxs[slot] == NULL)
++				break;
++		}
++
++		if (slot == LX_MAX_IO_CTX) {
++			mutex_exit(&lxpd->l_io_ctx_lock);
++			mutex_enter(&lxzd->lxzd_lock);
++			lxzd->lxzd_aio_nr -= nr_events;
++			mutex_exit(&lxzd->lxzd_lock);
++			return (set_errno(ENOMEM));
++		}
++	}
++
++	cp = kmem_zalloc(sizeof (lx_io_ctx_t), KM_SLEEP);
++	list_create(&cp->lxioctx_free, sizeof (lx_io_elem_t),
++	    offsetof(lx_io_elem_t, lxioelem_link));
++	list_create(&cp->lxioctx_pending, sizeof (lx_io_elem_t),
++	    offsetof(lx_io_elem_t, lxioelem_link));
++	list_create(&cp->lxioctx_done, sizeof (lx_io_elem_t),
++	    offsetof(lx_io_elem_t, lxioelem_link));
++	mutex_init(&cp->lxioctx_f_lock, NULL, MUTEX_DEFAULT, NULL);
++	mutex_init(&cp->lxioctx_p_lock, NULL, MUTEX_DEFAULT, NULL);
++	mutex_init(&cp->lxioctx_d_lock, NULL, MUTEX_DEFAULT, NULL);
++	cv_init(&cp->lxioctx_pending_cv, NULL, CV_DEFAULT, NULL);
++	cv_init(&cp->lxioctx_done_cv, NULL, CV_DEFAULT, NULL);
++
++	/* Add a hold on this context until we're done setting up */
++	cp->lxioctx_in_use = 1;
++	lxpd->l_io_ctxs[slot] = cp;
++
++	cid = CTXID_TO_PTR(lxpd, slot);
++
++	mutex_exit(&lxpd->l_io_ctx_lock);
++
++	/*
++	 * Finish setting up the context.
++	 *
++	 * The context is in the l_io_ctxs array now, so it is potentially
++	 * visible to other threads. However, we have a hold so it cannot be
++	 * destroyed, and both lxioctx_free_cnt and lxioctx_maxn are still 0,
++	 * so nothing can be submitted to this context yet either.
++	 */
++
++	/* Setup the free list of internal control block elements */
++	for (i = 0; i < nr_events; i++) {
++		ep = kmem_zalloc(sizeof (lx_io_elem_t), KM_SLEEP);
++		list_insert_head(&cp->lxioctx_free, ep);
++	}
++
++	/*
++	 * Pre-allocate the worker threads at setup time.
++	 *
++	 * Based on how much concurrent input we may be given, we want enough
++	 * worker threads to get good parallelism but we also want to taper off
++	 * and cap at our upper limit. Our zone's ZFS I/O limit may also come
++	 * into play when we're pumping lots of I/O in parallel.
++	 *
++	 * Note: a possible enhancement here would be to also limit the number
++	 * of worker threads based on the zone's cpu-cap. That is, if the
++	 * cap is low, we might not want too many worker threads.
++	 */
++	if (nr_events <= lx_aio_base_workers) {
++		nworkers = nr_events;
++	} else {
++		/* scale up until hit max */
++		nworkers = (nr_events / 2) + (lx_aio_base_workers / 2);
++		if (nworkers > lx_aio_max_workers)
++			nworkers = lx_aio_max_workers;
++	}
++
++	for (i = 0; i < nworkers; i++) {
++		klwp_t *l;
++		kthread_t *t;
++
++		/*
++		 * Because lwp_create won't check the zone's max-lwp rctl
++		 * for a process in the system class, we do that here, but
++		 * we allow exceeding the rctl limit so that we can get at
++		 * least one worker thread.
++		 */
++		if (i > 0) {
++			boolean_t too_many = B_FALSE;
++
++			mutex_enter(&p->p_lock);
++			mutex_enter(&p->p_zone->zone_nlwps_lock);
++			if (p->p_zone->zone_nlwps >=
++			    p->p_zone->zone_nlwps_ctl &&
++			    (rctl_test(rc_zone_nlwps, p->p_zone->zone_rctls, p,
++			    1, 0) & RCT_DENY)) {
++				too_many = B_TRUE;
++			}
++			mutex_exit(&p->p_zone->zone_nlwps_lock);
++			mutex_exit(&p->p_lock);
++			if (too_many)
++				break;
++		}
++
++		/*
++		 * This is equivalent to lwp_kernel_create() but only a system
++		 * process can call that function. Note that this lwp will
++		 * not "stop at sys_rtt" as described on lwp_create. This lwp
++		 * will run entirely in the kernel as a worker thread serving
++		 * aio requests.
++		 */
++		if ((l = lwp_create(lx_io_worker, (void *)cp, 0, p, TS_STOPPED,
++		    minclsyspri, &t0.t_hold, syscid, 0)) == NULL && i == 0) {
++			/*
++			 * Uh-oh - we can't create a single worker. Release
++			 * our hold which will cleanup.
++			 */
++			lx_io_cp_rele(cp);
++			return (set_errno(ENOMEM));
++		}
++
++		atomic_inc_32(&cp->lxioctx_in_use);
++
++		/*
++		 * Mark it as an in-kernel thread, an lx AIO worker LWP, and
++		 * set it running.
++		 */
++		t = lwptot(l);
++		mutex_enter(&curproc->p_lock);
++		t->t_proc_flag = (t->t_proc_flag & ~TP_HOLDLWP) | TP_KTHREAD;
++		lwptolxlwp(l)->br_lwp_flags |= BR_AIO_LWP;
++		lwp_create_done(t);
++		mutex_exit(&curproc->p_lock);
++	}
++
++	/*
++	 * io_submit can occur once lxioctx_free_cnt and lxioctx_maxn are
++	 * non-zero.
++	 */
++	mutex_enter(&lxpd->l_io_ctx_lock);
++	cp->lxioctx_maxn = cp->lxioctx_free_cnt = nr_events;
++	mutex_exit(&lxpd->l_io_ctx_lock);
++	/* Release our hold, worker thread refs keep ctx alive. */
++	lx_io_cp_rele(cp);
++
++	if (copyout(&cid, ctxp, sizeof (cid)) != 0) {
++		/* Since we did a copyin above, this shouldn't fail */
++		(void) lx_io_destroy(cid);
++		return (set_errno(EFAULT));
++	}
++
++	return (0);
++}
++
++long
++lx_io_submit(lx_aio_context_t cid, const long nr, uintptr_t **bpp)
++{
++	int i = 0;
++	int err = 0;
++	const size_t sz = nr * sizeof (uintptr_t);
++	lx_io_ctx_t *cp;
++	lx_io_elem_t *ep;
++	lx_iocb_t **iocbpp;
++
++	if ((cp = lx_io_cp_hold(cid)) == NULL)
++		return (set_errno(EINVAL));
++
++	if (nr == 0) {
++		lx_io_cp_rele(cp);
++		return (0);
++	}
++
++	if (nr < 0 || nr > cp->lxioctx_maxn) {
++		lx_io_cp_rele(cp);
++		return (set_errno(EINVAL));
++	}
++
++	if (nr > MAX_ALLOC_ON_STACK) {
++		iocbpp = (lx_iocb_t **)kmem_alloc(sz, KM_NOSLEEP);
++		if (iocbpp == NULL) {
++			lx_io_cp_rele(cp);
++			return (set_errno(EAGAIN));
++		}
++	} else {
++		iocbpp = (lx_iocb_t **)alloca(sz);
++	}
++
++	if (copyin(bpp, iocbpp, nr * sizeof (uintptr_t)) != 0) {
++		lx_io_cp_rele(cp);
++		err = EFAULT;
++		goto out;
++	}
++
++	/* We need to return an error if not able to process any of them */
++	mutex_enter(&cp->lxioctx_f_lock);
++	if (cp->lxioctx_free_cnt == 0) {
++		mutex_exit(&cp->lxioctx_f_lock);
++		lx_io_cp_rele(cp);
++		err = EAGAIN;
++		goto out;
++	}
++	mutex_exit(&cp->lxioctx_f_lock);
++
++	for (i = 0; i < nr; i++) {
++		lx_iocb_t cb;
++		file_t *fp;
++
++		if (cp->lxioctx_shutdown)
++			break;
++
++		if (copyin(iocbpp[i], &cb, sizeof (lx_iocb_t)) != 0) {
++			err = EFAULT;
++			break;
++		}
++
++		/* We don't currently support eventfd-based notification. */
++		if (cb.lxiocb_flags & LX_IOCB_FLAG_RESFD) {
++			err = EINVAL;
++			break;
++		}
++
++		switch (cb.lxiocb_op) {
++		case LX_IOCB_CMD_FSYNC:
++		case LX_IOCB_CMD_FDSYNC:
++		case LX_IOCB_CMD_PREAD:
++		case LX_IOCB_CMD_PWRITE:
++			break;
++
++		/*
++		 * We don't support asynchronous preadv and pwritev (an
++		 * asynchronous scatter/gather being a somewhat odd
++		 * notion to begin with); we return EINVAL for that
++		 * case, which the caller should be able to deal with.
++		 * We also return EINVAL for LX_IOCB_CMD_NOOP or any
++		 * unrecognized opcode.
++		 */
++		default:
++			err = EINVAL;
++			break;
++		}
++		if (err != 0)
++			break;
++
++		/* Validate fd */
++		if ((fp = getf(cb.lxiocb_fd)) == NULL) {
++			err = EINVAL;
++			break;
++		}
++
++		if (cb.lxiocb_op == LX_IOCB_CMD_PREAD &&
++		    (fp->f_flag & FREAD) == 0) {
++			err = EINVAL;
++			releasef(cb.lxiocb_fd);
++			break;
++		} else if (cb.lxiocb_op == LX_IOCB_CMD_PWRITE &&
++		    (fp->f_flag & FWRITE) == 0) {
++			err = EINVAL;
++			releasef(cb.lxiocb_fd);
++			break;
++		}
++
++		/*
++		 * A character device is a bit complicated. Linux seems to
++		 * accept these on some devices (e.g. /dev/zero) but not
++		 * others (e.g. /proc/self/fd/0). This might be related to
++		 * the device being seek-able, but a simple seek-set to the
++		 * current offset will succeed for us on a pty. For now we
++		 * handle this by rejecting the device if it is a stream.
++		 *
++		 * If it is a pipe (VFIFO) or directory (VDIR), we error here
++		 * as does Linux. If it is a socket (VSOCK), it's ok here but
++		 * we will post ESPIPE when processing the I/O CB, as does
++		 * Linux. We also error on our other types: VDOOR, VPROC,
++		 * VPORT, VBAD.
++		 */
++		if (fp->f_vnode->v_type == VCHR) {
++			if (fp->f_vnode->v_stream != NULL) {
++				err = EINVAL;
++				releasef(cb.lxiocb_fd);
++				break;
++			}
++		} else if (fp->f_vnode->v_type != VREG &&
++		    fp->f_vnode->v_type != VBLK &&
++		    fp->f_vnode->v_type != VSOCK) {
++			err = EINVAL;
++			releasef(cb.lxiocb_fd);
++			break;
++		}
++
++		mutex_enter(&cp->lxioctx_f_lock);
++		if (cp->lxioctx_free_cnt == 0) {
++			mutex_exit(&cp->lxioctx_f_lock);
++			releasef(cb.lxiocb_fd);
++			if (i == 0) {
++				/*
++				 * Another thread used all of the free entries
++				 * after the check preceding this loop. Since
++				 * we did nothing, we must return an error.
++				 */
++				err = EAGAIN;
++			}
++			break;
++		}
++		ep = list_remove_head(&cp->lxioctx_free);
++		cp->lxioctx_free_cnt--;
++		ASSERT(ep != NULL);
++		mutex_exit(&cp->lxioctx_f_lock);
++
++		ep->lxioelem_op = cb.lxiocb_op;
++		ep->lxioelem_fd = cb.lxiocb_fd;
++		ep->lxioelem_fp = fp;
++		ep->lxioelem_buf = (void *)(uintptr_t)cb.lxiocb_buf;
++		ep->lxioelem_nbytes = cb.lxiocb_nbytes;
++		ep->lxioelem_offset = cb.lxiocb_offset;
++		ep->lxioelem_data = cb.lxiocb_data;
++		ep->lxioelem_cbp = iocbpp[i];
++
++		/* Hang on to the fp but setup to hand it off to a worker */
++		clear_active_fd(cb.lxiocb_fd);
++
++		mutex_enter(&cp->lxioctx_p_lock);
++		list_insert_tail(&cp->lxioctx_pending, ep);
++		cv_signal(&cp->lxioctx_pending_cv);
++		mutex_exit(&cp->lxioctx_p_lock);
++	}
++
++	lx_io_cp_rele(cp);
++
++out:
++	if (nr > MAX_ALLOC_ON_STACK) {
++		kmem_free(iocbpp, sz);
++	}
++	if (i == 0 && err != 0)
++		return (set_errno(err));
++
++	return (i);
++}
++
++long
++lx_io_getevents(lx_aio_context_t cid, long min_nr, const long nr,
++    lx_io_event_t *events, timespec_t *timeoutp)
++{
++	int i;
++	lx_io_ctx_t *cp;
++	const size_t sz = nr * sizeof (lx_io_event_t);
++	timespec_t timeout, *tp;
++	lx_io_event_t *out;
++
++	if ((cp = lx_io_cp_hold(cid)) == NULL)
++		return (set_errno(EINVAL));
++
++	if (min_nr < 0 || min_nr > cp->lxioctx_maxn ||
++	    nr < 0 || nr > cp->lxioctx_maxn) {
++		lx_io_cp_rele(cp);
++		return (set_errno(EINVAL));
++	}
++
++	if (nr == 0) {
++		lx_io_cp_rele(cp);
++		return (0);
++	}
++
++	if (events == NULL) {
++		lx_io_cp_rele(cp);
++		return (set_errno(EFAULT));
++	}
++
++	if (timeoutp == NULL) {
++		tp = NULL;
++	} else {
++		if (get_udatamodel() == DATAMODEL_NATIVE) {
++			if (copyin(timeoutp, &timeout, sizeof (timestruc_t))) {
++				lx_io_cp_rele(cp);
++				return (EFAULT);
++			}
++		}
++#ifdef _SYSCALL32_IMPL
++		else {
++			timestruc32_t timeout32;
++			if (copyin(timeoutp, &timeout32,
++			    sizeof (timestruc32_t))) {
++				lx_io_cp_rele(cp);
++				return (EFAULT);
++			}
++			timeout.tv_sec = (time_t)timeout32.tv_sec;
++			timeout.tv_nsec = timeout32.tv_nsec;
++		}
+ #endif
+-	{
+-		lx_emulate_user(ttolwp(curthread), LX_SYS_io_setup, uargs);
++
++		if (itimerspecfix(&timeout)) {
++			lx_io_cp_rele(cp);
++			return (EINVAL);
++		}
++
++		tp = &timeout;
++		if (timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
++			/*
++			 * A timeout of 0:0 is like a poll; we return however
++			 * many events are ready, irrespective of the passed
++			 * min_nr.
++			 */
++			min_nr = 0;
++		} else {
++			timestruc_t now;
++
++			/*
++			 * We're given a relative time; add it to the current
++			 * time to derive an absolute time.
++			 */
++			gethrestime(&now);
++			timespecadd(tp, &now);
++		}
+ 	}
+-	/* NOTREACHED */
++
++	out = kmem_zalloc(sz, KM_SLEEP);
++
++	/*
++	 * A min_nr of 0 is like a poll even if given a NULL timeout; we return
++	 * however many events are ready.
++	 */
++	if (min_nr > 0) {
++		mutex_enter(&cp->lxioctx_d_lock);
++		while (!cp->lxioctx_shutdown && cp->lxioctx_done_cnt < min_nr) {
++			int r;
++
++			r = cv_waituntil_sig(&cp->lxioctx_done_cv,
++			    &cp->lxioctx_d_lock, tp, timechanged);
++			if (r < 0) {
++				/* timeout */
++				mutex_exit(&cp->lxioctx_d_lock);
++				lx_io_cp_rele(cp);
++				kmem_free(out, sz);
++				return (0);
++			} else if (r == 0) {
++				/* interrupted */
++				mutex_exit(&cp->lxioctx_d_lock);
++				lx_io_cp_rele(cp);
++				kmem_free(out, sz);
++				return (set_errno(EINTR));
++			}
++
++			/*
++			 * Signalled that something was queued up. Check if
++			 * there are now enough or if we have to wait for more.
++			 */
++		}
++		ASSERT(cp->lxioctx_done_cnt >= min_nr || cp->lxioctx_shutdown);
++		mutex_exit(&cp->lxioctx_d_lock);
++	}
++
++	/*
++	 * For each done control block, move it into the Linux event we return.
++	 * As we're doing this, we also moving it from the done list to the
++	 * free list.
++	 */
++	for (i = 0; i < nr && !cp->lxioctx_shutdown; i++) {
++		lx_io_event_t *lxe;
++		lx_io_elem_t *ep;
++
++		lxe = &out[i];
++
++		mutex_enter(&cp->lxioctx_d_lock);
++		if (cp->lxioctx_done_cnt == 0) {
++			mutex_exit(&cp->lxioctx_d_lock);
++			break;
++		}
++
++		ep = list_remove_head(&cp->lxioctx_done);
++		cp->lxioctx_done_cnt--;
++		mutex_exit(&cp->lxioctx_d_lock);
++
++		lxe->lxioe_data = ep->lxioelem_data;
++		lxe->lxioe_object = (uint64_t)(uintptr_t)ep->lxioelem_cbp;
++		lxe->lxioe_res = ep->lxioelem_res;
++		lxe->lxioe_res2 = 0;
++
++		/* Put it back on the free list */
++		ep->lxioelem_cbp = NULL;
++		ep->lxioelem_data = 0;
++		ep->lxioelem_res = 0;
++		mutex_enter(&cp->lxioctx_f_lock);
++		list_insert_head(&cp->lxioctx_free, ep);
++		cp->lxioctx_free_cnt++;
++		mutex_exit(&cp->lxioctx_f_lock);
++	}
++
++	lx_io_cp_rele(cp);
++
++	/*
++	 * Note: Linux seems to push the events back into the queue if the
++	 * copyout fails. Since this error is due to an application bug, it
++	 * seems unlikely we need to worry about it, but we can revisit this
++	 * if it is ever seen to be an issue.
++	 */
++	if (i > 0 && copyout(out, events, i * sizeof (lx_io_event_t)) != 0) {
++		kmem_free(out, sz);
++		return (set_errno(EFAULT));
++	}
++
++	kmem_free(out, sz);
++	return (i);
++}
++
++long
++lx_io_cancel(lx_aio_context_t cid, lx_iocb_t *iocbp, lx_io_event_t *result)
++{
++	lx_io_ctx_t *cp;
++	lx_io_elem_t *ep;
++	lx_io_event_t ev;
++
++	if ((cp = lx_io_cp_hold(cid)) == NULL)
++		return (set_errno(EINVAL));
++
++	/* Try to pull the CB off the pending list */
++	mutex_enter(&cp->lxioctx_p_lock);
++	ep = list_head(&cp->lxioctx_pending);
++	while (ep != NULL) {
++		if (ep->lxioelem_cbp == iocbp) {
++			list_remove(&cp->lxioctx_pending, ep);
++			break;
++		}
++		ep = list_next(&cp->lxioctx_pending, ep);
++	}
++	mutex_exit(&cp->lxioctx_p_lock);
++
++	if (ep == NULL) {
++		lx_io_cp_rele(cp);
++		return (set_errno(EAGAIN));
++	}
++
++	set_active_fd(-1);	 /* See comment in lx_io_cp_rele */
++	set_active_fd(ep->lxioelem_fd);
++	releasef(ep->lxioelem_fd);
++	ep->lxioelem_fd = 0;
++	ep->lxioelem_fp = NULL;
++
++	ev.lxioe_data = ep->lxioelem_cbp->lxiocb_data;
++	ev.lxioe_object = (uint64_t)(uintptr_t)ep->lxioelem_cbp;
++	ev.lxioe_res = 0;
++	ev.lxioe_res2 = 0;
++
++	/* Put it back on the free list */
++	ep->lxioelem_cbp = NULL;
++	ep->lxioelem_res = 0;
++	mutex_enter(&cp->lxioctx_f_lock);
++	list_insert_head(&cp->lxioctx_free, ep);
++	cp->lxioctx_free_cnt++;
++	mutex_exit(&cp->lxioctx_f_lock);
++	lx_io_cp_rele(cp);
++
++	if (copyout(&ev, result, sizeof (lx_io_event_t)) != 0)
++		return (set_errno(EFAULT));
++
++	return (0);
++}
++
++static void
++lx_io_destroy_common(lx_io_ctx_t *cp)
++{
++	lx_proc_data_t *lxpd = ptolxproc(curproc);
++	lx_zone_data_t *lxzd = ztolxzd(curproc->p_zone);
++
++	ASSERT(MUTEX_HELD(&lxpd->l_io_ctx_lock));
++	if (cp->lxioctx_shutdown == B_FALSE) {
++		cp->lxioctx_shutdown = B_TRUE;
++		/* decrement zone aio cnt */
++		mutex_enter(&lxzd->lxzd_lock);
++		VERIFY(cp->lxioctx_maxn <= lxzd->lxzd_aio_nr);
++		lxzd->lxzd_aio_nr -= cp->lxioctx_maxn;
++		mutex_exit(&lxzd->lxzd_lock);
++	}
++}
++
++long
++lx_io_destroy(lx_aio_context_t cid)
++{
++	lx_proc_data_t *lxpd = ptolxproc(curproc);
++	lx_io_ctx_t *cp;
++	int cnt = 0;
++
++	if ((cp = lx_io_cp_hold(cid)) == NULL)
++		return (set_errno(EINVAL));
++
++	mutex_enter(&lxpd->l_io_ctx_lock);
++	lx_io_destroy_common(cp);
++
++	/*
++	 * Wait for the worker threads and any blocked io_getevents threads to
++	 * exit. We have a hold and our rele will cleanup after all other holds
++	 * are released.
++	 */
++	ASSERT(cp->lxioctx_in_use >= 1);
++	while (cp->lxioctx_in_use > 1) {
++		DTRACE_PROBE2(lx__io__destroy, lx_io_ctx_t *, cp, int, cnt);
++		cv_broadcast(&cp->lxioctx_pending_cv);
++		cv_broadcast(&cp->lxioctx_done_cv);
++
++		/*
++		 * Each worker has a hold. We want to let those threads finish
++		 * up and exit.
++		 */
++		cv_wait(&lxpd->l_io_destroy_cv, &lxpd->l_io_ctx_lock);
++		cnt++;
++	}
++
++	mutex_exit(&lxpd->l_io_ctx_lock);
++	lx_io_cp_rele(cp);
+ 	return (0);
+ }
++
++/*
++ * Called at proc fork to clear contexts from child. We don't bother to unmap
++ * l_io_ctxpage since the vast majority of processes will immediately exec and
++ * cause an unmapping. If the child does not exec, there will simply be a
++ * single shared page in its address space, so no additional anonymous memory
++ * is consumed.
++ */
++void
++lx_io_clear(lx_proc_data_t *cpd)
++{
++	cpd->l_io_ctxs = NULL;
++	cpd->l_io_ctxpage = NULL;
++}
++
++/*
++ * Called via the lx_exit_all_lwps brand hook at proc exit to cleanup any
++ * outstanding io context data and worker threads. This handles the case when
++ * a process exits without calling io_destroy() on its open contexts. We need a
++ * brand hook for this because exitlwps() will call pokelwps() which will loop
++ * until we're the last thread in the process. The presence of any aio worker
++ * threads will block pokelwps from completing and none of our other brand
++ * hooks are called until later in the process exit path. There is no
++ * guarantee that more than one thread won't call exitlwps(), so we start over
++ * if we have to drop the l_io_ctx_lock mutex. Under normal conditions, the
++ * l_io_ctxs array will be NULL or empty.
++ */
++void
++lx_io_cleanup()
++{
++	lx_proc_data_t *lxpd = ptolxproc(curproc);
++	int i;
++
++restart:
++	mutex_enter(&lxpd->l_io_ctx_lock);
++	if (lxpd->l_io_ctxs == NULL) {
++		mutex_exit(&lxpd->l_io_ctx_lock);
++		return;
++	}
++
++	for (i = 0; i < LX_MAX_IO_CTX; i++) {
++		lx_io_ctx_t *cp;
++
++		if ((cp = lxpd->l_io_ctxs[i]) != NULL) {
++			lx_io_destroy_common(cp);
++
++			/*
++			 * We want the worker threads and any blocked
++			 * io_getevents threads to exit. We do not have a hold
++			 * so rele from the last thread will cleanup.
++			 */
++			cv_broadcast(&cp->lxioctx_pending_cv);
++			cv_broadcast(&cp->lxioctx_done_cv);
++
++			cv_wait(&lxpd->l_io_destroy_cv, &lxpd->l_io_ctx_lock);
++			mutex_exit(&lxpd->l_io_ctx_lock);
++			goto restart;
++		}
++	}
++
++	kmem_free(lxpd->l_io_ctxs, LX_MAX_IO_CTX * sizeof (lx_io_ctx_t *));
++	lxpd->l_io_ctxs = NULL;
++	mutex_exit(&lxpd->l_io_ctx_lock);
++}
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_close.c b/usr/src/uts/common/brand/lx/syscall/lx_close.c
+index 8df0cbbe2f..5d1a1605c1 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_close.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_close.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <sys/systm.h>
+@@ -26,32 +26,5 @@ extern int close(int);
+ long
+ lx_close(int fdes)
+ {
+-	lx_proc_data_t *lxpd = ptolxproc(curproc);
+-	boolean_t aio_used;
+-	uintptr_t uargs[1] = {(uintptr_t)fdes};
+-
+-	mutex_enter(&curproc->p_lock);
+-	aio_used = ((lxpd->l_flags & LX_PROC_AIO_USED) != 0);
+-	mutex_exit(&curproc->p_lock);
+-
+-	if (!aio_used) {
+-		return (close(fdes));
+-	}
+-
+-	/*
+-	 * If the process potentially has any AIO contexts open, the userspace
+-	 * emulation must be used so that libc can properly maintain its state.
+-	 */
+-
+-	ttolxlwp(curthread)->br_eosys = JUSTRETURN;
+-#if defined(_LP64)
+-	if (get_udatamodel() != DATAMODEL_NATIVE) {
+-		lx_emulate_user32(ttolwp(curthread), LX_SYS32_close, uargs);
+-	} else
+-#endif
+-	{
+-		lx_emulate_user(ttolwp(curthread), LX_SYS_close, uargs);
+-	}
+-	/* NOTREACHED */
+-	return (0);
++	return (close(fdes));
+ }
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_rw.c b/usr/src/uts/common/brand/lx/syscall/lx_rw.c
+index 8e6dd87dd5..d04e5fea18 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_rw.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_rw.c
+@@ -564,19 +564,16 @@ out:
+ }
+ 
+ ssize_t
+-lx_pread(int fdes, void *cbuf, size_t ccount, off64_t offset)
++lx_pread_fp(file_t *fp, void *cbuf, size_t ccount, off64_t offset)
+ {
+ 	struct uio auio;
+ 	struct iovec aiov;
+-	file_t *fp;
+ 	ssize_t count = (ssize_t)ccount;
+ 	size_t nread = 0;
+ 	int fflag, error = 0;
+ 
+ 	if (count < 0)
+ 		return (set_errno(EINVAL));
+-	if ((fp = getf(fdes)) == NULL)
+-		return (set_errno(EBADF));
+ 	if (((fflag = fp->f_flag) & FREAD) == 0) {
+ 		error = EBADF;
+ 		goto out;
+@@ -624,7 +621,6 @@ lx_pread(int fdes, void *cbuf, size_t ccount, off64_t offset)
+ 		}
+ 	}
+ out:
+-	releasef(fdes);
+ 	if (error) {
+ 		return (set_errno(error));
+ 	}
+@@ -633,19 +629,30 @@ out:
+ }
+ 
+ ssize_t
+-lx_pwrite(int fdes, void *cbuf, size_t ccount, off64_t offset)
++lx_pread(int fdes, void *cbuf, size_t ccount, off64_t offset)
++{
++	file_t *fp;
++	size_t nread;
++
++	if ((fp = getf(fdes)) == NULL)
++		return (set_errno(EBADF));
++
++	nread = lx_pread_fp(fp, cbuf, ccount, offset);
++	releasef(fdes);
++	return (nread);
++}
++
++ssize_t
++lx_pwrite_fp(file_t *fp, void *cbuf, size_t ccount, off64_t offset)
+ {
+ 	struct uio auio;
+ 	struct iovec aiov;
+-	file_t *fp;
+ 	ssize_t count = (ssize_t)ccount;
+ 	size_t nwrite = 0;
+ 	int fflag, error = 0;
+ 
+ 	if (count < 0)
+ 		return (set_errno(EINVAL));
+-	if ((fp = getf(fdes)) == NULL)
+-		return (set_errno(EBADF));
+ 	if (((fflag = fp->f_flag) & (FWRITE)) == 0) {
+ 		error = EBADF;
+ 		goto out;
+@@ -708,13 +715,26 @@ lx_pwrite(int fdes, void *cbuf, size_t ccount, off64_t offset)
+ 		}
+ 	}
+ out:
+-	releasef(fdes);
+ 	if (error) {
+ 		return (set_errno(error));
+ 	}
+ 	return (nwrite);
+ }
+ 
++ssize_t
++lx_pwrite(int fdes, void *cbuf, size_t ccount, off64_t offset)
++{
++	file_t *fp;
++	size_t nwrite;
++
++	if ((fp = getf(fdes)) == NULL)
++		return (set_errno(EBADF));
++
++	nwrite = lx_pwrite_fp(fp, cbuf, ccount, offset);
++	releasef(fdes);
++	return (nwrite);
++}
++
+ ssize_t
+ lx_pread32(int fdes, void *cbuf, size_t ccount, uint32_t off_lo,
+     uint32_t off_hi)
+diff --git a/usr/src/uts/common/brand/sn1/sn1_brand.c b/usr/src/uts/common/brand/sn1/sn1_brand.c
+index f31961b231..1dc025414a 100644
+--- a/usr/src/uts/common/brand/sn1/sn1_brand.c
++++ b/usr/src/uts/common/brand/sn1/sn1_brand.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <sys/errno.h>
+@@ -103,7 +103,8 @@ struct brand_ops sn1_brops = {
+ 	NULL,				/* b_setid_clear */
+ 	NULL,				/* b_pagefault */
+ 	B_TRUE,				/* b_intp_parse_arg */
+-	NULL				/* b_clearbrand */
++	NULL,				/* b_clearbrand */
++	NULL				/* b_exitlwps */
+ };
+ 
+ #ifdef	sparc
+diff --git a/usr/src/uts/common/brand/solaris10/s10_brand.c b/usr/src/uts/common/brand/solaris10/s10_brand.c
+index c49d605b00..6b6e0b575a 100644
+--- a/usr/src/uts/common/brand/solaris10/s10_brand.c
++++ b/usr/src/uts/common/brand/solaris10/s10_brand.c
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright (c) 2013, OmniTI Computer Consulting, Inc. All rights reserved.
+  * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/errno.h>
+@@ -108,7 +108,8 @@ struct brand_ops s10_brops = {
+ 	NULL,				/* b_setid_clear */
+ 	NULL,				/* b_pagefault */
+ 	B_TRUE,				/* b_intp_parse_arg */
+-	NULL				/* b_clearbrand */
++	NULL,				/* b_clearbrand */
++	NULL				/* b_exitlwps */
+ };
+ 
+ #ifdef	sparc
+diff --git a/usr/src/uts/common/fs/proc/prsubr.c b/usr/src/uts/common/fs/proc/prsubr.c
+index f5b5343da5..0645a91de1 100644
+--- a/usr/src/uts/common/fs/proc/prsubr.c
++++ b/usr/src/uts/common/fs/proc/prsubr.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1989, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -148,6 +148,11 @@ prchoose(proc_t *p)
+ 			continue;
+ 		}
+ 
++		/* If this is a process kernel thread, ignore it. */
++		if ((t->t_proc_flag & TP_KTHREAD) != 0) {
++			continue;
++		}
++
+ 		thread_lock(t);		/* make sure thread is in good state */
+ 		switch (t->t_state) {
+ 		default:
+diff --git a/usr/src/uts/common/os/fio.c b/usr/src/uts/common/os/fio.c
+index bfee77130d..62f7a307f1 100644
+--- a/usr/src/uts/common/os/fio.c
++++ b/usr/src/uts/common/os/fio.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1989, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2015, Joyent Inc.
++ * Copyright 2017, Joyent Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -487,7 +487,7 @@ free_afd(afd_t *afd)		/* called below and from thread_free() */
+ 		afd->a_fd[i] = -1;
+ }
+ 
+-static void
++void
+ set_active_fd(int fd)
+ {
+ 	afd_t *afd = &curthread->t_activefd;
+diff --git a/usr/src/uts/common/os/lwp.c b/usr/src/uts/common/os/lwp.c
+index a7de7b513f..5350729bbd 100644
+--- a/usr/src/uts/common/os/lwp.c
++++ b/usr/src/uts/common/os/lwp.c
+@@ -25,7 +25,7 @@
+  */
+ 
+ /*
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/param.h>
+@@ -1729,6 +1729,9 @@ exitlwps(int coredump)
+ 	proc_t *p = curproc;
+ 	int heldcnt;
+ 
++	if (PROC_IS_BRANDED(p) && BROP(p)->b_exitlwps != NULL)
++		BROP(p)->b_exitlwps(p, coredump);
++
+ 	if (curthread->t_door)
+ 		door_slam();
+ 	if (p->p_door_list)
+diff --git a/usr/src/uts/common/sys/brand.h b/usr/src/uts/common/sys/brand.h
+index e50c4e055a..2852bb8fee 100644
+--- a/usr/src/uts/common/sys/brand.h
++++ b/usr/src/uts/common/sys/brand.h
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_BRAND_H
+@@ -150,6 +150,7 @@ struct execa;
+  * b_pagefault - Trap pagefault events
+  * b_intp_parse_arg - Controls interpreter argument handling (allow 1 or all)
+  * b_clearbrand - Perform any actions necessary when clearing the brand.
++ * b_exitlwps - Perform any preliminary actions when all LWPs are exiting.
+  */
+ struct brand_ops {
+ 	void	(*b_init_brand_data)(zone_t *, kmutex_t *);
+@@ -200,6 +201,7 @@ struct brand_ops {
+ 	    enum seg_rw);
+ 	boolean_t b_intp_parse_arg;
+ 	void	(*b_clearbrand)(proc_t *, boolean_t);
++	void	(*b_exitlwps)(proc_t *, int);
+ };
+ 
+ /*
+diff --git a/usr/src/uts/common/sys/file.h b/usr/src/uts/common/sys/file.h
+index 7e297042af..ad73e8f1ae 100644
+--- a/usr/src/uts/common/sys/file.h
++++ b/usr/src/uts/common/sys/file.h
+@@ -27,7 +27,7 @@
+ /*	  All Rights Reserved  	*/
+ 
+ /* Copyright (c) 2013, OmniTI Computer Consulting, Inc. All rights reserved. */
+-/* Copyright 2015 Joyent, Inc. */
++/* Copyright 2017 Joyent, Inc. */
+ 
+ #ifndef _SYS_FILE_H
+ #define	_SYS_FILE_H
+@@ -225,6 +225,7 @@ extern void fcnt_add(uf_info_t *, int);
+ extern void close_exec(uf_info_t *);
+ extern void clear_stale_fd(void);
+ extern void clear_active_fd(int);
++extern void set_active_fd(int);
+ extern void free_afd(afd_t *afd);
+ extern int fgetstartvp(int, char *, struct vnode **);
+ extern int fsetattrat(int, char *, int, struct vattr *);
+diff --git a/usr/src/uts/common/sys/thread.h b/usr/src/uts/common/sys/thread.h
+index 9a75c5282f..73aa768d39 100644
+--- a/usr/src/uts/common/sys/thread.h
++++ b/usr/src/uts/common/sys/thread.h
+@@ -25,7 +25,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015, Joyent, Inc.  All rights reserved.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ #ifndef	_SYS_THREAD_H
+@@ -401,6 +401,7 @@ typedef struct _kthread {
+ #define	TP_CHANGEBIND	0x1000	/* thread has a new cpu/cpupart binding */
+ #define	TP_ZTHREAD	0x2000	/* this is a kernel thread for a zone */
+ #define	TP_WATCHSTOP	0x4000	/* thread is stopping via holdwatch() */
++#define	TP_KTHREAD	0x8000	/* in-kernel worker thread for a process */
+ 
+ /*
+  * Thread scheduler flag (t_schedflag) definitions.
+-- 
+2.21.0
+

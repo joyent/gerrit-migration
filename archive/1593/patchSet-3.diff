@@ -1,0 +1,4022 @@
+From 237d4690892469d8682f9a890977c08a34b519dd Mon Sep 17 00:00:00 2001
+From: Robert Mustacchi <rm@joyent.com>
+Date: Fri, 27 Jan 2017 19:13:44 +0000
+Subject: [PATCH] OS-5565 Need smrt HBA mode support
+
+---
+ usr/src/uts/common/Makefile.files             |   7 +-
+ .../uts/common/io/scsi/adapters/smrt/smrt.c   | 131 ++-
+ .../common/io/scsi/adapters/smrt/smrt_ciss.c  | 759 +++++++++++++++++-
+ .../io/scsi/adapters/smrt/smrt_commands.c     |   3 +-
+ .../io/scsi/adapters/smrt/smrt_device.c       |  25 +-
+ .../common/io/scsi/adapters/smrt/smrt_hba.c   | 578 ++++++++++---
+ .../io/scsi/adapters/smrt/smrt_interrupts.c   |  12 +-
+ .../io/scsi/adapters/smrt/smrt_logvol.c       | 260 +++---
+ .../io/scsi/adapters/smrt/smrt_physical.c     | 613 ++++++++++++++
+ .../common/io/scsi/adapters/smrt/smrt_sata.c  | 160 ++++
+ .../uts/common/sys/scsi/adapters/smrt/smrt.h  | 205 ++++-
+ .../common/sys/scsi/adapters/smrt/smrt_ciss.h |  16 +-
+ .../common/sys/scsi/adapters/smrt/smrt_scsi.h | 213 ++++-
+ usr/src/uts/common/sys/scsi/scsi_address.h    |  12 +
+ usr/src/uts/intel/smrt/Makefile               |  12 +-
+ 15 files changed, 2731 insertions(+), 275 deletions(-)
+ create mode 100644 usr/src/uts/common/io/scsi/adapters/smrt/smrt_physical.c
+ create mode 100644 usr/src/uts/common/io/scsi/adapters/smrt/smrt_sata.c
+
+diff --git a/usr/src/uts/common/Makefile.files b/usr/src/uts/common/Makefile.files
+index 40a98cb3b6..482d4d7e7d 100644
+--- a/usr/src/uts/common/Makefile.files
++++ b/usr/src/uts/common/Makefile.files
+@@ -24,9 +24,8 @@
+ # Copyright (c) 2011, 2014 by Delphix. All rights reserved.
+ # Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
+ # Copyright 2015 Nexenta Systems, Inc.  All rights reserved.
+-# Copyright 2016 Joyent, Inc.
++# Copyright (c) 2017 Joyent, Inc.
+ # Copyright 2016 Garrett D'Amore <garrett@damore.org>
+-# Copyright 2016 Joyent, Inc.
+ # Copyright 2016 OmniTI Computer Consulting, Inc.  All rights reserved.
+ # Copyright 2016 Hans Rosenfeld <rosenfeld@grumpf.hope-2000.org>
+ #
+@@ -2167,7 +2166,9 @@ SMRT_OBJS =	smrt.o \
+ 		smrt_logvol.o \
+ 		smrt_hba.o \
+ 		smrt_ciss_simple.o \
+-		smrt_ciss.o
++		smrt_ciss.o \
++		smrt_physical.o \
++		smrt_sata.o
+ 
+ #
+ #	ISCSI_INITIATOR module
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c
+index b182d1dab3..a7ef2b69d7 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/scsi/adapters/smrt/smrt.h>
+@@ -165,6 +165,75 @@ _info(struct modinfo *modinfop)
+ 	return (mod_info(&smrt_modlinkage, modinfop));
+ }
+ 
++static int
++smrt_iport_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
++{
++	const char *addr;
++	dev_info_t *pdip;
++	int instance;
++	smrt_t *smrt;
++
++	if (cmd != DDI_ATTACH)
++		return (DDI_FAILURE);
++
++	/*
++	 * Note, we cannot get to our parent via the tran's tran_hba_private
++	 * member.  This pointer is reset to NULL when the scsi_hba_tran_t
++	 * structure is duplicated.
++	 */
++	addr = scsi_hba_iport_unit_address(dip);
++	VERIFY(addr != NULL);
++	pdip = ddi_get_parent(dip);
++	instance = ddi_get_instance(pdip);
++	smrt = ddi_get_soft_state(smrt_state, instance);
++	VERIFY(smrt != NULL);
++
++	if (strcmp(addr, SMRT_IPORT_VIRT) == 0) {
++		if (smrt_logvol_hba_setup(smrt, dip) != DDI_SUCCESS)
++			return (DDI_FAILURE);
++		smrt->smrt_virt_iport = dip;
++	} else if (strcmp(addr, SMRT_IPORT_PHYS) == 0) {
++		if (smrt_phys_hba_setup(smrt, dip) != DDI_SUCCESS)
++			return (DDI_FAILURE);
++		smrt->smrt_phys_iport = dip;
++	} else {
++		return (DDI_FAILURE);
++	}
++
++	return (DDI_SUCCESS);
++}
++
++static int
++smrt_iport_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
++{
++	const char *addr;
++	scsi_hba_tran_t *tran;
++	smrt_t *smrt;
++
++	if (cmd != DDI_DETACH)
++		return (DDI_FAILURE);
++
++	tran = ddi_get_driver_private(dip);
++	VERIFY(tran != NULL);
++	smrt = tran->tran_hba_private;
++	VERIFY(smrt != NULL);
++
++	addr = scsi_hba_iport_unit_address(dip);
++	VERIFY(addr != NULL);
++
++	if (strcmp(addr, SMRT_IPORT_VIRT) == 0) {
++		smrt_logvol_hba_teardown(smrt, dip);
++		smrt->smrt_virt_iport = NULL;
++	} else if (strcmp(addr, SMRT_IPORT_PHYS) == 0) {
++		smrt_phys_hba_teardown(smrt, dip);
++		smrt->smrt_phys_iport = NULL;
++	} else {
++		return (DDI_FAILURE);
++	}
++
++	return (DDI_SUCCESS);
++}
++
+ static int
+ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ {
+@@ -172,6 +241,10 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	smrt_t *smrt;
+ 	boolean_t check_for_interrupts = B_FALSE;
+ 	int r;
++	char taskq_name[64];
++
++	if (scsi_hba_iport_unit_address(dip) != NULL)
++		return (smrt_iport_attach(dip, cmd));
+ 
+ 	if (cmd != DDI_ATTACH) {
+ 		return (DDI_FAILURE);
+@@ -206,6 +279,8 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	    offsetof(smrt_command_t, smcm_link_abort));
+ 	list_create(&smrt->smrt_volumes, sizeof (smrt_volume_t),
+ 	    offsetof(smrt_volume_t, smlv_link));
++	list_create(&smrt->smrt_physicals, sizeof (smrt_physical_t),
++	    offsetof(smrt_physical_t, smpt_link));
+ 	list_create(&smrt->smrt_targets, sizeof (smrt_target_t),
+ 	    offsetof(smrt_target_t, smtg_link_ctlr));
+ 	avl_create(&smrt->smrt_inflight, smrt_command_comparator,
+@@ -273,7 +348,7 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 		goto fail;
+ 	}
+ 
+-	if (smrt_hba_setup(smrt) != DDI_SUCCESS) {
++	if (smrt_ctrl_hba_setup(smrt) != DDI_SUCCESS) {
+ 		dev_err(dip, CE_WARN, "SCSI framework setup failed");
+ 		goto fail;
+ 	}
+@@ -292,15 +367,28 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	    SMRT_PERIODIC_RATE * NANOSEC, DDI_IPL_0);
+ 	smrt->smrt_init_level |= SMRT_INITLEVEL_PERIODIC;
+ 
+-	/*
+-	 * Discover the set of logical volumes attached to this controller:
+-	 */
+-	if ((r = smrt_logvol_discover(smrt, SMRT_LOGVOL_DISCOVER_TIMEOUT)) !=
+-	    0) {
+-		dev_err(dip, CE_WARN, "could not discover logical volumes "
++	(void) snprintf(taskq_name, sizeof (taskq_name), "smrt_discover_%u",
++	    instance);
++	smrt->smrt_discover_taskq = ddi_taskq_create(smrt->smrt_dip, taskq_name,
++	    1, TASKQ_DEFAULTPRI, 0);
++	if (smrt->smrt_discover_taskq == NULL) {
++		dev_err(dip, CE_WARN, "failed to create discovery task queue");
++		goto fail;
++	}
++	smrt->smrt_init_level |= SMRT_INITLEVEL_TASKQ;
++
++	if ((r = smrt_event_init(smrt)) != 0) {
++		dev_err(dip, CE_WARN, "could not initialize event subsystem "
+ 		    "(%d)", r);
+ 		goto fail;
+ 	}
++	smrt->smrt_init_level |= SMRT_INITLEVEL_ASYNC_EVENT;
++
++	if (scsi_hba_iport_register(dip, SMRT_IPORT_VIRT) != DDI_SUCCESS)
++		goto fail;
++
++	if (scsi_hba_iport_register(dip, SMRT_IPORT_PHYS) != DDI_SUCCESS)
++		goto fail;
+ 
+ 	/*
+ 	 * Announce the attachment of this controller.
+@@ -326,6 +414,9 @@ smrt_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+ 	scsi_hba_tran_t *tran = (scsi_hba_tran_t *)ddi_get_driver_private(dip);
+ 	smrt_t *smrt = (smrt_t *)tran->tran_hba_private;
+ 
++	if (scsi_hba_iport_unit_address(dip) != NULL)
++		return (smrt_iport_detach(dip, cmd));
++
+ 	if (cmd != DDI_DETACH) {
+ 		return (DDI_FAILURE);
+ 	}
+@@ -342,6 +433,13 @@ smrt_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
+ 		return (DDI_FAILURE);
+ 	}
+ 
++	if (smrt->smrt_virt_iport != NULL || smrt->smrt_phys_iport != NULL) {
++		mutex_exit(&smrt->smrt_mutex);
++		dev_err(smrt->smrt_dip, CE_WARN, "cannot detach: iports still "
++		    "attached");
++		return (DDI_FAILURE);
++	}
++
+ 	/*
+ 	 * Prevent new targets from attaching now:
+ 	 */
+@@ -386,14 +484,25 @@ smrt_ioctl(dev_t dev, int cmd, intptr_t arg, int mode, cred_t *credp,
+ static void
+ smrt_cleanup(smrt_t *smrt)
+ {
++	if (smrt->smrt_init_level & SMRT_INITLEVEL_ASYNC_EVENT) {
++		smrt_event_fini(smrt);
++		smrt->smrt_init_level &= ~SMRT_INITLEVEL_ASYNC_EVENT;
++	}
++
+ 	smrt_interrupts_teardown(smrt);
+ 
++	if (smrt->smrt_init_level & SMRT_INITLEVEL_TASKQ) {
++		ddi_taskq_destroy(smrt->smrt_discover_taskq);
++		smrt->smrt_discover_taskq = NULL;
++		smrt->smrt_init_level &= ~SMRT_INITLEVEL_TASKQ;
++	}
++
+ 	if (smrt->smrt_init_level & SMRT_INITLEVEL_PERIODIC) {
+ 		ddi_periodic_delete(smrt->smrt_periodic);
+ 		smrt->smrt_init_level &= ~SMRT_INITLEVEL_PERIODIC;
+ 	}
+ 
+-	smrt_hba_teardown(smrt);
++	smrt_ctrl_hba_teardown(smrt);
+ 
+ 	smrt_ctlr_teardown(smrt);
+ 
+@@ -401,6 +510,7 @@ smrt_cleanup(smrt_t *smrt)
+ 
+ 	if (smrt->smrt_init_level & SMRT_INITLEVEL_BASIC) {
+ 		smrt_logvol_teardown(smrt);
++		smrt_phys_teardown(smrt);
+ 
+ 		cv_destroy(&smrt->smrt_cv_finishq);
+ 
+@@ -412,6 +522,9 @@ smrt_cleanup(smrt_t *smrt)
+ 		VERIFY(list_is_empty(&smrt->smrt_volumes));
+ 		list_destroy(&smrt->smrt_volumes);
+ 
++		VERIFY(list_is_empty(&smrt->smrt_physicals));
++		list_destroy(&smrt->smrt_physicals);
++
+ 		VERIFY(list_is_empty(&smrt->smrt_targets));
+ 		list_destroy(&smrt->smrt_targets);
+ 
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c
+index 9de93fda45..b4cdd5607e 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c
+@@ -10,18 +10,172 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/scsi/adapters/smrt/smrt.h>
+ 
++/*
++ * Discovery, Resets, Periodics, and Events
++ * ----------------------------------------
++ *
++ * Discovery is the act of figuring out what logical and physical volumes exist
++ * under the controller.  Discovery happens in response to the following events:
++ *
++ *   o iports for virtual and physical devices being attached
++ *   o Controller event notifications indicating potential topology changes
++ *   o After a reset of the controller, before we can perform I/O again
++ *
++ * Because we have to perform discovery after a reset, which can happen during
++ * panic(), that also means that discovery may be run in panic context.  We
++ * also need to emphasize the need for discovery to happen after a controller
++ * reset.  Once a reset is initiated, we cannot be certain about the addresses
++ * of any of the existing targets until the reset has completed.  The driver
++ * performs I/Os to addresses that the controller provides.  The controller
++ * specification says that these addresses may change after a controller reset.
++ *
++ * Unfortunately, all of this combined means that making sure we can correctly
++ * run discovery is somewhat complicated.  In non-panic contexts, discovery is
++ * always run from a taskq.  We'll kick off the discovery in the taskq if
++ * nothing is pending at that time.  The state is managed by bits in the
++ * smrt_status member of the smrt_t.  There are four bits at this time:
++ *
++ *	SMRT_CTLR_DISCOVERY_REQUESTED	This flag indicates that something has
++ *					requested that a discovery be performed.
++ *					If no flags are set when this is set,
++ *					then we will kick off discovery.  All
++ *					discovery requests are initiated via the
++ *					smrt_discover_request() function.
++ *
++ *	SMRT_CTLR_DISCOVERY_RUNNING	This flag is set at the start of us
++ *					running a discovery.  It is removed when
++ *					discovery finishes.
++ *
++ *	SMRT_CTLR_DISCOVERY_PERIODIC	This flag is set in a number of
++ *					circumstances, which will be described
++ *					in a subsequent section.  This indicates
++ *					that the periodic must kick off the
++ *					discovery process.
++ *
++ *	SMRT_CTLR_DISCOVERY_REQUIRED	This flag indicates that at some point a
++ *					controller reset occurred and we need to
++ *					have a successful discovery to finish
++ *					the act of resetting and allowing I/O to
++ *					continue.
++ *
++ * In general, a request to discover kicks off the taskq to discover entries, if
++ * it hasn't already been requested or started.  This also allows us to coalesce
++ * multiple requests, if needed.  Note that if a request comes in when a
++ * discovery is ongoing, we do not kick off discovery again.  Instead, we set
++ * the SMRT_CTLR_DISCOVERY_REQUESTED flag which will rerun discovery after the
++ * initial pass has completed.
++ *
++ * When a discovery starts, the first thing it does is clear the
++ * SMRT_CTLR_DISCOVERY_REQUESTED flag.  This is important, because any
++ * additional requests for discovery that come in after this has started likely
++ * indicate that we've missed something.  As such, when the discovery process
++ * finishes, if it sees the REQUESTED flag, then it will need to set the
++ * PERIODIC flag.  The PERIODIC flag is used to indicate that we should run
++ * discovery again, but not kick if off immediately.  Instead, it should be
++ * driven by the normal periodic behavior.
++ *
++ * If for some reason the act of discovery fails, or we fail to dispatch
++ * discovery due to a transient error, then we will flag PERIODIC so that the
++ * periodic tick will try and run things again.
++ *
++ * Now, we need to talk about SMRT_CTLR_DISCOVERY_REQUIRED.  This flag is set
++ * after a reset occurs.  The reset thread will be blocked on this.
++ * Importantly, none of the code in the discovery path can ask for a controller
++ * reset at this time.  If at the end of a discovery, this flag is set, then we
++ * will signal the reset thread that it should check on its status by
++ * broadcasting on the smrt_cv_finishq.  At that point, the reset thread will
++ * continue.
++ *
++ * Panic Context
++ * -------------
++ *
++ * All of this talk of threads and taskqs is well and good, but as an HBA
++ * driver, we have a serious responsibility to try and deal with panic sanely.
++ * In panic context, we will directly call the discovery functions and not poll
++ * for them to occur.
++ *
++ * However, because our discovery relies on the target maps, which aren't safe
++ * for panic context at this time, we have to take a different approach.  We
++ * leverage the fact that we have a generation number stored with every
++ * discovery.  If we try to do an I/O to a device where the generation doesn't
++ * match, then we know that it disappeared and should not be used.  We also
++ * sanity check the model, serial numbers, and WWNs to make sure that these are
++ * the same devices.  If they are, then we'll end up updating the address
++ * structures.
++ *
++ * Now, it is possible that when we were panicking, we had a thread that was in
++ * the process of running a discovery or even resetting the system.  Once we're
++ * in panic, those threads aren't running, so if they didn't end up producing a
++ * new view of the world that the SCSI framework is using, then it shouldn't
++ * really matter, as we won't have updated the list of devices.  Importantly,
++ * once we're in that context, we're not going to be attaching or detaching
++ * targets.  If we get a request for one of these targets which has disappeared,
++ * we're going to have to end up giving up.
++ *
++ * Request Attributes
++ * ------------------
++ *
++ * The CISS specification allows for three different kinds of attributes that
++ * describe how requests are queued to the controller.  These are:
++ *
++ * 	HEAD OF QUEUE		The request should go to the head of the
++ * 				controller queue.  This is used for resets and
++ * 				aborts to ensure that they're not blocked behind
++ * 				additional I/O.
++ *
++ * 	SIMPLE			This queues the request for normal processing.
++ * 				Commands queued this way are not special with
++ * 				respect to one another.  We use this for all I/O
++ * 				and discovery commands.
++ *
++ *	ORDERED			This attribute is used to indicate that commands
++ *				should be submitted and processed in some order.
++ *				This is used primarily for the event
++ *				notification bits so we can ensure that at the
++ *				return of a cancellation of the event
++ *				notification, that any outstanding request has
++ *				been honored.
++ */
++
+ static int smrt_ctlr_versions(smrt_t *, uint16_t, smrt_versions_t *);
++static void smrt_discover(void *);
+ 
+ /*
+  * The maximum number of seconds to wait for the controller to come online.
+  */
+ unsigned smrt_ciss_init_time = 90;
+ 
++/*
++ * A tunable that determines the number of events per tick that we'll process
++ * via asynchronous event notification.  If this rate is very high, then we will
++ * not submit the event and it will be picked up at the next tick of the
++ * periodic.
++ */
++uint_t smrt_event_intervention_threshold = 1000;
++
++/*
++ * Converts a LUN Address to a BMIC Identifier.  The BMIC Identifier is used
++ * when performing various physical commands and generally should stay the same
++ * for a given device across inserts and removals; however, not across
++ * controller resets.  These are calculated based on what the CISS specification
++ * calls the 'Level 2' target and bus, which don't have a real meaning in the
++ * SAS world otherwise.
++ */
++uint16_t
++smrt_lun_addr_to_bmic(PhysDevAddr_t *paddr)
++{
++	uint16_t id;
++
++	id = (paddr->Target[1].PeripDev.Bus - 1) << 8;
++	id += paddr->Target[1].PeripDev.Dev;
++
++	return (id);
++}
+ 
+ void
+ smrt_write_lun_addr_phys(LUNAddr_t *lun, boolean_t masked, unsigned bus,
+@@ -36,6 +190,18 @@ smrt_write_lun_addr_phys(LUNAddr_t *lun, boolean_t masked, unsigned bus,
+ 	bzero(&lun->PhysDev.Target, sizeof (lun->PhysDev.Target));
+ }
+ 
++/*
++ * According to the CISS Specification, the controller is always addressed in
++ * Mask Perhiperhal mode with a bus and target ID of zero.  This is used by
++ * commands that need to write to the controller itself, which is generally
++ * discovery and other commands.
++ */
++void
++smrt_write_controller_lun_addr(LUNAddr_t *lun)
++{
++	smrt_write_lun_addr_phys(lun, B_TRUE, 0, 0);
++}
++
+ void
+ smrt_write_message_common(smrt_command_t *smcm, uint8_t type, int timeout_secs)
+ {
+@@ -87,14 +253,14 @@ smrt_write_message_abort_one(smrt_command_t *smcm, uint32_t tag)
+ }
+ 
+ void
+-smrt_write_message_abort_all(smrt_command_t *smcm, LogDevAddr_t *addr)
++smrt_write_message_abort_all(smrt_command_t *smcm, LUNAddr_t *addr)
+ {
+ 	/*
+ 	 * When aborting all tasks for a particular Logical Volume,
+ 	 * the command is addressed not to the controller but to
+ 	 * the Volume itself.
+ 	 */
+-	smcm->smcm_va_cmd->Header.LUN.LogDev = *addr;
++	smcm->smcm_va_cmd->Header.LUN = *addr;
+ 
+ 	smrt_write_message_common(smcm, CISS_MSG_ABORT, 0);
+ 
+@@ -104,6 +270,51 @@ smrt_write_message_abort_all(smrt_command_t *smcm, LogDevAddr_t *addr)
+ 	smcm->smcm_va_cmd->Request.CDB[1] = CISS_ABORT_TASKSET;
+ }
+ 
++void
++smrt_write_message_event_notify(smrt_command_t *smcm)
++{
++	smrt_event_notify_req_t senr;
++
++	smrt_write_controller_lun_addr(&smcm->smcm_va_cmd->Header.LUN);
++
++	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_ORDERED;
++	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_READ;
++	smcm->smcm_va_cmd->Request.Timeout = 0;
++	smcm->smcm_va_cmd->Request.CDBLen = sizeof (senr);
++
++	bzero(&senr, sizeof (senr));
++	senr.senr_opcode = CISS_SCMD_READ;
++	senr.senr_subcode = CISS_BMIC_NOTIFY_ON_EVENT;
++	senr.senr_flags = BE_32(0);
++	senr.senr_size = BE_32(SMRT_EVENT_NOTIFY_BUFLEN);
++
++	bcopy(&senr, &smcm->smcm_va_cmd->Request.CDB[0],
++	    MIN(CISS_CDBLEN, sizeof (senr)));
++}
++
++void
++smrt_write_message_cancel_event_notify(smrt_command_t *smcm)
++{
++	smrt_event_notify_req_t senr;
++
++	smrt_write_controller_lun_addr(&smcm->smcm_va_cmd->Header.LUN);
++
++	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_ORDERED;
++	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_WRITE;
++	smcm->smcm_va_cmd->Request.Timeout = LE_16(SMRT_ASYNC_CANCEL_TIMEOUT);
++	smcm->smcm_va_cmd->Request.CDBLen = sizeof (senr);
++
++	bzero(&senr, sizeof (senr));
++	senr.senr_opcode = CISS_SCMD_WRITE;
++	senr.senr_subcode = CISS_BMIC_NOTIFY_ON_EVENT_CANCEL;
++	senr.senr_size = BE_32(SMRT_EVENT_NOTIFY_BUFLEN);
++
++	bcopy(&senr, &smcm->smcm_va_cmd->Request.CDB[0],
++	    MIN(CISS_CDBLEN, sizeof (senr)));
++}
++
+ void
+ smrt_write_message_reset_ctlr(smrt_command_t *smcm)
+ {
+@@ -138,6 +349,24 @@ smrt_periodic(void *arg)
+ 	smrt_t *smrt = arg;
+ 
+ 	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * Before we even check if the controller is running to process
++	 * everything else, we must first check if we had a request to kick off
++	 * discovery.  We do this before the check if the controller is running,
++	 * as this may be required to finish a discovery.
++	 */
++	if ((smrt->smrt_status & SMRT_CTLR_DISCOVERY_PERIODIC) != 0 &&
++	    (smrt->smrt_status & SMRT_CTLR_DISCOVERY_RUNNING) == 0 &&
++	    (smrt->smrt_status & SMRT_CTLR_STATUS_RESETTING) == 0) {
++		if (ddi_taskq_dispatch(smrt->smrt_discover_taskq,
++		    smrt_discover, smrt, DDI_NOSLEEP) != DDI_SUCCESS) {
++			smrt->smrt_stats.smrts_discovery_tq_errors++;
++		} else {
++			smrt->smrt_status &= ~SMRT_CTLR_DISCOVERY_PERIODIC;
++		}
++	}
++
+ 	if (!(smrt->smrt_status & SMRT_CTLR_STATUS_RUNNING)) {
+ 		/*
+ 		 * The device is currently not active, e.g. due to an
+@@ -153,6 +382,11 @@ smrt_periodic(void *arg)
+ 	 */
+ 	smrt_lockup_check(smrt);
+ 
++	/*
++	 * Reset the event notification threshold counter.
++	 */
++	smrt->smrt_event_count = 0;
++
+ 	/*
+ 	 * Check inflight commands to see if they have timed out.
+ 	 */
+@@ -199,6 +433,23 @@ smrt_periodic(void *arg)
+ 	 */
+ 	(void) smrt_process_abortq(smrt);
+ 
++	/*
++	 * Check if we have an outstanding event intervention request.  Note,
++	 * the command in question should always be in a state such that it is
++	 * usable by the system here.  The command is always prepared again by
++	 * the normal event notification path, even if a reset has occurred.
++	 * The reset will be processed before we'd ever consider running an
++	 * event again.  Note, if we fail to submit this, then we leave this for
++	 * the next occurrence of the periodic.
++	 */
++	if (smrt->smrt_status & SMRT_CTLR_ASYNC_INTERVENTION) {
++		smrt->smrt_stats.smrts_events_intervened++;
++
++		if (smrt_submit(smrt, smrt->smrt_event_cmd) == 0) {
++			smrt->smrt_status &= ~SMRT_CTLR_ASYNC_INTERVENTION;
++		}
++	}
++
+ 	mutex_exit(&smrt->smrt_mutex);
+ }
+ 
+@@ -269,11 +520,21 @@ smrt_submit(smrt_t *smrt, smrt_command_t *smcm)
+ 	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
+ 	VERIFY(smcm->smcm_type != SMRT_CMDTYPE_PREINIT);
+ 
++	/*
++	 * Anything that asks us to ignore the running state of the controller
++	 * must be wired up to poll for completion.
++	 */
++	if (smcm->smcm_status & SMRT_CMD_IGNORE_RUNNING) {
++		VERIFY(smcm->smcm_status & SMRT_CMD_STATUS_POLLED);
++	}
++
+ 	/*
+ 	 * If the controller is currently being reset, do not allow command
+-	 * submission.
++	 * submission.  However, if this is one of the commands needed to finish
++	 * reset, as indicated on the command structure, allow it.
+ 	 */
+-	if (!(smrt->smrt_status & SMRT_CTLR_STATUS_RUNNING)) {
++	if (!(smrt->smrt_status & SMRT_CTLR_STATUS_RUNNING) &&
++	    !(smcm->smcm_status & SMRT_CMD_IGNORE_RUNNING)) {
+ 		return (EIO);
+ 	}
+ 
+@@ -367,6 +628,10 @@ smrt_process_finishq_one(smrt_command_t *smcm)
+ 		smrt_hba_complete(smcm);
+ 		return;
+ 
++	case SMRT_CMDTYPE_EVENT:
++		smrt_event_complete(smcm);
++		return;
++
+ 	case SMRT_CMDTYPE_ABORTQ:
+ 		/*
+ 		 * Abort messages sent as part of abort queue processing
+@@ -791,7 +1056,7 @@ smrt_ctlr_init(smrt_t *smrt)
+ 	 * Determine the firmware version of the controller so that we can
+ 	 * select which type of interrupts to use.
+ 	 */
+-	if ((e = smrt_ctlr_versions(smrt, SMRT_LOGVOL_DISCOVER_TIMEOUT,
++	if ((e = smrt_ctlr_versions(smrt, SMRT_DISCOVER_TIMEOUT,
+ 	    &smrt->smrt_versions)) != 0) {
+ 		dev_err(smrt->smrt_dip, CE_WARN, "could not identify "
+ 		    "controller (%d)", e);
+@@ -949,17 +1214,12 @@ smrt_ctlr_identify(smrt_t *smrt, uint16_t timeout,
+ 		return (ENOMEM);
+ 	}
+ 
+-	/*
+-	 * This BMIC command is addressed to the controller itself.  The
+-	 * Masked Peripheral Device addressing mode is used, with a LUN of 0.
+-	 */
+-	smrt_write_lun_addr_phys(&smcm->smcm_va_cmd->Header.LUN, B_TRUE,
+-	    0, 0);
++	smrt_write_controller_lun_addr(&smcm->smcm_va_cmd->Header.LUN);
+ 
+ 	smcm->smcm_va_cmd->Request.CDBLen = sizeof (smicr);
+ 	smcm->smcm_va_cmd->Request.Timeout = timeout;
+ 	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
+-	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_ORDERED;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_SIMPLE;
+ 	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_READ;
+ 
+ 	/*
+@@ -1210,13 +1470,12 @@ skip_check:
+ 	dev_err(smrt->smrt_dip, CE_NOTE, "soft reset: controller configured");
+ 
+ 	smrt_write_message_nop(smcm_nop, 0);
+-	smcm_nop->smcm_status |= SMRT_CMD_STATUS_POLLED;
+-	smrt->smrt_status |= SMRT_CTLR_STATUS_RUNNING;
++	smcm_nop->smcm_status |= SMRT_CMD_STATUS_POLLED |
++	    SMRT_CMD_IGNORE_RUNNING;
+ 	if ((r = smrt_submit(smrt, smcm_nop)) != 0) {
+ 		dev_err(smrt->smrt_dip, CE_PANIC, "soft reset failed: "
+ 		    "ping could not be submitted (%d)", r);
+ 	}
+-	smrt->smrt_status &= ~SMRT_CTLR_STATUS_RUNNING;
+ 
+ 	/*
+ 	 * Interrupts are still masked at this stage.  Poll manually in
+@@ -1276,12 +1535,45 @@ skip_check:
+ 	}
+ 
+ 	/*
+-	 * Re-enable interrupts, mark the controller running and
+-	 * the reset as complete....
++	 * Quiesce our discovery thread.  Note, because
++	 * SMRT_CTLR_STATUS_RESTARTING is set, nothing can cause it to be
++	 * enabled again.
++	 */
++	if (!ddi_in_panic()) {
++		mutex_exit(&smrt->smrt_mutex);
++		ddi_taskq_wait(smrt->smrt_discover_taskq);
++		mutex_enter(&smrt->smrt_mutex);
++	}
++
++	/*
++	 * Re-enable interrupts.  Now, we must kick off a discovery to make sure
++	 * that the system is in a sane state and that we can perform I/O.
+ 	 */
+ 	smrt_intr_set(smrt, B_TRUE);
+-	smrt->smrt_status |= SMRT_CTLR_STATUS_RUNNING;
+ 	smrt->smrt_status &= ~SMRT_CTLR_STATUS_RESETTING;
++	smrt->smrt_status |= SMRT_CTLR_DISCOVERY_REQUIRED;
++
++	/*
++	 * Attempt a discovery to make sure that the drivers sees a realistic
++	 * view of the world.  If we're not in panic context, spin for the
++	 * asynchronous process to complete, otherwise we're in panic context
++	 * and this is going to happen regardless if we want it to or not.
++	 * Before we kick off the request to run discovery, we reset the
++	 * discovery request flags as we know that nothing else can consider
++	 * running discovery and we don't want to delay until the next smrt
++	 * periodic tick if we can avoid it.  In panic context, if this failed,
++	 * then we won't make it back.
++	 */
++	VERIFY0(smrt->smrt_status & SMRT_CTLR_DISCOVERY_RUNNING);
++	smrt->smrt_status &= ~(SMRT_CTLR_DISCOVERY_MASK);
++	smrt_discover(smrt);
++	if (!ddi_in_panic()) {
++		while (smrt->smrt_status & SMRT_CTLR_DISCOVERY_REQUIRED) {
++			cv_wait(&smrt->smrt_cv_finishq, &smrt->smrt_mutex);
++		}
++	}
++
++	smrt->smrt_status |= SMRT_CTLR_STATUS_RUNNING;
+ 	smrt->smrt_last_reset_finish = gethrtime();
+ 
+ 	/*
+@@ -1300,3 +1592,432 @@ skip_check:
+ 	mutex_enter(&smrt->smrt_mutex);
+ 	return (0);
+ }
++
++int
++smrt_event_init(smrt_t *smrt)
++{
++	int ret;
++	smrt_command_t *event, *cancel;
++
++	event = smrt_command_alloc(smrt, SMRT_CMDTYPE_EVENT, KM_NOSLEEP);
++	if (event == NULL)
++		return (ENOMEM);
++	if (smrt_command_attach_internal(smrt, event, SMRT_EVENT_NOTIFY_BUFLEN,
++	    KM_NOSLEEP) != 0) {
++		smrt_command_free(event);
++		return (ENOMEM);
++	}
++	smrt_write_message_event_notify(event);
++
++	cancel = smrt_command_alloc(smrt, SMRT_CMDTYPE_INTERNAL, KM_NOSLEEP);
++	if (cancel == NULL) {
++		smrt_command_free(event);
++		return (ENOMEM);
++	}
++	if (smrt_command_attach_internal(smrt, cancel, SMRT_EVENT_NOTIFY_BUFLEN,
++	    KM_NOSLEEP) != 0) {
++		smrt_command_free(event);
++		smrt_command_free(cancel);
++		return (ENOMEM);
++	}
++	smrt_write_message_cancel_event_notify(cancel);
++
++	cv_init(&smrt->smrt_event_queue, NULL, CV_DRIVER, NULL);
++
++	mutex_enter(&smrt->smrt_mutex);
++	if ((ret = smrt_submit(smrt, event)) != 0) {
++		mutex_exit(&smrt->smrt_mutex);
++		smrt_command_free(event);
++		smrt_command_free(cancel);
++		return (ret);
++	}
++
++	smrt->smrt_event_cmd = event;
++	smrt->smrt_event_cancel_cmd = cancel;
++	mutex_exit(&smrt->smrt_mutex);
++
++	return (0);
++}
++
++void
++smrt_event_complete(smrt_command_t *smcm)
++{
++	smrt_event_notify_t *sen;
++	boolean_t log, rescan;
++
++	boolean_t intervene = B_FALSE;
++	smrt_t *smrt = smcm->smcm_ctlr;
++
++	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
++	VERIFY3P(smcm, ==, smrt->smrt_event_cmd);
++	VERIFY0(smrt->smrt_status & SMRT_CTLR_ASYNC_INTERVENTION);
++
++	smrt->smrt_stats.smrts_events_received++;
++
++	if (smrt->smrt_status & SMRT_CTLR_STATUS_DETACHING) {
++		cv_signal(&smrt->smrt_event_queue);
++		return;
++	}
++
++	if (smrt->smrt_status & SMRT_CTLR_STATUS_RESETTING) {
++		intervene = B_TRUE;
++		goto clean;
++	}
++
++	/*
++	 * The event notification command failed for some reason.  Attempt to
++	 * drive on and try again at the next intervention period.  Because this
++	 * may represent a programmer error (though it's hard to know), we wait
++	 * until the next intervention period and don't panic.
++	 */
++	if (smcm->smcm_status & SMRT_CMD_STATUS_ERROR) {
++		ErrorInfo_t *ei = smcm->smcm_va_err;
++		intervene = B_TRUE;
++
++		smrt->smrt_stats.smrts_events_errors++;
++		dev_err(smrt->smrt_dip, CE_WARN, "!event notification request "
++		    "error: status 0x%x", ei->CommandStatus);
++		goto clean;
++	}
++
++	sen = smcm->smcm_internal->smcmi_va;
++	log = rescan = B_FALSE;
++	switch (sen->sen_class) {
++	case SMRT_EVENT_CLASS_PROTOCOL:
++		/*
++		 * Most of the event protocol class events aren't really
++		 * actionable.  However, subclass 1 indicates errors.  Today,
++		 * the only error is an event overflow.  If there's an event
++		 * overflow, then we must assume that we need to rescan.
++		 */
++		if (sen->sen_subclass == SMRT_EVENT_PROTOCOL_SUBCLASS_ERROR) {
++			rescan = B_TRUE;
++		}
++		break;
++	case SMRT_EVENT_CLASS_HOTPLUG:
++		/*
++		 * We want to log all hotplug events.  However we only need to
++		 * scan these if the subclass indicates the event is for a disk.
++		 */
++		log = B_TRUE;
++		if (sen->sen_subclass == SMRT_EVENT_HOTPLUG_SUBCLASS_DRIVE) {
++			rescan = B_TRUE;
++		}
++		break;
++	case SMRT_EVENT_CLASS_HWERROR:
++	case SMRT_EVENT_CLASS_ENVIRONMENT:
++		log = B_TRUE;
++		break;
++	case SMRT_EVENT_CLASS_PHYS:
++		log = B_TRUE;
++		/*
++		 * This subclass indicates some change for physical drives.  As
++		 * such, this should trigger a rescan.
++		 */
++		if (sen->sen_subclass == SMRT_EVENT_PHYS_SUBCLASS_STATE) {
++			rescan = B_TRUE;
++		}
++		break;
++	case SMRT_EVENT_CLASS_LOGVOL:
++		rescan = B_TRUE;
++		log = B_TRUE;
++		break;
++	default:
++		/*
++		 * While there are other classes of events, it's hard to say how
++		 * actionable they are for the moment.  If we revamp this such
++		 * that it becomes an ireport based system, then we should just
++		 * always log these.  We opt not to at the moment to try and be
++		 * kind to the system log.
++		 */
++		break;
++	}
++
++	/*
++	 * Ideally, this would be an ireport that we could pass onto
++	 * administrators; however, since we don't have any way to generate
++	 * that, we provide a subset of the event information.
++	 */
++	if (log) {
++		const char *rmsg;
++		if (rescan == B_TRUE) {
++			rmsg = "rescanning";
++		} else {
++			rmsg = "not rescanning";
++		}
++		if (sen->sen_message[0] != '\0') {
++			sen->sen_message[sizeof (sen->sen_message) - 1] = '\0';
++			dev_err(smrt->smrt_dip, CE_NOTE, "!controller event "
++			    "class/sub-class/detail %x, %x, %x: %s; %s devices",
++			    sen->sen_class, sen->sen_subclass, sen->sen_detail,
++			    sen->sen_message, rmsg);
++		} else {
++			dev_err(smrt->smrt_dip, CE_NOTE, "!controller event "
++			    "class/sub-class/detail %x, %x, %x; %s devices",
++			    sen->sen_class, sen->sen_subclass, sen->sen_detail,
++			    rmsg);
++		}
++	}
++
++	if (rescan)
++		smrt_discover_request(smrt);
++
++clean:
++	mutex_exit(&smrt->smrt_mutex);
++	smrt_command_reuse(smcm);
++	bzero(smcm->smcm_internal->smcmi_va, SMRT_EVENT_NOTIFY_BUFLEN);
++	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * Make sure we're not _now_ detaching or resetting.
++	 */
++	if (smrt->smrt_status & SMRT_CTLR_STATUS_DETACHING) {
++		cv_signal(&smrt->smrt_event_queue);
++		return;
++	}
++
++	if ((smrt->smrt_status & SMRT_CTLR_STATUS_RESETTING) != 0 ||
++	    intervene == B_TRUE) {
++		smrt->smrt_status |= SMRT_CTLR_ASYNC_INTERVENTION;
++		return;
++	}
++
++	/*
++	 * Check out command count per tick.  If it's too high, leave it for
++	 * intervention to solve.  Likely there is some serious driver or
++	 * firmware error going on.
++	 */
++	smrt->smrt_event_count++;
++	if (smrt->smrt_event_count > smrt_event_intervention_threshold) {
++		smrt->smrt_status |= SMRT_CTLR_ASYNC_INTERVENTION;
++		return;
++	}
++
++	if (smrt_submit(smrt, smcm) != 0) {
++		smrt->smrt_status |= SMRT_CTLR_ASYNC_INTERVENTION;
++	}
++}
++
++void
++smrt_event_fini(smrt_t *smrt)
++{
++	int ret;
++	smrt_command_t *event, *cancel;
++	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * If intervention has been requested, there is nothing for us to do. We
++	 * clear the flag so nothing else accidentally sees this and takes
++	 * action.  We also don't need to bother sending a cancellation request,
++	 * as there is no outstanding event.
++	 */
++	if (smrt->smrt_status & SMRT_CTLR_ASYNC_INTERVENTION) {
++		smrt->smrt_status &= ~SMRT_CTLR_ASYNC_INTERVENTION;
++		goto free;
++	}
++
++	/*
++	 * Submit a cancel request for the event notification queue.  Because we
++	 * submit both the cancel event and the regular notification event as an
++	 * ordered command, we know that by the time this completes, that the
++	 * existing one will have completed.
++	 */
++	smrt->smrt_event_cancel_cmd->smcm_status |= SMRT_CMD_STATUS_POLLED;
++	if ((ret = smrt_submit(smrt, smrt->smrt_event_cancel_cmd)) != 0) {
++		/*
++		 * This is unfortunate.  We've failed to submit the command.  At
++		 * this point all we can do is reset the device.  If the reset
++		 * succeeds, we're done and we can clear all the memory.  If it
++		 * fails, then all we can do is just leak the command and scream
++		 * to the system, sorry.
++		 */
++		if (smrt_ctlr_reset(smrt) != 0) {
++			dev_err(smrt->smrt_dip, CE_WARN, "failed to reset "
++			    "device after failure to submit cancellation "
++			    "(%d), abandoning smrt_command_t at address %p",
++			    ret, smrt->smrt_event_cmd);
++			smrt->smrt_event_cmd = NULL;
++			goto free;
++		}
++	}
++
++	smrt->smrt_event_cancel_cmd->smcm_expiry = gethrtime() +
++	    SMRT_ASYNC_CANCEL_TIMEOUT * NANOSEC;
++	if ((ret = smrt_poll_for(smrt, smrt->smrt_event_cancel_cmd)) != 0) {
++		VERIFY3S(ret, ==, ETIMEDOUT);
++		VERIFY0(smrt->smrt_event_cancel_cmd->smcm_status &
++		    SMRT_CMD_STATUS_POLL_COMPLETE);
++
++		/*
++		 * The command timed out.  All we can do is hope a reset will
++		 * work.
++		 */
++		if (smrt_ctlr_reset(smrt) != 0) {
++			dev_err(smrt->smrt_dip, CE_WARN, "failed to reset "
++			    "device after failure to poll for async "
++			    "cancellation command abandoning smrt_command_t "
++			    "event command at address %p and cancellation "
++			    "command at %p", smrt->smrt_event_cmd,
++			    smrt->smrt_event_cancel_cmd);
++			smrt->smrt_event_cmd = NULL;
++			smrt->smrt_event_cancel_cmd = NULL;
++			goto free;
++		}
++
++	}
++
++	/*
++	 * Well, in the end, it's results that count.
++	 */
++	if (smrt->smrt_event_cancel_cmd->smcm_status &
++	    SMRT_CMD_STATUS_RESET_SENT) {
++		goto free;
++	}
++
++	if (smrt->smrt_event_cancel_cmd->smcm_status & SMRT_CMD_STATUS_ERROR) {
++		ErrorInfo_t *ei = smrt->smrt_event_cancel_cmd->smcm_va_err;
++
++		/*
++		 * This can return a CISS_CMD_TARGET_STATUS entry when the
++		 * controller doesn't think a command is outstanding.  It is
++		 * possible we raced, so don't think too much about that case.
++		 * Anything else leaves us between a rock and a hard place, the
++		 * only way out is a reset.
++		 */
++		if (ei->CommandStatus != CISS_CMD_TARGET_STATUS &&
++		    smrt_ctlr_reset(smrt) != 0) {
++			dev_err(smrt->smrt_dip, CE_WARN, "failed to reset  "
++			    "device after receiving an error on the async "
++			    "cancellation command (%d); abandoning "
++			    "smrt_command_t event command at address %p and "
++			    "cancellation command at %p", ei->CommandStatus,
++			    smrt->smrt_event_cmd, smrt->smrt_event_cancel_cmd);
++			smrt->smrt_event_cmd = NULL;
++			smrt->smrt_event_cancel_cmd = NULL;
++			goto free;
++		}
++	}
++
++free:
++	event = smrt->smrt_event_cmd;
++	smrt->smrt_event_cmd = NULL;
++	cancel = smrt->smrt_event_cancel_cmd;
++	smrt->smrt_event_cancel_cmd = NULL;
++	mutex_exit(&smrt->smrt_mutex);
++	if (event != NULL)
++		smrt_command_free(event);
++	if (cancel != NULL)
++		smrt_command_free(cancel);
++	cv_destroy(&smrt->smrt_event_queue);
++}
++
++/*
++ * We've been asked to do a discovery in panic context.  This would have
++ * occurred because there was a device reset.  Because we can't rely on the
++ * target maps, all we can do at the moment is go over all the active targets
++ * and note which ones no longer exist.  If this target was required to dump,
++ * then the dump code will encounter a fatal error.  If not, then we should
++ * count ourselves surprisingly lucky.
++ */
++static void
++smrt_discover_panic_check(smrt_t *smrt)
++{
++	smrt_target_t *smtg;
++
++	ASSERT(MUTEX_HELD(&smrt->smrt_mutex));
++	for (smtg = list_head(&smrt->smrt_targets); smtg != NULL;
++	    smtg = list_next(&smrt->smrt_targets, smtg)) {
++		uint64_t gen;
++
++		if (smtg->smtg_physical) {
++			smrt_physical_t *smpt = smtg->smtg_lun.smtg_phys;
++			/*
++			 * Don't worry about drives that aren't visible.
++			 */
++			if (!smpt->smpt_visible)
++				continue;
++			gen = smpt->smpt_gen;
++		} else {
++			smrt_volume_t *smlv = smtg->smtg_lun.smtg_vol;
++			gen = smlv->smlv_gen;
++		}
++
++		if (gen != smrt->smrt_discover_gen) {
++			dev_err(smrt->smrt_dip, CE_WARN, "target %s "
++			    "disappeared during post-panic discovery",
++			    scsi_device_unit_address(smtg->smtg_scsi_dev));
++			smtg->smtg_gone = B_TRUE;
++		}
++	}
++}
++
++static void
++smrt_discover(void *arg)
++{
++	int log = 0, phys = 0;
++	smrt_t *smrt = arg;
++	uint64_t gen;
++	boolean_t runphys, runvirt;
++
++	mutex_enter(&smrt->smrt_mutex);
++	smrt->smrt_status |= SMRT_CTLR_DISCOVERY_RUNNING;
++	smrt->smrt_status &= ~SMRT_CTLR_DISCOVERY_REQUESTED;
++
++	smrt->smrt_discover_gen++;
++	gen = smrt->smrt_discover_gen;
++	runphys = smrt->smrt_phys_tgtmap != NULL;
++	runvirt = smrt->smrt_virt_tgtmap != NULL;
++	mutex_exit(&smrt->smrt_mutex);
++	if (runphys)
++		phys = smrt_phys_discover(smrt, SMRT_DISCOVER_TIMEOUT, gen);
++	if (runvirt)
++		log = smrt_logvol_discover(smrt, SMRT_DISCOVER_TIMEOUT, gen);
++	mutex_enter(&smrt->smrt_mutex);
++
++	if (phys != 0 || log != 0) {
++		if (!ddi_in_panic()) {
++			smrt->smrt_status |= SMRT_CTLR_DISCOVERY_PERIODIC;
++		} else {
++			panic("smrt_t %p failed to perform discovery after "
++			    "a reset in panic context, unable to continue. "
++			    "logvol: %d, phys: %d", smrt, log, phys);
++		}
++	} else {
++		if (!ddi_in_panic() &&
++		    smrt->smrt_status & SMRT_CTLR_DISCOVERY_REQUIRED) {
++			smrt->smrt_status &= ~SMRT_CTLR_DISCOVERY_REQUIRED;
++			cv_broadcast(&smrt->smrt_cv_finishq);
++		}
++
++		if (ddi_in_panic()) {
++			smrt_discover_panic_check(smrt);
++		}
++	}
++	smrt->smrt_status &= ~SMRT_CTLR_DISCOVERY_RUNNING;
++	if (smrt->smrt_status & SMRT_CTLR_DISCOVERY_REQUESTED)
++		smrt->smrt_status |= SMRT_CTLR_DISCOVERY_PERIODIC;
++	mutex_exit(&smrt->smrt_mutex);
++}
++
++/*
++ * Request discovery, which is always run via a taskq.
++ */
++void
++smrt_discover_request(smrt_t *smrt)
++{
++	boolean_t run;
++	ASSERT(MUTEX_HELD(&smrt->smrt_mutex));
++
++	if (ddi_in_panic()) {
++		smrt_discover(smrt);
++		return;
++	}
++
++	run = (smrt->smrt_status & SMRT_CTLR_DISCOVERY_MASK) == 0;
++	smrt->smrt_status |= SMRT_CTLR_DISCOVERY_REQUESTED;
++	if (run && ddi_taskq_dispatch(smrt->smrt_discover_taskq,
++	    smrt_discover, smrt, DDI_NOSLEEP) != DDI_SUCCESS) {
++		smrt->smrt_status |= SMRT_CTLR_DISCOVERY_PERIODIC;
++		smrt->smrt_stats.smrts_discovery_tq_errors++;
++	}
++}
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c
+index d4b658e0c8..edcbfa65e2 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/scsi/adapters/smrt/smrt.h>
+@@ -58,6 +58,7 @@ smrt_check_command_type(smrt_command_type_t type)
+ 	case SMRT_CMDTYPE_SCSA:
+ 	case SMRT_CMDTYPE_INTERNAL:
+ 	case SMRT_CMDTYPE_PREINIT:
++	case SMRT_CMDTYPE_EVENT:
+ 		return (type);
+ 	}
+ 
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_device.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_device.c
+index b50aff03c1..9e27448b68 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_device.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_device.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/scsi/adapters/smrt/smrt.h>
+@@ -89,6 +89,26 @@ smrt_locate_cfgtbl(smrt_t *smrt, pci_regspec_t *regs, unsigned nregs,
+ 	return (DDI_FAILURE);
+ }
+ 
++/*
++ * Determine the PCI vendor and device ID which is a proxy for which generation
++ * of controller we're working with.
++ */
++static int
++smrt_identify_device(smrt_t *smrt)
++{
++	ddi_acc_handle_t pci_hdl;
++
++	if (pci_config_setup(smrt->smrt_dip, &pci_hdl) != DDI_SUCCESS)
++		return (DDI_FAILURE);
++
++	smrt->smrt_pci_vendor = pci_config_get16(pci_hdl, PCI_CONF_VENID);
++	smrt->smrt_pci_device = pci_config_get16(pci_hdl, PCI_CONF_DEVID);
++
++	pci_config_teardown(&pci_hdl);
++
++	return (DDI_SUCCESS);
++}
++
+ static int
+ smrt_map_device(smrt_t *smrt)
+ {
+@@ -163,6 +183,9 @@ smrt_device_setup(smrt_t *smrt)
+ 		return (DDI_FAILURE);
+ 	}
+ 
++	if (smrt_identify_device(smrt) != DDI_SUCCESS)
++		goto fail;
++
+ 	if (smrt_map_device(smrt) != DDI_SUCCESS) {
+ 		goto fail;
+ 	}
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_hba.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_hba.c
+index ed226de088..2895b73e89 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_hba.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_hba.c
+@@ -10,34 +10,86 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/scsi/adapters/smrt/smrt.h>
+ 
++/*
++ * The controller is not allowed to attach.
++ */
++static int
++smrt_ctrl_tran_tgt_init(dev_info_t *hba_dip, dev_info_t *tgt_dip,
++    scsi_hba_tran_t *hba_tran, struct scsi_device *sd)
++{
++	return (DDI_FAILURE);
++}
++
++/*
++ * The controller is not allowed to send packets.
++ */
++static int
++smrt_ctrl_tran_start(struct scsi_address *sa, struct scsi_pkt *pkt)
++{
++	return (TRAN_BADPKT);
++}
++
+ static boolean_t
+-smrt_device_is_controller(struct scsi_device *sd)
++smrt_logvol_parse(const char *ua, uint_t *targp)
+ {
+-	return (sd->sd_address.a_target == SMRT_CONTROLLER_TARGET &&
+-	    sd->sd_address.a_lun == 0);
++	long targ, lun;
++	const char *comma;
++	char *eptr;
++
++	comma = strchr(ua, ',');
++	if (comma == NULL) {
++		return (B_FALSE);
++	}
++
++	/*
++	 * We expect the target number for a logical unit number to be zero for
++	 * a logical volume.
++	 */
++	if (ddi_strtol(comma + 1, &eptr, 16, &lun) != 0 || *eptr != '\0' ||
++	    lun != 0) {
++		return (B_FALSE);
++	}
++
++	if (ddi_strtol(ua, &eptr, 16, &targ) != 0 || eptr != comma ||
++	    targ < 0 || targ >= SMRT_MAX_LOGDRV) {
++		return (B_FALSE);
++	}
++
++	*targp = (uint_t)targ;
++
++	return (B_TRUE);
+ }
+ 
+ static int
+-smrt_tran_tgt_init(dev_info_t *hba_dip, dev_info_t *tgt_dip,
++smrt_logvol_tran_tgt_init(dev_info_t *hba_dip, dev_info_t *tgt_dip,
+     scsi_hba_tran_t *hba_tran, struct scsi_device *sd)
+ {
+ 	_NOTE(ARGUNUSED(hba_dip))
+ 
+-	smrt_t *smrt = (smrt_t *)hba_tran->tran_hba_private;
+ 	smrt_volume_t *smlv;
+ 	smrt_target_t *smtg;
++	const char *ua;
++	uint_t targ;
++
++	smrt_t *smrt = (smrt_t *)hba_tran->tran_hba_private;
+ 	dev_info_t *dip = smrt->smrt_dip;
+ 
+ 	/*
+-	 * Check to see if new logical volumes are available.
++	 * The unit address comes in the form of 'target,lun'.  We expect the
++	 * lun to be zero.  The target is what we set when we added it to the
++	 * target map earlier.
+ 	 */
+-	if (smrt_logvol_discover(smrt, SMRT_LOGVOL_DISCOVER_TIMEOUT) != 0) {
+-		dev_err(dip, CE_WARN, "discover logical volumes failure");
++	ua = scsi_device_unit_address(sd);
++	if (ua == NULL) {
++		return (DDI_FAILURE);
++	}
++
++	if (!smrt_logvol_parse(ua, &targ)) {
+ 		return (DDI_FAILURE);
+ 	}
+ 
+@@ -60,28 +112,19 @@ smrt_tran_tgt_init(dev_info_t *hba_dip, dev_info_t *tgt_dip,
+ 	}
+ 
+ 	/*
+-	 * Check to see if this is the SCSI address of the pseudo target
+-	 * representing the Smart Array controller itself.
+-	 */
+-	if (smrt_device_is_controller(sd)) {
+-		smtg->smtg_controller_target = B_TRUE;
+-		goto skip_logvol;
+-	}
+-
+-	/*
+-	 * Look for a logical volume for the SCSI address of this target.
++	 * Look for a logical volume for the SCSI unit address of this target.
+ 	 */
+-	if ((smlv = smrt_logvol_lookup_by_addr(smrt, &sd->sd_address)) ==
+-	    NULL) {
++	if ((smlv = smrt_logvol_lookup_by_id(smrt, targ)) == NULL) {
+ 		mutex_exit(&smrt->smrt_mutex);
+ 		kmem_free(smtg, sizeof (*smtg));
+ 		return (DDI_FAILURE);
+ 	}
+ 
+-	smtg->smtg_volume = smlv;
++	smtg->smtg_lun.smtg_vol = smlv;
++	smtg->smtg_addr = &smlv->smlv_addr;
++	smtg->smtg_physical = B_FALSE;
+ 	list_insert_tail(&smlv->smlv_targets, smtg);
+ 
+-skip_logvol:
+ 	/*
+ 	 * Link this target object to the controller:
+ 	 */
+@@ -91,48 +134,144 @@ skip_logvol:
+ 	smtg->smtg_scsi_dev = sd;
+ 	VERIFY(sd->sd_dev == tgt_dip);
+ 
+-	/*
+-	 * We passed SCSI_HBA_TRAN_CLONE to scsi_hba_attach(9F), so we
+-	 * can stash our target-specific data structure on the (cloned)
+-	 * "hba_tran" without affecting the private data pointers of the
+-	 * HBA or of other targets.
+-	 */
+-	hba_tran->tran_tgt_private = smtg;
++	scsi_device_hba_private_set(sd, smtg);
+ 
+ 	mutex_exit(&smrt->smrt_mutex);
+ 	return (DDI_SUCCESS);
+ }
+ 
+ static void
+-smrt_tran_tgt_free(dev_info_t *hba_dip, dev_info_t *tgt_dip,
++smrt_logvol_tran_tgt_free(dev_info_t *hba_dip, dev_info_t *tgt_dip,
+     scsi_hba_tran_t *hba_tran, struct scsi_device *sd)
+ {
+ 	_NOTE(ARGUNUSED(hba_dip, tgt_dip))
+ 
+ 	smrt_t *smrt = (smrt_t *)hba_tran->tran_hba_private;
+-	smrt_target_t *smtg = (smrt_target_t *)hba_tran->tran_tgt_private;
+-	smrt_volume_t *smlv = smtg->smtg_volume;
++	smrt_target_t *smtg = scsi_device_hba_private_get(sd);
++	smrt_volume_t *smlv = smtg->smtg_lun.smtg_vol;
+ 
+ 	VERIFY(smtg->smtg_scsi_dev == sd);
++	VERIFY(smtg->smtg_physical == B_FALSE);
+ 
+ 	mutex_enter(&smrt->smrt_mutex);
++	list_remove(&smlv->smlv_targets, smtg);
++	list_remove(&smrt->smrt_targets, smtg);
++
++	scsi_device_hba_private_set(sd, NULL);
++
++	mutex_exit(&smrt->smrt_mutex);
++
++	kmem_free(smtg, sizeof (*smtg));
++}
++
++static int
++smrt_phys_tran_tgt_init(dev_info_t *hba_dip, dev_info_t *tgt_dip,
++    scsi_hba_tran_t *hba_tran, struct scsi_device *sd)
++{
++	_NOTE(ARGUNUSED(hba_dip))
++
++	smrt_target_t *smtg;
++	smrt_physical_t *smpt;
++	const char *ua, *comma;
++	char *eptr;
++	long lun;
++
++	smrt_t *smrt = (smrt_t *)hba_tran->tran_hba_private;
++	dev_info_t *dip = smrt->smrt_dip;
+ 
+ 	/*
+-	 * Remove this target from the tracking lists:
++	 * The unit address comes in the form of 'target,lun'.  We expect the
++	 * lun to be zero.  The target is what we set when we added it to the
++	 * target map earlier.
+ 	 */
+-	if (!smtg->smtg_controller_target) {
+-		list_remove(&smlv->smlv_targets, smtg);
++	ua = scsi_device_unit_address(sd);
++	if (ua == NULL)
++		return (DDI_FAILURE);
++
++	comma = strchr(ua, ',');
++	if (comma == NULL) {
++		return (DDI_FAILURE);
++	}
++
++	/*
++	 * Confirm the LUN is zero.  We may want to instead check the scsi
++	 * 'lun'/'lun64' property or do so in addition to this logic.
++	 */
++	if (ddi_strtol(comma + 1, &eptr, 16, &lun) != 0 || *eptr != '\0' ||
++	    lun != 0) {
++		return (DDI_FAILURE);
++	}
++
++	if ((smtg = kmem_zalloc(sizeof (*smtg), KM_NOSLEEP)) == NULL) {
++		dev_err(dip, CE_WARN, "could not allocate target object "
++		    "due to memory exhaustion");
++		return (DDI_FAILURE);
+ 	}
+-	list_remove(&smrt->smrt_targets, smtg);
++
++	mutex_enter(&smrt->smrt_mutex);
++
++	if (smrt->smrt_status & SMRT_CTLR_STATUS_DETACHING) {
++		/*
++		 * We are detaching.  Do not accept any more requests to
++		 * attach targets from the framework.
++		 */
++		mutex_exit(&smrt->smrt_mutex);
++		kmem_free(smtg, sizeof (*smtg));
++		return (DDI_FAILURE);
++	}
++
++
++	/*
++	 * Look for a physical target based on the unit address of the target
++	 * (which will encode its WWN and LUN).
++	 */
++	smpt = smrt_phys_lookup_by_ua(smrt, ua);
++	if (smpt == NULL) {
++		mutex_exit(&smrt->smrt_mutex);
++		kmem_free(smtg, sizeof (*smtg));
++		return (DDI_FAILURE);
++	}
++
++	smtg->smtg_scsi_dev = sd;
++	smtg->smtg_physical = B_TRUE;
++	smtg->smtg_lun.smtg_phys = smpt;
++	list_insert_tail(&smpt->smpt_targets, smtg);
++	smtg->smtg_addr = &smpt->smpt_addr;
+ 
+ 	/*
+-	 * Clear the target-specific private data pointer; see comments
+-	 * in smrt_tran_tgt_init() above.
++	 * Link this target object to the controller:
+ 	 */
+-	hba_tran->tran_tgt_private = NULL;
++	smtg->smtg_ctlr = smrt;
++	list_insert_tail(&smrt->smrt_targets, smtg);
+ 
++	VERIFY(sd->sd_dev == tgt_dip);
++	smtg->smtg_scsi_dev = sd;
++
++	scsi_device_hba_private_set(sd, smtg);
+ 	mutex_exit(&smrt->smrt_mutex);
+ 
++	return (DDI_SUCCESS);
++}
++
++static void
++smrt_phys_tran_tgt_free(dev_info_t *hba_dip, dev_info_t *tgt_dip,
++    scsi_hba_tran_t *hba_tran, struct scsi_device *sd)
++{
++	_NOTE(ARGUNUSED(hba_dip, tgt_dip))
++
++	smrt_t *smrt = (smrt_t *)hba_tran->tran_hba_private;
++	smrt_target_t *smtg = scsi_device_hba_private_get(sd);
++	smrt_physical_t *smpt = smtg->smtg_lun.smtg_phys;
++
++	VERIFY(smtg->smtg_scsi_dev == sd);
++	VERIFY(smtg->smtg_physical == B_TRUE);
++
++	mutex_enter(&smrt->smrt_mutex);
++	list_remove(&smpt->smpt_targets, smtg);
++	list_remove(&smrt->smrt_targets, smtg);
++
++	scsi_device_hba_private_set(sd, NULL);
++	mutex_exit(&smrt->smrt_mutex);
+ 	kmem_free(smtg, sizeof (*smtg));
+ }
+ 
+@@ -153,14 +292,21 @@ smrt_tran_setup_pkt(struct scsi_pkt *pkt, int (*callback)(caddr_t),
+ {
+ 	_NOTE(ARGUNUSED(arg))
+ 
+-	scsi_hba_tran_t *tran = pkt->pkt_address.a_hba_tran;
+-	smrt_t *smrt = (smrt_t *)tran->tran_hba_private;
+-	smrt_target_t *smtg = (smrt_target_t *)tran->tran_tgt_private;
+-	smrt_command_scsa_t *smcms = (smrt_command_scsa_t *)
+-	    pkt->pkt_ha_private;
++	struct scsi_device *sd;
++	smrt_target_t *smtg;
++	smrt_t *smrt;
+ 	smrt_command_t *smcm;
++	smrt_command_scsa_t *smcms;
+ 	int kmflags = callback == SLEEP_FUNC ? KM_SLEEP : KM_NOSLEEP;
+ 
++	sd = scsi_address_device(&pkt->pkt_address);
++	VERIFY(sd != NULL);
++	smtg = scsi_device_hba_private_get(sd);
++	VERIFY(smtg != NULL);
++	smrt = smtg->smtg_ctlr;
++	VERIFY(smrt != NULL);
++	smcms = (smrt_command_scsa_t *)pkt->pkt_ha_private;
++
+ 	/*
+ 	 * Check that we have enough space in the command object for the
+ 	 * request from the target driver:
+@@ -241,18 +387,80 @@ smrt_set_arq_data(struct scsi_pkt *pkt, uchar_t key)
+ 	pkt->pkt_state |= STATE_ARQ_DONE;
+ }
+ 
++/*
++ * When faking up a REPORT LUNS data structure, we simply report one LUN, LUN 0.
++ * We need 16 bytes for this, 4 for the size, 4 reserved bytes, and the 8 for
++ * the actual LUN.
++ */
++static void
++smrt_fake_report_lun(smrt_command_t *smcm, struct scsi_pkt *pkt)
++{
++	size_t sz;
++	char resp[16];
++	struct buf *bp;
++
++	pkt->pkt_reason = CMD_CMPLT;
++	pkt->pkt_state |= STATE_GOT_BUS | STATE_GOT_TARGET | STATE_SENT_CMD |
++	    STATE_GOT_STATUS;
++
++	/*
++	 * Check to make sure this is valid.  If reserved bits are set or if the
++	 * mode is one other than 0x00, 0x01, 0x02, then it's an illegal
++	 * request.
++	 */
++	if (pkt->pkt_cdbp[1] != 0 || pkt->pkt_cdbp[3] != 0 ||
++	    pkt->pkt_cdbp[4] != 0 || pkt->pkt_cdbp[5] != 0 ||
++	    pkt->pkt_cdbp[10] != 0 || pkt->pkt_cdbp[11] != 0 ||
++	    pkt->pkt_cdbp[2] > 0x2) {
++		smrt_set_arq_data(pkt, KEY_ILLEGAL_REQUEST);
++		return;
++	}
++
++	/*
++	 * Construct the actual REPORT LUNS reply.  We need to indicate a single
++	 * LUN of all zeros.  This means that the length needs to be 8 bytes,
++	 * the size of the lun.  Otherwise, the rest of this structure can be
++	 * zeros.
++	 */
++	bzero(resp, sizeof (resp));
++	resp[3] = sizeof (scsi_lun_t);
++
++	bp = scsi_pkt2bp(pkt);
++	sz = MIN(sizeof (resp), bp->b_bcount);
++
++	bp_mapin(bp);
++	bcopy(resp, bp->b_un.b_addr, sz);
++	bp_mapout(bp);
++	pkt->pkt_state |= STATE_XFERRED_DATA;
++	pkt->pkt_resid = bp->b_bcount - sz;
++	if (pkt->pkt_scblen >= 1) {
++		pkt->pkt_scbp[0] = STATUS_GOOD;
++	}
++}
++
+ static int
+ smrt_tran_start(struct scsi_address *sa, struct scsi_pkt *pkt)
+ {
+ 	_NOTE(ARGUNUSED(sa))
+ 
+-	scsi_hba_tran_t *tran = pkt->pkt_address.a_hba_tran;
+-	smrt_t *smrt = (smrt_t *)tran->tran_hba_private;
+-	smrt_command_scsa_t *smcms = (smrt_command_scsa_t *)
+-	    pkt->pkt_ha_private;
+-	smrt_command_t *smcm = smcms->smcms_command;
++	struct scsi_device *sd;
++	smrt_target_t *smtg;
++	smrt_t *smrt;
++	smrt_command_scsa_t *smcms;
++	smrt_command_t *smcm;
+ 	int r;
+ 
++	sd = scsi_address_device(&pkt->pkt_address);
++	VERIFY(sd != NULL);
++	smtg = scsi_device_hba_private_get(sd);
++	VERIFY(smtg != NULL);
++	smrt = smtg->smtg_ctlr;
++	VERIFY(smrt != NULL);
++	smcms = (smrt_command_scsa_t *)pkt->pkt_ha_private;
++	VERIFY(smcms != NULL);
++	smcm = smcms->smcms_command;
++	VERIFY(smcm != NULL);
++
+ 	if (smcm->smcm_status & SMRT_CMD_STATUS_TRAN_START) {
+ 		/*
+ 		 * This is a retry of a command that has already been
+@@ -273,6 +481,10 @@ smrt_tran_start(struct scsi_address *sa, struct scsi_pkt *pkt)
+ 	case SCMD_LOG_SENSE_G1:
+ 	case SCMD_MODE_SELECT:
+ 	case SCMD_PERSISTENT_RESERVE_IN:
++		if (smtg->smtg_physical) {
++			break;
++		}
++
+ 		smrt->smrt_stats.smrts_ignored_scsi_cmds++;
+ 		smcm->smcm_status |= SMRT_CMD_STATUS_TRAN_IGNORED;
+ 
+@@ -291,6 +503,22 @@ smrt_tran_start(struct scsi_address *sa, struct scsi_pkt *pkt)
+ 
+ 		scsi_hba_pkt_comp(pkt);
+ 		return (TRAN_ACCEPT);
++	case SCMD_REPORT_LUNS:
++		/*
++		 * The SMRT controller does not accept a REPORT LUNS command for
++		 * logical volumes.  As such, we need to fake up a REPORT LUNS
++		 * response that has a single LUN, LUN 0.
++		 */
++		if (smtg->smtg_physical) {
++			break;
++		}
++
++		smrt_fake_report_lun(smcm, pkt);
++
++		scsi_hba_pkt_comp(pkt);
++		return (TRAN_ACCEPT);
++	default:
++		break;
+ 	}
+ 
+ 	if (pkt->pkt_flags & FLAG_NOINTR) {
+@@ -322,27 +550,17 @@ smrt_tran_start(struct scsi_address *sa, struct scsi_pkt *pkt)
+ 		    LE_32(pkt->pkt_cookies[i].dmac_size);
+ 	}
+ 
+-	if (smcm->smcm_target->smtg_controller_target) {
+-		/*
+-		 * The controller is, according to the CISS Specification,
+-		 * always LUN 0 in the peripheral device addressing mode.
+-		 */
+-		smrt_write_lun_addr_phys(&smcm->smcm_va_cmd->Header.LUN,
+-		    B_TRUE, 0, 0);
+-	} else {
+-		/*
+-		 * Copy logical volume address from the target object:
+-		 */
+-		smcm->smcm_va_cmd->Header.LUN.LogDev = smcm->smcm_target->
+-		    smtg_volume->smlv_addr;
+-	}
++	/*
++	 * Copy logical volume address from the target object:
++	 */
++	smcm->smcm_va_cmd->Header.LUN = *smcm->smcm_target->smtg_addr;
+ 
+ 	/*
+ 	 * Initialise the command block.
+ 	 */
+ 	smcm->smcm_va_cmd->Request.CDBLen = pkt->pkt_cdblen;
+ 	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
+-	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_ORDERED;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_SIMPLE;
+ 	smcm->smcm_va_cmd->Request.Timeout = LE_16(pkt->pkt_time);
+ 	if (pkt->pkt_numcookies > 0) {
+ 		/*
+@@ -388,6 +606,23 @@ smrt_tran_start(struct scsi_address *sa, struct scsi_pkt *pkt)
+ 	 * Submit the command to the controller.
+ 	 */
+ 	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * If we're dumping, there's a chance that the target we're talking to
++	 * could have ended up disappearing during the process of discovery.  If
++	 * this target is part of the dump device, we check here and return that
++	 * we hit a fatal error.
++	 */
++	if (ddi_in_panic() && smtg->smtg_gone) {
++		mutex_exit(&smrt->smrt_mutex);
++
++		dev_err(smrt->smrt_dip, CE_WARN, "smrt_submit failed: target "
++		    "%s is gone, it did not come back after post-panic reset "
++		    "device discovery", scsi_device_unit_address(sd));
++
++		return (TRAN_FATAL_ERROR);
++	}
++
+ 	smrt->smrt_stats.smrts_tran_starts++;
+ 	if ((r = smrt_submit(smrt, smcm)) != 0) {
+ 		mutex_exit(&smrt->smrt_mutex);
+@@ -427,10 +662,17 @@ smrt_tran_reset(struct scsi_address *sa, int level)
+ {
+ 	_NOTE(ARGUNUSED(level))
+ 
+-	scsi_hba_tran_t *tran = sa->a_hba_tran;
+-	smrt_t *smrt = (smrt_t *)tran->tran_hba_private;
+-	int r;
++	struct scsi_device *sd;
++	smrt_target_t *smtg;
++	smrt_t *smrt;
+ 	smrt_command_t *smcm;
++	int r;
++
++	sd = scsi_address_device(sa);
++	VERIFY(sd != NULL);
++	smtg = scsi_device_hba_private_get(sd);
++	VERIFY(smtg != NULL);
++	smrt = smtg->smtg_ctlr;
+ 
+ 	/*
+ 	 * The framework has requested some kind of SCSI reset.  A
+@@ -549,11 +791,20 @@ skip_check:
+ static int
+ smrt_tran_abort(struct scsi_address *sa, struct scsi_pkt *pkt)
+ {
+-	scsi_hba_tran_t *tran = sa->a_hba_tran;
+-	smrt_t *smrt = (smrt_t *)tran->tran_hba_private;
++	struct scsi_device *sd;
++	smrt_target_t *smtg;
++	smrt_t *smrt;
+ 	smrt_command_t *smcm = NULL;
+ 	smrt_command_t *abort_smcm;
+ 
++	sd = scsi_address_device(sa);
++	VERIFY(sd != NULL);
++	smtg = scsi_device_hba_private_get(sd);
++	VERIFY(smtg != NULL);
++	smrt = smtg->smtg_ctlr;
++	VERIFY(smrt != NULL);
++
++
+ 	if ((abort_smcm = smrt_command_alloc(smrt, SMRT_CMDTYPE_INTERNAL,
+ 	    KM_NOSLEEP)) == NULL) {
+ 		/*
+@@ -594,19 +845,7 @@ smrt_tran_abort(struct scsi_address *sa, struct scsi_pkt *pkt)
+ 		 * The framework wants us to abort every in flight command
+ 		 * for the target with this address.
+ 		 */
+-		smrt_target_t *smtg = (smrt_target_t *)tran->
+-		    tran_tgt_private;
+-
+-		if (smtg->smtg_volume == NULL) {
+-			/*
+-			 * We currently do not support sending an abort
+-			 * to anything but a Logical Volume.
+-			 */
+-			goto fail;
+-		}
+-
+-		smrt_write_message_abort_all(abort_smcm,
+-		    &smtg->smtg_volume->smlv_addr);
++		smrt_write_message_abort_all(abort_smcm, smtg->smtg_addr);
+ 	}
+ 
+ 	/*
+@@ -913,10 +1152,18 @@ smrt_getcap(struct scsi_address *sa, char *cap, int whom)
+ {
+ 	_NOTE(ARGUNUSED(whom))
+ 
+-	scsi_hba_tran_t *tran = sa->a_hba_tran;
+-	smrt_t *smrt = (smrt_t *)tran->tran_hba_private;
++	struct scsi_device *sd;
++	smrt_target_t *smtg;
++	smrt_t *smrt;
+ 	int index;
+ 
++	sd = scsi_address_device(sa);
++	VERIFY(sd != NULL);
++	smtg = scsi_device_hba_private_get(sd);
++	VERIFY(smtg != NULL);
++	smrt = smtg->smtg_ctlr;
++	VERIFY(smrt != NULL);
++
+ 	if ((index = scsi_hba_lookup_capstr(cap)) == DDI_FAILURE) {
+ 		/*
+ 		 * This capability string could not be translated to an
+@@ -945,8 +1192,21 @@ smrt_getcap(struct scsi_address *sa, char *cap, int whom)
+ 		}
+ 		return ((int)smrt->smrt_dma_attr.dma_attr_granular);
+ 
+-	case SCSI_CAP_INITIATOR_ID:
+-		return (SMRT_CONTROLLER_TARGET);
++	/*
++	 * If this target corresponds to a physical device, then we always
++	 * indicate that we're on a SAS interconnect.  Otherwise, we default to
++	 * saying that we're on a prallelbus.  We can't use SAS for everything,
++	 * unfortunately.  When you declare yourself to be a SAS interconnect,
++	 * it's expected that you have a full 16-byte WWN as the target.  If
++	 * not, devfsadm will not be able to enumerate the device and create
++	 * /dev/[r]dsk entries.
++	 */
++	case SCSI_CAP_INTERCONNECT_TYPE:
++		if (smtg->smtg_physical) {
++			return (INTERCONNECT_SAS);
++		} else {
++			return (INTERCONNECT_PARALLEL);
++		}
+ 
+ 	case SCSI_CAP_DISCONNECT:
+ 	case SCSI_CAP_SYNCHRONOUS:
+@@ -960,9 +1220,10 @@ smrt_getcap(struct scsi_address *sa, char *cap, int whom)
+ 		 */
+ 		return (1);
+ 
++	case SCSI_CAP_INITIATOR_ID:
+ 	case SCSI_CAP_RESET_NOTIFICATION:
+ 		/*
+-		 * This capability is not supported.
++		 * These capabilities are not supported.
+ 		 */
+ 		return (0);
+ 
+@@ -1009,6 +1270,7 @@ smrt_setcap(struct scsi_address *sa, char *cap, int value, int whom)
+ 	case SCSI_CAP_UNTAGGED_QING:
+ 	case SCSI_CAP_TAGGED_QING:
+ 	case SCSI_CAP_RESET_NOTIFICATION:
++	case SCSI_CAP_INTERCONNECT_TYPE:
+ 		/*
+ 		 * We do not support changing any capabilities at this time.
+ 		 */
+@@ -1023,8 +1285,9 @@ smrt_setcap(struct scsi_address *sa, char *cap, int value, int whom)
+ }
+ 
+ int
+-smrt_hba_setup(smrt_t *smrt)
++smrt_ctrl_hba_setup(smrt_t *smrt)
+ {
++	int flags;
+ 	dev_info_t *dip = smrt->smrt_dip;
+ 	scsi_hba_tran_t *tran;
+ 
+@@ -1036,13 +1299,10 @@ smrt_hba_setup(smrt_t *smrt)
+ 	smrt->smrt_hba_tran = tran;
+ 	tran->tran_hba_private = smrt;
+ 
+-	tran->tran_tgt_init = smrt_tran_tgt_init;
++	tran->tran_tgt_init = smrt_ctrl_tran_tgt_init;
+ 	tran->tran_tgt_probe = scsi_hba_probe;
+-	tran->tran_tgt_free = smrt_tran_tgt_free;
+ 
+-	tran->tran_start = smrt_tran_start;
+-	tran->tran_reset = smrt_tran_reset;
+-	tran->tran_abort = smrt_tran_abort;
++	tran->tran_start = smrt_ctrl_tran_start;
+ 
+ 	tran->tran_getcap = smrt_getcap;
+ 	tran->tran_setcap = smrt_setcap;
+@@ -1050,9 +1310,11 @@ smrt_hba_setup(smrt_t *smrt)
+ 	tran->tran_setup_pkt = smrt_tran_setup_pkt;
+ 	tran->tran_teardown_pkt = smrt_tran_teardown_pkt;
+ 	tran->tran_hba_len = sizeof (smrt_command_scsa_t);
++	tran->tran_interconnect_type = INTERCONNECT_SAS;
+ 
+-	if (scsi_hba_attach_setup(dip, &smrt->smrt_dma_attr, tran,
+-	    SCSI_HBA_TRAN_CLONE | SCSI_HBA_TRAN_SCB) != DDI_SUCCESS) {
++	flags = SCSI_HBA_HBA | SCSI_HBA_TRAN_SCB | SCSI_HBA_ADDR_COMPLEX;
++	if (scsi_hba_attach_setup(dip, &smrt->smrt_dma_attr, tran, flags) !=
++	    DDI_SUCCESS) {
+ 		dev_err(dip, CE_WARN, "could not attach to SCSA framework");
+ 		scsi_hba_tran_free(tran);
+ 		return (DDI_FAILURE);
+@@ -1063,7 +1325,7 @@ smrt_hba_setup(smrt_t *smrt)
+ }
+ 
+ void
+-smrt_hba_teardown(smrt_t *smrt)
++smrt_ctrl_hba_teardown(smrt_t *smrt)
+ {
+ 	if (smrt->smrt_init_level & SMRT_INITLEVEL_SCSA) {
+ 		VERIFY(scsi_hba_detach(smrt->smrt_dip) != DDI_FAILURE);
+@@ -1071,3 +1333,125 @@ smrt_hba_teardown(smrt_t *smrt)
+ 		smrt->smrt_init_level &= ~SMRT_INITLEVEL_SCSA;
+ 	}
+ }
++
++int
++smrt_logvol_hba_setup(smrt_t *smrt, dev_info_t *iport)
++{
++	scsi_hba_tran_t *tran;
++
++	tran = ddi_get_driver_private(iport);
++	if (tran == NULL)
++		return (DDI_FAILURE);
++
++	tran->tran_tgt_init = smrt_logvol_tran_tgt_init;
++	tran->tran_tgt_free = smrt_logvol_tran_tgt_free;
++
++	tran->tran_start = smrt_tran_start;
++	tran->tran_reset = smrt_tran_reset;
++	tran->tran_abort = smrt_tran_abort;
++
++	tran->tran_hba_private = smrt;
++
++	mutex_enter(&smrt->smrt_mutex);
++	if (scsi_hba_tgtmap_create(iport, SCSI_TM_FULLSET, MICROSEC,
++	    2 * MICROSEC, smrt, smrt_logvol_tgtmap_activate,
++	    smrt_logvol_tgtmap_deactivate, &smrt->smrt_virt_tgtmap) !=
++	    DDI_SUCCESS) {
++		return (DDI_FAILURE);
++	}
++
++	smrt_discover_request(smrt);
++	mutex_exit(&smrt->smrt_mutex);
++
++	return (DDI_SUCCESS);
++}
++
++void
++smrt_logvol_hba_teardown(smrt_t *smrt, dev_info_t *iport)
++{
++	ASSERT(smrt->smrt_virt_iport == iport);
++
++	mutex_enter(&smrt->smrt_mutex);
++
++	if (smrt->smrt_virt_tgtmap != NULL) {
++		scsi_hba_tgtmap_t *t;
++
++		/*
++		 * Ensure that we can't be racing with discovery.
++		 */
++		while (smrt->smrt_status & SMRT_CTLR_DISCOVERY_RUNNING) {
++			mutex_exit(&smrt->smrt_mutex);
++			ddi_taskq_wait(smrt->smrt_discover_taskq);
++			mutex_enter(&smrt->smrt_mutex);
++		}
++
++		t = smrt->smrt_virt_tgtmap;
++		smrt->smrt_virt_tgtmap = NULL;
++		mutex_exit(&smrt->smrt_mutex);
++		scsi_hba_tgtmap_destroy(t);
++		mutex_enter(&smrt->smrt_mutex);
++	}
++
++	mutex_exit(&smrt->smrt_mutex);
++}
++
++int
++smrt_phys_hba_setup(smrt_t *smrt, dev_info_t *iport)
++{
++	scsi_hba_tran_t *tran;
++
++	tran = ddi_get_driver_private(iport);
++	if (tran == NULL)
++		return (DDI_FAILURE);
++
++	tran->tran_tgt_init = smrt_phys_tran_tgt_init;
++	tran->tran_tgt_free = smrt_phys_tran_tgt_free;
++
++	tran->tran_start = smrt_tran_start;
++	tran->tran_reset = smrt_tran_reset;
++	tran->tran_abort = smrt_tran_abort;
++
++	tran->tran_hba_private = smrt;
++
++	mutex_enter(&smrt->smrt_mutex);
++	if (scsi_hba_tgtmap_create(iport, SCSI_TM_FULLSET, MICROSEC,
++	    2 * MICROSEC, smrt, smrt_phys_tgtmap_activate,
++	    smrt_phys_tgtmap_deactivate, &smrt->smrt_phys_tgtmap) !=
++	    DDI_SUCCESS) {
++		return (DDI_FAILURE);
++	}
++
++	smrt_discover_request(smrt);
++	mutex_exit(&smrt->smrt_mutex);
++
++	return (DDI_SUCCESS);
++}
++
++void
++smrt_phys_hba_teardown(smrt_t *smrt, dev_info_t *iport)
++{
++	ASSERT(smrt->smrt_phys_iport == iport);
++
++	mutex_enter(&smrt->smrt_mutex);
++
++	if (smrt->smrt_phys_tgtmap != NULL) {
++		scsi_hba_tgtmap_t *t;
++
++		/*
++		 * Ensure that we can't be racing with discovery.
++		 */
++		while (smrt->smrt_status & SMRT_CTLR_DISCOVERY_RUNNING) {
++			mutex_exit(&smrt->smrt_mutex);
++			ddi_taskq_wait(smrt->smrt_discover_taskq);
++			mutex_enter(&smrt->smrt_mutex);
++		}
++
++		t = smrt->smrt_phys_tgtmap;
++		smrt->smrt_phys_tgtmap = NULL;
++		mutex_exit(&smrt->smrt_mutex);
++		scsi_hba_tgtmap_destroy(t);
++		mutex_enter(&smrt->smrt_mutex);
++	}
++
++	mutex_exit(&smrt->smrt_mutex);
++}
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c
+index 9e1ee9c2cd..18d5b8e936 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/scsi/adapters/smrt/smrt.h>
+@@ -35,6 +35,16 @@ smrt_try_msix(smrt_t *smrt)
+ {
+ 	char *fwver = smrt->smrt_versions.smrtv_firmware_rev;
+ 
++	/*
++	 * Generation 9 controllers end up having a different firmware
++	 * versioning scheme than others.  If this is a generation 9 controller,
++	 * which all share the same PCI device ID, then we default to MSI.
++	 */
++	if (smrt->smrt_pci_vendor == SMRT_VENDOR_HP &&
++	    smrt->smrt_pci_device == SMRT_DEVICE_GEN9) {
++		return (B_FALSE);
++	}
++
+ 	if (fwver[0] == '8' && fwver[1] == '.' && isdigit(fwver[2]) &&
+ 	    isdigit(fwver[3])) {
+ 		/*
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c
+index 449280d3ca..05963ac2e2 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c
+@@ -10,19 +10,32 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/scsi/adapters/smrt/smrt.h>
+ 
++static void
++smrt_logvol_free(smrt_volume_t *smlv)
++{
++	/*
++	 * By this stage of teardown, all of the SCSI target drivers
++	 * must have been detached from this logical volume.
++	 */
++	VERIFY(list_is_empty(&smlv->smlv_targets));
++	list_destroy(&smlv->smlv_targets);
++
++	kmem_free(smlv, sizeof (*smlv));
++}
++
+ smrt_volume_t *
+-smrt_logvol_lookup_by_id(smrt_t *smrt, unsigned id)
++smrt_logvol_lookup_by_id(smrt_t *smrt, unsigned long id)
+ {
+ 	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
+ 
+ 	for (smrt_volume_t *smlv = list_head(&smrt->smrt_volumes);
+ 	    smlv != NULL; smlv = list_next(&smrt->smrt_volumes, smlv)) {
+-		if (smlv->smlv_addr.VolId == id) {
++		if (smlv->smlv_addr.LogDev.VolId == id) {
+ 			return (smlv);
+ 		}
+ 	}
+@@ -30,82 +43,81 @@ smrt_logvol_lookup_by_id(smrt_t *smrt, unsigned id)
+ 	return (NULL);
+ }
+ 
+-smrt_volume_t *
+-smrt_logvol_lookup_by_addr(smrt_t *smrt, struct scsi_address *sa)
+-{
+-	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
+-
+-	/*
+-	 * As outlined in scsi_address(9S), a SCSI target device is described
+-	 * by an address in two parts: the target ID, and a logical unit
+-	 * number.  Logical volumes are essentially a simple, single-unit SCSI
+-	 * "device", which for our purposes is only available on logical unit
+-	 * number 0.
+-	 */
+-	if (sa->a_lun != 0) {
+-		return (NULL);
+-	}
+-
+-	return (smrt_logvol_lookup_by_id(smrt, sa->a_target));
+-}
+-
+ static int
+-smrt_read_logvols(smrt_t *smrt, smrt_report_logical_lun_t *smrll)
++smrt_read_logvols(smrt_t *smrt, smrt_report_logical_lun_t *smrll, uint64_t gen)
+ {
+ 	smrt_report_logical_lun_ent_t *ents = smrll->smrll_data.ents;
+ 	uint32_t count = BE_32(smrll->smrll_datasize) /
+ 	    sizeof (smrt_report_logical_lun_ent_t);
+ 
++	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
++
+ 	if (count > SMRT_MAX_LOGDRV) {
+ 		count = SMRT_MAX_LOGDRV;
+ 	}
+ 
+ 	for (unsigned i = 0; i < count; i++) {
+ 		smrt_volume_t *smlv;
++		char id[SCSI_MAXNAMELEN];
+ 
+ 		DTRACE_PROBE2(read_logvol, unsigned, i,
+ 		    smrt_report_logical_lun_ent_t *, &ents[i]);
+ 
+ 		if ((smlv = smrt_logvol_lookup_by_id(smrt,
+-		    ents[i].smrle_addr.VolId)) != NULL) {
+-			continue;
++		    ents[i].smrle_addr.VolId)) == NULL) {
++
++			/*
++			 * This is a new Logical Volume, so add it the the list.
++			 */
++			if ((smlv = kmem_zalloc(sizeof (*smlv), KM_NOSLEEP)) ==
++			    NULL) {
++				return (ENOMEM);
++			}
++
++			list_create(&smlv->smlv_targets,
++			    sizeof (smrt_target_t),
++			    offsetof(smrt_target_t, smtg_link_lun));
++
++			smlv->smlv_ctlr = smrt;
++			list_insert_tail(&smrt->smrt_volumes, smlv);
+ 		}
+ 
+ 		/*
+-		 * This is a new Logical Volume, so add it the the list.
++		 * Always make sure that the address and the generation are up
++		 * to date, regardless of where this came from.
+ 		 */
+-		if ((smlv = kmem_zalloc(sizeof (*smlv), KM_NOSLEEP)) ==
+-		    NULL) {
+-			return (ENOMEM);
++		smlv->smlv_addr.LogDev = ents[i].smrle_addr;
++		smlv->smlv_gen = gen;
++		(void) snprintf(id, sizeof (id), "%x",
++		    smlv->smlv_addr.LogDev.VolId);
++		if (!ddi_in_panic() &&
++		    scsi_hba_tgtmap_set_add(smrt->smrt_virt_tgtmap,
++		    SCSI_TGT_SCSI_DEVICE, id, NULL) != DDI_SUCCESS) {
++			return (EIO);
+ 		}
+-
+-		smlv->smlv_addr = ents[i].smrle_addr;
+-
+-		list_create(&smlv->smlv_targets,
+-		    sizeof (smrt_target_t),
+-		    offsetof(smrt_target_t, smtg_link_volume));
+-
+-		smlv->smlv_ctlr = smrt;
+-		list_insert_tail(&smrt->smrt_volumes, smlv);
+ 	}
+ 
+ 	return (0);
+ }
+ 
+ static int
+-smrt_read_logvols_ext(smrt_t *smrt, smrt_report_logical_lun_t *smrll)
++smrt_read_logvols_ext(smrt_t *smrt, smrt_report_logical_lun_t *smrll,
++    uint64_t gen)
+ {
+ 	smrt_report_logical_lun_extent_t *extents =
+ 	    smrll->smrll_data.extents;
+ 	uint32_t count = BE_32(smrll->smrll_datasize) /
+ 	    sizeof (smrt_report_logical_lun_extent_t);
+ 
++	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
++
+ 	if (count > SMRT_MAX_LOGDRV) {
+ 		count = SMRT_MAX_LOGDRV;
+ 	}
+ 
+ 	for (unsigned i = 0; i < count; i++) {
+ 		smrt_volume_t *smlv;
++		char id[SCSI_MAXNAMELEN];
+ 
+ 		DTRACE_PROBE2(read_logvol_ext, unsigned, i,
+ 		    smrt_report_logical_lun_extent_t *, &extents[i]);
+@@ -118,28 +130,39 @@ smrt_read_logvols_ext(smrt_t *smrt, smrt_report_logical_lun_t *smrll)
+ 				dev_err(smrt->smrt_dip, CE_PANIC, "logical "
+ 				    "volume %u WWN changed unexpectedly", i);
+ 			}
+-			continue;
++		} else {
++			/*
++			 * This is a new Logical Volume, so add it the the list.
++			 */
++			if ((smlv = kmem_zalloc(sizeof (*smlv), KM_NOSLEEP)) ==
++			    NULL) {
++				return (ENOMEM);
++			}
++
++			bcopy(extents[i].smrle_wwn, smlv->smlv_wwn, 16);
++			smlv->smlv_flags |= SMRT_VOL_FLAG_WWN;
++
++			list_create(&smlv->smlv_targets,
++			    sizeof (smrt_target_t),
++			    offsetof(smrt_target_t, smtg_link_lun));
++
++			smlv->smlv_ctlr = smrt;
++			list_insert_tail(&smrt->smrt_volumes, smlv);
+ 		}
+ 
+ 		/*
+-		 * This is a new Logical Volume, so add it the the list.
++		 * Always make sure that the address and the generation are up
++		 * to date.  The address may have changed on a reset.
+ 		 */
+-		if ((smlv = kmem_zalloc(sizeof (*smlv), KM_NOSLEEP)) ==
+-		    NULL) {
+-			return (ENOMEM);
++		smlv->smlv_addr.LogDev = extents[i].smrle_addr;
++		smlv->smlv_gen = gen;
++		(void) snprintf(id, sizeof (id), "%x",
++		    smlv->smlv_addr.LogDev.VolId);
++		if (!ddi_in_panic() &&
++		    scsi_hba_tgtmap_set_add(smrt->smrt_virt_tgtmap,
++		    SCSI_TGT_SCSI_DEVICE, id, NULL) != DDI_SUCCESS) {
++			return (EIO);
+ 		}
+-
+-		smlv->smlv_addr = extents[i].smrle_addr;
+-
+-		bcopy(extents[i].smrle_wwn, smlv->smlv_wwn, 16);
+-		smlv->smlv_flags |= SMRT_VOL_FLAG_WWN;
+-
+-		list_create(&smlv->smlv_targets,
+-		    sizeof (smrt_target_t),
+-		    offsetof(smrt_target_t, smtg_link_volume));
+-
+-		smlv->smlv_ctlr = smrt;
+-		list_insert_tail(&smrt->smrt_volumes, smlv);
+ 	}
+ 
+ 	return (0);
+@@ -150,36 +173,13 @@ smrt_read_logvols_ext(smrt_t *smrt, smrt_report_logical_lun_t *smrll)
+  * controller.
+  */
+ int
+-smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
++smrt_logvol_discover(smrt_t *smrt, uint16_t timeout, uint64_t gen)
+ {
+ 	smrt_command_t *smcm;
+ 	smrt_report_logical_lun_t *smrll;
+ 	smrt_report_logical_lun_req_t smrllr = { 0 };
+ 	int r;
+ 
+-	if (!ddi_in_panic()) {
+-		mutex_enter(&smrt->smrt_mutex);
+-		while (smrt->smrt_status & SMRT_CTLR_STATUS_DISCOVERY) {
+-			/*
+-			 * A discovery is already occuring.  Wait for
+-			 * completion.
+-			 */
+-			cv_wait(&smrt->smrt_cv_finishq, &smrt->smrt_mutex);
+-		}
+-
+-		if (gethrtime() < smrt->smrt_last_discovery + 5 * NANOSEC) {
+-			/*
+-			 * A discovery completed successfully within the
+-			 * last five seconds.  Just use the existing data.
+-			 */
+-			mutex_exit(&smrt->smrt_mutex);
+-			return (0);
+-		}
+-
+-		smrt->smrt_status |= SMRT_CTLR_STATUS_DISCOVERY;
+-		mutex_exit(&smrt->smrt_mutex);
+-	}
+-
+ 	/*
+ 	 * Allocate the command to send to the device, including buffer space
+ 	 * for the returned list of Logical Volumes.
+@@ -194,18 +194,12 @@ smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
+ 
+ 	smrll = smcm->smcm_internal->smcmi_va;
+ 
+-	/*
+-	 * According to the CISS Specification, the Report Logical LUNs
+-	 * command is sent to the controller itself.  The Masked Peripheral
+-	 * Device addressing mode is used, with LUN of 0.
+-	 */
+-	smrt_write_lun_addr_phys(&smcm->smcm_va_cmd->Header.LUN, B_TRUE,
+-	    0, 0);
++	smrt_write_controller_lun_addr(&smcm->smcm_va_cmd->Header.LUN);
+ 
+ 	smcm->smcm_va_cmd->Request.CDBLen = sizeof (smrllr);
+-	smcm->smcm_va_cmd->Request.Timeout = timeout;
++	smcm->smcm_va_cmd->Request.Timeout = LE_16(timeout);
+ 	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
+-	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_ORDERED;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_SIMPLE;
+ 	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_READ;
+ 
+ 	/*
+@@ -213,6 +207,7 @@ smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
+ 	 * SCSI command, which we assemble into the CDB region of the command
+ 	 * block.
+ 	 */
++	bzero(&smrllr, sizeof (smrllr));
+ 	smrllr.smrllr_opcode = CISS_SCMD_REPORT_LOGICAL_LUNS;
+ 	smrllr.smrllr_extflag = 1;
+ 	smrllr.smrllr_datasize = htonl(sizeof (smrt_report_logical_lun_t));
+@@ -268,10 +263,34 @@ smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
+ 		}
+ 	}
+ 
++	if (!ddi_in_panic() &&
++	    scsi_hba_tgtmap_set_begin(smrt->smrt_virt_tgtmap) != DDI_SUCCESS) {
++		dev_err(smrt->smrt_dip, CE_WARN, "failed to begin target map "
++		    "observation on %s", SMRT_IPORT_VIRT);
++		r = EIO;
++		goto out;
++	}
++
+ 	if ((smrll->smrll_extflag & 0x1) != 0) {
+-		r = smrt_read_logvols_ext(smrt, smrll);
++		r = smrt_read_logvols_ext(smrt, smrll, gen);
+ 	} else {
+-		r = smrt_read_logvols(smrt, smrll);
++		r = smrt_read_logvols(smrt, smrll, gen);
++	}
++
++	if (r == 0 && !ddi_in_panic()) {
++		if (scsi_hba_tgtmap_set_end(smrt->smrt_virt_tgtmap, 0) !=
++		    DDI_SUCCESS) {
++			dev_err(smrt->smrt_dip, CE_WARN, "failed to end target "
++			    "map observation on %s", SMRT_IPORT_VIRT);
++			r = EIO;
++		}
++	} else if (r != 0 && !ddi_in_panic()) {
++		if (scsi_hba_tgtmap_set_flush(smrt->smrt_virt_tgtmap) !=
++		    DDI_SUCCESS) {
++			dev_err(smrt->smrt_dip, CE_WARN, "failed to end target "
++			    "map observation on %s", SMRT_IPORT_VIRT);
++			r = EIO;
++		}
+ 	}
+ 
+ 	if (r == 0) {
+@@ -279,12 +298,10 @@ smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
+ 		 * Update the time of the last successful Logical Volume
+ 		 * discovery:
+ 		 */
+-		smrt->smrt_last_discovery = gethrtime();
++		smrt->smrt_last_log_discovery = gethrtime();
+ 	}
+ 
+ out:
+-	smrt->smrt_status &= ~SMRT_CTLR_STATUS_DISCOVERY;
+-	cv_broadcast(&smrt->smrt_cv_finishq);
+ 	mutex_exit(&smrt->smrt_mutex);
+ 
+ 	if (smcm != NULL) {
+@@ -293,19 +310,58 @@ out:
+ 	return (r);
+ }
+ 
++void
++smrt_logvol_tgtmap_activate(void *arg, char *addr, scsi_tgtmap_tgt_type_t type,
++    void **privpp)
++{
++	smrt_t *smrt = arg;
++	unsigned long volume;
++	char *eptr;
++
++	VERIFY(type == SCSI_TGT_SCSI_DEVICE);
++	VERIFY0(ddi_strtoul(addr, &eptr, 16, &volume));
++	VERIFY3S(*eptr, ==, '\0');
++	VERIFY3S(volume, >=, 0);
++	VERIFY3S(volume, <, SMRT_MAX_LOGDRV);
++	mutex_enter(&smrt->smrt_mutex);
++	VERIFY(smrt_logvol_lookup_by_id(smrt, volume) != NULL);
++	mutex_exit(&smrt->smrt_mutex);
++	*privpp = NULL;
++}
++
++boolean_t
++smrt_logvol_tgtmap_deactivate(void *arg, char *addr,
++    scsi_tgtmap_tgt_type_t type, void *priv, scsi_tgtmap_deact_rsn_t reason)
++{
++	smrt_t *smrt = arg;
++	smrt_volume_t *smlv;
++	unsigned long volume;
++	char *eptr;
++
++	VERIFY(type == SCSI_TGT_SCSI_DEVICE);
++	VERIFY(priv == NULL);
++	VERIFY0(ddi_strtoul(addr, &eptr, 16, &volume));
++	VERIFY3S(*eptr, ==, '\0');
++	VERIFY3S(volume, >=, 0);
++	VERIFY3S(volume, <, SMRT_MAX_LOGDRV);
++
++	mutex_enter(&smrt->smrt_mutex);
++	smlv = smrt_logvol_lookup_by_id(smrt, volume);
++	VERIFY(smlv != NULL);
++
++	list_remove(&smrt->smrt_volumes, smlv);
++	smrt_logvol_free(smlv);
++	mutex_exit(&smrt->smrt_mutex);
++
++	return (B_FALSE);
++}
++
+ void
+ smrt_logvol_teardown(smrt_t *smrt)
+ {
+ 	smrt_volume_t *smlv;
+ 
+ 	while ((smlv = list_remove_head(&smrt->smrt_volumes)) != NULL) {
+-		/*
+-		 * By this stage of teardown, all of the SCSI target drivers
+-		 * must have been detached from this logical volume.
+-		 */
+-		VERIFY(list_is_empty(&smlv->smlv_targets));
+-		list_destroy(&smlv->smlv_targets);
+-
+-		kmem_free(smlv, sizeof (*smlv));
++		smrt_logvol_free(smlv);
+ 	}
+ }
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_physical.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_physical.c
+new file mode 100644
+index 0000000000..af7d0e2f2b
+--- /dev/null
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_physical.c
+@@ -0,0 +1,613 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright (c) 2017 Joyent, Inc.
++ */
++
++#include <sys/scsi/adapters/smrt/smrt.h>
++
++static void
++smrt_physical_free(smrt_physical_t *smpt)
++{
++	VERIFY(list_is_empty(&smpt->smpt_targets));
++	VERIFY(smpt->smpt_info != NULL);
++
++	kmem_free(smpt->smpt_info, sizeof (*smpt->smpt_info));
++	list_destroy(&smpt->smpt_targets);
++	kmem_free(smpt, sizeof (*smpt));
++}
++
++/*
++ * Determine if a physical device enumerated should be shown to the world. There
++ * are three conditions to satisfy for this to be true.
++ *
++ * 1. The device (SAS, SATA, SES, etc.) must not have a masked CISS address.  A
++ * masked CISS address indicates a device that we should not be performing I/O
++ * to.
++ * 2. The drive (SAS or SATA device) must not be marked as a member of a logical
++ * volume.
++ * 3. The drive (SAS or SATA device) must not be marked as a spare.
++ */
++static boolean_t
++smrt_physical_visible(PhysDevAddr_t *addr, smrt_identify_physical_drive_t *info)
++{
++	if (addr->Mode == SMRT_CISS_MODE_MASKED) {
++		return (B_FALSE);
++	}
++
++	if ((info->sipd_more_flags & (SMRT_MORE_FLAGS_LOGVOL |
++	    SMRT_MORE_FLAGS_SPARE)) != 0) {
++		return (B_FALSE);
++	}
++
++	return (B_TRUE);
++}
++
++/*
++ * Note, the caller is responsible for making sure that the unit-address form of
++ * the WWN is pased in.  Any additional information to target a specific LUN
++ * will be ignored.
++ */
++smrt_physical_t *
++smrt_phys_lookup_by_ua(smrt_t *smrt, const char *ua)
++{
++	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
++
++	/*
++	 * Sanity check that the caller has provided us enough bytes for a
++	 * properly formed unit-address form of a WWN.
++	 */
++	if (strlen(ua) < SCSI_WWN_UA_STRLEN)
++		return (NULL);
++
++	for (smrt_physical_t *smpt = list_head(&smrt->smrt_physicals);
++	    smpt != NULL; smpt = list_next(&smrt->smrt_physicals, smpt)) {
++		char wwnstr[SCSI_WWN_BUFLEN];
++
++		(void) scsi_wwn_to_wwnstr(smpt->smpt_wwn, 1, wwnstr);
++		if (strncmp(wwnstr, ua, SCSI_WWN_UA_STRLEN) != 0)
++			continue;
++
++		/*
++		 * Verify that the UA string is either a comma or null there.
++		 * We accept the comma in case it's being used as part of a
++		 * normal UA with a LUN.
++		 */
++		if (ua[SCSI_WWN_UA_STRLEN] != '\0' &&
++		    ua[SCSI_WWN_UA_STRLEN] != ',') {
++			continue;
++		}
++
++		return (smpt);
++	}
++
++	return (NULL);
++}
++
++static smrt_physical_t *
++smrt_phys_lookup_by_wwn(smrt_t *smrt, uint64_t wwn)
++{
++	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
++
++	for (smrt_physical_t *smpt = list_head(&smrt->smrt_physicals);
++	    smpt != NULL; smpt = list_next(&smrt->smrt_physicals, smpt)) {
++		if (wwn == smpt->smpt_wwn)
++			return (smpt);
++	}
++
++	return (NULL);
++}
++
++static int
++smrt_phys_identify(smrt_t *smrt, smrt_identify_physical_drive_t *info,
++    uint16_t bmic, uint16_t timeout)
++{
++	smrt_command_t *smcm = NULL;
++	smrt_identify_physical_drive_t *sipd;
++	smrt_identify_physical_drive_req_t sipdr;
++	int ret;
++	size_t sz, copysz;
++
++	sz = sizeof (smrt_identify_physical_drive_t);
++	sz = P2ROUNDUP_TYPED(sz, 512, size_t);
++	if ((smcm = smrt_command_alloc(smrt, SMRT_CMDTYPE_INTERNAL,
++	    KM_NOSLEEP)) == NULL || smrt_command_attach_internal(smrt, smcm,
++	    sizeof (*sipd), KM_NOSLEEP) != 0) {
++		ret = ENOMEM;
++		goto out;
++	}
++
++	sipd = smcm->smcm_internal->smcmi_va;
++
++	smrt_write_controller_lun_addr(&smcm->smcm_va_cmd->Header.LUN);
++
++	smcm->smcm_va_cmd->Request.CDBLen = sizeof (sipdr);
++	smcm->smcm_va_cmd->Request.Timeout = LE_16(timeout);
++	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_SIMPLE;
++	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_READ;
++
++	/*
++	 * Construct the IDENTIFY PHYSICAL DEVICE request CDB.  Note that any
++	 * reserved fields in the request must be filled with zeroes.
++	 */
++	bzero(&sipdr, sizeof (sipdr));
++	sipdr.sipdr_opcode = CISS_SCMD_BMIC_READ;
++	sipdr.sipdr_lun = 0;
++	sipdr.sipdr_bmic_index1 = bmic & 0x00ff;
++	sipdr.sipdr_command = CISS_BMIC_IDENTIFY_PHYSICAL_DEVICE;
++	sipdr.sipdr_bmic_index2 = (bmic & 0xff00) >> 8;
++	bcopy(&sipdr, &smcm->smcm_va_cmd->Request.CDB[0],
++	    MIN(CISS_CDBLEN, sizeof (sipdr)));
++
++	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * Send the command to the device.
++	 */
++	smcm->smcm_status |= SMRT_CMD_STATUS_POLLED;
++	if ((ret = smrt_submit(smrt, smcm)) != 0) {
++		mutex_exit(&smrt->smrt_mutex);
++		goto out;
++	}
++
++	/*
++	 * Poll for completion.
++	 */
++	smcm->smcm_expiry = gethrtime() + timeout * NANOSEC;
++	if ((ret = smrt_poll_for(smrt, smcm)) != 0) {
++		VERIFY3S(ret, ==, ETIMEDOUT);
++		VERIFY0(smcm->smcm_status & SMRT_CMD_STATUS_POLL_COMPLETE);
++
++		/*
++		 * The command timed out; abandon it now.  Remove the POLLED
++		 * flag so that the periodic routine will send an abort to
++		 * clean it up next time around.
++		 */
++		smcm->smcm_status |= SMRT_CMD_STATUS_ABANDONED;
++		smcm->smcm_status &= ~SMRT_CMD_STATUS_POLLED;
++		smcm = NULL;
++		mutex_exit(&smrt->smrt_mutex);
++		goto out;
++	}
++	mutex_exit(&smrt->smrt_mutex);
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_RESET_SENT) {
++		/*
++		 * The controller was reset while we were trying to discover
++		 * physical volumes.  Report failure.
++		 */
++		ret = EIO;
++		goto out;
++	}
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_ERROR) {
++		ErrorInfo_t *ei = smcm->smcm_va_err;
++
++		if (ei->CommandStatus != CISS_CMD_DATA_UNDERRUN) {
++			dev_err(smrt->smrt_dip, CE_WARN, "identify physical "
++			    "device error: status 0x%x", ei->CommandStatus);
++			ret = EIO;
++			goto out;
++		}
++
++		copysz = MIN(sizeof (*sipd), sz - ei->ResidualCnt);
++	} else {
++		copysz = sizeof (*sipd);
++	}
++
++
++	sz = MIN(sizeof (*sipd), copysz);
++	bcopy(sipd, info, sizeof (*sipd));
++
++	ret = 0;
++out:
++	if (smcm != NULL) {
++		smrt_command_free(smcm);
++	}
++
++	return (ret);
++}
++
++static int
++smrt_read_phys_ext(smrt_t *smrt, smrt_report_physical_lun_t *smrpl,
++    uint16_t timeout, uint64_t gen)
++{
++	smrt_report_physical_lun_extent_t *extents = smrpl->smrpl_data.extents;
++	uint32_t count = BE_32(smrpl->smrpl_datasize) /
++	    sizeof (smrt_report_physical_lun_extent_t);
++	uint32_t i;
++
++	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
++
++	if (count > SMRT_MAX_PHYSDEV) {
++		count = SMRT_MAX_PHYSDEV;
++	}
++
++	for (i = 0; i < count; i++) {
++		int ret;
++		smrt_physical_t *smpt;
++		smrt_identify_physical_drive_t *info;
++		smrt_report_physical_opdi_t *opdi;
++		uint16_t bmic;
++		uint64_t wwn, satawwn;
++		char name[SCSI_MAXNAMELEN];
++
++		opdi = &extents[i].srple_extdata.srple_opdi;
++
++		mutex_exit(&smrt->smrt_mutex);
++
++		/*
++		 * Get the extended information about this device.
++		 */
++		info = kmem_zalloc(sizeof (*info), KM_NOSLEEP);
++		if (info == NULL) {
++			mutex_enter(&smrt->smrt_mutex);
++			return (ENOMEM);
++		}
++
++		bmic = smrt_lun_addr_to_bmic(&extents[i].srple_addr);
++		ret = smrt_phys_identify(smrt, info, bmic, timeout);
++		if (ret != 0) {
++			mutex_enter(&smrt->smrt_mutex);
++			kmem_free(info, sizeof (*info));
++			return (ret);
++		}
++
++		wwn = *(uint64_t *)opdi->srpo_wwid;
++		wwn = BE_64(wwn);
++
++		/*
++		 * SATA devices may not have a proper WWN returned from firmware
++		 * based on the SATL specification.  Try to fetch the proper id
++		 * for SATA devices, if the drive has one.  If the drive doesn't
++		 * have one or the SATL refuses to give us one, we use whatever
++		 * the controller told us.
++		 */
++		if (opdi->srpo_dtype == SMRT_DTYPE_SATA &&
++		    smrt_sata_determine_wwn(smrt, &extents[i].srple_addr,
++		    &satawwn, timeout) == 0) {
++			wwn = satawwn;
++		}
++
++		mutex_enter(&smrt->smrt_mutex);
++		smpt = smrt_phys_lookup_by_wwn(smrt, wwn);
++		if (smpt != NULL) {
++			/*
++			 * Sanity check that the model and serial number of this
++			 * device is the same for this WWN.  If it's not, the
++			 * controller is probably lying about something.
++			 */
++			if (bcmp(smpt->smpt_info->sipd_model, info->sipd_model,
++			    sizeof (info->sipd_model)) != 0 ||
++			    bcmp(smpt->smpt_info->sipd_serial,
++			    info->sipd_serial, sizeof (info->sipd_serial)) !=
++			    0 || smpt->smpt_dtype != opdi->srpo_dtype) {
++				dev_err(smrt->smrt_dip, CE_PANIC, "physical "
++				    "target with wwn 0x%" PRIx64 " changed "
++				    "model, serial, or type unexpectedly: "
++				    "smrt_physical_t %p, phys info: %p", wwn,
++				    smpt, info);
++			}
++
++			/*
++			 * When panicking, we don't allow a device's visibility
++			 * to change to being invisible and be able to actually
++			 * panic.  We only worry about devices which are used
++			 * for I/O.  We purposefully ignore SES devices.
++			 */
++			if (ddi_in_panic() &&
++			    (opdi->srpo_dtype == SMRT_DTYPE_SATA ||
++			    opdi->srpo_dtype == SMRT_DTYPE_SAS)) {
++				boolean_t visible;
++
++				visible = smrt_physical_visible(
++				    &smpt->smpt_addr.PhysDev, smpt->smpt_info);
++
++				if (visible != smpt->smpt_visible) {
++					dev_err(smrt->smrt_dip, CE_PANIC,
++					    "physical target with wwn 0x%"
++					    PRIx64 " changed visibility status "
++					    "unexpectedly", wwn);
++				}
++			}
++
++			kmem_free(smpt->smpt_info, sizeof (*smpt->smpt_info));
++			smpt->smpt_info = NULL;
++		} else {
++			smpt = kmem_zalloc(sizeof (smrt_physical_t),
++			    KM_NOSLEEP);
++			if (smpt == NULL) {
++				kmem_free(info, sizeof (*info));
++				return (ENOMEM);
++			}
++
++			smpt->smpt_wwn = wwn;
++			smpt->smpt_dtype = opdi->srpo_dtype;
++			list_create(&smpt->smpt_targets, sizeof (smrt_target_t),
++			    offsetof(smrt_target_t, smtg_link_lun));
++			smpt->smpt_ctlr = smrt;
++			list_insert_tail(&smrt->smrt_physicals, smpt);
++		}
++
++		VERIFY3P(smpt->smpt_info, ==, NULL);
++
++		/*
++		 * Determine if this device is supported and if it's visible to
++		 * the system.  Some devices may not be visible to the system
++		 * because they're used in logical volumes or spares.
++		 * Unsupported devices are also not visible.
++		 */
++		switch (smpt->smpt_dtype) {
++		case SMRT_DTYPE_SATA:
++		case SMRT_DTYPE_SAS:
++			smpt->smpt_supported = B_TRUE;
++			smpt->smpt_visible =
++			    smrt_physical_visible(&extents[i].srple_addr, info);
++			break;
++		case SMRT_DTYPE_SES:
++			smpt->smpt_visible = B_TRUE;
++			smpt->smpt_visible =
++			    smrt_physical_visible(&extents[i].srple_addr, info);
++			break;
++		default:
++			smpt->smpt_visible = B_FALSE;
++			smpt->smpt_supported = B_FALSE;
++		}
++
++		smpt->smpt_info = info;
++		smpt->smpt_addr.PhysDev = extents[i].srple_addr;
++		smpt->smpt_bmic = bmic;
++		smpt->smpt_gen = gen;
++		(void) scsi_wwn_to_wwnstr(smpt->smpt_wwn, 1, name);
++		if (!ddi_in_panic() && smpt->smpt_visible &&
++		    scsi_hba_tgtmap_set_add(smrt->smrt_phys_tgtmap,
++		    SCSI_TGT_SCSI_DEVICE, name, NULL) != DDI_SUCCESS) {
++			return (EIO);
++		}
++	}
++
++	return (0);
++}
++
++int
++smrt_phys_discover(smrt_t *smrt, uint16_t timeout, uint64_t gen)
++{
++	smrt_command_t *smcm;
++	smrt_report_physical_lun_t *smrpl;
++	smrt_report_physical_lun_req_t smrplr;
++	int r;
++
++	/*
++	 * Allocate the command to send to the device, including buffer space
++	 * for the returned list of Physical Volumes.
++	 */
++	if ((smcm = smrt_command_alloc(smrt, SMRT_CMDTYPE_INTERNAL,
++	    KM_NOSLEEP)) == NULL || smrt_command_attach_internal(smrt, smcm,
++	    sizeof (*smrpl), KM_NOSLEEP) != 0) {
++		r = ENOMEM;
++		mutex_enter(&smrt->smrt_mutex);
++		goto out;
++	}
++
++	smrpl = smcm->smcm_internal->smcmi_va;
++
++	smrt_write_controller_lun_addr(&smcm->smcm_va_cmd->Header.LUN);
++
++	smcm->smcm_va_cmd->Request.CDBLen = sizeof (smrplr);
++	smcm->smcm_va_cmd->Request.Timeout = LE_16(timeout);
++	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_SIMPLE;
++	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_READ;
++
++	/*
++	 * The Report Physical LUNs command is essentially a vendor-specific
++	 * SCSI command, which we assemble into the CDB region of the command
++	 * block.
++	 */
++	bzero(&smrplr, sizeof (smrplr));
++	smrplr.smrplr_opcode = CISS_SCMD_REPORT_PHYSICAL_LUNS;
++	smrplr.smrplr_extflag = SMRT_REPORT_PHYSICAL_LUN_EXT_OPDI;
++	smrplr.smrplr_datasize = BE_32(sizeof (smrt_report_physical_lun_t));
++	bcopy(&smrplr, &smcm->smcm_va_cmd->Request.CDB[0],
++	    MIN(CISS_CDBLEN, sizeof (smrplr)));
++
++	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * Send the command to the device.
++	 */
++	smcm->smcm_status |= SMRT_CMD_STATUS_POLLED;
++	if ((r = smrt_submit(smrt, smcm)) != 0) {
++		goto out;
++	}
++
++	/*
++	 * Poll for completion.
++	 */
++	smcm->smcm_expiry = gethrtime() + timeout * NANOSEC;
++	if ((r = smrt_poll_for(smrt, smcm)) != 0) {
++		VERIFY3S(r, ==, ETIMEDOUT);
++		VERIFY0(smcm->smcm_status & SMRT_CMD_STATUS_POLL_COMPLETE);
++
++		/*
++		 * The command timed out; abandon it now.  Remove the POLLED
++		 * flag so that the periodic routine will send an abort to
++		 * clean it up next time around.
++		 */
++		smcm->smcm_status |= SMRT_CMD_STATUS_ABANDONED;
++		smcm->smcm_status &= ~SMRT_CMD_STATUS_POLLED;
++		smcm = NULL;
++		goto out;
++	}
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_RESET_SENT) {
++		/*
++		 *
++		 * The controller was reset while we were trying to discover
++		 * logical volumes.  Report failure.
++		 */
++		r = EIO;
++		goto out;
++	}
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_ERROR) {
++		ErrorInfo_t *ei = smcm->smcm_va_err;
++
++		if (ei->CommandStatus != CISS_CMD_DATA_UNDERRUN) {
++			dev_err(smrt->smrt_dip, CE_WARN, "physical target "
++			    "discovery error: status 0x%x", ei->CommandStatus);
++			r = EIO;
++			goto out;
++		}
++	}
++
++	/*
++	 * If the controller doesn't support extended physical reporting, it
++	 * likely doesn't even support physical devices that we'd care about
++	 * exposing.  As such, we treat this as an OK case.
++	 */
++	if ((smrpl->smrpl_extflag & SMRT_REPORT_PHYSICAL_LUN_EXT_MASK) !=
++	    SMRT_REPORT_PHYSICAL_LUN_EXT_OPDI) {
++		r = 0;
++		goto out;
++	}
++
++	if (!ddi_in_panic() &&
++	    scsi_hba_tgtmap_set_begin(smrt->smrt_phys_tgtmap) != DDI_SUCCESS) {
++		dev_err(smrt->smrt_dip, CE_WARN, "failed to begin target map "
++		    "observation on %s", SMRT_IPORT_PHYS);
++		r = EIO;
++		goto out;
++	}
++
++	r = smrt_read_phys_ext(smrt, smrpl, timeout, gen);
++
++	if (r == 0 && !ddi_in_panic()) {
++		if (scsi_hba_tgtmap_set_end(smrt->smrt_phys_tgtmap, 0) !=
++		    DDI_SUCCESS) {
++			dev_err(smrt->smrt_dip, CE_WARN, "failed to end target "
++			    "map observation on %s", SMRT_IPORT_PHYS);
++			r = EIO;
++		}
++	} else if (r != 0 && !ddi_in_panic()) {
++		if (scsi_hba_tgtmap_set_flush(smrt->smrt_phys_tgtmap) !=
++		    DDI_SUCCESS) {
++			dev_err(smrt->smrt_dip, CE_WARN, "failed to end target "
++			    "map observation on %s", SMRT_IPORT_PHYS);
++			r = EIO;
++		}
++	}
++
++	if (r == 0) {
++		smrt_physical_t *smpt, *next;
++
++		/*
++		 * Prune physical devices that do not match the current
++		 * generation and are not marked as visible devices.  Visible
++		 * devices will be dealt with as part of the target map work.
++		 */
++		for (smpt = list_head(&smrt->smrt_physicals), next = NULL;
++		    smpt != NULL; smpt = next) {
++			next = list_next(&smrt->smrt_physicals, smpt);
++			if (smpt->smpt_visible || smpt->smpt_gen == gen)
++				continue;
++			list_remove(&smrt->smrt_physicals, smpt);
++			smrt_physical_free(smpt);
++		}
++
++		/*
++		 * Update the time of the last successful Physical Volume
++		 * discovery:
++		 */
++		smrt->smrt_last_phys_discovery = gethrtime();
++
++		/*
++		 * Now, for each unsupported device that we haven't warned about
++		 * encountering, try and give the administrator some hope of
++		 * knowing about this.
++		 */
++		for (smpt = list_head(&smrt->smrt_physicals), next = NULL;
++		    smpt != NULL; smpt = next) {
++			if (smpt->smpt_supported || smpt->smpt_unsup_warn)
++				continue;
++			smpt->smpt_unsup_warn = B_TRUE;
++			dev_err(smrt->smrt_dip, CE_WARN, "encountered "
++			    "unsupported device with device type %d",
++			    smpt->smpt_dtype);
++		}
++	}
++
++out:
++	mutex_exit(&smrt->smrt_mutex);
++
++	if (smcm != NULL) {
++		smrt_command_free(smcm);
++	}
++	return (r);
++}
++
++void
++smrt_phys_tgtmap_activate(void *arg, char *addr, scsi_tgtmap_tgt_type_t type,
++    void **privpp)
++{
++	smrt_t *smrt = arg;
++	smrt_physical_t *smpt;
++
++	VERIFY3S(type, ==, SCSI_TGT_SCSI_DEVICE);
++	mutex_enter(&smrt->smrt_mutex);
++	smpt = smrt_phys_lookup_by_ua(smrt, addr);
++	VERIFY(smpt != NULL);
++	VERIFY(smpt->smpt_supported);
++	VERIFY(smpt->smpt_visible);
++	*privpp = NULL;
++	mutex_exit(&smrt->smrt_mutex);
++}
++
++boolean_t
++smrt_phys_tgtmap_deactivate(void *arg, char *addr, scsi_tgtmap_tgt_type_t type,
++    void *priv, scsi_tgtmap_deact_rsn_t reason)
++{
++	smrt_t *smrt = arg;
++	smrt_physical_t *smpt;
++
++	VERIFY3S(type, ==, SCSI_TGT_SCSI_DEVICE);
++	VERIFY3P(priv, ==, NULL);
++
++	mutex_enter(&smrt->smrt_mutex);
++	smpt = smrt_phys_lookup_by_ua(smrt, addr);
++
++	/*
++	 * If the device disappeared or became invisible, then it may have
++	 * already been removed.
++	 */
++	if (smpt == NULL || !smpt->smpt_visible) {
++		mutex_exit(&smrt->smrt_mutex);
++		return (B_FALSE);
++	}
++
++	list_remove(&smrt->smrt_physicals, smpt);
++	smrt_physical_free(smpt);
++	mutex_exit(&smrt->smrt_mutex);
++	return (B_FALSE);
++}
++
++void
++smrt_phys_teardown(smrt_t *smrt)
++{
++	smrt_physical_t *smpt;
++
++	VERIFY(MUTEX_HELD(&smrt->smrt_mutex));
++	while ((smpt = list_remove_head(&smrt->smrt_physicals)) != NULL) {
++		smrt_physical_free(smpt);
++	}
++}
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_sata.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_sata.c
+new file mode 100644
+index 0000000000..a18d620c5f
+--- /dev/null
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_sata.c
+@@ -0,0 +1,160 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright 2017 Joyent, Inc.
++ */
++
++/*
++ * Collection of routines specific to SATA devices and attempting to make them
++ * work.
++ */
++
++#include <sys/scsi/adapters/smrt/smrt.h>
++
++/*
++ * This is a buffer size that should easily cover all of the data that we need
++ * to properly determine the buffer allocation.
++ */
++#define	SMRT_SATA_INQ83_LEN	256
++
++/*
++ * We need to try and determine if a SATA WWN exists on the device.  SAT-2
++ * defines that the response to the inquiry page 0x83.
++ */
++int
++smrt_sata_determine_wwn(smrt_t *smrt, PhysDevAddr_t *addr, uint64_t *wwnp,
++    uint16_t timeout)
++{
++	smrt_command_t *smcm;
++	int r;
++	uint8_t *inq;
++	uint64_t wwn;
++	size_t resid;
++
++	VERIFY3P(wwnp, !=, NULL);
++
++	if ((smcm = smrt_command_alloc(smrt, SMRT_CMDTYPE_INTERNAL,
++	    KM_NOSLEEP)) == NULL || smrt_command_attach_internal(smrt, smcm,
++	    SMRT_SATA_INQ83_LEN, KM_NOSLEEP) != 0) {
++		if (smcm != NULL) {
++			smrt_command_free(smcm);
++		}
++		return (ENOMEM);
++	}
++
++	smcm->smcm_va_cmd->Header.LUN.PhysDev = *addr;
++	smcm->smcm_va_cmd->Request.CDBLen = CDB_GROUP0;
++	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_SIMPLE;
++	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_READ;
++	smcm->smcm_va_cmd->Request.Timeout = LE_16(timeout);
++
++	smcm->smcm_va_cmd->Request.CDB[0] = SCMD_INQUIRY;
++	smcm->smcm_va_cmd->Request.CDB[1] = 1;
++	smcm->smcm_va_cmd->Request.CDB[2] = 0x83;
++	smcm->smcm_va_cmd->Request.CDB[3] = (SMRT_SATA_INQ83_LEN & 0xff00) >> 8;
++	smcm->smcm_va_cmd->Request.CDB[4] = SMRT_SATA_INQ83_LEN & 0x00ff;
++	smcm->smcm_va_cmd->Request.CDB[5] = 0;
++
++	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * Send the command to the device.
++	 */
++	smcm->smcm_status |= SMRT_CMD_STATUS_POLLED;
++	if ((r = smrt_submit(smrt, smcm)) != 0) {
++		mutex_exit(&smrt->smrt_mutex);
++		smrt_command_free(smcm);
++		return (r);
++	}
++
++	if ((r = smrt_poll_for(smrt, smcm)) != 0) {
++		VERIFY3S(r, ==, ETIMEDOUT);
++		VERIFY0(smcm->smcm_status & SMRT_CMD_STATUS_POLL_COMPLETE);
++
++		/*
++		 * The command timed out; abandon it now.  Remove the POLLED
++		 * flag so that the periodic routine will send an abort to
++		 * clean it up next time around.
++		 */
++		smcm->smcm_status |= SMRT_CMD_STATUS_ABANDONED;
++		smcm->smcm_status &= ~SMRT_CMD_STATUS_POLLED;
++		mutex_exit(&smrt->smrt_mutex);
++		return (r);
++	}
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_RESET_SENT) {
++		/*
++		 * The controller was reset while we were trying to discover
++		 * logical volumes.  Report failure.
++		 */
++		mutex_exit(&smrt->smrt_mutex);
++		smrt_command_free(smcm);
++		return (EIO);
++	}
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_ERROR) {
++		ErrorInfo_t *ei = smcm->smcm_va_err;
++
++		if (ei->CommandStatus != CISS_CMD_DATA_UNDERRUN) {
++			dev_err(smrt->smrt_dip, CE_WARN, "physical target "
++			    "SATA WWN error: status 0x%x", ei->CommandStatus);
++			mutex_exit(&smrt->smrt_mutex);
++			smrt_command_free(smcm);
++			return (EIO);
++		}
++		resid = ei->ResidualCnt;
++	} else {
++		resid = 0;
++	}
++
++	mutex_exit(&smrt->smrt_mutex);
++
++	/*
++	 * We must have at least 12 bytes.  The first four bytes are the header,
++	 * the next four are for the LUN header, and the last 8 are for the
++	 * actual WWN, which according to SAT-2 will always be first.
++	 */
++	if (SMRT_SATA_INQ83_LEN - resid < 16) {
++		smrt_command_free(smcm);
++		return (EINVAL);
++	}
++	inq = smcm->smcm_internal->smcmi_va;
++
++	/*
++	 * Sanity check we have the right page.
++	 */
++	if (inq[1] != 0x83) {
++		smrt_command_free(smcm);
++		return (EINVAL);
++	}
++
++	/*
++	 * Check to see if we have a proper Network Address Authority (NAA)
++	 * based world wide number for this LUN.  It is possible that firmware
++	 * interposes on this and conses up a fake world wide number (WWN).  If
++	 * this is the case, we don't want to actually use it.  We need to
++	 * verify that the WWN declares the correct naming authority and is of
++	 * the proper length.
++	 */
++	if ((inq[5] & 0x30) != 0 || (inq[5] & 0x0f) != 3 || inq[7] != 8) {
++		smrt_command_free(smcm);
++		return (ENOTSUP);
++	}
++
++	bcopy(&inq[8], &wwn, sizeof (uint64_t));
++	*wwnp = BE_64(wwn);
++
++	smrt_command_free(smcm);
++
++	return (0);
++}
+diff --git a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h
+index 39b6d414b9..5aba743834 100644
+--- a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h
++++ b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #ifndef	_SMRT_H
+@@ -54,6 +54,7 @@ extern "C" {
+  * inclusion.
+  */
+ #define	SMRT_MAX_LOGDRV		64	/* Maximum number of logical drives */
++#define	SMRT_MAX_PHYSDEV	128	/* Maximum number of physical devices */
+ 
+ #include <sys/scsi/adapters/smrt/smrt_ciss.h>
+ #include <sys/scsi/adapters/smrt/smrt_scsi.h>
+@@ -74,6 +75,8 @@ typedef enum smrt_init_level {
+ 	SMRT_INITLEVEL_INT_ENABLED =		(0x1 << 6),
+ 	SMRT_INITLEVEL_SCSA =			(0x1 << 7),
+ 	SMRT_INITLEVEL_MUTEX =			(0x1 << 8),
++	SMRT_INITLEVEL_TASKQ =			(0x1 << 9),
++	SMRT_INITLEVEL_ASYNC_EVENT =		(0x1 << 10),
+ } smrt_init_level_t;
+ 
+ /*
+@@ -89,6 +92,13 @@ typedef enum smrt_init_level {
+ #define	SMRT_MIN_TAG_NUMBER			0x00001000
+ #define	SMRT_MAX_TAG_NUMBER			0x0fffffff
+ 
++/*
++ * Character strings that represent the names of the iports used for both
++ * physical and virtual volumes.
++ */
++#define	SMRT_IPORT_PHYS				"p0"
++#define	SMRT_IPORT_VIRT				"v0"
++
+ /*
+  * Definitions to support waiting for the controller to converge on a
+  * particular state: ready or not ready.  These are used with
+@@ -112,10 +122,10 @@ typedef enum smrt_ctlr_mode {
+ #define	SMRT_CONTROLLER_TARGET			128
+ 
+ /*
+- * When waiting for logical volume discovery to complete, we wait for a maximum
++ * When waiting for volume discovery to complete, we wait for a maximum
+  * duration (in seconds) before giving up.
+  */
+-#define	SMRT_LOGVOL_DISCOVER_TIMEOUT		30
++#define	SMRT_DISCOVER_TIMEOUT			30
+ 
+ /*
+  * The maintenance routine which checks for controller lockup and aborts
+@@ -131,31 +141,62 @@ typedef enum smrt_ctlr_mode {
+  */
+ #define	SMRT_PING_CHECK_TIMEOUT			60
+ 
++/*
++ * When detaching the device, we may need to have an asynchronous event
++ * cancellation be issued.  While this should be relatively smooth, we don't
++ * want to wait forever for it.  As such we set a timeout in seconds.
++ */
++#define	SMRT_ASYNC_CANCEL_TIMEOUT		60
+ 
+-typedef enum smrt_controller_status {
+-	/*
+-	 * A Logical Volume discovery is currently occuring.
+-	 */
+-	SMRT_CTLR_STATUS_DISCOVERY =		(0x1 << 0),
++/*
++ * HP PCI vendor ID and Generation 9 device ID. Used to identify generations of
++ * supported controllers.
++ */
++#define	SMRT_VENDOR_HP				0x103c
++#define	SMRT_DEVICE_GEN9			0x3238
+ 
++typedef enum smrt_controller_status {
+ 	/*
+ 	 * An attempt is being made to detach the controller instance.
+ 	 */
+-	SMRT_CTLR_STATUS_DETACHING =		(0x1 << 1),
++	SMRT_CTLR_STATUS_DETACHING =		(0x1 << 0),
+ 
+ 	/*
+ 	 * The controller is believed to be functioning correctly.  The driver
+ 	 * is to allow command submission, process interrupts, and perform
+ 	 * periodic background maintenance.
+ 	 */
+-	SMRT_CTLR_STATUS_RUNNING =		(0x1 << 2),
++	SMRT_CTLR_STATUS_RUNNING =		(0x1 << 1),
+ 
+ 	/*
+ 	 * The controller is currently being reset.
+ 	 */
+-	SMRT_CTLR_STATUS_RESETTING =		(0x1 << 3),
++	SMRT_CTLR_STATUS_RESETTING =		(0x1 << 2),
++
++	/*
++	 * Our async event notification command is currently in need of help
++	 * from the broader driver.  This will be set by smrt_event_complete()
++	 * to indicate that the command is not being processed due to a
++	 * controller reset or because another fatal error occurred.  The
++	 * periodic will have to pick up and recover this for us.  It is only
++	 * safe for the driver to manipulate the event command outside of
++	 * smrt_event_complete() if this flag is set.
++	 */
++	SMRT_CTLR_ASYNC_INTERVENTION =		(0x1 << 3),
++
++	/*
++	 * See the theory statement on discovery and resets in smrt_ciss.c for
++	 * an explanation of these values.
++	 */
++	SMRT_CTLR_DISCOVERY_REQUESTED =		(0x1 << 4),
++	SMRT_CTLR_DISCOVERY_RUNNING =		(0x1 << 5),
++	SMRT_CTLR_DISCOVERY_PERIODIC =		(0x1 << 6),
++	SMRT_CTLR_DISCOVERY_REQUIRED =		(0x1 << 7),
+ } smrt_controller_status_t;
+ 
++#define	SMRT_CTLR_DISCOVERY_MASK	(SMRT_CTLR_DISCOVERY_REQUESTED | \
++    SMRT_CTLR_DISCOVERY_RUNNING | SMRT_CTLR_DISCOVERY_PERIODIC)
++
+ typedef struct smrt_stats {
+ 	uint64_t smrts_tran_aborts;
+ 	uint64_t smrts_tran_resets;
+@@ -165,6 +206,10 @@ typedef struct smrt_stats {
+ 	uint64_t smrts_unclaimed_interrupts;
+ 	uint64_t smrts_claimed_interrupts;
+ 	uint64_t smrts_ignored_scsi_cmds;
++	uint64_t smrts_events_received;
++	uint64_t smrts_events_errors;
++	uint64_t smrts_events_intervened;
++	uint64_t smrts_discovery_tq_errors;
+ } smrt_stats_t;
+ 
+ typedef struct smrt_versions {
+@@ -180,10 +225,15 @@ typedef struct smrt_versions {
+ 	char smrtv_bootblock_rev[5];
+ } smrt_versions_t;
+ 
++typedef struct smrt smrt_t;
++typedef struct smrt_command smrt_command_t;
++typedef struct smrt_command_internal smrt_command_internal_t;
++typedef struct smrt_command_scsa smrt_command_scsa_t;
++typedef struct smrt_pkt smrt_pkt_t;
++
+ /*
+  * Per-Controller Structure
+  */
+-typedef struct smrt smrt_t;
+ struct smrt {
+ 	dev_info_t *smrt_dip;
+ 	int smrt_instance;
+@@ -198,6 +248,16 @@ struct smrt {
+ 	uint32_t smrt_maxcmds;
+ 	uint32_t smrt_sg_cnt;
+ 	smrt_versions_t smrt_versions;
++	uint16_t smrt_pci_vendor;
++	uint16_t smrt_pci_device;
++
++	/*
++	 * iport specific data
++	 */
++	dev_info_t *smrt_virt_iport;
++	dev_info_t *smrt_phys_iport;
++	scsi_hba_tgtmap_t *smrt_virt_tgtmap;
++	scsi_hba_tgtmap_t *smrt_phys_tgtmap;
+ 
+ 	/*
+ 	 * The transport mode of the controller.
+@@ -224,6 +284,11 @@ struct smrt {
+ 	 */
+ 	list_t smrt_volumes;
+ 
++	/*
++	 * List of enumerated physical devices (smrt_physical_t).
++	 */
++	list_t smrt_physicals;
++
+ 	/*
+ 	 * List of attached SCSA target drivers (smrt_target_t).
+ 	 */
+@@ -237,7 +302,6 @@ struct smrt {
+ 
+ 	hrtime_t smrt_last_interrupt_claimed;
+ 	hrtime_t smrt_last_interrupt_unclaimed;
+-	hrtime_t smrt_last_discovery;
+ 	hrtime_t smrt_last_reset_start;
+ 	hrtime_t smrt_last_reset_finish;
+ 
+@@ -251,6 +315,14 @@ struct smrt {
+ 	list_t smrt_finishq;		/* List of completed commands. */
+ 	list_t smrt_abortq;		/* List of commands to abort. */
+ 
++	/*
++	 * Discovery coordination
++	 */
++	ddi_taskq_t *smrt_discover_taskq;
++	hrtime_t smrt_last_phys_discovery;
++	hrtime_t smrt_last_log_discovery;
++	uint64_t smrt_discover_gen;
++
+ 	/*
+ 	 * Controller interrupt handler registration.
+ 	 */
+@@ -280,6 +352,14 @@ struct smrt {
+ 	uint32_t smrt_ct_baseaddr;
+ 	CfgTable_t *smrt_ct;
+ 	ddi_acc_handle_t smrt_ct_handle;
++
++	/*
++	 * Asynchronous Event State
++	 */
++	uint32_t smrt_event_count;
++	smrt_command_t *smrt_event_cmd;
++	smrt_command_t *smrt_event_cancel_cmd;
++	kcondvar_t smrt_event_queue;
+ };
+ 
+ /*
+@@ -290,10 +370,11 @@ typedef enum smrt_volume_flags {
+ } smrt_volume_flags_t;
+ 
+ typedef struct smrt_volume {
+-	LogDevAddr_t smlv_addr;
++	LUNAddr_t smlv_addr;
+ 	smrt_volume_flags_t smlv_flags;
+ 
+ 	uint8_t smlv_wwn[16];
++	uint64_t smlv_gen;
+ 
+ 	smrt_t *smlv_ctlr;
+ 	list_node_t smlv_link;
+@@ -304,18 +385,46 @@ typedef struct smrt_volume {
+ 	list_t smlv_targets;
+ } smrt_volume_t;
+ 
++typedef struct smrt_physical {
++	LUNAddr_t smpt_addr;
++	uint64_t smpt_wwn;
++	uint8_t smpt_dtype;
++	uint16_t smpt_bmic;
++	uint64_t smpt_gen;
++	boolean_t smpt_supported;
++	boolean_t smpt_visible;
++	boolean_t smpt_unsup_warn;
++	list_node_t smpt_link;
++	list_t smpt_targets;
++	smrt_t *smpt_ctlr;
++	smrt_identify_physical_drive_t *smpt_info;
++} smrt_physical_t;
++
+ /*
+  * Per-Target Structure
+  */
+ typedef struct smrt_target {
+ 	struct scsi_device *smtg_scsi_dev;
+-	boolean_t smtg_controller_target;
++
++	boolean_t smtg_physical;
+ 
+ 	/*
+-	 * Linkage back to the Logical Volume that this target represents:
++	 * This is only used when performing discovery during panic, as we need
++	 * a mechanism to determine if the set of drives has shifted.
+ 	 */
+-	smrt_volume_t *smtg_volume;
+-	list_node_t smtg_link_volume;
++	boolean_t smtg_gone;
++
++	/*
++	 * Linkage back to the device that this target represents. This may be
++	 * either a smrt_volume_t or a smrt_physical_t. We keep a pointer to the
++	 * address, as that's the one thing we generally care about.
++	 */
++	union {
++		smrt_physical_t *smtg_phys;
++		smrt_volume_t *smtg_vol;
++	} smtg_lun;
++	list_node_t smtg_link_lun;
++	LUNAddr_t *smtg_addr;
+ 
+ 	/*
+ 	 * Linkage back to the controller:
+@@ -343,11 +452,6 @@ typedef struct smrt_dma {
+ } smrt_dma_t;
+ 
+ 
+-typedef struct smrt_command smrt_command_t;
+-typedef struct smrt_command_internal smrt_command_internal_t;
+-typedef struct smrt_command_scsa smrt_command_scsa_t;
+-typedef struct smrt_pkt smrt_pkt_t;
+-
+ typedef enum smrt_command_status {
+ 	/*
+ 	 * When a command is submitted to the controller, it is marked USED
+@@ -430,10 +534,19 @@ typedef enum smrt_command_status {
+ 	 * taken effect, it likely cannot be trusted.
+ 	 */
+ 	SMRT_CMD_STATUS_RESET_SENT =		(0x1 << 12),
++
++	/*
++	 * Certain commands related to discovery and pinging need to be run
++	 * during the context after a reset has occurred, but before the
++	 * controller is considered.  Such commands can use this flag to bypass
++	 * the normal smrt_submit() check.
++	 */
++	SMRT_CMD_IGNORE_RUNNING =		(0x1 << 13),
+ } smrt_command_status_t;
+ 
+ typedef enum smrt_command_type {
+ 	SMRT_CMDTYPE_INTERNAL = 1,
++	SMRT_CMDTYPE_EVENT,
+ 	SMRT_CMDTYPE_ABORTQ,
+ 	SMRT_CMDTYPE_SCSA,
+ 	SMRT_CMDTYPE_PREINIT,
+@@ -551,18 +664,36 @@ uint32_t smrt_ctlr_get_cmdsoutmax(smrt_t *);
+ uint32_t smrt_ctlr_get_maxsgelements(smrt_t *);
+ 
+ /*
+- * Device enumeration routines.
++ * Device enumeration and lookup routines.
+  */
+-int smrt_logvol_discover(smrt_t *, uint16_t);
++void smrt_discover_request(smrt_t *);
++
++int smrt_logvol_discover(smrt_t *, uint16_t, uint64_t);
+ void smrt_logvol_teardown(smrt_t *);
+-smrt_volume_t *smrt_logvol_lookup_by_id(smrt_t *, unsigned);
+-smrt_volume_t *smrt_logvol_lookup_by_addr(smrt_t *, struct scsi_address *);
++smrt_volume_t *smrt_logvol_lookup_by_id(smrt_t *, unsigned long);
++void smrt_logvol_tgtmap_activate(void *, char *, scsi_tgtmap_tgt_type_t,
++    void **);
++boolean_t smrt_logvol_tgtmap_deactivate(void *, char *, scsi_tgtmap_tgt_type_t,
++    void *, scsi_tgtmap_deact_rsn_t);
++
++int smrt_phys_discover(smrt_t *, uint16_t, uint64_t);
++smrt_physical_t *smrt_phys_lookup_by_ua(smrt_t *, const char *);
++void smrt_phys_teardown(smrt_t *);
++void smrt_phys_tgtmap_activate(void *, char *, scsi_tgtmap_tgt_type_t,
++    void **);
++boolean_t smrt_phys_tgtmap_deactivate(void *, char *, scsi_tgtmap_tgt_type_t,
++    void *, scsi_tgtmap_deact_rsn_t);
+ 
+ /*
+  * SCSI framework routines.
+  */
+-int smrt_hba_setup(smrt_t *);
+-void smrt_hba_teardown(smrt_t *);
++int smrt_ctrl_hba_setup(smrt_t *);
++void smrt_ctrl_hba_teardown(smrt_t *);
++
++int smrt_logvol_hba_setup(smrt_t *, dev_info_t *);
++void smrt_logvol_hba_teardown(smrt_t *, dev_info_t *);
++int smrt_phys_hba_setup(smrt_t *, dev_info_t *);
++void smrt_phys_hba_teardown(smrt_t *, dev_info_t *);
+ 
+ void smrt_hba_complete(smrt_command_t *);
+ 
+@@ -585,9 +716,12 @@ void smrt_command_reuse(smrt_command_t *);
+  * Device message construction routines.
+  */
+ void smrt_write_lun_addr_phys(LUNAddr_t *, boolean_t, unsigned, unsigned);
++void smrt_write_controller_lun_addr(LUNAddr_t *);
++uint16_t smrt_lun_addr_to_bmic(PhysDevAddr_t *);
+ void smrt_write_message_abort_one(smrt_command_t *, uint32_t);
+-void smrt_write_message_abort_all(smrt_command_t *, LogDevAddr_t *);
++void smrt_write_message_abort_all(smrt_command_t *, LUNAddr_t *);
+ void smrt_write_message_nop(smrt_command_t *, int);
++void smrt_write_message_event_notify(smrt_command_t *);
+ 
+ /*
+  * Device management routines.
+@@ -597,6 +731,17 @@ void smrt_device_teardown(smrt_t *);
+ uint32_t smrt_get32(smrt_t *, offset_t);
+ void smrt_put32(smrt_t *, offset_t, uint32_t);
+ 
++/*
++ * SATA related routines.
++ */
++int smrt_sata_determine_wwn(smrt_t *, PhysDevAddr_t *, uint64_t *, uint16_t);
++
++/*
++ * Asynchronous Event Notification
++ */
++int smrt_event_init(smrt_t *);
++void smrt_event_fini(smrt_t *);
++void smrt_event_complete(smrt_command_t *);
+ 
+ #ifdef	__cplusplus
+ }
+diff --git a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_ciss.h b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_ciss.h
+index fbc6a1be3b..e1f1db68b3 100644
+--- a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_ciss.h
++++ b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_ciss.h
+@@ -11,7 +11,7 @@
+ 
+ /*
+  * Copyright (C) 2013 Hewlett-Packard Development Company, L.P.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #ifndef	_SMRT_CISS_H
+@@ -195,6 +195,12 @@ extern "C" {
+ #define	CISS_OPQ_READ_TAG(x)			((x) >> 2)
+ #define	CISS_OPQ_READ_ERROR(x)			((x) & (1UL << 1))
+ 
++/*
++ * Physical devices that are reported may be marked as 'masked'. A masked device
++ * is one that the driver can see, but must not perform any I/O to.
++ */
++#define	SMRT_CISS_MODE_MASKED			3
++
+ /*
+  * The following packed structures are used to ease the manipulation of
+  * requests and responses from the controller.
+@@ -210,20 +216,20 @@ typedef struct smrt_tag {
+ 
+ typedef union SCSI3Addr {
+ 	struct {
++		uint8_t Dev;
+ 		uint8_t Bus:6;
+ 		uint8_t Mode:2;
+-		uint8_t Dev;
+ 	} PeripDev;
+ 	struct {
++		uint8_t DevLSB;
+ 		uint8_t DevMSB:6;
+ 		uint8_t Mode:2;
+-		uint8_t DevLSB;
+ 	} LogDev;
+ 	struct {
+-		uint8_t Targ:6;
+-		uint8_t Mode:2;
+ 		uint8_t Dev:5;
+ 		uint8_t Bus:3;
++		uint8_t Targ:6;
++		uint8_t Mode:2;
+ 	} LogUnit;
+ } SCSI3Addr_t;
+ 
+diff --git a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h
+index cca02e4637..47ef99b2e0 100644
+--- a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h
++++ b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h
+@@ -11,7 +11,7 @@
+ 
+ /*
+  * Copyright (C) 2013 Hewlett-Packard Development Company, L.P.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017 Joyent, Inc.
+  */
+ 
+ #ifndef	_SMRT_SCSI_H
+@@ -38,6 +38,8 @@ extern "C" {
+  * of type CISS_TYPE_CMD.  They are custom SCSI commands, using the
+  * vendor-specific part of the opcode space; i.e., 0xC0 through 0xFF.
+  */
++#define	CISS_SCMD_READ				0xC0
++#define	CISS_SCMD_WRITE				0xC1
+ #define	CISS_SCMD_REPORT_LOGICAL_LUNS		0xC2
+ #define	CISS_SCMD_REPORT_PHYSICAL_LUNS		0xC3
+ 
+@@ -79,6 +81,25 @@ extern "C" {
+  * constructed CDB with the CISS_SCMD_BMIC_READ or CISS_SCMD_BMIC_WRITE opcode.
+  */
+ #define	CISS_BMIC_IDENTIFY_CONTROLLER		0x11
++#define	CISS_BMIC_IDENTIFY_PHYSICAL_DEVICE	0x15
++#define	CISS_BMIC_NOTIFY_ON_EVENT		0xD0
++#define	CISS_BMIC_NOTIFY_ON_EVENT_CANCEL	0xD1
++
++/*
++ * Device and Phy type codes.  These are used across many commands, including
++ * IDENTIFY PHYSICAL DEVICE and the REPORT PHYSICAL LUN extended reporting.
++ */
++#define	SMRT_DTYPE_PSCSI			0x00
++#define	SMRT_DTYPE_SATA				0x01
++#define	SMRT_DTYPE_SAS				0x02
++#define	SMRT_DTYPE_SATA_BW			0x03
++#define	SMRT_DTYPE_SAS_BW			0x04
++#define	SMRT_DTYPE_EXPANDER			0x05
++#define	SMRT_DTYPE_SES				0x06
++#define	SMRT_DTYPE_CONTROLLER			0x07
++#define	SMRT_DTYPE_SGPIO			0x08
++#define	SMRT_DTYPE_NVME				0x09
++#define	SMRT_DTYPE_NOPHY			0xFF
+ 
+ /*
+  * The following packed structures are used to ease the manipulation of SCSI
+@@ -115,6 +136,73 @@ typedef struct smrt_report_logical_lun_req {
+ 	uint8_t smrllr_control;
+ } smrt_report_logical_lun_req_t;
+ 
++typedef struct smrt_report_physical_lun_ent {
++	PhysDevAddr_t srple_addr;
++} smrt_report_physical_lun_ent_t;
++
++/*
++ * This structure represents the 'physical node identifier' extended option for
++ * REPORT PHYSICAL LUNS.  This is triggered when the extended flags is set to
++ * 0x1.  Note that for SAS the other structure should always be used.
++ */
++typedef struct smrt_report_physical_pnid {
++	uint8_t srpp_node[8];
++	uint8_t srpp_port[8];
++} smrt_report_physical_pnid_t;
++
++/*
++ * This structure represents the 'other physical device info' extended option
++ * for report physical luns.  This is triggered when the extended flags is set
++ * to 0x2.
++ */
++typedef struct smrt_report_physical_opdi {
++	uint8_t srpo_wwid[8];
++	uint8_t srpo_dtype;
++	uint8_t srpo_flags;
++	uint8_t srpo_multilun;
++	uint8_t srpo_paths;
++	uint32_t srpo_iohdl;
++} smrt_report_physical_opdi_t;
++
++typedef struct smrt_report_physical_lun_extent {
++	PhysDevAddr_t srple_addr;
++	union {
++		smrt_report_physical_pnid_t srple_pnid;
++		smrt_report_physical_opdi_t srple_opdi;
++	} srple_extdata;
++} smrt_report_physical_lun_extent_t;
++
++/*
++ * Values that can be ORed together into smrllr_extflag. smprl_extflag indicates
++ * if any extended processing was done or not.
++ */
++#define	SMRT_REPORT_PHYSICAL_LUN_EXT_NONE	0x00
++#define	SMRT_REPORT_PHYSICAL_LUN_EXT_PNID	0x01
++#define	SMRT_REPORT_PHYSICAL_LUN_EXT_OPDI	0x02
++#define	SMRT_REPORT_PHYSICAL_LUN_EXT_MASK	0x0f
++#define	SMRT_REPORT_PHYSICAL_LUN_CTRL_ONLY	(1 << 6)
++#define	SMRT_REPORT_PHYSICAL_LUN_ALL_PATHS	(1 << 7)
++
++typedef struct smrt_report_physical_lun {
++	uint32_t smrpl_datasize; /* Big Endian */
++	uint8_t smrpl_extflag;
++	uint8_t smrpl_reserved1[3];
++	union {
++		smrt_report_physical_lun_ent_t ents[SMRT_MAX_PHYSDEV];
++		smrt_report_physical_lun_extent_t extents[SMRT_MAX_PHYSDEV];
++	} smrpl_data;
++} smrt_report_physical_lun_t;
++
++
++typedef struct smrt_report_physical_lun_req {
++	uint8_t smrplr_opcode;
++	uint8_t smrplr_extflag;
++	uint8_t smrplr_reserved[1];
++	uint32_t smrplr_datasize; /* Big Endian */
++	uint8_t smrplr_reserved2;
++	uint8_t smrplr_control;
++} smrt_report_physical_lun_req_t;
++
+ /*
+  * Request structure for the BMIC command IDENTIFY CONTROLLER.  This structure
+  * is written into the CDB with the CISS_SCMD_BMIC_READ SCSI opcode.  Reserved
+@@ -151,6 +239,129 @@ typedef struct smrt_identify_controller {
+ 	uint32_t smic_board_id;
+ } smrt_identify_controller_t;
+ 
++/*
++ * Request structure for IDENTIFY PHYSICAL DEVICE.  This structure is written
++ * into the CDB with the CISS_SCMD_BMIC_READ SCSI opcode.  Reserved fields
++ * should be filled with zeroes.  Note, the lower 8 bits of the BMIC ID are in
++ * index1, whereas the upper 8 bites are in index2; however, the controller may
++ * only support 8 bits worth of devices (and this driver does not support that
++ * many devices).
++ */
++typedef struct smrt_identify_physical_drive_req {
++	uint8_t sipdr_opcode;
++	uint8_t sipdr_lun;
++	uint8_t	sipdr_bmic_index1;
++	uint8_t sipdr_reserved1[3];
++	uint8_t sipdr_command;
++	uint8_t sipdr_reserved2[2];
++	uint8_t sipdr_bmic_index2;
++	uint8_t sipdr_reserved4[6];
++} smrt_identify_physical_drive_req_t;
++
++/*
++ * Relevant values for the sipd_more_flags member.
++ */
++#define	SMRT_MORE_FLAGS_LOGVOL	(1 << 5)
++#define	SMRT_MORE_FLAGS_SPARE	(1 << 6)
++
++/*
++ * Response structure for IDENTIFY PHYSICAL DEVICE.  This structure is used to
++ * describe aspects of a physical drive. Note, not all fields are valid in all
++ * firmware revisions.
++ */
++typedef struct smrt_identify_physical_drive {
++	uint8_t		sipd_scsi_bus;	/* Invalid for SAS */
++	uint8_t		sipd_scsi_id;	/* Invalid for SAS */
++	uint16_t	sipd_lblk_size;
++	uint32_t	sipd_nblocks;
++	uint32_t	sipd_rsrvd_blocsk;
++	uint8_t		sipd_model[40];
++	uint8_t		sipd_serial[40];
++	uint8_t		sipd_firmware[8];
++	uint8_t		sipd_scsi_inquiry;
++	uint8_t		sipd_compaq_stamp;
++	uint8_t		sipd_last_failure;
++	uint8_t		sipd_flags;
++	uint8_t		sipd_more_flags;
++	uint8_t		sipd_scsi_lun;	/* Invalid for SAS */
++	uint8_t		sipd_yet_more_flags;
++	uint8_t		sipd_even_more_flags;
++	uint32_t	sipd_spi_speed_rules;
++	uint8_t		sipd_phys_connector[2];
++	uint8_t		sipd_phys_box_on_bus;
++	uint8_t		sipd_phys_bay_in_box;
++	uint32_t	sipd_rpm;
++	uint8_t		sipd_device_type;
++	uint8_t		sipd_sata_version;
++	uint64_t	sipd_big_nblocks;
++	uint64_t	sipd_ris_slba;
++	uint32_t	sipd_ris_size;
++	uint8_t		sipd_wwid[20];
++	uint8_t		sipd_controller_phy_map[32];
++	uint16_t	sipd_phy_count;
++	uint8_t		sipd_phy_connected_dev_type[256];
++	uint8_t		sipd_phy_to_drive_bay[256];
++	uint16_t	sipd_phy_to_attached_dev[256];
++	uint8_t		sipd_box_index;
++	uint8_t		sipd_drive_support;
++	uint16_t	sipd_extra_flags;
++	uint8_t		sipd_neogiated_link_rate[256];
++	uint8_t		sipd_phy_to_phy_map[256];
++	uint8_t		sipd_pad[312];
++} smrt_identify_physical_drive_t;
++
++/*
++ * Note that this structure describes the CISS version of the command. There
++ * also exists a BMIC version, but it has a slightly different structure.  This
++ * structure is also used for the cancellation request; however, in that case,
++ * the senr_flags field is reserved.
++ */
++typedef struct smrt_event_notify_req {
++	uint8_t		senr_opcode;
++	uint8_t		senr_subcode;
++	uint8_t		senr_reserved1[2];
++	uint32_t	senr_flags;	/* Big Endian */
++	uint32_t	senr_size;	/* Big Endian */
++	uint8_t		senr_control;
++} smrt_event_notify_req_t;
++
++/*
++ * When receiving event notifications, the buffer size must be 512 bytes large.
++ * We make sure that we always allocate a buffer of this size, even though we
++ * define a structure that is much shorter and only uses the fields that we end
++ * up caring about.  This size requirement comes from the specification.
++ */
++#define	SMRT_EVENT_NOTIFY_BUFLEN	512
++
++#define	SMRT_EVENT_CLASS_PROTOCOL		0
++#define	SMRT_EVENT_PROTOCOL_SUBCLASS_ERROR	1
++
++#define	SMRT_EVENT_CLASS_HOTPLUG		1
++#define	SMRT_EVENT_HOTPLUG_SUBCLASS_DRIVE	0
++
++#define	SMRT_EVENT_CLASS_HWERROR		2
++#define	SMRT_EVENT_CLASS_ENVIRONMENT		3
++
++#define	SMRT_EVENT_CLASS_PHYS			4
++#define	SMRT_EVENT_PHYS_SUBCLASS_STATE		0
++
++#define	SMRT_EVENT_CLASS_LOGVOL			5
++
++typedef struct smrt_event_notify {
++	uint32_t	sen_timestamp;
++	uint16_t	sen_class;
++	uint16_t	sen_subclass;
++	uint16_t	sen_detail;
++	uint8_t		sen_data[64];
++	char		sen_message[80];
++	uint32_t	sen_tag;
++	uint16_t	sen_date;
++	uint16_t	sen_year;
++	uint32_t	sen_time;
++	uint16_t	sen_pre_power_time;
++	LUNAddr_t	sen_addr;
++} smrt_event_notify_t;
++
+ #pragma pack()
+ 
+ #ifdef	__cplusplus
+diff --git a/usr/src/uts/common/sys/scsi/scsi_address.h b/usr/src/uts/common/sys/scsi/scsi_address.h
+index 36b5543dff..d2c11f3849 100644
+--- a/usr/src/uts/common/sys/scsi/scsi_address.h
++++ b/usr/src/uts/common/sys/scsi/scsi_address.h
+@@ -21,6 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #ifndef	_SYS_SCSI_SCSI_ADDRESS_H
+@@ -171,6 +172,17 @@ char		*scsi_wwn_to_wwnstr(uint64_t wwn,
+ void		scsi_wwnstr_hexcase(char *wwnstr, int lower_case);
+ const char	*scsi_wwnstr_skip_ua_prefix(const char *wwnstr);
+ void		scsi_free_wwnstr(char *wwnstr);
++
++/*
++ * Buffer lengths for SCSI strings. SCSI_WWN_STRLEN is the length of a WWN
++ * that's not in unit-address form. SCSI_WWN_UA_STRLEN includes the
++ * unit-address. SCSI_WWN_BUFLEN provides a buffer that's large enough for all
++ * of these.
++ */
++#define	SCSI_WWN_STRLEN	16
++#define	SCSI_WWN_UA_STRLEN	17
++#define	SCSI_WWN_BUFLEN	SCSI_MAXNAMELEN
++
+ #endif	/* _KERNEL */
+ 
+ #ifdef	__cplusplus
+diff --git a/usr/src/uts/intel/smrt/Makefile b/usr/src/uts/intel/smrt/Makefile
+index 40b4a52002..1d9d8969ed 100644
+--- a/usr/src/uts/intel/smrt/Makefile
++++ b/usr/src/uts/intel/smrt/Makefile
+@@ -10,7 +10,7 @@
+ #
+ 
+ #
+-# Copyright 2016 Joyent, Inc.
++# Copyright (c) 2017, Joyent, Inc.
+ #
+ 
+ #
+@@ -27,6 +27,11 @@ LINTS		= $(SMRT_OBJS:%.o=$(LINTS_DIR)/%.ln)
+ ROOTMODULE	= $(ROOT_DRV_DIR)/$(MODULE)
+ CONF_SRCDIR     = $(UTSBASE)/common/io/scsi/adapters/smrt
+ 
++#
++#	Include common rules.
++#
++include $(UTSBASE)/intel/Makefile.intel
++
+ #
+ #	Define targets
+ #
+@@ -39,11 +44,6 @@ INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOT_CONFFILE)
+ #
+ LDFLAGS		+= -dy -Nmisc/scsi
+ 
+-#
+-#	Include common rules.
+-#
+-include $(UTSBASE)/intel/Makefile.intel
+-
+ 
+ #
+ #	Default build targets.
+-- 
+2.21.0
+

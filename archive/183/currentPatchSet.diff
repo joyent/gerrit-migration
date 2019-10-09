@@ -1,0 +1,338 @@
+From 100cd24f6e23e51397d6b5bfde6f10869333e1f1 Mon Sep 17 00:00:00 2001
+From: Patrick Mooney <pmooney@pfmooney.com>
+Date: Fri, 29 Jul 2016 20:07:10 +0000
+Subject: [PATCH] OS-5007 support SO_ATTACH_FILTER on ICMP sockets Reviewed by:
+ Cody Mello <melloc@joyent.com> Reviewed by: Jerry Jelinek
+ <jerry.jelinek@joyent.com> Approved by: Jerry Jelinek
+ <jerry.jelinek@joyent.com>
+
+---
+ usr/src/uts/common/inet/ip/icmp.c          | 125 ++++++++++++++++++++-
+ usr/src/uts/common/inet/ip/icmp_opt_data.c |   6 +
+ usr/src/uts/common/inet/ip/ipclassifier.c  |   4 +-
+ usr/src/uts/common/inet/rawip_impl.h       |   6 +
+ usr/src/uts/intel/icmp/Makefile            |   3 +
+ usr/src/uts/sparc/icmp/Makefile            |   3 +
+ 6 files changed, 142 insertions(+), 5 deletions(-)
+
+diff --git a/usr/src/uts/common/inet/ip/icmp.c b/usr/src/uts/common/inet/ip/icmp.c
+index a4abdbd130..01119bf65b 100644
+--- a/usr/src/uts/common/inet/ip/icmp.c
++++ b/usr/src/uts/common/inet/ip/icmp.c
+@@ -22,6 +22,7 @@
+  * Copyright (c) 1991, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright (c) 2013 by Delphix. All rights reserved.
+  * Copyright 2014, OmniTI Computer Consulting, Inc. All rights reserved.
++ * Copyright 2016 Joyent, Inc.
+  */
+ /* Copyright (c) 1990 Mentat Inc. */
+ 
+@@ -80,6 +81,7 @@
+ #include <sys/tsol/tnet.h>
+ 
+ #include <inet/rawip_impl.h>
++#include <net/bpf.h>
+ 
+ #include <sys/disp.h>
+ 
+@@ -1011,6 +1013,12 @@ icmp_close_free(conn_t *connp)
+ 		icmp->icmp_filter = NULL;
+ 	}
+ 
++	if (icmp->icmp_bpf_len != 0) {
++		kmem_free(icmp->icmp_bpf_prog, icmp->icmp_bpf_len);
++		icmp->icmp_bpf_len = 0;
++		icmp->icmp_bpf_prog = NULL;
++	}
++
+ 	/*
+ 	 * Clear any fields which the kmem_cache constructor clears.
+ 	 * Only icmp_connp needs to be preserved.
+@@ -1964,6 +1972,104 @@ icmp_tpi_opt_get(queue_t *q, int level, int name, uchar_t *ptr)
+ 	return (err);
+ }
+ 
++static int
++icmp_attach_filter(icmp_t *icmp, uint_t inlen, const uchar_t *invalp)
++{
++	struct bpf_program prog;
++	ip_bpf_insn_t *insns = NULL;
++	unsigned int size;
++
++#ifdef _LP64
++	if (get_udatamodel() != DATAMODEL_NATIVE) {
++		struct bpf_program32 *prog32;
++
++		if (inlen != sizeof (struct bpf_program32)) {
++			return (EINVAL);
++		}
++		prog32 = (struct bpf_program32 *)invalp;
++		prog.bf_len = prog32->bf_len;
++		prog.bf_insns = (void *)(uint64_t)prog32->bf_insns;
++	} else
++#endif
++	if (inlen == sizeof (struct bpf_program)) {
++		bcopy(invalp, &prog, sizeof (prog));
++	} else {
++		return (EINVAL);
++	}
++
++	if (prog.bf_len > BPF_MAXINSNS || prog.bf_len == 0) {
++		return (EINVAL);
++	}
++	size = prog.bf_len * sizeof (struct bpf_insn);
++	insns = kmem_alloc(size, KM_SLEEP);
++	if (copyin(prog.bf_insns, insns, size) != 0) {
++		kmem_free(insns, size);
++		return (EFAULT);
++	}
++	if (!ip_bpf_validate(insns, prog.bf_len)) {
++		kmem_free(insns, size);
++		return (EINVAL);
++	}
++
++	rw_enter(&icmp->icmp_bpf_lock, RW_WRITER);
++	if (icmp->icmp_bpf_len != 0) {
++		ASSERT(icmp->icmp_bpf_prog != NULL);
++
++		kmem_free(icmp->icmp_bpf_prog, icmp->icmp_bpf_len);
++	}
++	icmp->icmp_bpf_len = size;
++	icmp->icmp_bpf_prog = insns;
++	rw_exit(&icmp->icmp_bpf_lock);
++	return (0);
++}
++
++static int
++icmp_detach_filter(icmp_t *icmp)
++{
++	int error;
++
++	rw_enter(&icmp->icmp_bpf_lock, RW_WRITER);
++	if (icmp->icmp_bpf_len == 0) {
++		ASSERT(icmp->icmp_bpf_prog == NULL);
++		error = ENOENT;
++	} else {
++		kmem_free(icmp->icmp_bpf_prog,
++		    icmp->icmp_bpf_len);
++		icmp->icmp_bpf_len = 0;
++		icmp->icmp_bpf_prog = NULL;
++		error = 0;
++	}
++	rw_exit(&icmp->icmp_bpf_lock);
++	return (error);
++}
++
++static boolean_t
++icmp_eval_filter(icmp_t *icmp, mblk_t *mp, ip_recv_attr_t *ira)
++{
++	boolean_t res;
++	uchar_t *buf = mp->b_rptr;
++	uint_t wirelen, len = MBLKL(mp);
++
++	rw_enter(&icmp->icmp_bpf_lock, RW_READER);
++	if (icmp->icmp_bpf_len == 0) {
++		rw_exit(&icmp->icmp_bpf_lock);
++		return (B_FALSE);
++	}
++	if (ira->ira_flags & IRAF_IS_IPV4) {
++		ipha_t *ipha = (ipha_t *)buf;
++
++		wirelen = ntohs(ipha->ipha_length);
++	} else {
++		ip6_t *ip6h = (ip6_t *)buf;
++
++		wirelen = ntohs(ip6h->ip6_plen) + IPV6_HDR_LEN;
++	}
++	res = !ip_bpf_filter(icmp->icmp_bpf_prog, buf, wirelen, len);
++	rw_exit(&icmp->icmp_bpf_lock);
++
++	return (res);
++}
++
+ /*
+  * This routine sets socket options.
+  */
+@@ -2053,6 +2159,10 @@ icmp_do_opt_set(conn_opt_arg_t *coa, int level, int name,
+ 				return (ENOBUFS);
+ 			}
+ 			break;
++		case SO_ATTACH_FILTER:
++			return (icmp_attach_filter(icmp, inlen, invalp));
++		case SO_DETACH_FILTER:
++			return (icmp_detach_filter(icmp));
+ 		}
+ 		break;
+ 
+@@ -2598,6 +2708,14 @@ icmp_input(void *arg1, mblk_t *mp, void *arg2, ip_recv_attr_t *ira)
+ 	/* Initialize regardless of IP version */
+ 	ipps.ipp_fields = 0;
+ 
++	/* Apply socket filter, if needed */
++	if (icmp->icmp_bpf_len != 0) {
++		if (icmp_eval_filter(icmp, mp, ira)) {
++			freemsg(mp);
++			return;
++		}
++	}
++
+ 	if (ira->ira_flags & IRAF_IS_IPV4) {
+ 		ASSERT(IPH_HDR_VERSION(rptr) == IPV4_VERSION);
+ 		ASSERT(MBLKL(mp) >= sizeof (ipha_t));
+@@ -5027,7 +5145,8 @@ rawip_stack_fini(netstackid_t stackid, void *arg)
+ }
+ 
+ static void *
+-rawip_kstat_init(netstackid_t stackid) {
++rawip_kstat_init(netstackid_t stackid)
++{
+ 	kstat_t	*ksp;
+ 
+ 	rawip_named_kstat_t template = {
+@@ -5039,9 +5158,7 @@ rawip_kstat_init(netstackid_t stackid) {
+ 	};
+ 
+ 	ksp = kstat_create_netstack("icmp", 0, "rawip", "mib2",
+-					KSTAT_TYPE_NAMED,
+-					NUM_OF_FIELDS(rawip_named_kstat_t),
+-					0, stackid);
++	    KSTAT_TYPE_NAMED, NUM_OF_FIELDS(rawip_named_kstat_t), 0, stackid);
+ 	if (ksp == NULL || ksp->ks_data == NULL)
+ 		return (NULL);
+ 
+diff --git a/usr/src/uts/common/inet/ip/icmp_opt_data.c b/usr/src/uts/common/inet/ip/icmp_opt_data.c
+index ff0310de0c..d65d3164d3 100644
+--- a/usr/src/uts/common/inet/ip/icmp_opt_data.c
++++ b/usr/src/uts/common/inet/ip/icmp_opt_data.c
+@@ -21,6 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ #include <sys/types.h>
+@@ -41,6 +42,7 @@
+ #include <netinet/ip_mroute.h>
+ #include <inet/optcom.h>
+ #include <inet/rawip_impl.h>
++#include <net/bpf.h>
+ 
+ /*
+  * Table of all known options handled on a ICMP protocol stack.
+@@ -86,6 +88,10 @@ opdes_t	icmp_opt_arr[] = {
+ 	0 },
+ { SO_DOMAIN,	SOL_SOCKET, OA_R, OA_R, OP_NP, 0, sizeof (int), 0 },
+ 
++{ SO_ATTACH_FILTER,	SOL_SOCKET, OA_W, OA_W, OP_NP, 0,
++	sizeof (struct bpf_program), 0 },
++{ SO_DETACH_FILTER,	SOL_SOCKET, OA_W, OA_W, OP_NP, 0, 0, 0 },
++
+ { IP_OPTIONS,	IPPROTO_IP, OA_RW, OA_RW, OP_NP,
+ 	(OP_VARLEN|OP_NODEFAULT),
+ 	IP_MAX_OPT_LENGTH + IP_ADDR_LEN, -1 /* not initialized */ },
+diff --git a/usr/src/uts/common/inet/ip/ipclassifier.c b/usr/src/uts/common/inet/ip/ipclassifier.c
+index 3a12e58c3a..a59027801f 100644
+--- a/usr/src/uts/common/inet/ip/ipclassifier.c
++++ b/usr/src/uts/common/inet/ip/ipclassifier.c
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ /*
+@@ -2117,6 +2117,7 @@ rawip_conn_constructor(void *buf, void *cdrarg, int kmflags)
+ 	connp->conn_flags = IPCL_RAWIPCONN;
+ 	connp->conn_proto = IPPROTO_ICMP;
+ 	icmp->icmp_connp = connp;
++	rw_init(&icmp->icmp_bpf_lock, NULL, RW_DEFAULT, NULL);
+ 	rw_init(&connp->conn_ilg_lock, NULL, RW_DEFAULT, NULL);
+ 	connp->conn_ixa = kmem_zalloc(sizeof (ip_xmit_attr_t), kmflags);
+ 	if (connp->conn_ixa == NULL)
+@@ -2141,6 +2142,7 @@ rawip_conn_destructor(void *buf, void *cdrarg)
+ 	mutex_destroy(&connp->conn_lock);
+ 	cv_destroy(&connp->conn_cv);
+ 	rw_destroy(&connp->conn_ilg_lock);
++	rw_destroy(&icmp->icmp_bpf_lock);
+ 
+ 	/* Can be NULL if constructor failed */
+ 	if (connp->conn_ixa != NULL) {
+diff --git a/usr/src/uts/common/inet/rawip_impl.h b/usr/src/uts/common/inet/rawip_impl.h
+index 6fb72d1d08..ddb482db78 100644
+--- a/usr/src/uts/common/inet/rawip_impl.h
++++ b/usr/src/uts/common/inet/rawip_impl.h
+@@ -20,6 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2016 Joyent, Inc.
+  */
+ /* Copyright (c) 1990 Mentat Inc. */
+ 
+@@ -43,6 +44,7 @@ extern "C" {
+ #include <inet/ip.h>
+ #include <inet/optcom.h>
+ #include <inet/tunables.h>
++#include <inet/bpf.h>
+ 
+ /*
+  * ICMP stack instances
+@@ -84,6 +86,10 @@ typedef	struct icmp_s {
+ 	mblk_t		*icmp_fallback_queue_head;
+ 	mblk_t		*icmp_fallback_queue_tail;
+ 	struct sockaddr_storage	icmp_delayed_addr;
++
++	krwlock_t	icmp_bpf_lock;	/* protects icmp_bpf */
++	ip_bpf_insn_t	*icmp_bpf_prog; /* SO_ATTACH_FILTER bpf */
++	uint_t		icmp_bpf_len;
+ } icmp_t;
+ 
+ /*
+diff --git a/usr/src/uts/intel/icmp/Makefile b/usr/src/uts/intel/icmp/Makefile
+index 259530f9dc..b6b1048254 100644
+--- a/usr/src/uts/intel/icmp/Makefile
++++ b/usr/src/uts/intel/icmp/Makefile
+@@ -23,6 +23,7 @@
+ #
+ # Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+ # Use is subject to license terms.
++# Copyright 2016 Joyent, Inc.
+ #
+ #	This makefile drives the production of the icmp IP driver
+ #
+@@ -63,6 +64,8 @@ ALL_TARGET	= $(BINARY) $(SRC_CONFFILE)
+ LINT_TARGET	= $(MODULE).lint
+ INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOTLINK) $(ROOT_CONFFILE)
+ 
++INC_PATH	+= -I$(UTSBASE)/common/io/bpf
++
+ #
+ #	depends on ip and sockfs
+ #
+diff --git a/usr/src/uts/sparc/icmp/Makefile b/usr/src/uts/sparc/icmp/Makefile
+index 55c11a1ea0..a35e66abd6 100644
+--- a/usr/src/uts/sparc/icmp/Makefile
++++ b/usr/src/uts/sparc/icmp/Makefile
+@@ -22,6 +22,7 @@
+ # uts/sparc/icmp/Makefile
+ # Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+ # Use is subject to license terms.
++# Copyright 2016 Joyent, Inc.
+ #
+ #	This makefile drives the production of the icmp IP driver
+ #
+@@ -62,6 +63,8 @@ ALL_TARGET	= $(BINARY) $(SRC_CONFFILE)
+ LINT_TARGET	= $(MODULE).lint
+ INSTALL_TARGET	= $(BINARY) $(ROOTMODULE) $(ROOTLINK) $(ROOT_CONFFILE)
+ 
++INC_PATH	+= -I$(UTSBASE)/common/io/bpf
++
+ #
+ # lint pass one enforcement
+ #
+-- 
+2.21.0
+

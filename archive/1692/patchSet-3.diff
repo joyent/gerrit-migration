@@ -1,0 +1,361 @@
+From 819e77c57598ceae7dde246c2e83fe4305ced601 Mon Sep 17 00:00:00 2001
+From: Patrick Mooney <pmooney@pfmooney.com>
+Date: Fri, 17 Mar 2017 23:08:50 +0000
+Subject: [PATCH] OS-5261 lxbrand eventfd AIO overflow behavior is incorrect
+ OS-6016 lxbrand poll(2) wants implicit events
+
+---
+ usr/src/uts/common/brand/lx/syscall/lx_aio.c  | 24 +++--
+ usr/src/uts/common/brand/lx/syscall/lx_poll.c | 18 +++-
+ usr/src/uts/common/io/eventfd.c               | 88 ++++++++++++++-----
+ usr/src/uts/common/sys/eventfd.h              | 10 ++-
+ usr/src/uts/common/sys/poll_impl.h            |  1 +
+ usr/src/uts/common/syscall/poll.c             | 12 +--
+ 6 files changed, 109 insertions(+), 44 deletions(-)
+
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_aio.c b/usr/src/uts/common/brand/lx/syscall/lx_aio.c
+index 44313ebb75..4174ab4ba5 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_aio.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_aio.c
+@@ -113,6 +113,7 @@
+ #include <sys/sysmacros.h>
+ #include <sys/sdt.h>
+ #include <sys/procfs.h>
++#include <sys/eventfd.h>
+ 
+ #include <sys/lx_brand.h>
+ #include <sys/lx_syscalls.h>
+@@ -527,24 +528,19 @@ lx_io_worker(void *a)
+ 			/* Update the eventfd if necessary */
+ 			if (do_resfd) {
+ 				vnode_t *vp = resfp->f_vnode;
+-				struct uio auio;
+-				struct iovec aiov;
+ 				uint64_t val = 1;
+ 
+-				aiov.iov_base = (caddr_t)&val;
+-				aiov.iov_len = sizeof (val);
+-				auio.uio_iov = &aiov;
+-				auio.uio_iovcnt = 1;
+-				auio.uio_loffset = 0;
+-				auio.uio_offset = 0;
+-				auio.uio_resid = sizeof (val);
+-				auio.uio_segflg = UIO_SYSSPACE;
+-				auio.uio_fmode = FWRITE | FNONBLOCK;
+-
+ 				set_active_fd(resfd);
+ 
+-				(void) VOP_WRITE(vp, &auio, FWRITE,
+-				    resfp->f_cred, NULL);
++				/*
++				 * Eventfd notifications from AIO are special
++				 * in that they are not expected to block.
++				 * This interface allows the eventfd value to
++				 * reach (but not cross) the overflow value.
++				 */
++				(void) VOP_IOCTL(vp, EVENTFDIOC_POST,
++				    (intptr_t)&val, FKIOCTL, resfp->f_cred,
++				    NULL, NULL);
+ 
+ 				releasef(resfd);
+ 			}
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_poll.c b/usr/src/uts/common/brand/lx/syscall/lx_poll.c
+index 1d92a55ddf..92852e72ae 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_poll.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_poll.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/types.h>
+@@ -199,6 +199,14 @@ lx_poll_common(pollfd_t *fds, nfds_t nfds, timespec_t *tsp, k_sigset_t *ksetp)
+ 		if ((error = lx_poll_copyin(ps, fds, nfds, oldevt)) != 0)
+ 			goto pollout;
+ 		pollfdp = ps->ps_pollfd;
++
++		/*
++		 * The Linux poll(2) implicitly polls for POLLERR and POLLHUP
++		 * in addition to any other events specified for the file
++		 * descriptors in question.  It does not modify pollfd_t`events
++		 * to reflect that fact when performing a later copyout.
++		 */
++		ps->ps_implicit_ev = POLLERR | POLLHUP;
+ 	}
+ 
+ 	/*
+@@ -206,6 +214,14 @@ lx_poll_common(pollfd_t *fds, nfds_t nfds, timespec_t *tsp, k_sigset_t *ksetp)
+ 	 */
+ 	error = poll_common(ps, fds, nfds, tsp, &fdcnt);
+ 
++	/*
++	 * Clear implicit event interest, if needed.
++	 */
++	if (ps != NULL) {
++		ps->ps_implicit_ev = 0;
++	}
++
++
+ pollout:
+ 	/*
+ 	 * If we changed the signal mask but we received no signal then restore
+diff --git a/usr/src/uts/common/io/eventfd.c b/usr/src/uts/common/io/eventfd.c
+index 9b0840aa8b..e26cdfc78f 100644
+--- a/usr/src/uts/common/io/eventfd.c
++++ b/usr/src/uts/common/io/eventfd.c
+@@ -141,37 +141,39 @@ eventfd_read(dev_t dev, uio_t *uio, cred_t *cr)
+ 	 * transitions from EVENTFD_VALMAX to a lower value.  At all other
+ 	 * times, it is already considered writable by poll.
+ 	 */
+-	if (oval == EVENTFD_VALMAX) {
++	if (oval >= EVENTFD_VALMAX) {
+ 		pollwakeup(&state->efd_pollhd, POLLWRNORM | POLLOUT);
+ 	}
+ 
+ 	return (err);
+ }
+ 
+-/*ARGSUSED*/
+ static int
+-eventfd_write(dev_t dev, struct uio *uio, cred_t *credp)
++eventfd_post(eventfd_state_t *state, uint64_t val, boolean_t is_async,
++    boolean_t file_nonblock)
+ {
+-	eventfd_state_t *state;
+-	minor_t minor = getminor(dev);
+-	uint64_t val, oval;
+-	int err;
+-
+-	if (uio->uio_resid < sizeof (val))
+-		return (EINVAL);
+-
+-	if ((err = uiomove(&val, sizeof (val), UIO_WRITE, uio)) != 0)
+-		return (err);
+-
+-	if (val > EVENTFD_VALMAX)
+-		return (EINVAL);
+-
+-	state = ddi_get_soft_state(eventfd_softstate, minor);
++	uint64_t oval;
++	boolean_t overflow = B_FALSE;
+ 
+ 	mutex_enter(&state->efd_lock);
+ 
+ 	while (val > EVENTFD_VALMAX - state->efd_value) {
+-		if (uio->uio_fmode & (FNDELAY|FNONBLOCK)) {
++
++		/*
++		 * When called from (LX) AIO, expectations about overflow and
++		 * blocking are different than normal operation.  If the
++		 * incoming value would cause overflow, it is clamped to reach
++		 * the overflow value exactly.  This is added to the existing
++		 * value without blocking.  Any pollers of the eventfd will see
++		 * POLLERR asserted when this occurs.
++		 */
++		if (is_async) {
++			val = EVENTFD_VALOVERFLOW - state->efd_value;
++			overflow = B_TRUE;
++			break;
++		}
++
++		if (file_nonblock) {
+ 			mutex_exit(&state->efd_lock);
+ 			return (EAGAIN);
+ 		}
+@@ -186,7 +188,7 @@ eventfd_write(dev_t dev, struct uio *uio, cred_t *credp)
+ 	}
+ 
+ 	/*
+-	 * We now know that we can add the value without overflowing.
++	 * We now know that we can safely add the value.
+ 	 */
+ 	state->efd_value = (oval = state->efd_value) + val;
+ 
+@@ -200,15 +202,41 @@ eventfd_write(dev_t dev, struct uio *uio, cred_t *credp)
+ 	mutex_exit(&state->efd_lock);
+ 
+ 	/*
+-	 * Notify pollers as well if the eventfd is now readable.
++	 * Notify pollers as well if the eventfd has become readable or has
++	 * transitioned into overflow.
+ 	 */
+ 	if (oval == 0) {
+ 		pollwakeup(&state->efd_pollhd, POLLRDNORM | POLLIN);
++	} else if (overflow && val != 0) {
++		pollwakeup(&state->efd_pollhd, POLLERR);
+ 	}
+ 
+ 	return (0);
+ }
+ 
++/*ARGSUSED*/
++static int
++eventfd_write(dev_t dev, struct uio *uio, cred_t *credp)
++{
++	eventfd_state_t *state;
++	boolean_t file_nonblock;
++	uint64_t val;
++	int err;
++
++	if (uio->uio_resid < sizeof (val))
++		return (EINVAL);
++
++	if ((err = uiomove(&val, sizeof (val), UIO_WRITE, uio)) != 0)
++		return (err);
++
++	if (val > EVENTFD_VALMAX)
++		return (EINVAL);
++
++	file_nonblock = (uio->uio_fmode & (FNDELAY|FNONBLOCK)) != 0;
++	state = ddi_get_soft_state(eventfd_softstate, getminor(dev));
++	return (eventfd_post(state, val, B_FALSE, file_nonblock));
++}
++
+ /*ARGSUSED*/
+ static int
+ eventfd_poll(dev_t dev, short events, int anyyet, short *reventsp,
+@@ -228,6 +256,9 @@ eventfd_poll(dev_t dev, short events, int anyyet, short *reventsp,
+ 	if (state->efd_value < EVENTFD_VALMAX)
+ 		revents |= POLLWRNORM | POLLOUT;
+ 
++	if (state->efd_value == EVENTFD_VALOVERFLOW)
++		revents |= POLLERR;
++
+ 	*reventsp = revents & events;
+ 	if ((*reventsp == 0 && !anyyet) || (events & POLLET)) {
+ 		*phpp = &state->efd_pollhd;
+@@ -244,17 +275,28 @@ eventfd_ioctl(dev_t dev, int cmd, intptr_t arg, int md, cred_t *cr, int *rv)
+ {
+ 	eventfd_state_t *state;
+ 	minor_t minor = getminor(dev);
++	uint64_t *valp;
+ 
+ 	state = ddi_get_soft_state(eventfd_softstate, minor);
+ 
+ 	switch (cmd) {
+-	case EVENTFDIOC_SEMAPHORE: {
++	case EVENTFDIOC_SEMAPHORE:
+ 		mutex_enter(&state->efd_lock);
+ 		state->efd_semaphore ^= 1;
+ 		mutex_exit(&state->efd_lock);
++		return (0);
+ 
++	case EVENTFDIOC_POST:
++		/*
++		 * This ioctl is expected to be kernel-internal, used only by
++		 * the AIO emulation in LX.
++		 */
++		if ((md & FKIOCTL) == 0) {
++			break;
++		}
++		valp = (uint64_t *)arg;
++		VERIFY(eventfd_post(state, *valp, B_TRUE, B_FALSE) == 0);
+ 		return (0);
+-	}
+ 
+ 	default:
+ 		break;
+diff --git a/usr/src/uts/common/sys/eventfd.h b/usr/src/uts/common/sys/eventfd.h
+index 1b0d961b0b..b64a101348 100644
+--- a/usr/src/uts/common/sys/eventfd.h
++++ b/usr/src/uts/common/sys/eventfd.h
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2015 Joyent, Inc.  All rights reserved.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -47,6 +47,13 @@ typedef uint64_t eventfd_t;
+ #define	EVENTFDIOC		(('e' << 24) | ('f' << 16) | ('d' << 8))
+ #define	EVENTFDIOC_SEMAPHORE	(EVENTFDIOC | 1)	/* toggle sem state */
+ 
++/*
++ * Kernel-internal method to write to eventfd while bypassing overflow limits,
++ * therefore avoiding potential to block as well.  This is used to fulfill AIO
++ * behavior in LX related to eventfd notification.
++ */
++#define	EVENTFDIOC_POST		(EVENTFDIOC | 2)
++
+ #ifndef _KERNEL
+ 
+ extern int eventfd(unsigned int, int);
+@@ -58,6 +65,7 @@ extern int eventfd_write(int, eventfd_t);
+ #define	EVENTFDMNRN_EVENTFD	0
+ #define	EVENTFDMNRN_CLONE	1
+ #define	EVENTFD_VALMAX		(ULLONG_MAX - 1ULL)
++#define	EVENTFD_VALOVERFLOW	ULLONG_MAX
+ 
+ #endif /* _KERNEL */
+ 
+diff --git a/usr/src/uts/common/sys/poll_impl.h b/usr/src/uts/common/sys/poll_impl.h
+index 58a9d37dbe..2cd0b59233 100644
+--- a/usr/src/uts/common/sys/poll_impl.h
++++ b/usr/src/uts/common/sys/poll_impl.h
+@@ -140,6 +140,7 @@ struct pollstate {
+ 	pollstate_t	*ps_contend_nextp;	/* next in contender list */
+ 	pollstate_t	**ps_contend_pnextp;	/* pointer-to-previous-next */
+ 	int		ps_flags;	/* state flags */
++	short		ps_implicit_ev;	/* implicit poll event interest */
+ };
+ 
+ /* pollstate flags */
+diff --git a/usr/src/uts/common/syscall/poll.c b/usr/src/uts/common/syscall/poll.c
+index 9106a6d48e..2eb50323a0 100644
+--- a/usr/src/uts/common/syscall/poll.c
++++ b/usr/src/uts/common/syscall/poll.c
+@@ -29,7 +29,7 @@
+ 
+ /*
+  * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
+- * Copyright 2016, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -1321,8 +1321,8 @@ pcache_insert(pollstate_t *ps, file_t *fp, pollfd_t *pollfdp, int *fdcntp,
+ 	 * be OK too.
+ 	 */
+ 	ASSERT(curthread->t_pollcache == NULL);
+-	error = VOP_POLL(fp->f_vnode, pollfdp->events, 0, &pollfdp->revents,
+-	    &memphp, NULL);
++	error = VOP_POLL(fp->f_vnode, pollfdp->events | ps->ps_implicit_ev, 0,
++	    &pollfdp->revents, &memphp, NULL);
+ 	if (error) {
+ 		return (error);
+ 	}
+@@ -2036,7 +2036,8 @@ retry:
+ 			 * flag.
+ 			 */
+ 			ASSERT(curthread->t_pollcache == NULL);
+-			error = VOP_POLL(fp->f_vnode, pollfdp[entry].events, 0,
++			error = VOP_POLL(fp->f_vnode,
++			    pollfdp[entry].events | ps->ps_implicit_ev, 0,
+ 			    &pollfdp[entry].revents, &php, NULL);
+ 			/*
+ 			 * releasef after completely done with this cached
+@@ -2335,6 +2336,7 @@ pollstate_create()
+ 	} else {
+ 		ASSERT(ps->ps_depth == 0);
+ 		ASSERT(ps->ps_flags == 0);
++		ASSERT(ps->ps_implicit_ev == 0);
+ 		ASSERT(ps->ps_pc_stack[0] == 0);
+ 	}
+ 	return (ps);
+@@ -3069,7 +3071,7 @@ plist_chkdupfd(file_t *fp, polldat_t *pdp, pollstate_t *psp, pollfd_t *pollfdp,
+ 				php = NULL;
+ 				ASSERT(curthread->t_pollcache == NULL);
+ 				error = VOP_POLL(fp->f_vnode,
+-				    pollfdp[i].events, 0,
++				    pollfdp[i].events | psp->ps_implicit_ev, 0,
+ 				    &pollfdp[i].revents, &php, NULL);
+ 				if (error) {
+ 					return (error);
+-- 
+2.21.0
+

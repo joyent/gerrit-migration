@@ -1,0 +1,1248 @@
+From 7b22e799bc028cf67a0385ab6e95fbce6488ea33 Mon Sep 17 00:00:00 2001
+From: Patrick Mooney <pmooney@pfmooney.com>
+Date: Thu, 8 Sep 2016 20:32:04 +0000
+Subject: [PATCH] OS-5637 lxbrand vdso busts golang stack budget
+
+---
+ usr/src/lib/brand/lx/lx_vdso/Makefile.com     |   2 +-
+ usr/src/lib/brand/lx/lx_vdso/amd64/Makefile   |   3 +
+ .../lib/brand/lx/lx_vdso/amd64/vdso_subr.s    |  63 ++++
+ .../lib/brand/lx/lx_vdso/common/vdso_main.c   | 100 +++---
+ usr/src/lib/commpage/Makefile.shared.com      |   8 +-
+ usr/src/lib/commpage/Makefile.shared.targ     |   5 +-
+ usr/src/lib/commpage/amd64/cp_subr.s          | 338 ++++++++++++++----
+ usr/src/lib/commpage/common/cp_defs.h         |   3 +-
+ usr/src/lib/commpage/common/cp_main.c         | 143 ++++----
+ usr/src/lib/commpage/common/offsets.in        |  35 ++
+ usr/src/lib/commpage/i386/cp_subr.s           | 167 +++++----
+ usr/src/lib/libc/amd64/Makefile               |   4 +-
+ usr/src/lib/libc/i386/Makefile.com            |   4 +-
+ usr/src/lib/libc/i386/sys/__clock_gettime.c   |   6 +-
+ 14 files changed, 584 insertions(+), 297 deletions(-)
+ create mode 100644 usr/src/lib/commpage/common/offsets.in
+
+diff --git a/usr/src/lib/brand/lx/lx_vdso/Makefile.com b/usr/src/lib/brand/lx/lx_vdso/Makefile.com
+index 0cdb1aaf70..acca62d9dc 100644
+--- a/usr/src/lib/brand/lx/lx_vdso/Makefile.com
++++ b/usr/src/lib/brand/lx/lx_vdso/Makefile.com
+@@ -52,7 +52,7 @@ ASFLAGS =	-P $(ASFLAGS_$(CURTYPE)) -D_ASM
+ 
+ LIBS =		$(DYNLIB)
+ 
+-CLEANFILES =	$(DYNLIB)
++CLEANFILES +=	$(DYNLIB)
+ ROOTLIBDIR =	$(ROOT)/usr/lib/brand/lx
+ ROOTLIBDIR64 =	$(ROOT)/usr/lib/brand/lx/$(MACH64)
+ 
+diff --git a/usr/src/lib/brand/lx/lx_vdso/amd64/Makefile b/usr/src/lib/brand/lx/lx_vdso/amd64/Makefile
+index f1c17dcd91..1a12492a97 100644
+--- a/usr/src/lib/brand/lx/lx_vdso/amd64/Makefile
++++ b/usr/src/lib/brand/lx/lx_vdso/amd64/Makefile
+@@ -23,6 +23,9 @@ ASFLAGS += -D__$(MACH64)
+ 
+ SONAME = linux-vdso.so.1
+ 
++# Disable save-args since some vDSO consumers are sensitive to stack usage.
++SAVEARGS =
++
+ #
+ # You might ask, why aren't we overriding BUILD.SO in Makefile.com.
+ # That's a sad story. The answer is that Makefile.lib.64 includes
+diff --git a/usr/src/lib/brand/lx/lx_vdso/amd64/vdso_subr.s b/usr/src/lib/brand/lx/lx_vdso/amd64/vdso_subr.s
+index bf066600aa..6b90890f43 100644
+--- a/usr/src/lib/brand/lx/lx_vdso/amd64/vdso_subr.s
++++ b/usr/src/lib/brand/lx/lx_vdso/amd64/vdso_subr.s
+@@ -19,6 +19,11 @@
+ #include <sys/asm_linkage.h>
+ #include <sys/lx_syscalls.h>
+ 
++#define	LX_CLOCK_REALTIME		0	/* CLOCK_REALTIME	*/
++#define	LX_CLOCK_REALTIME_COARSE	5	/* CLOCK_REALTIME	*/
++#define	LX_CLOCK_MONOTONIC		1	/* CLOCK_HIGHRES	*/
++#define	LX_CLOCK_MONOTONIC_RAW		4	/* CLOCK_HIGHRES	*/
++#define	LX_CLOCK_MONOTONIC_COARSE	6	/* CLOCK_HIGHRES	*/
+ 
+ #if defined(lint)
+ 
+@@ -65,4 +70,62 @@ __vdso_sys_time(timespec_t *tp)
+ 	ret
+ 	SET_SIZE(__vdso_sys_time)
+ 
++/*
++ * long
++ * __vdso_clock_gettime(uint_t, timespec_t *)
++ */
++	ENTRY_NP(__vdso_clock_gettime)
++	subq	$0x18, %rsp
++	movl	%edi, (%rsp)
++	movq	%rsi, 0x8(%rsp)
++
++	call	__vdso_find_commpage
++	movq	%rax, 0x10(%rsp)
++
++	movq	%rax, %rdi
++	call	__cp_can_gettime
++	cmpl	$0, %eax
++	jne	5f
++
++	/* Restore the original args/stack (with commpage pointer in rdx) */
++	movl	(%rsp), %edi
++	movq	0x8(%rsp), %rsi
++	movq	0x10(%rsp), %rdx
++	addq	$0x18, %rsp
++
++	cmpl	$LX_CLOCK_REALTIME, %edi
++	jne	2f
++1:
++	movq	%rdx, %rdi
++	jmp	__cp_clock_gettime_realtime
++
++2:
++	cmpl	$LX_CLOCK_MONOTONIC, %edi
++	jne	4f
++3:
++	movq	%rdx, %rdi
++	jmp	__cp_clock_gettime_monotonic
++
++4:
++	cmpl	$LX_CLOCK_REALTIME_COARSE, %edi
++	je	1b
++	cmpl	$LX_CLOCK_MONOTONIC_RAW, %edi
++	je	3b
++	cmpl	$LX_CLOCK_MONOTONIC_COARSE, %edi
++	je	3b
++	jmp	6f
++
++5:
++	/*
++	 * When falling through from a failed cp_can_gettime, the stack
++	 * allocation must be released before jumping to the syscall handler.
++	 */
++	addq	$0x18, %rsp
++
++6:
++	/* Let the real syscall handle all other cases */
++	jmp	__vdso_sys_clock_gettime
++	SET_SIZE(__vdso_clock_gettime)
++
++
+ #endif /* lint */
+diff --git a/usr/src/lib/brand/lx/lx_vdso/common/vdso_main.c b/usr/src/lib/brand/lx/lx_vdso/common/vdso_main.c
+index 2fe7adffc8..9dabc7c1eb 100644
+--- a/usr/src/lib/brand/lx/lx_vdso/common/vdso_main.c
++++ b/usr/src/lib/brand/lx/lx_vdso/common/vdso_main.c
+@@ -26,17 +26,11 @@ extern int __vdso_sys_gettimeofday(timespec_t *, struct lx_timezone *);
+ extern time_t __vdso_sys_time(time_t *);
+ extern long __vdso_sys_clock_gettime(uint_t, timespec_t *);
+ 
+-#define	LX_CLOCK_REALTIME		0	/* CLOCK_REALTIME	*/
+-#define	LX_CLOCK_MONOTONIC		1	/* CLOCK_HIGHRES	*/
+-#define	LX_CLOCK_PROCESS_CPUTIME_ID	2	/* Emulated		*/
+-#define	LX_CLOCK_THREAD_CPUTIME_ID	3	/* Emulated		*/
+-#define	LX_CLOCK_MONOTONIC_RAW		4	/* CLOCK_HIGHRES	*/
+-#define	LX_CLOCK_REALTIME_COARSE	5	/* CLOCK_REALTIME	*/
+-#define	LX_CLOCK_MONOTONIC_COARSE	6	/* CLOCK_HIGHRES	*/
+ 
++#ifndef __amd64
+ 
+ void
+-__hrt2ts(hrtime_t hrt, timespec_t *tsp)
++hrt2ts(hrtime_t hrt, timespec_t *tsp)
+ {
+ 	uint32_t sec, nsec, tmp;
+ 
+@@ -61,40 +55,61 @@ __hrt2ts(hrtime_t hrt, timespec_t *tsp)
+ 	tsp->tv_nsec = nsec;
+ }
+ 
+-int
+-__vdso_gettimeofday(timespec_t *tp, struct lx_timezone *tz)
++#define	LX_CLOCK_REALTIME		0	/* CLOCK_REALTIME	*/
++#define	LX_CLOCK_MONOTONIC		1	/* CLOCK_HIGHRES	*/
++#define	LX_CLOCK_PROCESS_CPUTIME_ID	2	/* Emulated		*/
++#define	LX_CLOCK_THREAD_CPUTIME_ID	3	/* Emulated		*/
++#define	LX_CLOCK_MONOTONIC_RAW		4	/* CLOCK_HIGHRES	*/
++#define	LX_CLOCK_REALTIME_COARSE	5	/* CLOCK_REALTIME	*/
++#define	LX_CLOCK_MONOTONIC_COARSE	6	/* CLOCK_HIGHRES	*/
++
++long
++__vdso_clock_gettime(uint_t clock_id, timespec_t *tp)
+ {
+ 	comm_page_t *cp = __vdso_find_commpage();
+ 
+ 	if (__cp_can_gettime(cp) != 0) {
+-		return (__vdso_sys_gettimeofday(tp, tz));
++		return (__vdso_sys_clock_gettime(clock_id, tp));
+ 	}
+ 
+-	if (tp != NULL) {
+-		long usec, nsec;
++	switch (clock_id) {
++	case LX_CLOCK_REALTIME:
++	case LX_CLOCK_REALTIME_COARSE:
++		return (__cp_clock_gettime_realtime(cp, tp));
+ 
+-		__cp_clock_gettime_realtime(cp, tp);
++	case LX_CLOCK_MONOTONIC:
++	case LX_CLOCK_MONOTONIC_RAW:
++	case LX_CLOCK_MONOTONIC_COARSE:
++		return (__cp_clock_gettime_monotonic(cp, tp));
+ 
+-		nsec = tp->tv_nsec;
+-		usec = nsec + (nsec >> 2);
+-		usec = nsec + (usec >> 1);
+-		usec = nsec + (usec >> 2);
+-		usec = nsec + (usec >> 4);
+-		usec = nsec - (usec >> 3);
+-		usec = nsec + (usec >> 2);
+-		usec = nsec + (usec >> 3);
+-		usec = nsec + (usec >> 4);
+-		usec = nsec + (usec >> 1);
+-		usec = nsec + (usec >> 6);
+-		usec = usec >> 10;
+-		tp->tv_nsec = usec;
++	case LX_CLOCK_PROCESS_CPUTIME_ID:
++	case LX_CLOCK_THREAD_CPUTIME_ID:
++	default:
++		return (__vdso_sys_clock_gettime(clock_id, tp));
+ 	}
++}
++
++#endif
++
+ 
++int
++__vdso_gettimeofday(timespec_t *tp, struct lx_timezone *tz)
++{
+ 	if (tz != NULL) {
+ 		tz->tz_minuteswest = 0;
+ 		tz->tz_dsttime = 0;
+ 	}
+ 
++	if (tp != NULL) {
++		comm_page_t *cp = __vdso_find_commpage();
++
++		if (__cp_can_gettime(cp) != 0) {
++			return (__vdso_sys_gettimeofday(tp, tz));
++		}
++
++		__cp_clock_gettime_realtime(cp, tp);
++		tp->tv_nsec /= 1000;
++	}
+ 	return (0);
+ }
+ 
+@@ -115,36 +130,7 @@ __vdso_time(time_t *tp)
+ 	return (ts.tv_sec);
+ }
+ 
+-long
+-__vdso_clock_gettime(uint_t clock_id, timespec_t *tp)
+-{
+-	comm_page_t *cp = __vdso_find_commpage();
+-
+-	if (__cp_can_gettime(cp) != 0) {
+-		return (__vdso_sys_clock_gettime(clock_id, tp));
+-	}
+-
+-	switch (clock_id) {
+-	case LX_CLOCK_REALTIME:
+-	case LX_CLOCK_REALTIME_COARSE:
+-		__cp_clock_gettime_realtime(cp, tp);
+-		return (0);
+-
+-	case LX_CLOCK_MONOTONIC:
+-	case LX_CLOCK_MONOTONIC_RAW:
+-	case LX_CLOCK_MONOTONIC_COARSE:
+-		__hrt2ts(__cp_gethrtime(cp), tp);
+-		return (0);
+-
+-	case LX_CLOCK_PROCESS_CPUTIME_ID:
+-	case LX_CLOCK_THREAD_CPUTIME_ID:
+-	default:
+-		break;
+-	}
+-	return (__vdso_sys_clock_gettime(clock_id, tp));
+-}
+-
+-long
++int
+ __vdso_getcpu(uint_t *cpu, uint_t *node, void *tcache)
+ {
+ 	comm_page_t *cp = __vdso_find_commpage();
+diff --git a/usr/src/lib/commpage/Makefile.shared.com b/usr/src/lib/commpage/Makefile.shared.com
+index 29cd826706..056f25d404 100644
+--- a/usr/src/lib/commpage/Makefile.shared.com
++++ b/usr/src/lib/commpage/Makefile.shared.com
+@@ -21,7 +21,13 @@ COMMPAGE_OBJS = \
+ 	cp_subr.o \
+ 	cp_main.o
+ 
++COMMPAGE_OFFSETS_SRC = $(SRC)/lib/commpage/common/offsets.in
++COMMPAGE_OFFSETS_H = cp_offsets.h
++
++CLEANFILES += $(COMMPAGE_OFFSETS_H)
++
+ pics/cp_main.o := CPPFLAGS += -I$(SRC)/uts/i86pc
+-pics/cp_subr.o := ASFLAGS += -I$(SRC)/uts/i86pc
++pics/cp_subr.o := ASFLAGS += -I$(SRC)/uts/i86pc -I./
++$(COMMPAGE_OFFSETS_H) := CPPFLAGS += -I$(SRC)/uts/i86pc
+ 
+ COMMPAGE_CPPFLAGS = -I$(SRC)/lib/commpage/common
+diff --git a/usr/src/lib/commpage/Makefile.shared.targ b/usr/src/lib/commpage/Makefile.shared.targ
+index 667634cafa..85260e3c9e 100644
+--- a/usr/src/lib/commpage/Makefile.shared.targ
++++ b/usr/src/lib/commpage/Makefile.shared.targ
+@@ -21,6 +21,9 @@ pics/%.o: $(SRC)/lib/commpage/common/%.c
+ 	$(COMPILE.c) -o $@ $<
+ 	$(POST_PROCESS_O)
+ 
+-pics/%.o: $(SRC)/lib/commpage/$(TARGET_ARCH)/%.s
++pics/%.o: $(SRC)/lib/commpage/$(TARGET_ARCH)/%.s $(COMMPAGE_OFFSETS_H)
+ 	$(COMPILE.s) -o $@ $<
+ 	$(POST_PROCESS_O)
++
++$(COMMPAGE_OFFSETS_H): $(COMMPAGE_OFFSETS_SRC)
++	$(OFFSETS_CREATE) <$(COMMPAGE_OFFSETS_SRC) >$@
+diff --git a/usr/src/lib/commpage/amd64/cp_subr.s b/usr/src/lib/commpage/amd64/cp_subr.s
+index ceb946acf0..dfb31ffb3e 100644
+--- a/usr/src/lib/commpage/amd64/cp_subr.s
++++ b/usr/src/lib/commpage/amd64/cp_subr.s
+@@ -17,124 +17,318 @@
+ #include <sys/segments.h>
+ #include <sys/time_impl.h>
+ #include <sys/tsc.h>
++#include <cp_offsets.h>
+ 
+ #define	GETCPU_GDT_OFFSET	SEL_GDT(GDT_CPUID, SEL_UPL)
+ 
+ 	.file	"cp_subr.s"
+ 
++/*
++ * These are cloned from TSC and time related code in the kernel.  The should
++ * be kept in sync in the case that the source values are changed.
++ */
++#define	NSEC_SHIFT	5
++#define	ADJ_SHIFT	4
++#define	NANOSEC		0x3b9aca00
++
+ /*
+  * hrtime_t
+- * __cp_tsc_read(uint_t cp_tsc_type)
++ * __cp_tsc_read(comm_page_t *cp)
++ *
++ * Stack: 0
+  */
+ 	ENTRY_NP(__cp_tsc_read)
+-	cmpl	$TSC_TSCP, %edi
+-	je	1f
+-	cmpl	$TSC_RDTSC_MFENCE, %edi
+-	je	2f
+-	cmpl	$TSC_RDTSC_LFENCE, %edi
+-	je	3f
+-	cmpl	$TSC_RDTSC_CPUID, %edi
+-	je	4f
+-	ud2a	/* abort with SIGILL */
+-1:
++	movl	CP_TSC_TYPE(%rdi), %esi
++	movl	CP_TSC_NCPU(%rdi), %r8d
++	leaq	CP_TSC_SYNC_TICK_DELTA(%rdi), %r9
++
++	cmpl	$TSC_TSCP, %esi
++	jne	2f
+ 	rdtscp
+-	jmp 5f
++	shlq	$0x20, %rdx
++	orq	%rdx, %rax
++	cmpl	$0, %esi
++	jne	1f
++	ret
++1:
++	/* Grab the per-cpu offset and add it to the TSC result */
++	movq	(%r9, %rcx, 8), %rdx
++	addq	%rdx, %rax
++	ret
++
+ 2:
++	/*
++	 * If rdtscp is not an option, we must first check if the per-cpu
++	 * offset is needed.  If so, the current CPU is queried before the TSC.
++	 * This comparison will catch all but the most pathological scheduling
++	 * behavior as it pertains to CPU migration.
++	 */
++	cmpl	$0, %r8d
++	je	3f
++	mov	$GETCPU_GDT_OFFSET, %eax
++	lsl	%ax, %eax
++
++3:
++	movl	%eax, %r10d
++
++	cmpl	$TSC_RDTSC_MFENCE, %esi
++	jne	4f
+ 	mfence
+ 	rdtsc
+-	jmp 5f
+-3:
++	jmp	7f
++
++4:
++	cmpl	$TSC_RDTSC_LFENCE, %esi
++	jne	5f
+ 	lfence
+ 	rdtsc
+-	jmp 5f
+-4:
++	jmp	7f
++
++5:
++	cmpl	$TSC_RDTSC_CPUID, %esi
++	jne	6f
+ 	movq	%rbx, %r11
+ 	xorl	%eax, %eax
+ 	cpuid
+ 	rdtsc
+ 	movq	%r11, %rbx
+-5:
++	jmp	7f
++
++6:
++	/*
++	 * Other protections should have prevented this function from being
++	 * called in the first place.  The only sane action is to abort.
++	 * The easiest means in this context is via SIGILL.
++	 */
++	ud2a
++
++7:
+ 	shlq	$0x20, %rdx
+ 	orq	%rdx, %rax
++
++	/*
++	 * Query the current CPU again if a per-CPU offset is being applied to
++	 * the TSC reading.  This is where migrations are detected.
++	 */
++	cmpl	$0, %r8d
++	je	8f
++	movq	%rax, %rdx
++	movl	$GETCPU_GDT_OFFSET, %eax
++	lsl	%ax, %eax
++	cmpl	%eax, %r10d
++	jne	3b
++	movl	%eax, %ecx
++	movq	(%r9, %rcx, 8), %rax
++	addq	%rdx, %rax
++8:
+ 	ret
+ 	SET_SIZE(__cp_tsc_read)
+ 
+ 
+ /*
+- * hrtime_t
+- * __cp_tsc_readcpu(uint_t cp_tsc_type, uint_t *cpu_id)
++ * uint_t
++ * __cp_getcpu(comm_page_t *)
++ *
++ * Stack: 0
+  */
+-	ENTRY_NP(__cp_tsc_readcpu)
++	ENTRY_NP(__cp_getcpu)
++	movl	CP_TSC_TYPE(%rdi), %edi
+ 	/*
+-	 * Both time and cpu_id can be queried quickly (using few registers) on
+-	 * systems which support RDTSCP.  On each cpu, the cpu_id is stored in
+-	 * the TSC_AUX MSR by the kernel.
++	 * If RDTSCP is available, it is a quick way to grab the cpu_id which
++	 * is stored in the TSC_AUX MSR by the kernel.
+ 	 */
+ 	cmpl	$TSC_TSCP, %edi
+ 	jne	1f
+ 	rdtscp
+-	movl	%ecx, (%rsi)
+-	shlq	$0x20, %rdx
+-	orq	%rdx, %rax
++	movl	%ecx, %eax
+ 	ret
+ 1:
+ 	mov	$GETCPU_GDT_OFFSET, %eax
+ 	lsl	%ax, %eax
+-	movq	%rax, %r11
+-	cmpl	$TSC_RDTSC_MFENCE, %edi
+-	je	2f
+-	cmpl	$TSC_RDTSC_LFENCE, %edi
+-	je	3f
+-	cmpl	$TSC_RDTSC_CPUID, %edi
+-	je	4f
+-	ud2a	/* abort with SIGILL */
++	ret
++	SET_SIZE(__cp_getcpu)
++
++/*
++ * hrtime_t
++ * __cp_gethrtime(comm_page_t *cp)
++ *
++ * Stack: 0x20 + 0x8
++ */
++	ENTRY_NP(__cp_gethrtime)
++	subq	$0x20, %rsp
++	movq	%rdi, 0x10(%rsp)
++1:
++	movl	CP_HRES_LOCK(%rdi), %r9d
++	movl	%r9d, 0x18(%rsp)
++
++	movq	CP_TSC_LAST(%rdi), %rax
++	movq	CP_TSC_HRTIME_BASE(%rdi), %rdx
++	movq	%rax, (%rsp)
++	movq	%rdx, 0x8(%rsp)
++
++	call	__cp_tsc_read
++	movq	0x10(%rsp), %rdi
++
++	movl	0x18(%rsp), %r9d
++	movl	CP_HRES_LOCK(%rdi), %edx
++	andl	$0xfffffffd, %r9d
++	cmpl	%r9d, %edx
++	jne	1b
++
++	/* calculate tsc -= tsc_last for the fast-path */
++	movq	(%rsp), %rdx
++	subq	%rdx, %rax
++	jbe	3f
++
+ 2:
+-	mfence
+-	rdtsc
+-	jmp 5f
++	/*
++	 * Optimized TSC_CONVERT_AND_ADD:
++	 * hrtime_base += (tsc_delta * nsec_scale) >> (32 - NSEC_SHIFT)
++	 *
++	 * Since the multiply and shift are done in 128-bit, there is no need
++	 * to worry about overflow.
++	 */
++	movl	CP_NSEC_SCALE(%rdi), %ecx
++	mulq	%rcx
++	shrdq	$_CONST(32 - NSEC_SHIFT), %rdx, %rax
++	movq	0x8(%rsp), %r8
++	addq	%r8, %rax
++
++	addq	$0x20, %rsp
++	ret
++
+ 3:
+-	lfence
+-	rdtsc
+-	jmp 5f
++	movq	%rax, %r9
++	movl	CP_TSC_MAX_DELTA(%rdi), %ecx
++	sall	$1, %ecx
++	addq	%rcx, %rax
++	jae	4f
++	xorq	%rax, %rax
++	jmp	2b
++
+ 4:
+-	movq	%rbx, %r10
+-	xorl	%eax, %eax
+-	cpuid
+-	rdtsc
+-	movq	%r10, %rbx
+-5:
+-	shlq	%rdx
+-	orq	%rax, %rdx
+ 	/*
+-	 * With a TSC reading in-hand, confirm that the thread has not migrated
+-	 * since the cpu_id was first checked.
++	 * Repopulate %rax with the TSC reading by adding tsc_last to %r9
++	 * (which holds tsc - tsc_last)
+ 	 */
+-	mov	$GETCPU_GDT_OFFSET, %eax
+-	lsl	%ax, %eax
+-	cmpq	%rax, %r11
+-	jne	1b
+-	movl	%eax, (%rsi)
+-	movq	%rdx, %rax
+-	ret
+-	SET_SIZE(__cp_tsc_readcpu)
++	movq	(%rsp), %rax
++	addq	%r9, %rax
+ 
++	/* tsc = (tsc < resume_cap) ? tsc : resume_cap */
++	movq	CP_TSC_RESUME_CAP(%rdi), %rcx
++	cmpq	%rcx, %rax
++	jbe	5f
++	movq	%rcx, %rax
++5:
++	jmp	2b
++
++	SET_SIZE(__cp_gethrtime)
+ 
+ /*
+- * uint_t
+- * __cp_do_getcpu(uint_t cp_tsc_type)
++ * int
++ * __cp_clock_gettime_monotonic(comm_page_t *cp, timespec_t *tsp)
++ *
++ * Stack: 0x8 + 0x8 + 0x28
+  */
+-	ENTRY_NP(__cp_do_getcpu)
+-	/*
+-	 * If RDTSCP is available, it is a quick way to grab the cpu_id which
+-	 * is stored in the TSC_AUX MSR by the kernel.
+-	 */
+-	cmpl	$TSC_TSCP, %edi
+-	jne	1f
+-	rdtscp
+-	movl	%ecx, %eax
++	ENTRY_NP(__cp_clock_gettime_monotonic)
++	subq	$0x8, %rsp
++	movq	%rsi, (%rsp)
++
++	call	__cp_gethrtime
++
++	/* hrtime -> timespec_t */
++	movq	%rax, %r11
++	movq	$0x112e0be826d694b3, %rdx
++	imulq	%rdx
++	sarq	$0x1a,%rdx
++	movq	%r11, %rax
++	sarq	$0x3f,%rax
++	subq	%rax,%rdx
++	movq	(%rsp), %rsi
++	movq	%rdx, (%rsi)
++	imulq	$NANOSEC, %rdx, %rdx
++	subq	%rdx, %r11
++	movq	%r11, 0x8(%rsi)
++
++	xorl	%eax, %eax
++	addq	$0x8, %rsp
+ 	ret
++	SET_SIZE(__cp_clock_gettime_monotonic)
++
++/*
++ * int
++ * __cp_clock_gettime_realtime(comm_page_t *cp, timespec_t *tsp)
++ *
++ * Stack: 0x18 + 0x8 + 0x28
++ */
++	ENTRY_NP(__cp_clock_gettime_realtime)
++	subq	$0x18, %rsp
++	movq	%rdi, (%rsp)
++	movq	%rsi, 0x8(%rsp)
++
+ 1:
+-	mov	$GETCPU_GDT_OFFSET, %eax
+-	lsl	%ax, %eax
++	movl	CP_HRES_LOCK(%rdi), %eax
++	movl	%eax, 0x10(%rsp)
++
++	call	__cp_gethrtime
++	movq	(%rsp), %rdi
++	movq	CP_HRES_LAST_TICK(%rdi), %rdx
++	subq	%rdx, %rax			/* nslt = hrtime - last_tick */
++	jb	1b
++	movq	CP_HRESTIME(%rdi), %r9
++	movq	_CONST(CP_HRESTIME + CP_HRESTIME_INCR)(%rdi), %r10
++	movq	CP_HRESTIME_ADJ(%rdi), %r11
++
++	addq	%rax, %r10			/* now.tv_nsec += nslt */
++
++	cmpq	$0, %r11
++	jb 4f					/* hres_adj > 0 */
++	ja 6f					/* hres_adj < 0 */
++
++2:
++	cmpq	$NANOSEC, %r10
++	jae	8f				/* tv_nsec >= NANOSEC */
++
++3:
++	movl	0x10(%rsp), %eax
++	movl	CP_HRES_LOCK(%rdi), %edx
++	andl	$0xfffffffd, %edx
++	cmpl	%eax, %edx
++	jne	1b
++
++	movq	0x8(%rsp), %rsi
++	movq	%r9, (%rsi)
++	movq	%r10, 0x8(%rsi)
++
++	xorl	%eax, %eax
++	addq	$0x18, %rsp
+ 	ret
+-	SET_SIZE(__cp_do_getcpu)
++
++
++4:						/* hres_adj > 0 */
++	sarq	$ADJ_SHIFT, %rax
++	cmpq	%r11, %rax
++	jbe	5f
++	movq	%r11, %rax
++5:
++	addq	%rax, %r10
++	jmp	2b
++
++6:						/* hres_adj < 0 */
++	sarq	$ADJ_SHIFT, %rax
++	negq	%r11
++	cmpq	%r11, %rax
++	jbe	7f
++	movq	%r11, %rax
++7:
++	subq	%rax, %r10
++	jmp	2b
++
++8:						/* tv_nsec >= NANOSEC */
++	subq	$NANOSEC, %r10
++	incq	%r9
++	cmpq	$NANOSEC, %r10
++	jae	8b
++	jmp	3b
++
++	SET_SIZE(__cp_clock_gettime_realtime)
+diff --git a/usr/src/lib/commpage/common/cp_defs.h b/usr/src/lib/commpage/common/cp_defs.h
+index e2a6cbca45..687e4ea8bc 100644
+--- a/usr/src/lib/commpage/common/cp_defs.h
++++ b/usr/src/lib/commpage/common/cp_defs.h
+@@ -27,7 +27,8 @@ typedef struct comm_page comm_page_t;
+ 
+ extern uint_t __cp_can_gettime(comm_page_t *);
+ extern hrtime_t __cp_gethrtime(comm_page_t *);
+-extern void __cp_clock_gettime_realtime(comm_page_t *, timespec_t *);
++extern int __cp_clock_gettime_realtime(comm_page_t *, timespec_t *);
++extern int __cp_clock_gettime_monotonic(comm_page_t *, timespec_t *);
+ extern uint_t __cp_getcpu(comm_page_t *cp);
+ 
+ #ifdef	__cplusplus
+diff --git a/usr/src/lib/commpage/common/cp_main.c b/usr/src/lib/commpage/common/cp_main.c
+index 8386767695..cf1a4ebade 100644
+--- a/usr/src/lib/commpage/common/cp_main.c
++++ b/usr/src/lib/commpage/common/cp_main.c
+@@ -13,16 +13,41 @@
+  * Copyright 2016 Joyent, Inc.
+  */
+ 
+-
+ #include <sys/comm_page.h>
+ #include <sys/tsc.h>
+ 
++
++/*
++ * Interrogate if querying the clock via the comm page is possible.
++ */
++int
++__cp_can_gettime(comm_page_t *cp)
++{
++	switch (cp->cp_tsc_type) {
++	case TSC_TSCP:
++	case TSC_RDTSC_MFENCE:
++	case TSC_RDTSC_LFENCE:
++	case TSC_RDTSC_CPUID:
++		return (0);
++	default:
++		break;
++	}
++	return (1);
++}
++
++#ifdef __amd64
++
++/*
++ * The functions used for calculating time (both monotonic and wall-clock) are
++ * implemented in assembly on amd64.  This is primarily for stack conservation.
++ */
++
++#else /* i386 below */
++
+ /*
+  * ASM-defined functions.
+  */
+-extern hrtime_t __cp_tsc_read(uint_t);
+-extern hrtime_t __cp_tsc_readcpu(uint_t, uint_t *);
+-extern uint_t __cp_do_getcpu(uint_t);
++extern hrtime_t __cp_tsc_read(comm_page_t *);
+ 
+ /*
+  * These are cloned from TSC and time related code in the kernel.  The should
+@@ -39,7 +64,6 @@ extern uint_t __cp_do_getcpu(uint_t);
+ 	(hrt) += (uint64_t)(_l[0] * sc) >> (32 - NSEC_SHIFT);	\
+ } while (0)
+ 
+-
+ /*
+  * Userspace version of tsc_gethrtime.
+  * See: uts/i86pc/os/timestamp.c
+@@ -66,35 +90,12 @@ __cp_gethrtime(comm_page_t *cp)
+ 	 * this check.  Such a possibility is considered an acceptable risk.
+ 	 *
+ 	 */
+-	if (cp->cp_tsc_ncpu == 0) {
+-		/*
+-		 * No per-CPU offset data, use the simple hres_lock loop.
+-		 */
+-		do {
+-			old_hres_lock = cp->cp_hres_lock;
+-			tsc_last = cp->cp_tsc_last;
+-			hrt = cp->cp_tsc_hrtime_base;
+-			tsc = __cp_tsc_read(cp->cp_tsc_type);
+-		} while ((old_hres_lock & ~1) != cp->cp_hres_lock);
+-	} else {
+-		/*
+-		 * Per-CPU offset data is needed for an accurate TSC reading.
+-		 */
+-		do {
+-			uint_t cpu_id;
+-
+-			old_hres_lock = cp->cp_hres_lock;
+-			tsc_last = cp->cp_tsc_last;
+-			hrt = cp->cp_tsc_hrtime_base;
+-			/*
+-			 * When collecting the TSC and cpu_id, cp_tsc_readcpu
+-			 * will accurately detect CPU migrations in all but
+-			 * the most pathological scheduling conditions.
+-			 */
+-			tsc = __cp_tsc_readcpu(cp->cp_tsc_type, &cpu_id);
+-			tsc += cp->cp_tsc_sync_tick_delta[cpu_id];
+-		} while ((old_hres_lock & ~1) != cp->cp_hres_lock);
+-	}
++	do {
++		old_hres_lock = cp->cp_hres_lock;
++		tsc_last = cp->cp_tsc_last;
++		hrt = cp->cp_tsc_hrtime_base;
++		tsc = __cp_tsc_read(cp);
++	} while ((old_hres_lock & ~1) != cp->cp_hres_lock);
+ 
+ 	if (tsc >= tsc_last) {
+ 		tsc -= tsc_last;
+@@ -112,10 +113,10 @@ __cp_gethrtime(comm_page_t *cp)
+  * Userspace version of pc_gethrestime.
+  * See: uts/i86pc/os/machdep.c
+  */
+-void
+-__cp_clock_gettime_realtime(comm_page_t *cp, timespec_t *tp)
++int
++__cp_clock_gettime_realtime(comm_page_t *cp, timespec_t *tsp)
+ {
+-	int lock_prev, nslt, adj;
++	int lock_prev, nslt;
+ 	timespec_t now;
+ 	int64_t hres_adj;
+ 
+@@ -132,54 +133,52 @@ loop:
+ 		goto loop;
+ 	}
+ 	now.tv_nsec += nslt;
+-	if (hres_adj != 0) {
+-		if (hres_adj > 0) {
+-			adj = (nslt >> ADJ_SHIFT);
+-			if (adj > hres_adj)
+-				adj = (int)hres_adj;
+-		} else {
+-			adj = -(nslt >> ADJ_SHIFT);
+-			if (adj < hres_adj)
+-				adj = (int)hres_adj;
+-		}
+-		now.tv_nsec += adj;
++
++	/*
++	 * Apply hres_adj skew, if needed.
++	 */
++	if (hres_adj > 0) {
++		nslt = (nslt >> ADJ_SHIFT);
++		if (nslt > hres_adj)
++			nslt = (int)hres_adj;
++		now.tv_nsec += nslt;
++	} else if (hres_adj < 0) {
++		nslt = -(nslt >> ADJ_SHIFT);
++		if (nslt < hres_adj)
++			nslt = (int)hres_adj;
++		now.tv_nsec += nslt;
+ 	}
++
++	/*
++	 * Rope in tv_nsec from any excessive adjustments.
++	 */
+ 	while ((unsigned long)now.tv_nsec >= NANOSEC) {
+-		/*
+-		 * Rope in tv_nsec from any excessive adjustments.
+-		 */
+ 		now.tv_nsec -= NANOSEC;
+ 		now.tv_sec++;
+ 	}
++
+ 	if ((cp->cp_hres_lock & ~1) != lock_prev)
+ 		goto loop;
+ 
+-	*tp = now;
++	*tsp = now;
++	return (0);
+ }
+ 
+ /*
+- * Interrogate if querying the clock via the comm page is possible.
++ * The __cp_clock_gettime_monotonic function expects that hrt2ts be present
++ * when the code is finally linked.
++ * (The amd64 version has no such requirement.)
+  */
++extern void hrt2ts(hrtime_t, timespec_t *);
++
+ int
+-__cp_can_gettime(comm_page_t *cp)
++__cp_clock_gettime_monotonic(comm_page_t *cp, timespec_t *tsp)
+ {
+-	switch (cp->cp_tsc_type) {
+-	case TSC_TSCP:
+-	case TSC_RDTSC_MFENCE:
+-	case TSC_RDTSC_LFENCE:
+-	case TSC_RDTSC_CPUID:
+-		return (0);
+-	default:
+-		break;
+-	}
+-	return (1);
+-}
++	hrtime_t hrt;
+ 
+-/*
+- * Query which CPU this LWP is running on.
+- */
+-uint_t
+-__cp_getcpu(comm_page_t *cp)
+-{
+-	return (__cp_do_getcpu(cp->cp_tsc_type));
++	hrt = __cp_gethrtime(cp);
++	hrt2ts(hrt, tsp);
++	return (0);
+ }
++
++#endif /* __amd64 */
+diff --git a/usr/src/lib/commpage/common/offsets.in b/usr/src/lib/commpage/common/offsets.in
+new file mode 100644
+index 0000000000..a7d2d5665b
+--- /dev/null
++++ b/usr/src/lib/commpage/common/offsets.in
+@@ -0,0 +1,35 @@
++\
++\ This file and its contents are supplied under the terms of the
++\ Common Development and Distribution License ("CDDL"), version 1.0.
++\ You may only use this file in accordance with the terms of version
++\ 1.0 of the CDDL.
++\
++\ A full copy of the text of the CDDL should have accompanied this
++\ source.  A copy of the CDDL is also available via the Internet at
++\ http://www.illumos.org/license/CDDL.
++\
++\
++\ Copyright 2016 Joyent, Inc.
++\
++
++
++\
++\ offsets.in: input file to produce assym.h using the ctfstabs program
++\
++
++#include <sys/comm_page.h>
++
++
++comm_page_s	COMM_PAGE_S_SIZE
++	cp_tsc_last
++	cp_tsc_hrtime_base
++	cp_tsc_resume_cap
++	cp_tsc_type
++	cp_tsc_max_delta
++	cp_hres_lock
++	cp_nsec_scale
++	cp_hrestime_adj
++	cp_hres_last_tick
++	cp_tsc_ncpu
++	cp_hrestime
++	cp_tsc_sync_tick_delta
+diff --git a/usr/src/lib/commpage/i386/cp_subr.s b/usr/src/lib/commpage/i386/cp_subr.s
+index 3dda195c12..025f371f36 100644
+--- a/usr/src/lib/commpage/i386/cp_subr.s
++++ b/usr/src/lib/commpage/i386/cp_subr.s
+@@ -17,6 +17,7 @@
+ #include <sys/segments.h>
+ #include <sys/time_impl.h>
+ #include <sys/tsc.h>
++#include <cp_offsets.h>
+ 
+ #define	GETCPU_GDT_OFFSET	SEL_GDT(GDT_CPUID, SEL_UPL)
+ 
+@@ -25,122 +26,120 @@
+ /*
+  * hrtime_t
+  * __cp_tsc_read(uint_t cp_tsc_type)
++ *
++ * Stack: 0x18
+  */
+ 	ENTRY_NP(__cp_tsc_read)
+-	movl	4(%esp), %eax
+-	cmpl	$TSC_TSCP, %eax
+-	je	1f
+-	cmpl	$TSC_RDTSC_MFENCE, %eax
+-	je	2f
+-	cmpl	$TSC_RDTSC_LFENCE, %eax
+-	je	3f
+-	cmpl	$TSC_RDTSC_CPUID, %eax
+-	je	4f
+-	ud2a	/* abort with SIGILL */
+-1:
+-	rdtscp
+-	ret
+-2:
+-	mfence
+-	rdtsc
+-	ret
+-3:
+-	lfence
+-	rdtsc
+-	ret
+-4:
+-	pushl	%ebx
+-	xorl	%eax, %eax
+-	cpuid
+-	rdtsc
+-	popl	%ebx
+-	ret
+-	SET_SIZE(__cp_tsc_read)
+-
+-/*
+- * hrtime_t
+- *  __cp_tsc_readcpu(uint_t cp_tsc_type, uint_t *cpu_id)
+- */
+-	ENTRY_NP(__cp_tsc_readcpu)
+-	/*
+-	 * Both time and cpu_id can be queried quickly (using few registers) on
+-	 * systems which support RDTSCP.  On each cpu, the cpu_id is stored in
+-	 * the TSC_AUX MSR by the kernel.
+-	 */
+-	movl	4(%esp), %eax
+-	cmpl	$TSC_TSCP, %eax
+-	jne	1f
+-	rdtscp
+-	pushl	%eax
+-	movl	0xc(%esp), %eax
+-	movl	%ecx, (%eax)
+-	popl	%eax
+-	ret
+-1:
+-	/*
+-	 * Since the other methods of querying the TSC and cpu_id are
+-	 * vulnurable to CPU migrations, build a proper stack frame so a more
+-	 * complicated and thorough check and be performed.
+-	 */
+ 	pushl	%ebp
+ 	movl	%esp, %ebp
+ 	pushl	%edi
+ 	pushl	%esi
+-	movl	%eax, %edi
++	subl	$0x4, %esp
++
++	movl	0x8(%ebp), %edi
++	movl	CP_TSC_TYPE(%edi), %eax
++	movl	CP_TSC_NCPU(%edi), %esi
++	cmpl	$TSC_TSCP, %eax
++	jne	3f
++	rdtscp
++	cmpl	$0, %esi
++	jne	2f
++1:
++	addl	$0x4, %esp
++	popl	%esi
++	popl	%edi
++	leave
++	ret
+ 2:
++	leal	CP_TSC_SYNC_TICK_DELTA(%edi), %esi
++	leal	(%esi, %ecx, 8), %ecx
++	addl	(%ecx), %eax
++	adcl	0x4(%ecx), %edx
++	jmp	1b
++
++3:
++	cmpl	$0, %esi
++	je	4f
+ 	mov	$GETCPU_GDT_OFFSET, %eax
+ 	lsl	%ax, %eax
+-	movl	%eax, %esi
+-	cmpl	$TSC_RDTSC_MFENCE, %edi
+-	je	3f
+-	cmpl	$TSC_RDTSC_LFENCE, %edi
+-	je	4f
+-	cmpl	$TSC_RDTSC_CPUID, %edi
+-	je	5f
+-	ud2a	/* abort with SIGILL */
+-3:
++	movl	%eax, (%esp)
++	movl	CP_TSC_TYPE(%edi), %eax
++
++4:
++	cmpl	$TSC_RDTSC_MFENCE, %eax
++	jne	5f
+ 	mfence
+ 	rdtsc
+-	jmp 6f
+-4:
++	jmp	8f
++
++5:
++	cmpl	$TSC_RDTSC_LFENCE, %eax
++	jne	6f
+ 	lfence
+ 	rdtsc
+-	jmp 6f
+-5:
++	jmp	8f
++
++6:
++	cmpl	$TSC_RDTSC_CPUID, %eax
++	jne	7f
+ 	pushl	%ebx
+ 	xorl	%eax, %eax
+ 	cpuid
+ 	rdtsc
+ 	popl	%ebx
+-6:
++	jmp	8f
++
++7:
++	/*
++	 * Other protections should have prevented this function from being
++	 * called in the first place.  The only sane action is to abort.
++	 * The easiest means in this context is via SIGILL.
++	 */
++	ud2a
++
++8:
++
++	cmpl	$0, %esi
++	je	1b
+ 	/*
+ 	 * With a TSC reading in-hand, confirm that the thread has not migrated
+ 	 * since the cpu_id was first checked.
+ 	 */
+-	pushl	%eax
+-	mov	$GETCPU_GDT_OFFSET, %eax
++	movl	%eax, %ecx
++	movl	$GETCPU_GDT_OFFSET, %eax
+ 	lsl	%ax, %eax
++	movl	(%esp), %esi
+ 	cmpl	%eax, %esi
+-	jne	2b
+-	movl	0xc(%ebp), %edi
+-	mov	%eax, (%edi)
+-	popl	%eax
+-	popl	%esi
+-	popl	%edi
+-	leave
+-	ret
+-	SET_SIZE(__cp_tsc_readcpu)
++	je	9f
++	/*
++	 * There was a CPU migration, perform another reading.
++	 */
++	movl	%eax, (%esp)
++	movl	CP_TSC_NCPU(%edi), %esi
++	movl	CP_TSC_TYPE(%edi), %eax
++	jmp	4b
++
++9:
++	/* Grab the per-cpu offset and add it to the TSC result */
++	xchgl	%ecx, %eax
++	leal	CP_TSC_SYNC_TICK_DELTA(%edi), %esi
++	leal	(%esi, %ecx, 8), %ecx
++	addl	(%ecx), %eax
++	adcl	0x4(%ecx), %edx
++	jmp	1b
++	SET_SIZE(__cp_tsc_read)
+ 
+ /*
+  * uint_t
+- * __cp_do_getcpu(uint_t cp_tsc_type)
++ * __cp_getcpu(uint_t cp_tsc_type)
+  */
+-	ENTRY_NP(__cp_do_getcpu)
++	ENTRY_NP(__cp_getcpu)
+ 	/*
+ 	 * If RDTSCP is available, it is a quick way to grab the cpu_id which
+ 	 * is stored in the TSC_AUX MSR by the kernel.
+ 	 */
+ 	movl	4(%esp), %eax
++	movl	CP_TSC_TYPE(%eax), %eax
+ 	cmpl	$TSC_TSCP, %eax
+ 	jne	1f
+ 	rdtscp
+@@ -150,4 +149,4 @@
+ 	mov	$GETCPU_GDT_OFFSET, %eax
+ 	lsl	%ax, %eax
+ 	ret
+-	SET_SIZE(__cp_do_getcpu)
++	SET_SIZE(__cp_getcpu)
+diff --git a/usr/src/lib/libc/amd64/Makefile b/usr/src/lib/libc/amd64/Makefile
+index a2803faedf..b5514c4bed 100644
+--- a/usr/src/lib/libc/amd64/Makefile
++++ b/usr/src/lib/libc/amd64/Makefile
+@@ -37,8 +37,8 @@ CPP=		/usr/lib/cpp
+ TARGET_ARCH=	amd64
+ 
+ # include comm page definitions
+-include $(SRC)/lib/commpage/Makefile.shared.targ
+ include $(SRC)/lib/commpage/Makefile.shared.com
++include $(SRC)/lib/commpage/Makefile.shared.targ
+ 
+ # objects are grouped by source directory
+ 
+@@ -1066,7 +1066,7 @@ BUILD.AR= $(RM) $@ ; \
+ 	$(AR) q $@ `$(LORDER) $(MOSTOBJS:%=$(DIR)/%) | $(GREP) -v ' L ' | $(TSORT)`
+ 
+ # extra files for the clean target
+-CLEANFILES=			\
++CLEANFILES+=			\
+ 	$(LIBCDIR)/port/gen/errlst.c	\
+ 	$(LIBCDIR)/port/gen/new_list.c	\
+ 	assym.h			\
+diff --git a/usr/src/lib/libc/i386/Makefile.com b/usr/src/lib/libc/i386/Makefile.com
+index 7c768d1019..d3176ce802 100644
+--- a/usr/src/lib/libc/i386/Makefile.com
++++ b/usr/src/lib/libc/i386/Makefile.com
+@@ -35,8 +35,8 @@ CPP=		/usr/lib/cpp
+ TARGET_ARCH=	i386
+ 
+ # include comm page definitions
+-include $(SRC)/lib/commpage/Makefile.shared.targ
+ include $(SRC)/lib/commpage/Makefile.shared.com
++include $(SRC)/lib/commpage/Makefile.shared.targ
+ 
+ VALUES=		values-Xa.o
+ 
+@@ -1127,7 +1127,7 @@ BUILD.AR= $(RM) $@ ; \
+ 	$(AR) q $@ `$(LORDER) $(MOSTOBJS:%=$(DIR)/%) | $(GREP) -v ' L ' | $(TSORT)`
+ 
+ # extra files for the clean target
+-CLEANFILES=			\
++CLEANFILES+=			\
+ 	$(LIBCDIR)/port/gen/errlst.c	\
+ 	$(LIBCDIR)/port/gen/new_list.c	\
+ 	assym.h			\
+diff --git a/usr/src/lib/libc/i386/sys/__clock_gettime.c b/usr/src/lib/libc/i386/sys/__clock_gettime.c
+index cdc40f7747..1f600559c0 100644
+--- a/usr/src/lib/libc/i386/sys/__clock_gettime.c
++++ b/usr/src/lib/libc/i386/sys/__clock_gettime.c
+@@ -29,12 +29,10 @@ __clock_gettime(clockid_t clock_id, timespec_t *tp)
+ 		switch (clock_id) {
+ 		case __CLOCK_REALTIME0:
+ 		case CLOCK_REALTIME:
+-			__cp_clock_gettime_realtime(cp, tp);
+-			return (0);
++			return (__cp_clock_gettime_realtime(cp, tp));
+ 
+ 		case CLOCK_MONOTONIC:
+-			hrt2ts(__cp_gethrtime(cp), tp);
+-			return (0);
++			return (__cp_clock_gettime_monotonic(cp, tp));
+ 
+ 		default:
+ 			/* Fallback */
+-- 
+2.21.0
+

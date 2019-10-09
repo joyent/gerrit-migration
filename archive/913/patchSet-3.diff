@@ -1,0 +1,505 @@
+From 8eadcba17ee7d5b64e9648d8a85a6daaa28e0e9b Mon Sep 17 00:00:00 2001
+From: "Joshua M. Clulow" <jmc@joyent.com>
+Date: Wed, 16 Nov 2016 21:10:33 -0800
+Subject: [PATCH] OS-5799 Smart Array firmware 8.00 does not work with MSI
+ OS-5800 identify and record firmware version of Smart Array controllers
+
+---
+ .../uts/common/io/scsi/adapters/smrt/smrt.c   |  28 ++-
+ .../common/io/scsi/adapters/smrt/smrt_ciss.c  | 173 ++++++++++++++++++
+ .../io/scsi/adapters/smrt/smrt_commands.c     |  12 +-
+ .../io/scsi/adapters/smrt/smrt_interrupts.c   |  23 ++-
+ .../io/scsi/adapters/smrt/smrt_logvol.c       |   7 +-
+ .../uts/common/sys/scsi/adapters/smrt/smrt.h  |  18 +-
+ .../common/sys/scsi/adapters/smrt/smrt_scsi.h |  57 +++++-
+ 7 files changed, 296 insertions(+), 22 deletions(-)
+
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c
+index fa925395b7..d41153d8ec 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt.c
+@@ -170,6 +170,8 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ {
+ 	uint32_t instance;
+ 	smrt_t *smrt;
++	boolean_t check_for_interrupts = B_FALSE;
++	int r;
+ 
+ 	if (cmd != DDI_ATTACH) {
+ 		return (DDI_FAILURE);
+@@ -281,6 +283,7 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	 * command completion interrupts from the controller.
+ 	 */
+ 	smrt_intr_set(smrt, B_TRUE);
++	check_for_interrupts = B_TRUE;
+ 
+ 	/*
+ 	 * Register the maintenance routine for periodic execution:
+@@ -289,11 +292,26 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	    SMRT_PERIODIC_RATE * NANOSEC, DDI_IPL_0);
+ 	smrt->smrt_init_level |= SMRT_INITLEVEL_PERIODIC;
+ 
++	/*
++	 * Determine the firmware version running in the controller and
++	 * note it in the system log.
++	 */
++	if ((r = smrt_ctlr_versions(smrt, SMRT_LOGVOL_DISCOVER_TIMEOUT,
++	    &smrt->smrt_versions)) != 0) {
++		dev_err(dip, CE_WARN, "could not identify controller (%d)",
++		    r);
++		goto fail;
++	}
++	dev_err(dip, CE_NOTE, "!firmware rev %s",
++	    smrt->smrt_versions.smrtv_firmware_rev);
++
+ 	/*
+ 	 * Discover the set of logical volumes attached to this controller:
+ 	 */
+-	if (smrt_logvol_discover(smrt, SMRT_LOGVOL_DISCOVER_TIMEOUT) != 0) {
+-		dev_err(dip, CE_WARN, "could not discover logical volumes");
++	if ((r = smrt_logvol_discover(smrt, SMRT_LOGVOL_DISCOVER_TIMEOUT)) !=
++	    0) {
++		dev_err(dip, CE_WARN, "could not discover logical volumes "
++		    "(%d)", r);
+ 		goto fail;
+ 	}
+ 
+@@ -305,6 +323,12 @@ smrt_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	return (DDI_SUCCESS);
+ 
+ fail:
++	if (check_for_interrupts) {
++		if (smrt->smrt_stats.smrts_claimed_interrupts == 0) {
++			dev_err(dip, CE_WARN, "controller did not interrupt "
++			    "during attach");
++		}
++	}
+ 	smrt_cleanup(smrt);
+ 	return (DDI_FAILURE);
+ }
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c
+index 99b396c0e4..c1d58fb058 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_ciss.c
+@@ -900,6 +900,179 @@ smrt_lockup_check(smrt_t *smrt)
+ 	}
+ }
+ 
++/*
++ * Probe the controller with the IDENTIFY CONTROLLER request.  This is a BMIC
++ * command, and the controller must be initialised and functioning already for
++ * it to complete successfully.
++ */
++int
++smrt_ctlr_identify(smrt_t *smrt, uint16_t timeout,
++    smrt_identify_controller_t *resp)
++{
++	smrt_command_t *smcm;
++	smrt_identify_controller_req_t smicr;
++	int r;
++	size_t sz;
++
++	/*
++	 * Allocate a command with a data buffer; the controller will fill it
++	 * with identification information.  There is some suggestion in the
++	 * firmware-level specification that the buffer length should be a
++	 * multiple of 512 bytes for some controllers, so we round up.
++	 */
++	sz = P2ROUNDUP_TYPED(sizeof (*resp), 512, size_t);
++	if ((smcm = smrt_command_alloc(smrt, SMRT_CMDTYPE_INTERNAL,
++	    KM_NOSLEEP)) == NULL ||
++	    smrt_command_attach_internal(smrt, smcm, sz, KM_NOSLEEP) != 0) {
++		if (smcm != NULL) {
++			smrt_command_free(smcm);
++		}
++		return (ENOMEM);
++	}
++
++	/*
++	 * This BMIC command is addressed to the controller itself.  The
++	 * Masked Peripheral Device addressing mode is used, with a LUN of 0.
++	 */
++	smrt_write_lun_addr_phys(&smcm->smcm_va_cmd->Header.LUN, B_TRUE,
++	    0, 0);
++
++	smcm->smcm_va_cmd->Request.CDBLen = sizeof (smicr);
++	smcm->smcm_va_cmd->Request.Timeout = timeout;
++	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
++	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_ORDERED;
++	smcm->smcm_va_cmd->Request.Type.Direction = CISS_XFER_READ;
++
++	/*
++	 * Construct the IDENTIFY CONTROLLER request CDB.  Note that any
++	 * reserved fields in the request must be filled with zeroes.
++	 */
++	bzero(&smicr, sizeof (smicr));
++	smicr.smicr_opcode = CISS_SCMD_BMIC_READ;
++	smicr.smicr_lun = 0;
++	smicr.smicr_command = CISS_BMIC_IDENTIFY_CONTROLLER;
++	bcopy(&smicr, &smcm->smcm_va_cmd->Request.CDB[0],
++	    MIN(CISS_CDBLEN, sizeof (smicr)));
++
++	mutex_enter(&smrt->smrt_mutex);
++
++	/*
++	 * Send the command to the device.
++	 */
++	smcm->smcm_status |= SMRT_CMD_STATUS_POLLED;
++	if ((r = smrt_submit(smrt, smcm)) != 0) {
++		goto out;
++	}
++
++	/*
++	 * Poll for completion.
++	 */
++	smcm->smcm_expiry = gethrtime() + 30 * NANOSEC;
++	if ((r = smrt_poll_for(smrt, smcm)) != 0) {
++		VERIFY3S(r, ==, ETIMEDOUT);
++		VERIFY0(smcm->smcm_status & SMRT_CMD_STATUS_POLL_COMPLETE);
++
++		/*
++		 * The command timed out; abandon it now.  Removed the POLLED
++		 * flag so that the periodic routine will send an abort to
++		 * clean it up the next time around.
++		 */
++		smcm->smcm_status |= SMRT_CMD_STATUS_ABANDONED;
++		smcm->smcm_status &= ~SMRT_CMD_STATUS_POLLED;
++		smcm = NULL;
++		goto out;
++	}
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_RESET_SENT) {
++		/*
++		 * The controller was reset while we were trying to identify
++		 * it.  Report failure.
++		 */
++		r = EIO;
++		goto out;
++	}
++
++	if (smcm->smcm_status & SMRT_CMD_STATUS_ERROR) {
++		ErrorInfo_t *ei = smcm->smcm_va_err;
++
++		if (ei->CommandStatus != CISS_CMD_DATA_UNDERRUN) {
++			dev_err(smrt->smrt_dip, CE_WARN, "identify "
++			    "controller error: status 0x%x",
++			    ei->CommandStatus);
++			r = EIO;
++			goto out;
++		}
++	}
++
++	if (resp != NULL) {
++		/*
++		 * Copy the identify response out for the caller.
++		 */
++		bcopy(smcm->smcm_internal->smcmi_va, resp, sizeof (*resp));
++	}
++
++	r = 0;
++
++out:
++	mutex_exit(&smrt->smrt_mutex);
++	if (smcm != NULL) {
++		smrt_command_free(smcm);
++	}
++	return (r);
++}
++
++/*
++ * The firmware versions in an IDENTIFY CONTROLLER response generally take
++ * the form of a four byte ASCII string containing a dotted decimal version
++ * number; e.g., "8.00".
++ *
++ * This function sanitises the firmware version, replacing unexpected
++ * values with a question mark.
++ */
++static void
++smrt_copy_firmware_version(uint8_t *src, char *dst)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		/*
++		 * Make sure that this is a 7-bit clean ASCII value.
++		 */
++		char c = src[i] <= 0x7f ? (char)(src[i] & 0x7f) : '?';
++
++		if (isalnum(c) || c == '.' || c == ' ') {
++			dst[i] = c;
++		} else {
++			dst[i] = '?';
++		}
++	}
++	dst[4] = '\0';
++}
++
++/*
++ * Using an IDENTIFY CONTROLLER request, determine firmware and controller
++ * version details.  See the comments for "smrt_ctlr_identify()" for more
++ * details about calling context.
++ */
++int
++smrt_ctlr_versions(smrt_t *smrt, uint16_t timeout, smrt_versions_t *smrtv)
++{
++	smrt_identify_controller_t smic;
++	int r;
++
++	if ((r = smrt_ctlr_identify(smrt, timeout, &smic)) != 0) {
++		return (r);
++	}
++
++	smrtv->smrtv_hardware_version = smic.smic_hardware_version;
++	smrt_copy_firmware_version(smic.smic_firmware_rev,
++	    smrtv->smrtv_firmware_rev);
++	smrt_copy_firmware_version(smic.smic_recovery_rev,
++	    smrtv->smrtv_recovery_rev);
++	smrt_copy_firmware_version(smic.smic_bootblock_rev,
++	    smrtv->smrtv_bootblock_rev);
++
++	return (0);
++}
++
+ int
+ smrt_ctlr_reset(smrt_t *smrt)
+ {
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c
+index 914e7b926a..1436893747 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_commands.c
+@@ -46,14 +46,6 @@ static ddi_device_acc_attr_t smrt_command_dev_attr = {
+ static void smrt_contig_free(smrt_dma_t *);
+ 
+ 
+-extern __GNU_INLINE size_t
+-smrt_round_up(size_t offset)
+-{
+-	size_t gran = 0x20;
+-
+-	return ((offset + (gran - 1)) & ~(gran - 1));
+-}
+-
+ static int
+ smrt_check_command_type(smrt_command_type_t type)
+ {
+@@ -175,10 +167,10 @@ smrt_command_alloc(smrt_t *smrt, smrt_command_type_t type, int kmflags)
+ 	 * physical address of each block should be 32-byte aligned.
+ 	 */
+ 	size_t contig_size = 0;
+-	contig_size += smrt_round_up(sizeof (CommandList_t));
++	contig_size += P2ROUNDUP_TYPED(sizeof (CommandList_t), 32, size_t);
+ 
+ 	size_t errorinfo_offset = contig_size;
+-	contig_size += smrt_round_up(sizeof (ErrorInfo_t));
++	contig_size += P2ROUNDUP_TYPED(sizeof (ErrorInfo_t), 32, size_t);
+ 
+ 	if (smrt_contig_alloc(smrt, &smcm->smcm_contig, contig_size,
+ 	    kmflags, (void **)&smcm->smcm_va_cmd, &smcm->smcm_pa_cmd) !=
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c
+index 84d38184aa..4c0050ad96 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_interrupts.c
+@@ -146,9 +146,21 @@ smrt_interrupts_setup(smrt_t *smrt)
+ 	}
+ 
+ 	/*
+-	 * The specification is somewhat unclear of the precise nature of MSI-X
+-	 * support with Smart Array controllers, particularly with respect to
+-	 * the Simple Transport Method, so we'll just try for classical MSI.
++	 * At least one firmware version has been released for the Smart Array
++	 * line with entirely defective MSI support.  Though the specification
++	 * is somewhat unclear on the precise nature of MSI-X support with
++	 * Smart Array controllers, particularly with respect to the Simple
++	 * Transport Method, we need to try MSI-X first.
++	 */
++	if (types & DDI_INTR_TYPE_MSIX) {
++		if (smrt_interrupts_alloc(smrt, DDI_INTR_TYPE_MSIX) ==
++		    DDI_SUCCESS) {
++			goto add_handler;
++		}
++	}
++
++	/*
++	 * If MSI-X is not available, fall back to MSI.
+ 	 */
+ 	if (types & DDI_INTR_TYPE_MSI) {
+ 		if (smrt_interrupts_alloc(smrt, DDI_INTR_TYPE_MSI) ==
+@@ -158,7 +170,10 @@ smrt_interrupts_setup(smrt_t *smrt)
+ 	}
+ 
+ 	/*
+-	 * If MSI is not available, fall back to fixed interrupts.
++	 * If neither MSI-X nor MSI is available, fall back to fixed
++	 * interrupts.  Note that the use of fixed interrupts has been
++	 * observed, with some combination of controllers and systems, to
++	 * result in interrupts stopping completely at random times.
+ 	 */
+ 	if (types & DDI_INTR_TYPE_FIXED) {
+ 		if (smrt_interrupts_alloc(smrt, DDI_INTR_TYPE_FIXED) ==
+diff --git a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c
+index 67267ecb60..449280d3ca 100644
+--- a/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c
++++ b/usr/src/uts/common/io/scsi/adapters/smrt/smrt_logvol.c
+@@ -202,7 +202,7 @@ smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
+ 	smrt_write_lun_addr_phys(&smcm->smcm_va_cmd->Header.LUN, B_TRUE,
+ 	    0, 0);
+ 
+-	smcm->smcm_va_cmd->Request.CDBLen = 12;
++	smcm->smcm_va_cmd->Request.CDBLen = sizeof (smrllr);
+ 	smcm->smcm_va_cmd->Request.Timeout = timeout;
+ 	smcm->smcm_va_cmd->Request.Type.Type = CISS_TYPE_CMD;
+ 	smcm->smcm_va_cmd->Request.Type.Attribute = CISS_ATTR_ORDERED;
+@@ -225,8 +225,7 @@ smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
+ 	 * Send the command to the device.
+ 	 */
+ 	smcm->smcm_status |= SMRT_CMD_STATUS_POLLED;
+-	if (smrt_submit(smrt, smcm) != 0) {
+-		r = EIO;
++	if ((r = smrt_submit(smrt, smcm)) != 0) {
+ 		goto out;
+ 	}
+ 
+@@ -235,7 +234,7 @@ smrt_logvol_discover(smrt_t *smrt, uint16_t timeout)
+ 	 */
+ 	smcm->smcm_expiry = gethrtime() + timeout * NANOSEC;
+ 	if ((r = smrt_poll_for(smrt, smcm)) != 0) {
+-		VERIFY(r == ETIMEDOUT);
++		VERIFY3S(r, ==, ETIMEDOUT);
+ 		VERIFY0(smcm->smcm_status & SMRT_CMD_STATUS_POLL_COMPLETE);
+ 
+ 		/*
+diff --git a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h
+index e9e381f519..446a6e975e 100644
+--- a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h
++++ b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt.h
+@@ -33,6 +33,7 @@
+ #include <sys/sunddi.h>
+ #include <sys/sdt.h>
+ #include <sys/policy.h>
++#include <sys/ctype.h>
+ 
+ #if !defined(_LITTLE_ENDIAN) || !defined(_BIT_FIELDS_LTOH)
+ /*
+@@ -164,6 +165,19 @@ typedef struct smrt_stats {
+ 	uint64_t smrts_ignored_scsi_cmds;
+ } smrt_stats_t;
+ 
++typedef struct smrt_versions {
++	uint8_t smrtv_hardware_version;
++
++	/*
++	 * These strings must be large enough to hold the 4 byte version string
++	 * retrieved from an IDENTIFY CONTROLLER response, as well as the
++	 * terminating NUL byte:
++	 */
++	char smrtv_firmware_rev[5];
++	char smrtv_recovery_rev[5];
++	char smrtv_bootblock_rev[5];
++} smrt_versions_t;
++
+ /*
+  * Per-Controller Structure
+  */
+@@ -181,6 +195,7 @@ struct smrt {
+ 	uint32_t smrt_bus_support;
+ 	uint32_t smrt_maxcmds;
+ 	uint32_t smrt_sg_cnt;
++	smrt_versions_t smrt_versions;
+ 
+ 	/*
+ 	 * The transport mode of the controller.
+@@ -521,7 +536,8 @@ void smrt_intr_set(smrt_t *, boolean_t);
+ int smrt_ctlr_init(smrt_t *);
+ void smrt_ctlr_teardown(smrt_t *);
+ int smrt_ctlr_reset(smrt_t *);
+-int smrt_ctlr_ping(smrt_t *, int);
++int smrt_ctlr_identify(smrt_t *, uint16_t, smrt_identify_controller_t *);
++int smrt_ctlr_versions(smrt_t *, uint16_t, smrt_versions_t *);
+ int smrt_ctlr_wait_for_state(smrt_t *, smrt_wait_state_t);
+ int smrt_ctlr_init_simple(smrt_t *);
+ void smrt_ctlr_teardown_simple(smrt_t *);
+diff --git a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h
+index c6a0665eb1..cca02e4637 100644
+--- a/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h
++++ b/usr/src/uts/common/sys/scsi/adapters/smrt/smrt_scsi.h
+@@ -41,6 +41,15 @@ extern "C" {
+ #define	CISS_SCMD_REPORT_LOGICAL_LUNS		0xC2
+ #define	CISS_SCMD_REPORT_PHYSICAL_LUNS		0xC3
+ 
++/*
++ * These command opcodes are _not_ in the usual vendor-specific space, but are
++ * nonetheless vendor-specific.  They allow BMIC commands to be written to and
++ * read from the controller.  If a command transfers no data, the specification
++ * suggests that BMIC_WRITE (0x27) is appropriate.
++ */
++#define	CISS_SCMD_BMIC_READ			0x26
++#define	CISS_SCMD_BMIC_WRITE			0x27
++
+ /*
+  * CISS Messages
+  *
+@@ -62,9 +71,19 @@ extern "C" {
+ 
+ #define	CISS_MSG_NOP				0x3
+ 
++/*
++ * BMIC Commands
++ *
++ * These commands allow for the use of non-standard facilities specific to the
++ * Smart Array firmware.  They are sent to the controller through a specially
++ * constructed CDB with the CISS_SCMD_BMIC_READ or CISS_SCMD_BMIC_WRITE opcode.
++ */
++#define	CISS_BMIC_IDENTIFY_CONTROLLER		0x11
++
+ /*
+  * The following packed structures are used to ease the manipulation of SCSI
+- * commands sent to, and status information returned from, the controller.
++ * and BMIC commands sent to, and status information returned from, the
++ * controller.
+  */
+ #pragma pack(1)
+ 
+@@ -96,6 +115,42 @@ typedef struct smrt_report_logical_lun_req {
+ 	uint8_t smrllr_control;
+ } smrt_report_logical_lun_req_t;
+ 
++/*
++ * Request structure for the BMIC command IDENTIFY CONTROLLER.  This structure
++ * is written into the CDB with the CISS_SCMD_BMIC_READ SCSI opcode.  Reserved
++ * fields should be filled with zeroes.
++ */
++typedef struct smrt_identify_controller_req {
++	uint8_t smicr_opcode;
++	uint8_t smicr_lun;
++	uint8_t smicr_reserved1[4];
++	uint8_t smicr_command;
++	uint8_t smicr_reserved2[2];
++	uint8_t smicr_reserved3[1];
++	uint8_t smicr_reserved4[6];
++} smrt_identify_controller_req_t;
++
++/*
++ * Response structure for IDENTIFY CONTROLLER.  This structure is used to
++ * interpret the response the controller will write into the data buffer.
++ */
++typedef struct smrt_identify_controller {
++	uint8_t smic_logical_drive_count;
++	uint32_t smic_config_signature;
++	uint8_t smic_firmware_rev[4];
++	uint8_t smic_recovery_rev[4];
++	uint8_t smic_hardware_version;
++	uint8_t smic_bootblock_rev[4];
++
++	/*
++	 * These are obsolete for SAS controllers:
++	 */
++	uint32_t smic_drive_present_map;
++	uint32_t smic_external_drive_map;
++
++	uint32_t smic_board_id;
++} smrt_identify_controller_t;
++
+ #pragma pack()
+ 
+ #ifdef	__cplusplus
+-- 
+2.21.0
+

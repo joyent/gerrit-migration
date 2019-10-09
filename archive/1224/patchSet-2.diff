@@ -1,0 +1,742 @@
+From 0dc914c43baf2976c539d202241990d2768f87b0 Mon Sep 17 00:00:00 2001
+From: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date: Sat, 7 Jan 2017 00:50:36 +0000
+Subject: [PATCH] OS-5773 lxbrand wants FUTEX_LOCK_PI
+
+---
+ usr/src/uts/common/brand/lx/sys/lx_futex.h    |   5 +-
+ .../uts/common/brand/lx/syscall/lx_futex.c    | 564 +++++++++++++++++-
+ 2 files changed, 539 insertions(+), 30 deletions(-)
+
+diff --git a/usr/src/uts/common/brand/lx/sys/lx_futex.h b/usr/src/uts/common/brand/lx/sys/lx_futex.h
+index 6e4f6ee4a0..7eba389218 100644
+--- a/usr/src/uts/common/brand/lx/sys/lx_futex.h
++++ b/usr/src/uts/common/brand/lx/sys/lx_futex.h
+@@ -24,7 +24,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2016, Joyent, Inc.  All rights reserved.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_LX_FUTEX_H
+@@ -113,6 +113,9 @@ typedef struct fwaiter {
+ 	struct fwaiter	*fw_next;	/* hash queue */
+ 	struct fwaiter	*fw_prev;	/* hash queue */
+ 	uint32_t	fw_bits;	/* bits waiting on */
++	pid_t		fw_tid;		/* for PI futexes; the waiter's tid */
++	int		fw_opri;	/* for PI futexes; original pri. */
++	boolean_t	fw_pri_up;	/* for PI futexes; pri. increased */
+ 	volatile int	fw_woken;
+ } fwaiter_t;
+ 
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_futex.c b/usr/src/uts/common/brand/lx/syscall/lx_futex.c
+index 47784cb491..35a21cbcdf 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_futex.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_futex.c
+@@ -24,7 +24,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <sys/types.h>
+@@ -45,6 +45,7 @@
+ #include <sys/lx_brand.h>
+ #include <sys/lx_futex.h>
+ #include <sys/lx_impl.h>
++#include <sys/sdt.h>
+ 
+ /*
+  * Futexes are a Linux-specific implementation of inter-process mutexes.
+@@ -57,21 +58,23 @@
+  *
+  * A futex itself a 4-byte integer, which must be 4-byte aligned.  The
+  * value of this integer is expected to be modified using user-level atomic
+- * operations.  The futex(4) design itself does not impose any semantic
+- * constraints on the value stored in the futex; it is up to the
+- * application to define its own protocol.
++ * operations.  For the original, simple futexes, the futex(4) design itself did
++ * not impose any semantic constraints on the value stored in the futex; it is
++ * up to the application to define its own protocol. For the newer,
++ * priority-inheritance (PI) futexes, the value is 0 or the TID of the holder,
++ * as defined in futex(2).
+  *
+  * When the application decides that kernel intervention is required, it
+- * will use the futex(2) system call.  There are 5 different operations
+- * that can be performed on a futex, using this system call.  Since this
+- * interface has evolved over time, there are several different prototypes
+- * available to the user.  Fortunately, there is only a single kernel-level
+- * interface:
++ * will use the futex(2) system call.  Originally there were 5 different
++ * operations that could be performed on a futex, using this system call, but
++ * that has subsequently been extended.  Since this interface has evolved over
++ * time, there are several different prototypes available to the user.
++ * Fortunately, there is only a single kernel-level interface:
+  *
+  * long sys_futex(void *futex1, int cmd, int val1,
+  * 	struct timespec	*timeout, void *futex2, int val2)
+  *
+- * The kernel-level operations that may be performed on a futex are:
++ * The kernel-level operations that may be performed on a simple futex are:
+  *
+  * FUTEX_WAIT
+  *
+@@ -186,6 +189,74 @@
+  *	This operation was broken by design, and was blessedly removed in
+  *	Linux 2.6.26 ("because it was inherently racy"); it should go without
+  *	saying that we don't support this operation.
++ *
++ * The kernel-level operations that may be performed on a PI futex are:
++ *
++ * FUTEX_LOCK_PI
++ *
++ *	Called after a user-land attempt to acquire the lock using an atomic
++ *	instruction failed because the futex had a nonzero value (the current
++ *	holder's TID). Once enqueued, the thread sleeps until FUTEX_UNLOCK_PI
++ *	is called on the futex.
++ *
++ * FUTEX_TRYLOCK_PI
++ *
++ *	Similar to FUTEX_LOCK_PI but can be used for error recovery as
++ *	described in futex(2).
++ *
++ * FUTEX_UNLOCK_PI
++ *
++ *	Called when the user-land cannot atomically release the lock because
++ *	there are waiting threads. This will wake the highest priority waiting
++ *	thread.
++ *
++ * FUTEX_CMP_REQUEUE_PI
++ *
++ *	Not implemented at this time.
++ *
++ * FUTEX_WAIT_REQUEUE_PI
++ *
++ *	Not implemented at this time.
++ *
++ * Priority Inheritance
++ *
++ * Our general approach to priority inheritance recognizes the fact that the
++ * application is almost certainly not a real-time process running on dedicated
++ * hardware. The zone is most likely running in a multi-tenant environment under
++ * FSS, in spite of whatever scheduling class the Linux application thinks it is
++ * using. Thus, we make our best effort to handle priority inheritance. When a
++ * thread must block on a PI futex, it may increase the scheduling priority of
++ * the futex holder to match the blocking thread. The futex holder's original
++ * priority will be restored when it unlocks the futex.
++ *
++ * This approach does not always handle transitive priority inheritance. For
++ * example, three threads at Low, Medium and High priority:
++ *    L holds futex X
++ *    M holds futex Y and became enqueued on X (M bumped L's priority to M)
++ *    H enqueues on Y and bumps priority of M to H, but never bumps L's priority
++ *      (which is currently M) up to H
++ * In reality this scenario is both uncommon and likely still executes
++ * reasonably well under a multi-tenant, FSS scenario. Also note that if H
++ * enqueued on Y before M enqueues on X, then L will have its priority raised
++ * to H when M enqueues on X.
++ *
++ * PI Futex Cleanup
++ *
++ * Futex cleanup can occur when a thread exits unexpectedly while holding one
++ * or more futexes. Normally this done via a "robust" futex and cleanup of a
++ * robust PI futex works in the same way as a non-PI robust futex (see
++ * lx_futex_robust_exit). On Linux, in the case of a non-robust PI futex,
++ * cleanup can still occur because the futex is associated with a real-time
++ * mutex inside the kernel (see the futex(2) man page for more details). For lx
++ * we are not using anything similar. When a thread exits, lx_futex_robust_exit
++ * will be called, but we would have to iterate every hash bucket, and every
++ * futex in the chain, to look for futexes held by the exiting thread. This
++ * would be very expensive and would occur whether or not the thread held any
++ * futexes. Thus, at this time we don't set the FUTEX_OWNER_DIED bit on
++ * non-robust PI futexes held by a thread when it exits while holding futexes.
++ * In practice this does not seem to be a serious limitation since user-level
++ * code generally appears to use robust futexes, but this may need to be
++ * revisited if it is observed to be an issue.
+  */
+ 
+ /*
+@@ -234,6 +305,8 @@ typedef struct futex_robust_list32 {
+ 	((uintptr_t)((id)->val[0]) >> (3 + 2 * HASH_SHIFT_SZ))) &	\
+ 	(HASH_SIZE - 1))
+ 
++#define	BELOW_MINPRI	(-61)	/* See FSS_MAXUPRI and friends */
++
+ /*
+  * We place the per-chain lock next to the pointer to the chain itself.
+  * When compared to an array of orthogonal locks, this reduces false sharing
+@@ -306,6 +379,7 @@ futex_wait(memid_t *memid, caddr_t addr,
+ 
+ 	fwp->fw_woken = 0;
+ 	fwp->fw_bits = bits;
++	fwp->fw_tid = 0;
+ 
+ 	MEMID_COPY(memid, &fwp->fw_memid);
+ 	cv_init(&fwp->fw_cv, NULL, CV_DEFAULT, NULL);
+@@ -370,12 +444,22 @@ futex_wake(memid_t *memid, int wake_threads, uint32_t mask)
+ 	for (fwp = futex_hash[index].fh_waiters;
+ 	    fwp != NULL && ret < wake_threads; fwp = next) {
+ 		next = fwp->fw_next;
+-		if (MEMID_EQUAL(&fwp->fw_memid, memid) &&
+-		    (fwp->fw_bits & mask)) {
+-			futex_hashout(fwp);
+-			fwp->fw_woken = 1;
+-			cv_signal(&fwp->fw_cv);
+-			ret++;
++		if (MEMID_EQUAL(&fwp->fw_memid, memid)) {
++			if (fwp->fw_tid != 0) {
++				/*
++				 * There is an invalid waiter on this futex
++				 * (e.g. a thread enqueued via FUTEX_LOCK_PI).
++				 */
++				mutex_exit(&futex_hash[index].fh_lock);
++				return (set_errno(EINVAL));
++			}
++
++			if ((fwp->fw_bits & mask)) {
++				futex_hashout(fwp);
++				fwp->fw_woken = 1;
++				cv_signal(&fwp->fw_cv);
++				ret++;
++			}
+ 		}
+ 	}
+ 
+@@ -394,11 +478,15 @@ futex_wake_op_execute(int32_t *addr, int32_t val3)
+ 	label_t ljb;
+ 	int rval;
+ 
+-	if ((uintptr_t)addr >= KERNELBASE)
+-		return (set_errno(EFAULT));
++	if ((uintptr_t)addr >= KERNELBASE) {
++		set_errno(EFAULT);
++		return (-1);
++	}
+ 
+-	if (on_fault(&ljb))
+-		return (set_errno(EFAULT));
++	if (on_fault(&ljb)) {
++		set_errno(EFAULT);
++		return (-1);
++	}
+ 
+ 	oparg = FUTEX_OP_OPARG(val3);
+ 
+@@ -428,7 +516,8 @@ futex_wake_op_execute(int32_t *addr, int32_t val3)
+ 
+ 		default:
+ 			no_fault();
+-			return (set_errno(EINVAL));
++			set_errno(EINVAL);
++			return (-1);
+ 		}
+ 	} while (atomic_cas_32((uint32_t *)addr, oldval, newval) != oldval);
+ 
+@@ -460,7 +549,8 @@ futex_wake_op_execute(int32_t *addr, int32_t val3)
+ 		break;
+ 
+ 	default:
+-		return (set_errno(EINVAL));
++		set_errno(EINVAL);
++		return (-1);
+ 	}
+ 
+ 	return (rval);
+@@ -494,14 +584,25 @@ futex_wake_op(memid_t *memid, caddr_t addr2, memid_t *memid2,
+ 		mutex_enter(l2);
+ 
+ 	/* LINTED: alignment */
+-	if ((wake = futex_wake_op_execute((int32_t *)addr2, val3)) < 0)
++	if ((wake = futex_wake_op_execute((int32_t *)addr2, val3)) < 0) {
++		ret = -1;
+ 		goto out;
++	}
+ 
+ 	for (fwp = futex_hash[index1].fh_waiters; fwp != NULL; fwp = next) {
+ 		next = fwp->fw_next;
+ 		if (!MEMID_EQUAL(&fwp->fw_memid, memid))
+ 			continue;
+ 
++		if (fwp->fw_tid != 0) {
++			/*
++			 * There is an invalid waiter on this futex (e.g. a
++			 * thread enqueued via FUTEX_LOCK_PI).
++			 */
++			ret = set_errno(EINVAL);
++			goto out;
++		}
++
+ 		futex_hashout(fwp);
+ 		fwp->fw_woken = 1;
+ 		cv_signal(&fwp->fw_cv);
+@@ -518,6 +619,15 @@ futex_wake_op(memid_t *memid, caddr_t addr2, memid_t *memid2,
+ 		if (!MEMID_EQUAL(&fwp->fw_memid, memid2))
+ 			continue;
+ 
++		if (fwp->fw_tid != 0) {
++			/*
++			 * There is an invalid waiter on this futex (e.g. a
++			 * thread enqueued via FUTEX_LOCK_PI).
++			 */
++			ret = set_errno(EINVAL);
++			goto out;
++		}
++
+ 		futex_hashout(fwp);
+ 		fwp->fw_woken = 1;
+ 		cv_signal(&fwp->fw_cv);
+@@ -687,6 +797,357 @@ get_timeout(void *lx_timeout, timestruc_t *timeout, int cmd, int clock)
+ 	return (0);
+ }
+ 
++/*
++ * Go to sleep until somebody does a Unlock operation on this futex, we get a
++ * signal, or the timeout expires.
++ */
++static int
++futex_lock_pi(memid_t *memid, caddr_t addr, timespec_t *timeout)
++{
++	kthread_t *t = curthread;
++	lx_lwp_data_t *lwpd = ttolxlwp(t);
++	fwaiter_t *fwp = &lwpd->br_fwaiter;
++	int err;
++	int index;
++	pid_t mytid = lwpd->br_pid;
++	pid_t ftid;			/* current futex holder tid */
++	proc_t *fproc = NULL;		/* current futex holder proc */
++	kthread_t *fthrd;		/* current futex holder thread */
++
++	if ((uintptr_t)addr >= KERNELBASE)
++		return (set_errno(EFAULT));
++
++	/*
++	 * Have to take mutex first to prevent the following race with unlock:
++	 * a) T1 sees a tid in the futex and atomically sets FUTEX_WAITERS.
++	 * b) T2 calls unlock, sees there are waiters, but since nothing is in
++	 *    the queue yet, it simply returns with the futex now containing 0.
++	 * c) T1 proceeds to enqueue itself.
++	 * At this point nothing will ever wake T1.
++	 */
++	index = HASH_FUNC(memid);
++	mutex_enter(&futex_hash[index].fh_lock);
++
++	/* It would be very unusual to actually loop here. */
++	while (1) {
++		uint32_t oldval, newval;
++		label_t ljb;
++
++		if (fuword32(addr, &oldval) || on_fault(&ljb)) {
++			mutex_exit(&futex_hash[index].fh_lock);
++			return (set_errno(EFAULT));
++		}
++
++		/* The futex was released after we initiated the syscall. */
++		if (oldval == 0) {
++			oldval = atomic_cas_32((uint32_t *)addr, 0, mytid);
++			if (oldval == 0) {
++				no_fault();
++				mutex_exit(&futex_hash[index].fh_lock);
++				return (0);
++			}
++		}
++
++		ASSERT(oldval != 0);
++		ftid = oldval & FUTEX_TID_MASK;
++		if (ftid == mytid) {
++			no_fault();
++			mutex_exit(&futex_hash[index].fh_lock);
++			return (set_errno(EDEADLK));
++		}
++
++		newval = oldval | FUTEX_WAITERS;
++		if (atomic_cas_32((uint32_t *)addr, oldval, newval) == oldval) {
++			/*
++			 * We set the WAITERS bit so now we can enqueue our
++			 * thread on the mutex.
++			 */
++			no_fault();
++			break;
++		}
++
++		/*
++		 * The rare case when a change snuck into the window between
++		 * first getting the futex value and updating it - retry.
++		 */
++		no_fault();
++	}
++
++	/*
++	 * Determine if the current futex holder's priority needs to inherit
++	 * our priority (only if it should be increased).
++	 *
++	 * If a non-branded proc is sharing this futex(!?) then we don't
++	 * interact with it. This seems like it would only occur maliciously.
++	 * That proc will never be able to call futex(2) to unlock the futex.
++	 *
++	 * Otherwise, get the holder's priority and if necessary, bump it up to
++	 * our level.
++	 */
++	if (lx_lpid_lock(ftid, curzone, LXP_PRLOCK, &fproc, &fthrd) != 0) {
++		mutex_exit(&futex_hash[index].fh_lock);
++		return (set_errno(ESRCH));
++	}
++	if (PROC_IS_BRANDED(fproc)) {
++		int fpri, mypri;
++		fwaiter_t *f_fwp;
++
++		ASSERT(MUTEX_HELD(&fproc->p_lock));
++		if (fproc != curproc)
++			mutex_enter(&curproc->p_lock);
++
++		(void) CL_DOPRIO(curthread, kcred, 0, &mypri);
++		(void) CL_DOPRIO(fthrd, kcred, 0, &fpri);
++
++		f_fwp = &lwptolxlwp(ttolwp(fthrd))->br_fwaiter;
++		if (mypri > fpri) {
++			/* Save holder's current pri if not already bumped up */
++			if (!f_fwp->fw_pri_up)
++				f_fwp->fw_opri = fpri;
++			f_fwp->fw_pri_up = B_TRUE;
++			DTRACE_PROBE2(futex__lck__pri, int, mypri, int, fpri);
++			CL_DOPRIO(fthrd, kcred, mypri - fpri, &fpri);
++		}
++		if (fproc != curproc)
++			mutex_exit(&curproc->p_lock);
++
++		/*
++		 * If we haven't already been bumped by some other thread then
++		 * record our pri at time of enqueue.
++		 */
++		if (!fwp->fw_pri_up) {
++			fwp->fw_opri = mypri;
++		}
++	}
++	sprunlock(fproc);
++
++	/*
++	 * Enqueue our thread on the mutex. This is similar to futex_wait().
++	 * See futex_wait() for LMS_USER_LOCK state description.
++	 */
++	(void) new_mstate(t, LMS_USER_LOCK);
++
++	fwp->fw_woken = 0;
++	fwp->fw_bits = 0;
++	fwp->fw_tid = mytid;
++	MEMID_COPY(memid, &fwp->fw_memid);
++	cv_init(&fwp->fw_cv, NULL, CV_DEFAULT, NULL);
++
++	futex_hashin(fwp);
++
++	err = 0;
++	while (fwp->fw_woken == 0 && err == 0) {
++		int ret;
++
++		ret = cv_waituntil_sig(&fwp->fw_cv, &futex_hash[index].fh_lock,
++		    timeout, timechanged);
++		if (ret < 0) {
++			err = set_errno(ETIMEDOUT);
++		} else if (ret == 0) {
++			/* EINTR is not valid for futex_lock_pi */
++			err = set_errno(EAGAIN);
++		}
++	}
++
++	/*
++	 * The futex is normally hashed out in futex_unlock_pi. If we timed out
++	 * or got a signal, we need to hash it out here instead.
++	 */
++	if (fwp->fw_woken == 0)
++		futex_hashout(fwp);
++
++	mutex_exit(&futex_hash[index].fh_lock);
++	return (err);
++}
++
++/*
++ * Paired with futex_lock_pi; wake up highest priority thread that is blocked
++ * on the futex at memid. The 'must_own' argument is used during robust mutex
++ * cleanup when the calling thread may not own the futex.
++ */
++static int
++futex_unlock_pi(memid_t *memid, caddr_t addr, boolean_t must_own)
++{
++	kthread_t *t = curthread;
++	lx_lwp_data_t *lwpd = ttolxlwp(t);
++	fwaiter_t *fwp, *fnd_fwp;
++	uint32_t curval;
++	pid_t tid = lwpd->br_pid;
++	int index;
++	int hipri;
++	uint_t cnt = 0;
++	label_t ljb;
++
++	if ((uintptr_t)addr >= KERNELBASE)
++		return (set_errno(EFAULT));
++
++	/* See comment in futex_lock_pi for why we take the mutex first. */
++	index = HASH_FUNC(memid);
++	mutex_enter(&futex_hash[index].fh_lock);
++
++	if (fuword32(addr, &curval)) {
++		mutex_exit(&futex_hash[index].fh_lock);
++		return (set_errno(EFAULT));
++	}
++
++	if (must_own && (curval & FUTEX_TID_MASK) != tid) {
++		mutex_exit(&futex_hash[index].fh_lock);
++		return (set_errno(EPERM));
++	}
++
++	/*
++	 * If necessary, restore our old priority. Since we only ever bump up
++	 * the priority, our incr should be negative, but we allow for the
++	 * case where the priority was lowered in some other way while we held
++	 * the futex. Also, we only reset our priority on a true unlock, not
++	 * when cleaning up, as indicated by must_own.
++	 */
++	if (must_own) {
++		fwp = &lwpd->br_fwaiter;
++		if (fwp->fw_pri_up) {
++			int curpri;
++			int incr;
++
++			mutex_enter(&curproc->p_lock);
++			CL_DOPRIO(curthread, kcred, 0, &curpri);
++			DTRACE_PROBE2(futex__unl__pri, int, fwp->fw_opri,
++			    int, curpri);
++			incr = fwp->fw_opri - curpri;
++			if (incr < 0) {
++				CL_DOPRIO(curthread, kcred, incr, &curpri);
++			}
++			mutex_exit(&curproc->p_lock);
++			fwp->fw_pri_up = B_FALSE;
++		}
++	}
++
++	/*
++	 * Normally an application wouldn't make the syscall if the WAITERS
++	 * bit is not set, but it does not appear to be an error to do so.
++	 */
++	if ((curval & FUTEX_WAITERS) == 0) {
++		int res = 0;
++		label_t fjb;
++
++		if (on_fault(&fjb)) {
++			mutex_exit(&futex_hash[index].fh_lock);
++			return (set_errno(EFAULT));
++		}
++		if (atomic_cas_32((uint32_t *)addr, curval, 0) != curval)
++			res = EINVAL;
++
++		no_fault();
++		mutex_exit(&futex_hash[index].fh_lock);
++		return ((res == 0) ? 0 : set_errno(res));
++	}
++
++	/*
++	 * Even with the proper volatile declarations, the compiler continues
++	 * to be confused about fnd_fwp getting clobbered. Thus this on_fault
++	 * needs to be here (before the loop) to avoid the compiler warning
++	 * about longjmp.
++	 */
++	if (on_fault(&ljb)) {
++		mutex_exit(&futex_hash[index].fh_lock);
++		return (set_errno(EFAULT));
++	}
++
++	/* Find the highest priority waiter. */
++	hipri = BELOW_MINPRI;
++	fnd_fwp = NULL;
++	for (fwp = futex_hash[index].fh_waiters; fwp != NULL;
++	    fwp = fwp->fw_next) {
++		if (MEMID_EQUAL(&fwp->fw_memid, memid)) {
++			if (fwp->fw_tid == 0) {
++				/*
++				 * There is an invalid waiter on this futex
++				 * (e.g. a thread enqueued via FUTEX_WAIT).
++				 */
++				no_fault();
++				mutex_exit(&futex_hash[index].fh_lock);
++				return (set_errno(EINVAL));
++			}
++			cnt++;
++			/*
++			 * Because futex_hashin inserts at the head of the list
++			 * we want to find the oldest entry with the highest
++			 * priority (hence >=).
++			 */
++			if (fwp->fw_opri >= hipri) {
++				fnd_fwp = fwp;
++				hipri = fwp->fw_opri;
++			}
++		}
++	}
++
++	/* No waiter on this futex; again, not normal, but not an error. */
++	if (fnd_fwp == NULL) {
++		int res = 0;
++		if (atomic_cas_32((uint32_t *)addr, curval, 0) != curval)
++			res = EINVAL;
++		no_fault();
++		mutex_exit(&futex_hash[index].fh_lock);
++		return ((res == 0) ? 0 : set_errno(res));
++	}
++
++	tid = fnd_fwp->fw_tid;
++	if (cnt > 1)
++		tid |= FUTEX_WAITERS;
++	if (atomic_cas_32((uint32_t *)addr, curval, tid) != curval) {
++		/*
++		 * The value was changed behind our back, return an error and
++		 * don't dequeue any waiter.
++		 */
++		no_fault();
++		mutex_exit(&futex_hash[index].fh_lock);
++		return (set_errno(EINVAL));
++	}
++
++	no_fault();
++
++	futex_hashout(fnd_fwp);
++	fnd_fwp->fw_woken = 1;
++	cv_signal(&fnd_fwp->fw_cv);
++
++	mutex_exit(&futex_hash[index].fh_lock);
++	return (0);
++}
++
++/*
++ * Similar to futex_lock_pi but handle the case where the futex holder is
++ * gone and try to recover.
++ */
++static int
++futex_trylock_pi(memid_t *memid, caddr_t addr)
++{
++	uint32_t curval;
++	pid_t ftid;			/* current futex holder tid */
++	proc_t *fproc = NULL;		/* current futex holder proc */
++	kthread_t *fthrd;		/* current futex holder thread */
++
++	if ((uintptr_t)addr >= KERNELBASE)
++		return (set_errno(EFAULT));
++
++	if (fuword32(addr, &curval))
++		return (set_errno(EFAULT));
++
++	/* The futex is free, use the normal flow. */
++	if (curval == 0)
++		return (futex_lock_pi(memid, addr, NULL));
++
++	/* Determine if the current futex holder is still alive. */
++	ftid = curval & FUTEX_TID_MASK;
++	if (lx_lpid_lock(ftid, curzone, LXP_PRLOCK, &fproc, &fthrd) == 0) {
++		sprunlock(fproc);
++	} else {
++		/* The current holder is gone. Unlock then take the lock. */
++		int err;
++		if ((err = futex_unlock_pi(memid, addr, B_FALSE)) != 0)
++			return (err);
++	}
++	return (futex_lock_pi(memid, addr, NULL));
++}
++
+ long
+ lx_futex(uintptr_t addr, int op, int val, uintptr_t lx_timeout,
+     uintptr_t addr2, int val3)
+@@ -721,9 +1182,6 @@ lx_futex(uintptr_t addr, int op, int val, uintptr_t lx_timeout,
+ 	}
+ 
+ 	switch (cmd) {
+-	case FUTEX_LOCK_PI:
+-	case FUTEX_UNLOCK_PI:
+-	case FUTEX_TRYLOCK_PI:
+ 	case FUTEX_WAIT_REQUEUE_PI:
+ 	case FUTEX_CMP_REQUEUE_PI:
+ 		/*
+@@ -746,8 +1204,8 @@ lx_futex(uintptr_t addr, int op, int val, uintptr_t lx_timeout,
+ 	}
+ 
+ 	/* Copy in the timeout structure from userspace. */
+-	if ((cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) &&
+-	    lx_timeout != NULL) {
++	if ((cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET ||
++	    cmd == FUTEX_LOCK_PI) && lx_timeout != NULL) {
+ 		rval = get_timeout((timespec_t *)lx_timeout, &timeout, cmd,
+ 		    op & FUTEX_CLOCK_REALTIME ? CLOCK_REALTIME :
+ 		    CLOCK_MONOTONIC);
+@@ -829,11 +1287,59 @@ lx_futex(uintptr_t addr, int op, int val, uintptr_t lx_timeout,
+ 		    val2, (void *)addr2, &val3);
+ 
+ 		break;
++
++	case FUTEX_LOCK_PI:
++		rval = futex_lock_pi(&memid, (void *)addr, tptr);
++		break;
++
++	case FUTEX_TRYLOCK_PI:
++		rval = futex_trylock_pi(&memid, (void *)addr);
++		break;
++
++	case FUTEX_UNLOCK_PI:
++		rval = futex_unlock_pi(&memid, (void *)addr, B_TRUE);
++		break;
+ 	}
+ 
+ 	return (rval);
+ }
+ 
++/*
++ * Wake the next waiter if the thread holding the futex has exited without
++ * releasing the futex.
++ */
++static void
++futex_robust_wake(memid_t *memid)
++{
++	fwaiter_t *fwp;
++	int index;
++
++	index = HASH_FUNC(memid);
++
++	mutex_enter(&futex_hash[index].fh_lock);
++
++	for (fwp = futex_hash[index].fh_waiters; fwp != NULL;
++	    fwp = fwp->fw_next) {
++		if (MEMID_EQUAL(&fwp->fw_memid, memid)) {
++			if (fwp->fw_tid != 0) {
++				/* this is a PI futex, unlock it */
++				mutex_exit(&futex_hash[index].fh_lock);
++				(void) futex_unlock_pi(memid,
++				    (caddr_t)(uintptr_t)memid->val[1], B_FALSE);
++				return;
++			}
++
++			/* non-PI futex, just wake it */
++			futex_hashout(fwp);
++			fwp->fw_woken = 1;
++			cv_signal(&fwp->fw_cv);
++			break;
++		}
++	}
++
++	mutex_exit(&futex_hash[index].fh_lock);
++}
++
+ /*
+  * Does the dirty work of actually dropping a held robust lock in the event
+  * of the untimely death of the owner; see lx_futex_robust_exit(), below.
+@@ -862,7 +1368,7 @@ lx_futex_robust_drop(uintptr_t addr, uint32_t tid)
+ 	if (as_getmemid(curproc->p_as, (void *)addr, &memid) != 0)
+ 		return;
+ 
+-	(void) futex_wake(&memid, 1, FUTEX_BITSET_MATCH_ANY);
++	futex_robust_wake(&memid);
+ }
+ 
+ /*
+-- 
+2.21.0
+

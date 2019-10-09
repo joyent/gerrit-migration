@@ -1,0 +1,147 @@
+From 119ace94c152853dc724e9ea67716922a37af2b6 Mon Sep 17 00:00:00 2001
+From: Robert Mustacchi <rm@joyent.com>
+Date: Fri, 9 Dec 2016 18:55:36 +0000
+Subject: [PATCH] OS-5843 xhci BIOS takeover can trigger interrupts OS-5842
+ xhci intr data for one-shots not always allocated
+
+---
+ usr/src/uts/common/io/usb/hcd/xhci/xhci.c     | 13 +++++---
+ .../uts/common/io/usb/hcd/xhci/xhci_event.c   | 14 +++++++--
+ .../uts/common/io/usb/hcd/xhci/xhci_usba.c    | 30 +++++++++++++++++++
+ 3 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/usr/src/uts/common/io/usb/hcd/xhci/xhci.c b/usr/src/uts/common/io/usb/hcd/xhci/xhci.c
+index 91718a96ec..7816ba6e14 100644
+--- a/usr/src/uts/common/io/usb/hcd/xhci/xhci.c
++++ b/usr/src/uts/common/io/usb/hcd/xhci/xhci.c
+@@ -2025,16 +2025,21 @@ xhci_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
+ 	cv_init(&xhcip->xhci_statecv, NULL, CV_DRIVER, NULL);
+ 	xhcip->xhci_seq |= XHCI_ATTACH_SYNCH;
+ 
+-	if (xhci_ddi_intr_enable(xhcip) == B_FALSE)
+-		goto err;
+-	xhcip->xhci_seq |= XHCI_ATTACH_INTR_ENABLE;
+-
+ 	if (xhci_port_count(xhcip) == B_FALSE)
+ 		goto err;
+ 
+ 	if (xhci_controller_takeover(xhcip) == B_FALSE)
+ 		goto err;
+ 
++	/*
++	 * We don't enable interrupts until after we potentially take over the
++	 * controller from the BIOS. We've observed cases where this can cause
++	 * spurious interrupts.
++	 */
++	if (xhci_ddi_intr_enable(xhcip) == B_FALSE)
++		goto err;
++	xhcip->xhci_seq |= XHCI_ATTACH_INTR_ENABLE;
++
+ 	if ((ret = xhci_controller_stop(xhcip)) != 0) {
+ 		xhci_error(xhcip, "failed to stop controller: %s",
+ 		    ret == EIO ? "encountered FM register error" :
+diff --git a/usr/src/uts/common/io/usb/hcd/xhci/xhci_event.c b/usr/src/uts/common/io/usb/hcd/xhci/xhci_event.c
+index 03e37ac6df..57f54213ce 100644
+--- a/usr/src/uts/common/io/usb/hcd/xhci/xhci_event.c
++++ b/usr/src/uts/common/io/usb/hcd/xhci/xhci_event.c
+@@ -158,10 +158,20 @@ xhci_event_process(xhci_t *xhcip)
+ 	}
+ 	mutex_exit(&xhcip->xhci_lock);
+ 
++	/*
++	 * We've seen a few cases, particularly when dealing with controllers
++	 * where BIOS takeover is involved, that an interrupt gets injected into
++	 * the system before we've actually finished setting things up. If for
++	 * some reason that happens, and we don't actually have a ring yet,
++	 * don't try and do anything.
++	 */
++	if (xhcip->xhci_event.xev_segs == NULL)
++		return (B_TRUE);
++
+ 	XHCI_DMA_SYNC(xrp->xr_dma, DDI_DMA_SYNC_FORKERNEL);
+ 	if (xhci_check_dma_handle(xhcip, &xrp->xr_dma) != DDI_FM_OK) {
+ 		xhci_error(xhcip, "encountered fatal FM error trying to "
+-		    "synchronize event ring: reseting device");
++		    "synchronize event ring: resetting device");
+ 		xhci_fm_runtime_reset(xhcip);
+ 		return (B_FALSE);
+ 	}
+@@ -215,7 +225,7 @@ xhci_event_process(xhci_t *xhcip)
+ 	xhci_put64(xhcip, XHCI_R_RUN, XHCI_ERDP(0), addr);
+ 	if (xhci_check_regs_acc(xhcip) != DDI_FM_OK) {
+ 		xhci_error(xhcip, "failed to write to event ring dequeue "
+-		    "pointer: encountered fatal FM error, reseting device");
++		    "pointer: encountered fatal FM error, resetting device");
+ 		xhci_fm_runtime_reset(xhcip);
+ 		return (B_FALSE);
+ 	}
+diff --git a/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c b/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c
+index 67d2fd6a3e..ec547662df 100644
+--- a/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c
++++ b/usr/src/uts/common/io/usb/hcd/xhci/xhci_usba.c
+@@ -22,6 +22,7 @@
+ #include <sys/usb/hcd/xhci/xhci.h>
+ #include <sys/sysmacros.h>
+ #include <sys/strsun.h>
++#include <sys/strsubr.h>
+ 
+ static xhci_t *
+ xhci_hcdi_get_xhcip_from_dev(usba_device_t *ud)
+@@ -1116,6 +1117,7 @@ xhci_hcdi_intr_oneshot(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
+ 	xhci_endpoint_t *xep;
+ 	xhci_transfer_t *xt;
+ 	boolean_t datain;
++	mblk_t *mp = NULL;
+ 
+ 	mutex_enter(&xhcip->xhci_lock);
+ 	if (xhcip->xhci_state & XHCI_S_ERROR) {
+@@ -1153,11 +1155,35 @@ xhci_hcdi_intr_oneshot(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
+ 		xt->xt_timeout = HCDI_DEFAULT_TIMEOUT;
+ 	}
+ 
++	/*
++	 * Unlike other request types, USB Interrupt-IN requests aren't required
++	 * to have allcoated the message block for data. If they haven't, we
++	 * take care of that now.
++	 */
++	if (uirp->intr_len > 0 && datain == B_TRUE && uirp->intr_data == NULL) {
++		if (usb_flags & USB_FLAGS_SLEEP) {
++			mp = allocb_wait(uirp->intr_len, BPRI_LO, STR_NOSIG,
++			    NULL);
++		} else {
++			mp = allocb(uirp->intr_len, 0);
++		}
++		if (mp == NULL) {
++			xhci_transfer_free(xhcip, xt);
++			mutex_exit(&xhcip->xhci_lock);
++			return (USB_NO_RESOURCES);
++		}
++		uirp->intr_data = mp;
++	}
++
+ 	if (uirp->intr_len > 0 && datain == B_FALSE) {
+ 		xhci_transfer_copy(xt, uirp->intr_data->b_rptr, uirp->intr_len,
+ 		    B_FALSE);
+ 		if (xhci_transfer_sync(xhcip, xt, DDI_DMA_SYNC_FORDEV) !=
+ 		    DDI_FM_OK) {
++			if (mp != NULL) {
++				uirp->intr_data = NULL;
++				freemsg(mp);
++			}
+ 			xhci_transfer_free(xhcip, xt);
+ 			xhci_error(xhcip, "failed to synchronize interrupt "
+ 			    "transfer DMA memory on endpoint %u of "
+@@ -1172,6 +1198,10 @@ xhci_hcdi_intr_oneshot(xhci_t *xhcip, usba_pipe_handle_data_t *ph,
+ 	xhci_transfer_trb_fill_data(xep, xt, 0, datain);
+ 	mutex_enter(&xhcip->xhci_lock);
+ 	if (xhci_endpoint_schedule(xhcip, xd, xep, xt, B_TRUE) != 0) {
++		if (mp != NULL) {
++			uirp->intr_data = NULL;
++			freemsg(mp);
++		}
+ 		xhci_transfer_free(xhcip, xt);
+ 		mutex_exit(&xhcip->xhci_lock);
+ 		return (USB_NO_RESOURCES);
+-- 
+2.21.0
+

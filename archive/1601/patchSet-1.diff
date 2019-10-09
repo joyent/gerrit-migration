@@ -1,0 +1,318 @@
+From 35ef6dbff8780309bcb00e0a9e0e31c7eb56c2c5 Mon Sep 17 00:00:00 2001
+From: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date: Thu, 2 Mar 2017 15:33:49 +0000
+Subject: [PATCH] OS-5991 refactor aio to remove exitlwp brand hook OS-5992
+ harden aio worker thread signal handling
+
+---
+ usr/src/uts/common/brand/lx/os/lx_brand.c     |  18 +--
+ usr/src/uts/common/brand/lx/syscall/lx_aio.c  | 106 +++++++++---------
+ usr/src/uts/common/brand/sn1/sn1_brand.c      |   3 +-
+ .../uts/common/brand/solaris10/s10_brand.c    |   3 +-
+ usr/src/uts/common/os/lwp.c                   |   3 -
+ usr/src/uts/common/sys/brand.h                |   2 -
+ 6 files changed, 56 insertions(+), 79 deletions(-)
+
+diff --git a/usr/src/uts/common/brand/lx/os/lx_brand.c b/usr/src/uts/common/brand/lx/os/lx_brand.c
+index 71a416ab7b..499c0fd4c2 100644
+--- a/usr/src/uts/common/brand/lx/os/lx_brand.c
++++ b/usr/src/uts/common/brand/lx/os/lx_brand.c
+@@ -200,10 +200,9 @@ extern int zvol_create_minor(const char *);
+ 
+ extern void lx_proc_exit(proc_t *);
+ extern int lx_sched_affinity(int, uintptr_t, int, uintptr_t, int64_t *);
+-extern void lx_exitlwps(proc_t *, int);
+ 
+ extern void lx_io_clear(lx_proc_data_t *);
+-extern void lx_io_cleanup();
++extern void lx_io_cleanup(proc_t *);
+ 
+ extern void lx_ioctl_init();
+ extern void lx_ioctl_fini();
+@@ -304,8 +303,7 @@ struct brand_ops lx_brops = {
+ 	NULL,
+ #endif
+ 	B_FALSE,			/* b_intp_parse_arg */
+-	lx_clearbrand,			/* b_clearbrand */
+-	lx_exitlwps			/* b_exitlwps */
++	lx_clearbrand			/* b_clearbrand */
+ };
+ 
+ struct brand_mach_ops lx_mops = {
+@@ -341,6 +339,8 @@ lx_proc_exit(proc_t *p)
+ 	proc_t *cp;
+ 
+ 	lx_clone_grp_exit(p, B_FALSE);
++	/* Cleanup any outstanding aio contexts */
++	lx_io_cleanup(p);
+ 
+ 	mutex_enter(&p->p_lock);
+ 	VERIFY((lxpd = ptolxproc(p)) != NULL);
+@@ -367,16 +367,6 @@ lx_proc_exit(proc_t *p)
+ 	mutex_exit(&pidlock);
+ }
+ 
+-/* ARGSUSED */
+-void
+-lx_exitlwps(proc_t *p, int coredump)
+-{
+-	VERIFY(ptolxproc(p) != NULL);
+-
+-	/* Cleanup any outstanding aio contexts */
+-	lx_io_cleanup();
+-}
+-
+ void
+ lx_setbrand(proc_t *p)
+ {
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_aio.c b/usr/src/uts/common/brand/lx/syscall/lx_aio.c
+index 027c89ff99..b2819cd614 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_aio.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_aio.c
+@@ -278,6 +278,7 @@ static void
+ lx_io_cp_rele(lx_io_ctx_t *cp)
+ {
+ 	lx_proc_data_t *lxpd = ptolxproc(curproc);
++	lx_zone_data_t *lxzd;
+ 	int i;
+ 	lx_io_elem_t *ep;
+ 
+@@ -303,8 +304,17 @@ lx_io_cp_rele(lx_io_ctx_t *cp)
+ 	ASSERT(i < lxpd->l_io_ctx_cnt);
+ 	/* wake all threads waiting on context destruction */
+ 	cv_broadcast(&lxpd->l_io_destroy_cv);
++	ASSERT(cp->lxioctx_shutdown == B_TRUE);
++
+ 	mutex_exit(&lxpd->l_io_ctx_lock);
+ 
++	/* can now decrement the zone's overall aio counter */
++	lxzd = ztolxzd(curproc->p_zone);
++	mutex_enter(&lxzd->lxzd_lock);
++	VERIFY(cp->lxioctx_maxn <= lxzd->lxzd_aio_nr);
++	lxzd->lxzd_aio_nr -= cp->lxioctx_maxn;
++	mutex_exit(&lxzd->lxzd_lock);
++
+ 	/*
+ 	 * We have the only pointer to the context now. Free all
+ 	 * elements from all three queues and the context itself.
+@@ -443,27 +453,43 @@ lx_io_worker(void *a)
+ 	set_active_fd(-1);	/* See comment in lx_io_cp_rele */
+ 
+ 	while (!cp->lxioctx_shutdown) {
++		int wt_res = 1;
++
+ 		mutex_enter(&cp->lxioctx_p_lock);
+ 		if (list_is_empty(&cp->lxioctx_pending)) {
+-
+ 			/*
+ 			 * This must be cv_wait_sig, as opposed to cv_wait, so
+ 			 * that pokelwps works correctly on these threads.
+ 			 */
+-			(void) cv_wait_sig(&cp->lxioctx_pending_cv,
++			wt_res = cv_wait_sig(&cp->lxioctx_pending_cv,
+ 			    &cp->lxioctx_p_lock);
++		}
+ 
+-			if (cp->lxioctx_shutdown) {
+-				mutex_exit(&cp->lxioctx_p_lock);
+-				break;
+-			}
++		/* Normal thread exit via io_destroy. */
++		if (cp->lxioctx_shutdown) {
++			mutex_exit(&cp->lxioctx_p_lock);
++			break;
+ 		}
+ 
+-		ep = list_remove_head(&cp->lxioctx_pending);
+-		mutex_exit(&cp->lxioctx_p_lock);
++		/*
++		 * It is common to simply check p_flag outside of p_lock (see
++		 * issig) and we don't want to make p_lock any hotter here.
++		 *
++		 * The worker threads have all of their signals held, so a
++		 * cv_wait_sig return of 0 here only occurs while we're
++		 * shutting down.
++		 */
++		if (curproc->p_flag & (SEXITLWPS | SKILLED) || wt_res == 0) {
++			mutex_exit(&cp->lxioctx_p_lock);
++			cp->lxioctx_shutdown = B_TRUE;
++			break;
++		}
+ 
+ 		lx_io_worker_chk_status();
+ 
++		ep = list_remove_head(&cp->lxioctx_pending);
++		mutex_exit(&cp->lxioctx_p_lock);
++
+ 		while (ep != NULL) {
+ 			boolean_t do_resfd;
+ 			int resfd = 0;
+@@ -517,6 +543,11 @@ lx_io_worker(void *a)
+ 			if (cp->lxioctx_shutdown)
+ 				break;
+ 
++			if (curproc->p_flag & (SEXITLWPS | SKILLED)) {
++				cp->lxioctx_shutdown = B_TRUE;
++				break;
++			}
++
+ 			lx_io_worker_chk_status();
+ 
+ 			mutex_enter(&cp->lxioctx_p_lock);
+@@ -1191,23 +1222,6 @@ lx_io_cancel(lx_aio_context_t cid, lx_iocb_t *iocbp, lx_io_event_t *result)
+ 	return (0);
+ }
+ 
+-static void
+-lx_io_destroy_common(lx_io_ctx_t *cp)
+-{
+-	lx_proc_data_t *lxpd = ptolxproc(curproc);
+-	lx_zone_data_t *lxzd = ztolxzd(curproc->p_zone);
+-
+-	ASSERT(MUTEX_HELD(&lxpd->l_io_ctx_lock));
+-	if (cp->lxioctx_shutdown == B_FALSE) {
+-		cp->lxioctx_shutdown = B_TRUE;
+-		/* decrement zone aio cnt */
+-		mutex_enter(&lxzd->lxzd_lock);
+-		VERIFY(cp->lxioctx_maxn <= lxzd->lxzd_aio_nr);
+-		lxzd->lxzd_aio_nr -= cp->lxioctx_maxn;
+-		mutex_exit(&lxzd->lxzd_lock);
+-	}
+-}
+-
+ long
+ lx_io_destroy(lx_aio_context_t cid)
+ {
+@@ -1219,7 +1233,7 @@ lx_io_destroy(lx_aio_context_t cid)
+ 		return (set_errno(EINVAL));
+ 
+ 	mutex_enter(&lxpd->l_io_ctx_lock);
+-	lx_io_destroy_common(cp);
++	cp->lxioctx_shutdown = B_TRUE;
+ 
+ 	/*
+ 	 * Wait for the worker threads and any blocked io_getevents threads to
+@@ -1261,24 +1275,20 @@ lx_io_clear(lx_proc_data_t *cpd)
+ }
+ 
+ /*
+- * Called via the lx_exit_all_lwps brand hook at proc exit to cleanup any
+- * outstanding io context data and worker threads. This handles the case when
+- * a process exits without calling io_destroy() on its open contexts. We need a
+- * brand hook for this because exitlwps() will call pokelwps() which will loop
+- * until we're the last thread in the process. The presence of any aio worker
+- * threads will block pokelwps from completing and none of our other brand
+- * hooks are called until later in the process exit path. There is no
+- * guarantee that more than one thread won't call exitlwps(), so we start over
+- * if we have to drop the l_io_ctx_lock mutex. Under normal conditions, the
+- * l_io_ctxs array will be NULL or empty.
++ * Called via lx_proc_exit to cleanup any existing io context array. All
++ * worker threads should have already exited by this point, so all contexts
++ * should already be deleted.
+  */
+ void
+-lx_io_cleanup()
++lx_io_cleanup(proc_t *p)
+ {
+-	lx_proc_data_t *lxpd = ptolxproc(curproc);
++	lx_proc_data_t *lxpd;
+ 	int i;
+ 
+-restart:
++	mutex_enter(&p->p_lock);
++	VERIFY((lxpd = ptolxproc(p)) != NULL);
++	mutex_exit(&p->p_lock);
++
+ 	mutex_enter(&lxpd->l_io_ctx_lock);
+ 	if (lxpd->l_io_ctxs == NULL) {
+ 		ASSERT(lxpd->l_io_ctx_cnt == 0);
+@@ -1288,23 +1298,7 @@ restart:
+ 
+ 	ASSERT(lxpd->l_io_ctx_cnt > 0);
+ 	for (i = 0; i < lxpd->l_io_ctx_cnt; i++) {
+-		lx_io_ctx_t *cp;
+-
+-		if ((cp = lxpd->l_io_ctxs[i]) != NULL) {
+-			lx_io_destroy_common(cp);
+-
+-			/*
+-			 * We want the worker threads and any blocked
+-			 * io_getevents threads to exit. We do not have a hold
+-			 * so rele from the last thread will cleanup.
+-			 */
+-			cv_broadcast(&cp->lxioctx_pending_cv);
+-			cv_broadcast(&cp->lxioctx_done_cv);
+-
+-			cv_wait(&lxpd->l_io_destroy_cv, &lxpd->l_io_ctx_lock);
+-			mutex_exit(&lxpd->l_io_ctx_lock);
+-			goto restart;
+-		}
++		ASSERT(lxpd->l_io_ctxs[i] == NULL);
+ 	}
+ 
+ 	kmem_free(lxpd->l_io_ctxs, lxpd->l_io_ctx_cnt * sizeof (lx_io_ctx_t *));
+diff --git a/usr/src/uts/common/brand/sn1/sn1_brand.c b/usr/src/uts/common/brand/sn1/sn1_brand.c
+index 1dc025414a..5726beffa2 100644
+--- a/usr/src/uts/common/brand/sn1/sn1_brand.c
++++ b/usr/src/uts/common/brand/sn1/sn1_brand.c
+@@ -103,8 +103,7 @@ struct brand_ops sn1_brops = {
+ 	NULL,				/* b_setid_clear */
+ 	NULL,				/* b_pagefault */
+ 	B_TRUE,				/* b_intp_parse_arg */
+-	NULL,				/* b_clearbrand */
+-	NULL				/* b_exitlwps */
++	NULL				/* b_clearbrand */
+ };
+ 
+ #ifdef	sparc
+diff --git a/usr/src/uts/common/brand/solaris10/s10_brand.c b/usr/src/uts/common/brand/solaris10/s10_brand.c
+index 6b6e0b575a..6fb2ffd80d 100644
+--- a/usr/src/uts/common/brand/solaris10/s10_brand.c
++++ b/usr/src/uts/common/brand/solaris10/s10_brand.c
+@@ -108,8 +108,7 @@ struct brand_ops s10_brops = {
+ 	NULL,				/* b_setid_clear */
+ 	NULL,				/* b_pagefault */
+ 	B_TRUE,				/* b_intp_parse_arg */
+-	NULL,				/* b_clearbrand */
+-	NULL				/* b_exitlwps */
++	NULL				/* b_clearbrand */
+ };
+ 
+ #ifdef	sparc
+diff --git a/usr/src/uts/common/os/lwp.c b/usr/src/uts/common/os/lwp.c
+index 5350729bbd..cde81f511a 100644
+--- a/usr/src/uts/common/os/lwp.c
++++ b/usr/src/uts/common/os/lwp.c
+@@ -1729,9 +1729,6 @@ exitlwps(int coredump)
+ 	proc_t *p = curproc;
+ 	int heldcnt;
+ 
+-	if (PROC_IS_BRANDED(p) && BROP(p)->b_exitlwps != NULL)
+-		BROP(p)->b_exitlwps(p, coredump);
+-
+ 	if (curthread->t_door)
+ 		door_slam();
+ 	if (p->p_door_list)
+diff --git a/usr/src/uts/common/sys/brand.h b/usr/src/uts/common/sys/brand.h
+index 2852bb8fee..cf22a0f509 100644
+--- a/usr/src/uts/common/sys/brand.h
++++ b/usr/src/uts/common/sys/brand.h
+@@ -150,7 +150,6 @@ struct execa;
+  * b_pagefault - Trap pagefault events
+  * b_intp_parse_arg - Controls interpreter argument handling (allow 1 or all)
+  * b_clearbrand - Perform any actions necessary when clearing the brand.
+- * b_exitlwps - Perform any preliminary actions when all LWPs are exiting.
+  */
+ struct brand_ops {
+ 	void	(*b_init_brand_data)(zone_t *, kmutex_t *);
+@@ -201,7 +200,6 @@ struct brand_ops {
+ 	    enum seg_rw);
+ 	boolean_t b_intp_parse_arg;
+ 	void	(*b_clearbrand)(proc_t *, boolean_t);
+-	void	(*b_exitlwps)(proc_t *, int);
+ };
+ 
+ /*
+-- 
+2.21.0
+

@@ -1,0 +1,417 @@
+From 00ecd34dffbabbebff43d67be5c92b2dd16db7f5 Mon Sep 17 00:00:00 2001
+From: Robert Mustacchi <rm@joyent.com>
+Date: Thu, 13 Apr 2017 17:38:32 +0000
+Subject: [PATCH] OS-5849 SES topology information needs to search STP Bridge
+ ports OS-6058 mpt_sas needs to set bridge-port property for SATA devices
+ OS-6059 mptsas_handle_topo_change() can return without locks held
+
+---
+ .../lib/fm/topo/modules/common/disk/disk.h    |   4 +-
+ .../fm/topo/modules/common/disk/disk_common.c |  38 +++++
+ usr/src/lib/fm/topo/modules/common/ses/ses.c  |  64 +++++++-
+ .../common/io/scsi/adapters/mpt_sas/mptsas.c  | 138 +++++++++++++++++-
+ 4 files changed, 238 insertions(+), 6 deletions(-)
+
+diff --git a/usr/src/lib/fm/topo/modules/common/disk/disk.h b/usr/src/lib/fm/topo/modules/common/disk/disk.h
+index e61a54974b..d597df27b1 100644
+--- a/usr/src/lib/fm/topo/modules/common/disk/disk.h
++++ b/usr/src/lib/fm/topo/modules/common/disk/disk.h
+@@ -23,7 +23,7 @@
+  * Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
+  */
+ /*
+- * Copyright (c) 2013, Joyent, Inc.  All rights reserved.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #ifndef _DISK_H
+@@ -107,6 +107,8 @@ extern int disk_declare_path(topo_mod_t *, tnode_t *,
+     struct topo_list *, const char *);
+ extern int disk_declare_addr(topo_mod_t *, tnode_t *,
+     struct topo_list *, const char *, tnode_t **);
++extern int disk_declare_bridge(topo_mod_t *, tnode_t *,
++    struct topo_list *, const char *, tnode_t **);
+ extern char *disk_auth_clean(topo_mod_t *, const char *);
+ 
+ #ifdef __cplusplus
+diff --git a/usr/src/lib/fm/topo/modules/common/disk/disk_common.c b/usr/src/lib/fm/topo/modules/common/disk/disk_common.c
+index 7d42f3ee60..123e86f44f 100644
+--- a/usr/src/lib/fm/topo/modules/common/disk/disk_common.c
++++ b/usr/src/lib/fm/topo/modules/common/disk/disk_common.c
+@@ -21,6 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -495,6 +496,43 @@ disk_declare_addr(topo_mod_t *mod, tnode_t *parent, topo_list_t *listp,
+ 	return (1);
+ }
+ 
++/*
++ * Try to find a disk based on the bridge-port property. This is most often used
++ * for SATA devices which are attached to a SAS controller and are therefore
++ * behind a SATL bridge port. SES only knows of devices based on this SAS WWN,
++ * not based on any SATA GUIDs.
++ */
++int
++disk_declare_bridge(topo_mod_t *mod, tnode_t *parent, topo_list_t *listp,
++    const char *addr, tnode_t **childp)
++{
++	dev_di_node_t *dnode;
++	int i;
++
++	/* Check for match using addr. */
++	for (dnode = topo_list_next(listp); dnode != NULL;
++	    dnode = topo_list_next(dnode)) {
++		if (dnode->ddn_bridge_port == NULL)
++			continue;
++
++		for (i = 0; i < dnode->ddn_ppath_count; i++) {
++			if ((dnode->ddn_bridge_port[i] != NULL) &&
++			    (strncmp(dnode->ddn_bridge_port[i], addr,
++			    strcspn(dnode->ddn_bridge_port[i], ":"))) == 0) {
++				topo_mod_dprintf(mod, "disk_declare_bridge: "
++				    "found disk matching bridge %s", addr);
++				return (disk_declare(mod, parent, dnode,
++				    childp));
++			}
++		}
++	}
++
++	topo_mod_dprintf(mod, "disk_declare_bridge: "
++	    "failed to find disk matching bridge %s", addr);
++
++	return (1);
++}
++
+ /*
+  * Used to declare a disk that has been discovered through other means (usually
+  * ses), that is not enumerated in the devinfo tree.
+diff --git a/usr/src/lib/fm/topo/modules/common/ses/ses.c b/usr/src/lib/fm/topo/modules/common/ses/ses.c
+index 2d80a0b573..681c47f005 100644
+--- a/usr/src/lib/fm/topo/modules/common/ses/ses.c
++++ b/usr/src/lib/fm/topo/modules/common/ses/ses.c
+@@ -23,7 +23,7 @@
+  * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright 2012 Milan Jurik. All rights reserved.
+  * Copyright 2015 Nexenta Systems, Inc.  All rights reserved.
+- * Copyright 2015 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <alloca.h>
+@@ -1137,6 +1137,55 @@ ses_set_standard_props(topo_mod_t *mod, tnode_t *frutn, tnode_t *tn,
+ 	return (0);
+ }
+ 
++/*
++ * Iterate over the SES phy information. If any of the ports indicates that it's
++ * a SATA device and we haven't matched any disk devices yet, that means
++ * that the HBA was able to create a WWN for the SATA device based on its GUID,
++ * which is good. However, SES includes the WWN for the device's STP bridge. In
++ * theory, if the driver includes the WWN based on the SATA guid then it should
++ * also set the bridge-port property indicating the WWN that should match the
++ * SATA device.
++ */
++static int
++ses_create_disk_bridge(ses_enum_data_t *sdp, tnode_t *pnode, nvlist_t *props,
++    tnode_t **child)
++{
++	nvlist_t **phys;
++	uint_t i, n_phys;
++	topo_mod_t *mod = sdp->sed_mod;
++
++	if (nvlist_lookup_nvlist_array(props, SES_SAS_PROP_PHYS, &phys,
++	    &n_phys) != 0)
++		return (1);
++
++	for (i = 0; i < n_phys; i++) {
++		uint64_t wwn;
++		boolean_t sata;
++		char wwnstr[64];
++
++		if (nvlist_lookup_uint64(phys[i], SES_SAS_PROP_ADDR,
++		    &wwn) != 0 || wwn == 0) {
++			continue;
++		}
++
++		if (nvlist_lookup_boolean_value(phys[i],
++		    SES_SAS_PROP_SATA_DEVICE, &sata) != 0 || !sata) {
++			continue;
++		}
++
++		if (scsi_wwn_to_wwnstr(wwn, 0, wwnstr) == NULL)
++			continue;
++
++		if (disk_declare_bridge(mod, pnode, &sdp->sed_devs,
++		    wwnstr, child) == 0) {
++			return (0);
++		}
++
++	}
++
++	return (1);
++}
++
+ /*
+  * Callback to add a disk to a given bay.  We first check the status-code to
+  * determine if a disk is present, ignoring those that aren't in an appropriate
+@@ -1207,8 +1256,17 @@ ses_create_disk(ses_enum_data_t *sdp, tnode_t *pnode, nvlist_t *props)
+ 		}
+ 	}
+ 
+-	if (s == nsas)
+-		(void) disk_declare_non_enumerated(mod, pnode, &child);
++	/*
++	 * We need to take another pass through the properties for this bay by
++	 * iterating over the phys and noting if any of these are SATA. Note,
++	 * this information isn't commonly part of the topo tree at this time,
++	 * hence why we end up going back and iterating over the properties
++	 * ourselves.
++	 */
++	if (s == nsas) {
++		if (ses_create_disk_bridge(sdp, pnode, props, &child) != 0)
++			(void) disk_declare_non_enumerated(mod, pnode, &child);
++	}
+ 
+ 	/* copy sas_addresses (target-ports) from parent (with 'w'added) */
+ 	if (child != NULL) {
+diff --git a/usr/src/uts/common/io/scsi/adapters/mpt_sas/mptsas.c b/usr/src/uts/common/io/scsi/adapters/mpt_sas/mptsas.c
+index 53fcc0f5b1..6c249b716f 100644
+--- a/usr/src/uts/common/io/scsi/adapters/mpt_sas/mptsas.c
++++ b/usr/src/uts/common/io/scsi/adapters/mpt_sas/mptsas.c
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright 2016 Nexenta Systems, Inc. All rights reserved.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  * Copyright 2014 OmniTI Computer Consulting, Inc. All rights reserved.
+  * Copyright (c) 2014, Tegile Systems Inc. All rights reserved.
+  */
+@@ -6162,6 +6162,80 @@ mptsas_free_devhdl(mptsas_t *mpt, uint16_t devhdl)
+ 	return (DDI_SUCCESS);
+ }
+ 
++/*
++ * We have a SATA target that has changed, which means the "bridge-port"
++ * property must be updated to reflect the SAS WWN of the new attachment point.
++ * This may change if a SATA device changes which bay, and therefore phy, it is
++ * plugged into. This SATA device may be a multipath virtual device or may be a
++ * physical device. We have to handle both cases.
++ */
++static boolean_t
++mptsas_update_sata_bridge(mptsas_t *mpt, dev_info_t *parent,
++    mptsas_target_t *ptgt)
++{
++	int			rval;
++	uint16_t		dev_hdl;
++	uint16_t		pdev_hdl;
++	uint64_t		dev_sas_wwn;
++	uint8_t			physport;
++	uint8_t			phy_id;
++	uint32_t		page_address;
++	uint16_t		bay_num, enclosure, io_flags;
++	uint32_t		dev_info;
++	char 			uabuf[SCSI_WWN_BUFLEN];
++	dev_info_t		*dip;
++	mdi_pathinfo_t		*pip;
++
++	mutex_enter(&mpt->m_mutex);
++	page_address = (MPI2_SAS_DEVICE_PGAD_FORM_HANDLE &
++	    MPI2_SAS_DEVICE_PGAD_FORM_MASK) | (uint32_t)ptgt->m_devhdl;
++	rval = mptsas_get_sas_device_page0(mpt, page_address, &dev_hdl,
++	    &dev_sas_wwn, &dev_info, &physport, &phy_id, &pdev_hdl, &bay_num,
++	    &enclosure, &io_flags);
++	mutex_exit(&mpt->m_mutex);
++	if (rval != DDI_SUCCESS) {
++		mptsas_log(mpt, CE_WARN, "unable to get SAS page 0 for "
++		    "handle %d", page_address);
++		return (B_FALSE);
++	}
++
++	if (scsi_wwn_to_wwnstr(dev_sas_wwn, 1, uabuf) == NULL) {
++		mptsas_log(mpt, CE_WARN,
++		    "mptsas unable to format SATA bridge WWN");
++		return (B_FALSE);
++	}
++
++	if (mpt->m_mpxio_enable == TRUE && (pip = mptsas_find_path_addr(parent,
++	    ptgt->m_addr.mta_wwn, 0)) != NULL) {
++		if (mdi_prop_update_string(pip, SCSI_ADDR_PROP_BRIDGE_PORT,
++		    uabuf) != DDI_SUCCESS) {
++			mptsas_log(mpt, CE_WARN,
++			    "mptsas unable to create SCSI bridge port "
++			    "property for SATA device");
++			return (B_FALSE);
++		}
++		return (B_TRUE);
++	}
++
++	if ((dip = mptsas_find_child_addr(parent, ptgt->m_addr.mta_wwn,
++	    0)) != NULL) {
++		if (ndi_prop_update_string(DDI_DEV_T_NONE, dip,
++		    SCSI_ADDR_PROP_BRIDGE_PORT, uabuf) != DDI_PROP_SUCCESS) {
++			mptsas_log(mpt, CE_WARN,
++			    "mptsas unable to create SCSI bridge port "
++			    "property for SATA device");
++			return (B_FALSE);
++		}
++		return (B_TRUE);
++	}
++
++	mptsas_log(mpt, CE_WARN, "mptsas failed to find dev_info_t or "
++	    "mdi_pathinfo_t for target with WWN %016"PRIx64,
++	    ptgt->m_addr.mta_wwn);
++
++	return (B_FALSE);
++}
++
+ static void
+ mptsas_update_phymask(mptsas_t *mpt)
+ {
+@@ -6538,6 +6612,21 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 			ndi_devi_exit(parent, circ1);
+ 			ndi_devi_exit(scsi_vhci_dip, circ);
+ 
++			/*
++			 * If this is a SATA device, make sure that the
++			 * bridge-port (the SAS WWN that the SATA device is
++			 * plugged into) is updated. This may change if a SATA
++			 * device changes which bay, and therefore phy, it is
++			 * plugged into.
++			 */
++			if (IS_SATA_DEVICE(ptgt->m_deviceinfo)) {
++				if (!mptsas_update_sata_bridge(mpt, parent,
++				    ptgt)) {
++					mutex_enter(&mpt->m_mutex);
++					return;
++				}
++			}
++
+ 			/*
+ 			 * Add parent's props for SMHBA support
+ 			 */
+@@ -6556,6 +6645,7 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 					    SCSI_ADDR_PROP_ATTACHED_PORT);
+ 					mptsas_log(mpt, CE_WARN, "Failed to"
+ 					    "attached-port props");
++					mutex_enter(&mpt->m_mutex);
+ 					return;
+ 				}
+ 				if (ddi_prop_update_int(DDI_DEV_T_NONE, parent,
+@@ -6565,6 +6655,7 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 					    parent, MPTSAS_NUM_PHYS);
+ 					mptsas_log(mpt, CE_WARN, "Failed to"
+ 					    " create num-phys props");
++					mutex_enter(&mpt->m_mutex);
+ 					return;
+ 				}
+ 
+@@ -6573,7 +6664,6 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 				 */
+ 				mutex_enter(&mpt->m_mutex);
+ 				if (mptsas_smhba_phy_init(mpt)) {
+-					mutex_exit(&mpt->m_mutex);
+ 					mptsas_log(mpt, CE_WARN, "mptsas phy"
+ 					    " update failed");
+ 					return;
+@@ -6595,6 +6685,7 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 					mptsas_log(mpt, CE_WARN,
+ 					    "mptsas virtual-port"
+ 					    "port prop update failed");
++					mutex_enter(&mpt->m_mutex);
+ 					return;
+ 				}
+ 			}
+@@ -6672,6 +6763,7 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 				    SCSI_ADDR_PROP_ATTACHED_PORT);
+ 				mptsas_log(mpt, CE_WARN, "mptsas attached port "
+ 				    "prop update failed");
++				mutex_enter(&mpt->m_mutex);
+ 				break;
+ 			}
+ 			if (ddi_prop_update_int(DDI_DEV_T_NONE, parent,
+@@ -6681,6 +6773,7 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 				    MPTSAS_NUM_PHYS);
+ 				mptsas_log(mpt, CE_WARN, "mptsas num phys "
+ 				    "prop update failed");
++				mutex_enter(&mpt->m_mutex);
+ 				break;
+ 			}
+ 			if (ddi_prop_update_int(DDI_DEV_T_NONE, parent,
+@@ -6690,6 +6783,7 @@ mptsas_handle_topo_change(mptsas_topo_change_list_t *topo_node,
+ 				    MPTSAS_VIRTUAL_PORT);
+ 				mptsas_log(mpt, CE_WARN, "mptsas virtual port "
+ 				    "prop update failed");
++				mutex_enter(&mpt->m_mutex);
+ 				break;
+ 			}
+ 		}
+@@ -15437,6 +15531,27 @@ mptsas_create_virt_lun(dev_info_t *pdip, struct scsi_inquiry *inq, char *guid,
+ 			    mpt->un.m_base_wwid);
+ 		}
+ 
++		if (IS_SATA_DEVICE(ptgt->m_deviceinfo)) {
++			char	uabuf[SCSI_WWN_BUFLEN];
++
++			if (scsi_wwn_to_wwnstr(dev_sas_wwn, 1, uabuf) == NULL) {
++				mptsas_log(mpt, CE_WARN,
++				    "mptsas unable to format SATA bridge WWN");
++				mdi_rtn = MDI_FAILURE;
++				goto virt_create_done;
++			}
++
++			if (mdi_prop_update_string(*pip,
++			    SCSI_ADDR_PROP_BRIDGE_PORT, uabuf) !=
++			    DDI_SUCCESS) {
++				mptsas_log(mpt, CE_WARN,
++				    "mptsas unable to create SCSI bridge port "
++				    "property for SATA device");
++				mdi_rtn = MDI_FAILURE;
++				goto virt_create_done;
++			}
++		}
++
+ 		if (mdi_prop_update_string(*pip,
+ 		    SCSI_ADDR_PROP_ATTACHED_PORT, pdev_wwn_str) !=
+ 		    DDI_PROP_SUCCESS) {
+@@ -15756,6 +15871,8 @@ mptsas_create_phys_lun(dev_info_t *pdip, struct scsi_inquiry *inq,
+ 		}
+ 
+ 		if (IS_SATA_DEVICE(dev_info)) {
++			char	uabuf[SCSI_WWN_BUFLEN];
++
+ 			if (ndi_prop_update_string(DDI_DEV_T_NONE,
+ 			    *lun_dip, MPTSAS_VARIANT, "sata") !=
+ 			    DDI_PROP_SUCCESS) {
+@@ -15765,6 +15882,23 @@ mptsas_create_phys_lun(dev_info_t *pdip, struct scsi_inquiry *inq,
+ 				ndi_rtn = NDI_FAILURE;
+ 				goto phys_create_done;
+ 			}
++
++			if (scsi_wwn_to_wwnstr(dev_sas_wwn, 1, uabuf) == NULL) {
++				mptsas_log(mpt, CE_WARN,
++				    "mptsas unable to format SATA bridge WWN");
++				ndi_rtn = NDI_FAILURE;
++				goto phys_create_done;
++			}
++
++			if (ndi_prop_update_string(DDI_DEV_T_NONE, *lun_dip,
++			    SCSI_ADDR_PROP_BRIDGE_PORT, uabuf) !=
++			    DDI_PROP_SUCCESS) {
++				mptsas_log(mpt, CE_WARN,
++				    "mptsas unable to create SCSI bridge port "
++				    "property for SATA device");
++				ndi_rtn = NDI_FAILURE;
++				goto phys_create_done;
++			}
+ 		}
+ 
+ 		if (IS_ATAPI_DEVICE(dev_info)) {
+-- 
+2.21.0
+

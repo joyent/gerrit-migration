@@ -1,0 +1,491 @@
+From 6209c5b690ff2076dfe5accf04990958f9409d6c Mon Sep 17 00:00:00 2001
+From: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date: Mon, 10 Jul 2017 15:49:10 +0000
+Subject: [PATCH] OS-6211 support Linux accounting Reviewed by: Patrick Mooney
+ <patrick.mooney@joyent.com> Approved by: Patrick Mooney
+ <patrick.mooney@joyent.com>
+
+---
+ usr/src/uts/common/brand/lx/os/lx_acct.c      | 198 ++++++++++++++++++
+ usr/src/uts/common/brand/lx/os/lx_brand.c     |   3 +-
+ usr/src/uts/common/brand/lx/os/lx_syscall.c   |   4 +-
+ usr/src/uts/common/brand/lx/sys/lx_brand.h    |   1 +
+ usr/src/uts/common/brand/lx/sys/lx_syscalls.h |   1 +
+ .../uts/common/brand/lx/syscall/lx_miscsys.c  |  10 +-
+ usr/src/uts/common/brand/sn1/sn1_brand.c      |   3 +-
+ .../uts/common/brand/solaris10/s10_brand.c    |   3 +-
+ usr/src/uts/common/os/acct.c                  |  19 +-
+ usr/src/uts/common/os/exit.c                  |   4 +-
+ usr/src/uts/common/sys/acct.h                 |   3 +-
+ usr/src/uts/common/sys/brand.h                |   2 +
+ usr/src/uts/intel/Makefile.files              |   1 +
+ usr/src/uts/intel/lx_brand/Makefile           |   2 +-
+ 14 files changed, 243 insertions(+), 11 deletions(-)
+ create mode 100644 usr/src/uts/common/brand/lx/os/lx_acct.c
+
+diff --git a/usr/src/uts/common/brand/lx/os/lx_acct.c b/usr/src/uts/common/brand/lx/os/lx_acct.c
+new file mode 100644
+index 0000000000..7f38a240ab
+--- /dev/null
++++ b/usr/src/uts/common/brand/lx/os/lx_acct.c
+@@ -0,0 +1,198 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright 2017 Joyent, Inc.
++ */
++
++#include <sys/types.h>
++#include <sys/sysmacros.h>
++#include <sys/systm.h>
++#include <sys/acct.h>
++#include <sys/proc.h>
++#include <sys/user.h>
++#include <sys/cred.h>
++#include <sys/file.h>
++#include <sys/vnode.h>
++#include <sys/session.h>
++#include <sys/wait.h>
++#include <sys/ddi.h>
++#include <sys/zone.h>
++#include <sys/lx_types.h>
++
++/*
++ * Based on the Linux acct(5) man page, their comp_t definition is the same
++ * as ours. lxac_etime is encoded as a float for v3 accounting records.
++ */
++
++#define	LX_ACCT_VERSION	3
++
++/*
++ * Bit flags in lxac_flag. The Linux AFORK and ASU match native. The rest of
++ * the flags diverge.
++ */
++#define	LX_AFORK	0x01	/* executed fork, but no exec */
++#define	LX_ASU		0x02	/* used superuser privileges */
++#define	LX_ACORE	0x08	/* dumped core */
++#define	LX_AXSIG	0x10	/* killed by a signal */
++
++typedef struct lx_acct {
++	char		lxac_flag;
++	char		lxac_version;
++	uint16_t	lxac_tty;
++	uint32_t	lxac_exitcode;
++	uint32_t	lxac_uid;
++	uint32_t	lxac_gid;
++	uint32_t	lxac_pid;
++	uint32_t	lxac_ppid;
++	uint32_t	lxac_btime;	/* seconds since the epoch */
++	uint32_t	lxac_etime;	/* float representation of ticks */
++	comp_t		lxac_utime;
++	comp_t		lxac_stime;
++	comp_t		lxac_mem;	/* kb */
++	comp_t		lxac_io;	/* unused */
++	comp_t		lxac_rw;	/* unused */
++	comp_t		lxac_minflt;
++	comp_t		lxac_majflt;
++	comp_t		lxac_swaps;	/* unused */
++	char		lxac_comm[16];
++} lx_acct_t;
++
++/*
++ * Same functionality as acct_compress(). Produce a pseudo-floating point
++ * representation with 3 bits base-8 exponent, 13 bits fraction.
++ */
++static comp_t
++lx_acct_compt(ulong_t t)
++{
++	int exp = 0, round = 0;
++
++	while (t >= 8192) {
++		exp++;
++		round = t & 04;
++		t >>= 3;
++	}
++	if (round) {
++		t++;
++		if (t >= 8192) {
++			t >>= 3;
++			exp++;
++		}
++	}
++#ifdef _LP64
++	if (exp > 7) {
++		/* prevent wraparound */
++		t = 8191;
++		exp = 7;
++	}
++#endif
++	return ((exp << 13) + t);
++}
++
++/*
++ * 32-bit IEEE float encoding as-per Linux.
++ */
++static uint32_t
++lx_acct_float(int64_t t)
++{
++	uint32_t val, exp = 190;
++
++	if (t == 0)
++		return (0);
++
++	while (t > 0) {
++		t <<= 1;
++		exp--;
++	}
++	val = (uint32_t)(t >> 40) & 0x7fffffu;
++
++	return (val | (exp << 23));
++}
++
++/*
++ * Write a Linux-formatted record to the accounting file.
++ */
++void
++lx_acct_out(vnode_t *vp, int exit_status)
++{
++	struct proc *p;
++	user_t *ua;
++	struct cred *cr;
++	dev_t d;
++	pid_t pid, ppid;
++	struct vattr va;
++	ssize_t resid = 0;
++	int err;
++	lx_acct_t a;
++
++	p = curproc;
++	ua = PTOU(p);
++	cr = CRED();
++
++	bzero(&a, sizeof (a));
++
++	a.lxac_flag = ua->u_acflag & (LX_AFORK | LX_ASU);
++	a.lxac_version = LX_ACCT_VERSION;
++	d = cttydev(p);
++	a.lxac_tty = LX_MAKEDEVICE(getmajor(d), getminor(d));
++	if (WIFEXITED(exit_status)) {
++		a.lxac_exitcode = WEXITSTATUS(exit_status);
++	} else if (WIFSIGNALED(exit_status)) {
++		a.lxac_flag |= LX_AXSIG;
++		if (WCOREDUMP(exit_status)) {
++			a.lxac_flag |= LX_ACORE;
++		}
++	}
++	a.lxac_uid = crgetruid(cr);
++	a.lxac_gid = crgetrgid(cr);
++	pid = p->p_pid;
++	ppid = p->p_ppid;
++	/* Perform pid translation ala lxpr_fixpid(). */
++	if (pid == curzone->zone_proc_initpid) {
++		pid = 1;
++		ppid = 0;
++	} else {
++		if (ppid == curzone->zone_proc_initpid) {
++			ppid = 1;
++		} else if (ppid == curzone->zone_zsched->p_pid ||
++		    (p->p_flag & SZONETOP) != 0) {
++			ppid = 1;
++		}
++	}
++	a.lxac_pid = pid;
++	a.lxac_ppid = ppid;
++	a.lxac_btime = ua->u_start.tv_sec;
++	/* For Linux v3 accounting record, this is an encoded float. */
++	a.lxac_etime = lx_acct_float(ddi_get_lbolt() - ua->u_ticks);
++	a.lxac_utime = lx_acct_compt(NSEC_TO_TICK(p->p_acct[LMS_USER]));
++	a.lxac_stime = lx_acct_compt(
++	    NSEC_TO_TICK(p->p_acct[LMS_SYSTEM] + p->p_acct[LMS_TRAP]));
++	a.lxac_mem = lx_acct_compt((ulong_t)(ptob(ua->u_mem) / 1024));
++	/* a.lxac_io		unused */
++	/* a.lxac_rw		unused */
++	a.lxac_minflt = lx_acct_compt((ulong_t)p->p_ru.minflt);
++	a.lxac_majflt = lx_acct_compt((ulong_t)p->p_ru.majflt);
++	/* a.lxac_swaps		unused */
++	bcopy(ua->u_comm, a.lxac_comm, sizeof (a.lxac_comm));
++
++	/*
++	 * As with the native acct() handling, we save the size so that if the
++	 * write fails, we can reset the size to avoid corrupting the accounting
++	 * file.
++	 */
++	va.va_mask = AT_SIZE;
++	if (VOP_GETATTR(vp, &va, 0, kcred, NULL) == 0) {
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)&a, sizeof (a), 0LL,
++		    UIO_SYSSPACE, FAPPEND, (rlim64_t)MAXOFF_T, kcred, &resid);
++		if (err != 0 || resid != 0)
++			(void) VOP_SETATTR(vp, &va, 0, kcred, NULL);
++	}
++}
+diff --git a/usr/src/uts/common/brand/lx/os/lx_brand.c b/usr/src/uts/common/brand/lx/os/lx_brand.c
+index a8a710f088..3646df26e5 100644
+--- a/usr/src/uts/common/brand/lx/os/lx_brand.c
++++ b/usr/src/uts/common/brand/lx/os/lx_brand.c
+@@ -307,7 +307,8 @@ struct brand_ops lx_brops = {
+ #endif
+ 	B_FALSE,			/* b_intp_parse_arg */
+ 	lx_clearbrand,			/* b_clearbrand */
+-	lx_upcall_statd			/* b_rpc_statd */
++	lx_upcall_statd,		/* b_rpc_statd */
++	lx_acct_out			/* b_acct_out */
+ };
+ 
+ struct brand_mach_ops lx_mops = {
+diff --git a/usr/src/uts/common/brand/lx/os/lx_syscall.c b/usr/src/uts/common/brand/lx/os/lx_syscall.c
+index 7191a52f77..b8088e2b5d 100644
+--- a/usr/src/uts/common/brand/lx/os/lx_syscall.c
++++ b/usr/src/uts/common/brand/lx/os/lx_syscall.c
+@@ -570,7 +570,7 @@ lx_sysent_t lx_sysent32[] = {
+ 	{"signal",	NULL,			0,		2}, /* 48 */
+ 	{"geteuid16",	lx_geteuid16,		0,		0}, /* 49 */
+ 	{"getegid16",	lx_getegid16,		0,		0}, /* 50 */
+-	{"acct",	NULL,			NOSYS_NO_EQUIV,	0}, /* 51 */
++	{"acct",	lx_acct,		0,		1}, /* 51 */
+ 	{"umount2",	lx_umount2,		0,		2}, /* 52 */
+ 	{"lock",	NULL,			NOSYS_OBSOLETE,	0}, /* 53 */
+ 	{"ioctl",	lx_ioctl,		0,		3}, /* 54 */
+@@ -1053,7 +1053,7 @@ lx_sysent_t lx_sysent64[] = {
+ 	{"setrlimit",	lx_setrlimit,		0,		2}, /* 160 */
+ 	{"chroot",	lx_chroot,		0,		1}, /* 161 */
+ 	{"sync",	lx_sync,		0,		0}, /* 162 */
+-	{"acct",	NULL,			NOSYS_NO_EQUIV,	0}, /* 163 */
++	{"acct",	lx_acct,		0,		1}, /* 163 */
+ 	{"settimeofday", NULL,			0,		2}, /* 164 */
+ 	{"mount",	lx_mount,		0,		5}, /* 165 */
+ 	{"umount2",	lx_umount2,		0,		2}, /* 166 */
+diff --git a/usr/src/uts/common/brand/lx/sys/lx_brand.h b/usr/src/uts/common/brand/lx/sys/lx_brand.h
+index 6912f7a51c..ec5fedcff8 100644
+--- a/usr/src/uts/common/brand/lx/sys/lx_brand.h
++++ b/usr/src/uts/common/brand/lx/sys/lx_brand.h
+@@ -710,6 +710,7 @@ extern int lx_lpid_lock(pid_t, zone_t *, lx_pid_flag_t, proc_t **,
+ extern pid_t lx_lwp_ppid(klwp_t *, pid_t *, id_t *);
+ extern void lx_pid_init(void);
+ extern void lx_pid_fini(void);
++extern void lx_acct_out(vnode_t *, int);
+ 
+ extern uint_t lx_pipe_max_limit;
+ extern uint_t lx_pipe_max_default;
+diff --git a/usr/src/uts/common/brand/lx/sys/lx_syscalls.h b/usr/src/uts/common/brand/lx/sys/lx_syscalls.h
+index 988230bbd0..e658a241e1 100644
+--- a/usr/src/uts/common/brand/lx/sys/lx_syscalls.h
++++ b/usr/src/uts/common/brand/lx/sys/lx_syscalls.h
+@@ -37,6 +37,7 @@ extern "C" {
+ extern long lx_accept();
+ extern long lx_accept4();
+ extern long lx_access();
++extern long lx_acct();
+ extern long lx_alarm();
+ extern long lx_arch_prctl();
+ extern long lx_bind();
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_miscsys.c b/usr/src/uts/common/brand/lx/syscall/lx_miscsys.c
+index 5ae59327e5..b7057d3958 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_miscsys.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_miscsys.c
+@@ -10,7 +10,7 @@
+  */
+ 
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #include <sys/systeminfo.h>
+@@ -75,6 +75,8 @@ extern int chdir_proc(proc_t *, vnode_t *, boolean_t, boolean_t);
+ extern int lookupname(char *, enum uio_seg, int, vnode_t **, vnode_t **);
+ /* From uts/common/fs/fs_subr.c */
+ extern int fs_need_estale_retry(int);
++/* From uts/common/os/acct.c */
++extern int sysacct(char *);
+ 
+ /* The callback arguments when handling a FS clone group. */
+ typedef struct {
+@@ -411,3 +413,9 @@ lx_vhangup(void)
+ 	 */
+ 	return (0);
+ }
++
++long
++lx_acct(char *p)
++{
++	return (sysacct(p));
++}
+diff --git a/usr/src/uts/common/brand/sn1/sn1_brand.c b/usr/src/uts/common/brand/sn1/sn1_brand.c
+index 92c0aec1e0..a2383ca076 100644
+--- a/usr/src/uts/common/brand/sn1/sn1_brand.c
++++ b/usr/src/uts/common/brand/sn1/sn1_brand.c
+@@ -104,7 +104,8 @@ struct brand_ops sn1_brops = {
+ 	NULL,				/* b_pagefault */
+ 	B_TRUE,				/* b_intp_parse_arg */
+ 	NULL,				/* b_clearbrand */
+-	NULL				/* b_rpc_statd */
++	NULL,				/* b_rpc_statd */
++	NULL				/* b_acct_out */
+ };
+ 
+ #ifdef	sparc
+diff --git a/usr/src/uts/common/brand/solaris10/s10_brand.c b/usr/src/uts/common/brand/solaris10/s10_brand.c
+index c02fcdaef6..9da0855cc3 100644
+--- a/usr/src/uts/common/brand/solaris10/s10_brand.c
++++ b/usr/src/uts/common/brand/solaris10/s10_brand.c
+@@ -109,7 +109,8 @@ struct brand_ops s10_brops = {
+ 	NULL,				/* b_pagefault */
+ 	B_TRUE,				/* b_intp_parse_arg */
+ 	NULL,				/* b_clearbrand */
+-	NULL				/* b_rpc_statd */
++	NULL,				/* b_rpc_statd */
++	NULL				/* b_acct_out */
+ };
+ 
+ #ifdef	sparc
+diff --git a/usr/src/uts/common/os/acct.c b/usr/src/uts/common/os/acct.c
+index e598e0d08d..891c4e0836 100644
+--- a/usr/src/uts/common/os/acct.c
++++ b/usr/src/uts/common/os/acct.c
+@@ -20,6 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1992, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -47,6 +48,7 @@
+ #include <sys/time.h>
+ #include <sys/msacct.h>
+ #include <sys/zone.h>
++#include <sys/brand.h>
+ 
+ /*
+  * Each zone has its own accounting settings (on or off) and associated
+@@ -373,7 +375,7 @@ acct_compress(ulong_t t)
+  * On exit, write a record on the accounting file.
+  */
+ void
+-acct(char st)
++acct(int st)
+ {
+ 	struct vnode *vp;
+ 	struct cred *cr;
+@@ -402,6 +404,21 @@ acct(char st)
+ 	 * This only gets called from exit after all lwp's have exited so no
+ 	 * cred locking is needed.
+ 	 */
++
++	/* If there is a brand-specific hook, use it instead */
++	if (ZONE_IS_BRANDED(curzone) && ZBROP(curzone)->b_acct_out != NULL) {
++		ZBROP(curzone)->b_acct_out(vp, st);
++		mutex_exit(&ag->aclock);
++		return;
++	}
++
++	/*
++	 * The 'st' status value was traditionally masked this way by our
++	 * caller, but we now accept the unmasked value for brand handling.
++	 * Zones not using the brand hook mask the status here.
++	 */
++	st &= 0xff;
++
+ 	p = curproc;
+ 	ua = PTOU(p);
+ 	bcopy(ua->u_comm, ag->acctbuf.ac_comm, sizeof (ag->acctbuf.ac_comm));
+diff --git a/usr/src/uts/common/os/exit.c b/usr/src/uts/common/os/exit.c
+index 41f5f29eee..3edddcf61f 100644
+--- a/usr/src/uts/common/os/exit.c
++++ b/usr/src/uts/common/os/exit.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1988, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -601,7 +601,7 @@ proc_exit(int why, int what)
+ 		semexit(p);
+ 	rv = wstat(why, what);
+ 
+-	acct(rv & 0xff);
++	acct(rv);
+ 	exacct_commit_proc(p, rv);
+ 
+ 	/*
+diff --git a/usr/src/uts/common/sys/acct.h b/usr/src/uts/common/sys/acct.h
+index f00884681b..e01ad61025 100644
+--- a/usr/src/uts/common/sys/acct.h
++++ b/usr/src/uts/common/sys/acct.h
+@@ -22,6 +22,7 @@
+ /*
+  * Copyright 2014 Garrett D'Amore <garrett@damore.org>
+  * Copyright (c) 1989, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -88,7 +89,7 @@ extern int acct(const char *);
+ 
+ #if defined(_KERNEL)
+ 
+-void	acct(char);
++void	acct(int);
+ int	sysacct(char *);
+ 
+ struct vnode;
+diff --git a/usr/src/uts/common/sys/brand.h b/usr/src/uts/common/sys/brand.h
+index e7d4fb894e..e33de24757 100644
+--- a/usr/src/uts/common/sys/brand.h
++++ b/usr/src/uts/common/sys/brand.h
+@@ -151,6 +151,7 @@ struct execa;
+  * b_intp_parse_arg - Controls interpreter argument handling (allow 1 or all)
+  * b_clearbrand - Perform any actions necessary when clearing the brand.
+  * b_rpc_statd - Upcall to rpc.statd running within the zone
++ * b_acct_out - Output properly formatted accounting record
+  */
+ struct brand_ops {
+ 	void	(*b_init_brand_data)(zone_t *, kmutex_t *);
+@@ -202,6 +203,7 @@ struct brand_ops {
+ 	boolean_t b_intp_parse_arg;
+ 	void	(*b_clearbrand)(proc_t *, boolean_t);
+ 	void	(*b_rpc_statd)(int, void *, void *);
++	void	(*b_acct_out)(struct vnode *, int);
+ };
+ 
+ /*
+diff --git a/usr/src/uts/intel/Makefile.files b/usr/src/uts/intel/Makefile.files
+index 65e7dec2f0..962ac24afa 100644
+--- a/usr/src/uts/intel/Makefile.files
++++ b/usr/src/uts/intel/Makefile.files
+@@ -300,6 +300,7 @@ SN1_BRAND_OBJS	=	sn1_brand.o sn1_brand_asm.o
+ S10_BRAND_OBJS	=	s10_brand.o s10_brand_asm.o
+ LX_BRAND_OBJS  =		\
+ 	lx_access.o		\
++	lx_acct.o		\
+ 	lx_acl.o		\
+ 	lx_aio.o		\
+ 	lx_archdep.o		\
+diff --git a/usr/src/uts/intel/lx_brand/Makefile b/usr/src/uts/intel/lx_brand/Makefile
+index 819c22566c..4eff474a49 100644
+--- a/usr/src/uts/intel/lx_brand/Makefile
++++ b/usr/src/uts/intel/lx_brand/Makefile
+@@ -69,7 +69,7 @@ AS_INC_PATH	+= -I$(UTSBASE)/i86pc/genassym/$(OBJS_DIR)
+ CFLAGS		+= $(CCVERBOSE)
+ 
+ LDFLAGS		+= -dy -Nexec/elfexec -Nfs/fifofs -Nfs/sockfs -Ndrv/ip \
+-		    -Nfs/zfs -Nmisc/klmmod
++		    -Nfs/zfs -Nmisc/klmmod -Nsys/sysacct
+ 
+ #
+ # For now, disable these lint checks; maintainers should endeavor
+-- 
+2.21.0
+

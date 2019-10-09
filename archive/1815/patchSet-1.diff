@@ -1,0 +1,427 @@
+From 712f6ddfc80a10d6a9c0868a708bb43069ef6825 Mon Sep 17 00:00:00 2001
+From: Jason King <jason.king@joyent.com>
+Date: Thu, 20 Apr 2017 16:27:34 -0500
+Subject: [PATCH] OS-3617 libc ulwp walker should use CTF for uberdata offsets
+
+---
+ .../mdb/common/modules/conf/mapfile-extern    |   1 +
+ usr/src/cmd/mdb/common/modules/libc/libc.c    | 297 +++++++++++++++---
+ 2 files changed, 261 insertions(+), 37 deletions(-)
+
+diff --git a/usr/src/cmd/mdb/common/modules/conf/mapfile-extern b/usr/src/cmd/mdb/common/modules/conf/mapfile-extern
+index 9371b4834d..78a1651f51 100644
+--- a/usr/src/cmd/mdb/common/modules/conf/mapfile-extern
++++ b/usr/src/cmd/mdb/common/modules/conf/mapfile-extern
+@@ -63,6 +63,7 @@ SYMBOL_SCOPE {
+ 		mdb_ctf_enum_name		{ FLAGS = EXTERN };
+ 		mdb_ctf_lookup_by_addr		{ FLAGS = EXTERN };
+ 		mdb_ctf_lookup_by_name		{ FLAGS = EXTERN };
++		mdb_ctf_member_info		{ FLAGS = EXTERN };
+ 		mdb_ctf_member_iter		{ FLAGS = EXTERN };
+ 		mdb_ctf_module_lookup		{ FLAGS = EXTERN };
+ 		mdb_ctf_offsetof		{ FLAGS = EXTERN };
+diff --git a/usr/src/cmd/mdb/common/modules/libc/libc.c b/usr/src/cmd/mdb/common/modules/libc/libc.c
+index ad4c5c82ef..1405455ccf 100644
+--- a/usr/src/cmd/mdb/common/modules/libc/libc.c
++++ b/usr/src/cmd/mdb/common/modules/libc/libc.c
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright (c) 2001, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright (c) 2012 by Delphix. All rights reserved.
+- * Copyright 2016, Joyent, Inc.
++ * Copyright 2017, Joyent, Inc.
+  */
+ 
+ #include <sys/mdb_modapi.h>
+@@ -735,24 +735,247 @@ uberdata_addr(void)
+ 	return ((uintptr_t)sym.st_value);
+ }
+ 
++/*
++ * These are all the uberdata_t members that have been present since
++ * the Opensolaris launch.
++ */
++typedef struct mdb_uberdata {
++	atexit_root_t	atexit_root;
++	tsd_metadata_t	tsd_metadata;
++	tls_metadata_t	tls_metadata;
++	char		primary_map;
++	char		bucket_init;
++	uberflags_t	uberflags;
++	queue_head_t	*queue_head;
++	thr_hash_table_t *thr_hash_table;
++	uint_t		hash_size;
++	uint_t		hash_mask;
++	ulwp_t		*ulwp_one;
++	ulwp_t		*all_lwps;
++	ulwp_t		*all_zombies;
++	int		nthreads;
++	int		nzombies;
++	int		ndaemons;
++	pid_t		pid;
++	void		(*sigacthandler)(int, siginfo_t *, void *);
++	ulwp_t		*lwp_stacks;
++	ulwp_t		*lwp_laststack;
++	int		nfreestack;
++	int		thread_stack_cache;
++	ulwp_t		*ulwp_freelist;
++	ulwp_t		*ulwp_lastfree;
++	ulwp_t		*ulwp_replace_free;
++	ulwp_t		*ulwp_replace_last;
++	atfork_t	*atforklist;
++	struct uberdata **tdb_bootstrap;
++	tdb_t		tdb;
++} mdb_uberdata_t;
++
++/*
++ * uberdata_t has had a few changes that make it more likely offsets have
++ * changed, so ctf data is used when available
++ */
++static size_t
++uberdata_offset(mdb_ctf_id_t id, const char *member, size_t fallback)
++{
++	ulong_t offset;
++
++	if (mdb_ctf_offsetof(id, member, &offset) == -1)
++		return (fallback);
++
++	return ((size_t)offset / NBBY);
++}
++
++/*
++ * NSIG has also been increased several times.  The assumption is that
++ * the number of elements of uberdata.siguaction[] should indicate the
++ * value of NSIG from the target
++ */
++static const char *
++d_nsig(mdb_ctf_id_t uber_id, int pad)
++{
++	static char buf[24];
++	char val[11];
++	mdb_ctf_id_t siguaction_id;
++	mdb_ctf_arinfo_t ari;
++
++	if (mdb_ctf_member_info(uber_id, "siguaction", NULL,
++	    &siguaction_id) != 0) {
++		mdb_warn("Unable to get CTF member info for "
++		    "uberdata.siguaction");
++		goto fail;
++	}
++
++	if (mdb_ctf_type_kind(siguaction_id) != CTF_K_ARRAY) {
++		mdb_warn("CTF data for uberdata.siguaction is %d, expected "
++		    "%d (CTF_K_STRUCT)", mdb_ctf_type_kind(siguaction_id),
++		    CTF_K_STRUCT);
++		goto fail;
++	}
++
++	if (mdb_ctf_array_info(siguaction_id, &ari) != 0) {
++		mdb_warn("Unable to get CTF array info for "
++		    "siguaction");
++		goto fail;
++	}
++
++	(void) mdb_snprintf(val, sizeof (val), "%u", ari.mta_nelems);
++	(void) mdb_snprintf(buf, sizeof (buf),
++	    (pad != 0) ? "%-21s" : "%s", val);
++
++	return (buf);
++
++fail:
++	(void) mdb_snprintf(buf, sizeof (buf),
++	    (pad != 0) ? "%-21s" : "%s", "<Unknown>");
++	return (buf);
++}
++
++static void
++d_quickexit_root(uintptr_t addr, mdb_ctf_id_t id)
++{
++	mdb_ctf_id_t qe_id;
++	mdb_ctf_id_t qe_head;
++	ulong_t qe_off, exitfns_off, head_off;
++	void *head = NULL;
++
++	/* if it isn't there, assume it's an older target and silently return */
++	if (mdb_ctf_member_info(id, "quickexit_root", &qe_off, &qe_id) != 0)
++		return;
++
++	qe_off /= NBBY;
++
++	if (mdb_ctf_member_info(qe_id, "exitfns_lock", &exitfns_off,
++	    NULL) != 0) {
++		mdb_warn("Unable to read CTF info for "
++		    "quickexit_root_t.exitfns_lock");
++		return;
++	}
++	exitfns_off /= NBBY;
++
++	if (mdb_ctf_member_info(qe_id, "head", &head_off, NULL) != 0) {
++		mdb_warn("Unabvle to read CTF info for quickexit_root_t.head");
++		return;
++	}
++
++	if (mdb_vread(&head, sizeof (head), addr + qe_off + head_off) !=
++	    sizeof (head)) {
++		mdb_warn("Cannot read _uberdata.quickexit_root.head at 0x%p",
++		    addr + qe_off + head_off);
++		return;
++	}
++
++	HD("&quickexit_root       head");
++	mdb_printf(OFFSTR "%s %s\n",
++	    (size_t)qe_off,
++	    prt_addr((void *)(addr + qe_off + exitfns_off), 1),
++	    prt_addr(head, 0));
++}
++
++static void
++d_ub_buckets(uintptr_t addr, mdb_ctf_id_t id)
++{
++	mdb_ctf_id_t bucket_id;
++	mdb_ctf_arinfo_t ari;
++	uintptr_t bucket_addr;
++	ulong_t off;
++	size_t elsize;
++	size_t i, nbuckets;
++
++	if (mdb_ctf_member_info(id, "bucket", &off, &bucket_id) != 0) {
++		mdb_warn("Cannot read CTF info for uberdata_t.bucket[]");
++		return;
++	}
++
++	if (mdb_ctf_array_info(bucket_id, &ari) != 0) {
++		mdb_warn("Cannot read CTF array info for uberdata_t.bucket[]");
++		return;
++	}
++
++	off /= NBBY;
++	elsize = mdb_ctf_type_size(bucket_id) / ari.mta_nelems;
++	nbuckets = ari.mta_nelems;
++	bucket_addr = addr + off;
++
++	HD("&bucket               free_list             chunks");
++	for (i = 0; i < nbuckets; i++, bucket_addr += elsize) {
++		bucket_t bucket = { 0 };
++
++		if (mdb_vread(&bucket, sizeof (bucket), bucket_addr) !=
++		    sizeof (bucket)) {
++			mdb_warn("Cannot read uberdata.bucket[%u] at 0x%p",
++			    i, bucket_addr);
++			return;
++		}
++
++		mdb_printf(OFFSTR "%s %s %ld\n",
++		    off + i * elsize,
++		    prt_addr((void *)bucket_addr, 1),
++		    prt_addr(bucket.free_list, 1),
++		    bucket.chunks);
++	}
++}
++
++/*
++ * Wrapper around prt_addr for uberdata members that are pointer types.
++ * 'member' may not exist (depending on age of target) in which case
++ * the not present strings are returned.
++ */
++static const char *
++d_ub_ptrmem(uintptr_t uber_addr, mdb_ctf_id_t uber_id, const char *member,
++    int pad)
++{
++	static const char *missing = "<not present>";
++	static const char *missing_pad = "<not present>        ";
++	static const char *unknown = "<unknown>";
++	static const char *unknown_pad = "<unknown>            ";
++
++	const char *str = NULL;
++	void *addr = NULL;
++	ulong_t offset = 0;
++	uintptr_t memb_addr = 0;
++
++	if (mdb_ctf_offsetof(uber_id, member, &offset) == -1)
++		return (pad ? missing_pad : missing);
++
++	offset /= NBBY;
++
++	memb_addr = uber_addr + offset;
++
++	if (mdb_vread(&addr, sizeof (addr), memb_addr) != sizeof (addr)) {
++		mdb_warn("Cannot read uberdata.%s at 0x%p (+0x%x)",
++		    member, memb_addr, offset);
++		return (pad ? unknown_pad : unknown);
++	}
++
++	return (prt_addr(addr, pad));
++}
++
+ #undef OFFSET
+-#define	OFFSET(member)	((size_t)OFFSETOF(uberdata_t, member))
++#define	OFFSET(member)	(uberdata_offset(id, #member, \
++	(size_t)OFFSETOF(uberdata_t, member)))
+ 
+ /*ARGSUSED*/
+ static int
+ d_uberdata(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ {
+-	uberdata_t uberdata;
++	mdb_uberdata_t uberdata;
++	mdb_ctf_id_t id;
++	size_t offset;
+ 	int i;
+ 
+ 	if (argc != 0)
+ 		return (DCMD_USAGE);
+ 	if (!(flags & DCMD_ADDRSPEC) && (addr = uberdata_addr()) == NULL)
+ 		return (DCMD_ERR);
++	if (mdb_ctf_lookup_by_name("uberdata_t", &id) == -1) {
++		mdb_warn("Couldn't find CTF data for uberdata_t");
++		return (DCMD_ERR);
++	}
+ 
+-	if (mdb_vread(&uberdata, sizeof (uberdata), addr) !=
+-	    sizeof (uberdata)) {
+-		mdb_warn("failed to read uberdata at 0x%p", addr);
++	if (mdb_ctf_vread(&uberdata, "uberdata_t", "mdb_uberdata_t",
++	   addr, 0) != 0) {
++		mdb_warn("Unable to read uberdata using CTF");
+ 		return (DCMD_ERR);
+ 	}
+ 
+@@ -772,20 +995,14 @@ d_uberdata(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 	    prt_addr((void *)(addr + OFFSET(callout_lock)), 1),
+ 	    prt_addr((void *)(addr + OFFSET(tdb_hash_lock)), 0));
+ 
+-	HD("&tdb_hash_lock_stats  &siguaction[0]");
+-	mdb_printf(OFFSTR "%s %s\n",
++	HD("&tdb_hash_lock_stats  &siguaction[0]        NSIG");
++	mdb_printf(OFFSTR "%s %s %s\n",
+ 	    OFFSET(tdb_hash_lock_stats),
+ 	    prt_addr((void *)(addr + OFFSET(tdb_hash_lock_stats)), 1),
+-	    prt_addr((void *)(addr + OFFSET(siguaction)), 0));
++	    prt_addr((void *)(addr + OFFSET(siguaction)), 1),
++	    d_nsig(id, 0));
+ 
+-	HD("&bucket               free_list             chunks");
+-	for (i = 0; i < NBUCKETS; i++) {
+-		mdb_printf(OFFSTR "%s %s %ld\n",
+-		    OFFSET(bucket[i]),
+-		    prt_addr((void *)(addr + OFFSET(bucket[i])), 1),
+-		    prt_addr(uberdata.bucket[i].free_list, 1),
+-		    uberdata.bucket[i].chunks);
+-	}
++	d_ub_buckets(addr, id);
+ 
+ 	HD("&atexit_root          head                  exit_frame_monitor");
+ 	mdb_printf(OFFSTR "%s %s %s\n",
+@@ -794,31 +1011,30 @@ d_uberdata(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 	    prt_addr(uberdata.atexit_root.head, 1),
+ 	    prt_addr(uberdata.atexit_root.exit_frame_monitor, 0));
+ 
+-	HD("&quickexit_root       head");
+-	mdb_printf(OFFSTR "%s %s\n",
+-	    OFFSET(quickexit_root),
+-	    prt_addr((void *)(addr + OFFSET(quickexit_root.exitfns_lock)), 1),
+-	    prt_addr(uberdata.quickexit_root.head, 0));
+-
++	d_quickexit_root(addr, id);
+ 
++	offset = OFFSET(tsd_metadata);
+ 	HD("&tsd_metadata         tsdm_nkeys tsdm_nused tsdm_destro");
+ 	mdb_printf(OFFSTR "%s %-10d %-10d %s\n",
+-	    OFFSET(tsd_metadata),
+-	    prt_addr((void *)(addr + OFFSET(tsd_metadata.tsdm_lock)), 1),
++	    offset,
++	    prt_addr((void *)(addr + offset +
++	    OFFSETOF(tsd_metadata_t, tsdm_lock)), 1),
+ 	    uberdata.tsd_metadata.tsdm_nkeys,
+ 	    uberdata.tsd_metadata.tsdm_nused,
+ 	    prt_addr((void *)uberdata.tsd_metadata.tsdm_destro, 0));
+ 
++	offset = OFFSET(tls_metadata);
+ 	HD("&tls_metadata         tls_modinfo.data      tls_modinfo.size");
+ 	mdb_printf(OFFSTR "%s %s %ld\n",
+-	    OFFSET(tls_metadata),
+-	    prt_addr((void *)(addr + OFFSET(tls_metadata.tls_lock)), 1),
++	    offset,
++	    prt_addr((void *)(addr + offset +
++	    OFFSETOF(tls_metadata_t, tls_lock)), 1),
+ 	    prt_addr(uberdata.tls_metadata.tls_modinfo.tls_data, 1),
+ 	    uberdata.tls_metadata.tls_modinfo.tls_size);
+ 
+ 	HD("                      static_tls.data       static_tls.size");
+ 	mdb_printf(OFFSTR "%s %s %ld\n",
+-	    OFFSET(tls_metadata.static_tls),
++	    offset + OFFSETOF(tls_metadata_t, static_tls),
+ 	    "                     ",
+ 	    prt_addr(uberdata.tls_metadata.static_tls.tls_data, 1),
+ 	    uberdata.tls_metadata.static_tls.tls_size);
+@@ -860,7 +1076,7 @@ d_uberdata(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 	mdb_printf(OFFSTR "%s %s\n",
+ 	    OFFSET(sigacthandler),
+ 	    prt_addr((void *)uberdata.sigacthandler, 1),
+-	    prt_addr((void *)uberdata.setctxt, 1));
++	    d_ub_ptrmem(addr, id, "setctxt", 1));
+ 
+ 	HD("lwp_stacks            lwp_laststack         nfreestack stk_cache");
+ 	mdb_printf(OFFSTR "%s %s %-10d %d\n",
+@@ -886,14 +1102,14 @@ d_uberdata(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 	HD("robustlocks           robustlist");
+ 	mdb_printf(OFFSTR "%s %s\n",
+ 	    OFFSET(robustlocks),
+-	    prt_addr(uberdata.robustlocks, 1),
+-	    prt_addr(uberdata.robustlist, 1));
++	    d_ub_ptrmem(addr, id, "robustlocks", 1),
++	    d_ub_ptrmem(addr, id, "robustlist", 1));
+ 
+ 	HD("progname              ub_broot");
+ 	mdb_printf(OFFSTR "%s %s\n",
+ 	    OFFSET(progname),
+-	    prt_addr(uberdata.progname, 1),
+-	    prt_addr(uberdata.ub_broot, 1));
++	    d_ub_ptrmem(addr, id, "progname", 1),
++	    d_ub_ptrmem(addr, id, "ub_broot", 1));
+ 
+ 	HD("tdb_bootstrap         tdb_sync_addr_hash    tdb_'count tdb_'fail");
+ 	mdb_printf(OFFSTR "%s %s %-10d %d\n",
+@@ -903,16 +1119,17 @@ d_uberdata(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+ 	    uberdata.tdb.tdb_register_count,
+ 	    uberdata.tdb.tdb_hash_alloc_failed);
+ 
++	offset = OFFSET(tdb);
+ 	HD("tdb_sync_addr_free    tdb_sync_addr_last    tdb_sync_alloc");
+ 	mdb_printf(OFFSTR "%s %s %ld\n",
+-	    OFFSET(tdb.tdb_sync_addr_free),
++	    offset + OFFSETOF(tdb_t, tdb_sync_addr_free),
+ 	    prt_addr(uberdata.tdb.tdb_sync_addr_free, 1),
+ 	    prt_addr(uberdata.tdb.tdb_sync_addr_last, 1),
+ 	    uberdata.tdb.tdb_sync_alloc);
+ 
+ 	HD("tdb_ev_global_mask    tdb_events");
+ 	mdb_printf(OFFSTR "0x%08x 0x%08x %s\n",
+-	    OFFSET(tdb.tdb_ev_global_mask),
++	    offset + OFFSETOF(tdb_t, tdb_ev_global_mask),
+ 	    uberdata.tdb.tdb_ev_global_mask.event_bits[0],
+ 	    uberdata.tdb.tdb_ev_global_mask.event_bits[1],
+ 	    prt_addr((void *)uberdata.tdb.tdb_events, 0));
+@@ -925,11 +1142,17 @@ ulwp_walk_init(mdb_walk_state_t *wsp)
+ {
+ 	uintptr_t addr = wsp->walk_addr;
+ 	uintptr_t uber_addr;
++	int offset;
++
++	offset = mdb_ctf_offsetof_by_name("uberdata_t", "all_lwps");
++	/* fallback if for some reason CTF is missing */
++	if (offset == -1)
++		offset = OFFSETOF(uberdata_t, all_lwps);
++
+ 
+ 	if (addr == NULL &&
+ 	    ((uber_addr = uberdata_addr()) == NULL ||
+-	    mdb_vread(&addr, sizeof (addr),
+-	    uber_addr + OFFSETOF(uberdata_t, all_lwps))
++	    mdb_vread(&addr, sizeof (addr), uber_addr + offset)
+ 	    != sizeof (addr))) {
+ 		mdb_warn("cannot find 'uberdata.all_lwps'");
+ 		return (WALK_ERR);
+-- 
+2.21.0
+

@@ -1,0 +1,162 @@
+From 4c7f631d398a370c7f30dfaea3bf03f50019d737 Mon Sep 17 00:00:00 2001
+From: Bryan Cantrill <bryan@joyent.com>
+Date: Mon, 5 Dec 2016 23:13:27 +0000
+Subject: [PATCH] OS-5825 by allocating fw_cv on stack, futex_wait() can induce
+ deadlock
+
+---
+ usr/src/uts/common/brand/lx/sys/lx_brand.h    |  3 ++
+ usr/src/uts/common/brand/lx/sys/lx_futex.h    | 21 +++++++++-
+ .../uts/common/brand/lx/syscall/lx_futex.c    | 42 ++++++-------------
+ 3 files changed, 35 insertions(+), 31 deletions(-)
+
+diff --git a/usr/src/uts/common/brand/lx/sys/lx_brand.h b/usr/src/uts/common/brand/lx/sys/lx_brand.h
+index 30d576044f..9be10aff98 100644
+--- a/usr/src/uts/common/brand/lx/sys/lx_brand.h
++++ b/usr/src/uts/common/brand/lx/sys/lx_brand.h
+@@ -39,6 +39,7 @@
+ #include <sys/sunddi.h>
+ #include <sys/sunldi.h>
+ #include <sys/cpuvar.h>
++#include <sys/lx_futex.h>
+ #endif
+ 
+ #ifdef	__cplusplus
+@@ -563,6 +564,8 @@ struct lx_lwp_data {
+ 	uint64_t br_schd_runtime;	/* emulated DEADLINE */
+ 	uint64_t br_schd_deadline;	/* emulated DEADLINE */
+ 	uint64_t br_schd_period;	/* emulated DEADLINE */
++
++	fwaiter_t br_fwaiter;		/* futex upon which we're waiting */
+ };
+ 
+ /*
+diff --git a/usr/src/uts/common/brand/lx/sys/lx_futex.h b/usr/src/uts/common/brand/lx/sys/lx_futex.h
+index a400b3bd83..6e4f6ee4a0 100644
+--- a/usr/src/uts/common/brand/lx/sys/lx_futex.h
++++ b/usr/src/uts/common/brand/lx/sys/lx_futex.h
+@@ -24,7 +24,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2014, Joyent, Inc.  All rights reserved.
++ * Copyright (c) 2016, Joyent, Inc.  All rights reserved.
+  */
+ 
+ #ifndef _SYS_LX_FUTEX_H
+@@ -97,6 +97,25 @@ extern "C" {
+ 
+ #ifdef _KERNEL
+ 
++/*
++ * This structure is used to track all the threads currently waiting on a
++ * futex.  There is one fwaiter_t for each blocked thread.  We store all
++ * fwaiter_t's in a hash structure, indexed by the memid_t of the integer
++ * containing the futex's value.
++ *
++ * At the moment, all fwaiter_t's for a single futex are simply dumped into
++ * the hash bucket.  If futex contention ever becomes a hot path, we can
++ * chain a single futex's waiters together.
++ */
++typedef struct fwaiter {
++	memid_t		fw_memid;	/* memid of the user-space futex */
++	kcondvar_t	fw_cv;		/* cond var */
++	struct fwaiter	*fw_next;	/* hash queue */
++	struct fwaiter	*fw_prev;	/* hash queue */
++	uint32_t	fw_bits;	/* bits waiting on */
++	volatile int	fw_woken;
++} fwaiter_t;
++
+ #define	FUTEX_WAITERS			0x80000000
+ #define	FUTEX_OWNER_DIED		0x40000000
+ #define	FUTEX_TID_MASK			0x3fffffff
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_futex.c b/usr/src/uts/common/brand/lx/syscall/lx_futex.c
+index 94c215fedc..b3f9848ff5 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_futex.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_futex.c
+@@ -188,25 +188,6 @@
+  *	saying that we don't support this operation.
+  */
+ 
+-/*
+- * This structure is used to track all the threads currently waiting on a
+- * futex.  There is one fwaiter_t for each blocked thread.  We store all
+- * fwaiter_t's in a hash structure, indexed by the memid_t of the integer
+- * containing the futex's value.
+- *
+- * At the moment, all fwaiter_t's for a single futex are simply dumped into
+- * the hash bucket.  If futex contention ever becomes a hot path, we can
+- * chain a single futex's waiters together.
+- */
+-typedef struct fwaiter {
+-	memid_t		fw_memid;	/* memid of the user-space futex */
+-	kcondvar_t	fw_cv;		/* cond var */
+-	struct fwaiter	*fw_next;	/* hash queue */
+-	struct fwaiter	*fw_prev;	/* hash queue */
+-	uint32_t	fw_bits;	/* bits waiting on */
+-	volatile int	fw_woken;
+-} fwaiter_t;
+-
+ /*
+  * The structure of the robust_list, as set with the set_robust_list() system
+  * call.  See lx_futex_robust_exit(), below, for details.
+@@ -309,9 +290,10 @@ futex_wait(memid_t *memid, caddr_t addr,
+     int val, timespec_t *timeout, uint32_t bits)
+ {
+ 	kthread_t *t = curthread;
++	lx_lwp_data_t *lwpd = ttolxlwp(t);
++	fwaiter_t *fwp = &lwpd->br_fwaiter;
+ 	int err, ret;
+ 	int32_t curval;
+-	fwaiter_t fw;
+ 	int index;
+ 
+ 	/*
+@@ -322,13 +304,13 @@ futex_wait(memid_t *memid, caddr_t addr,
+ 	 */
+ 	(void) new_mstate(t, LMS_USER_LOCK);
+ 
+-	fw.fw_woken = 0;
+-	fw.fw_bits = bits;
++	fwp->fw_woken = 0;
++	fwp->fw_bits = bits;
+ 
+-	MEMID_COPY(memid, &fw.fw_memid);
+-	cv_init(&fw.fw_cv, NULL, CV_DEFAULT, NULL);
++	MEMID_COPY(memid, &fwp->fw_memid);
++	cv_init(&fwp->fw_cv, NULL, CV_DEFAULT, NULL);
+ 
+-	index = HASH_FUNC(&fw.fw_memid);
++	index = HASH_FUNC(&fwp->fw_memid);
+ 	mutex_enter(&futex_hash[index].fh_lock);
+ 
+ 	if (fuword32(addr, (uint32_t *)&curval)) {
+@@ -340,11 +322,11 @@ futex_wait(memid_t *memid, caddr_t addr,
+ 		goto out;
+ 	}
+ 
+-	futex_hashin(&fw);
++	futex_hashin(fwp);
+ 
+ 	err = 0;
+-	while ((fw.fw_woken == 0) && (err == 0)) {
+-		ret = cv_waituntil_sig(&fw.fw_cv, &futex_hash[index].fh_lock,
++	while ((fwp->fw_woken == 0) && (err == 0)) {
++		ret = cv_waituntil_sig(&fwp->fw_cv, &futex_hash[index].fh_lock,
+ 		    timeout, timechanged);
+ 		if (ret < 0) {
+ 			err = set_errno(ETIMEDOUT);
+@@ -362,8 +344,8 @@ futex_wait(memid_t *memid, caddr_t addr,
+ 	 * The futex is normally hashed out in wakeup.  If we timed out or
+ 	 * got a signal, we need to hash it out here instead.
+ 	 */
+-	if (fw.fw_woken == 0)
+-		futex_hashout(&fw);
++	if (fwp->fw_woken == 0)
++		futex_hashout(fwp);
+ 
+ out:
+ 	mutex_exit(&futex_hash[index].fh_lock);
+-- 
+2.21.0
+

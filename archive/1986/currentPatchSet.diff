@@ -1,0 +1,748 @@
+From 08e6479aa08c33355170328482371691f5f34e1a Mon Sep 17 00:00:00 2001
+From: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date: Thu, 25 May 2017 12:07:19 +0000
+Subject: [PATCH] OS-6065 add support for xsaveopt or xsavec for improved
+ context switching OS-6136 better handling for AMD-specifc *save_ctxt FP
+ exceptions Reviewed by: Robert Mustacchi <rm@joyent.com> Reviewed by: Patrick
+ Mooney <patrick.mooney@joyent.com> Approved by: Robert Mustacchi
+ <rm@joyent.com>
+
+---
+ usr/src/uts/i86pc/os/cpuid.c          |  32 ++++
+ usr/src/uts/i86pc/os/fpu_subr.c       |  66 +++++++-
+ usr/src/uts/i86pc/sys/asm_misc.h      |  20 +--
+ usr/src/uts/intel/ia32/ml/exception.s |   4 +-
+ usr/src/uts/intel/ia32/ml/float.s     | 211 +++++++++++++++++++++-----
+ usr/src/uts/intel/ia32/os/fpu.c       |   9 +-
+ usr/src/uts/intel/sys/fp.h            |  57 +++++--
+ usr/src/uts/intel/sys/x86_archext.h   |   6 +
+ 8 files changed, 331 insertions(+), 74 deletions(-)
+
+diff --git a/usr/src/uts/i86pc/os/cpuid.c b/usr/src/uts/i86pc/os/cpuid.c
+index 0396e92871..085b130598 100644
+--- a/usr/src/uts/i86pc/os/cpuid.c
++++ b/usr/src/uts/i86pc/os/cpuid.c
+@@ -364,6 +364,7 @@ struct cpuid_info {
+ 	char cpi_brandstr[49];		/* fn 0x8000000[234] */
+ 	uint8_t cpi_pabits;		/* fn 0x80000006: %eax */
+ 	uint8_t	cpi_vabits;		/* fn 0x80000006: %eax */
++	uint8_t cpi_fp_amd_save;	/* AMD: FP error pointer save rqd. */
+ 	struct	cpuid_regs cpi_extd[NMAX_CPI_EXTD];	/* 0x800000XX */
+ 
+ 	id_t cpi_coreid;		/* same coreid => strands share core */
+@@ -1881,6 +1882,21 @@ cpuid_pass1(cpu_t *cpu, uchar_t *featureset)
+ 	cpi->cpi_socket = _cpuid_skt(cpi->cpi_vendor, cpi->cpi_family,
+ 	    cpi->cpi_model, cpi->cpi_step);
+ 
++	/*
++	 * While we're here, check for the AMD "Error Pointer Zero/Restore"
++	 * feature. This can be used to setup the FP save handlers
++	 * appropriately.
++	 */
++	if (cpi->cpi_vendor == X86_VENDOR_AMD) {
++		if (cpi->cpi_xmaxeax >= 0x80000008 &&
++		    cpi->cpi_extd[8].cp_ebx & CPUID_AMD_EBX_ERR_PTR_ZERO) {
++			/* Special handling for AMD FP not necessary. */
++			cpi->cpi_fp_amd_save = 0;
++		} else {
++			cpi->cpi_fp_amd_save = 1;
++		}
++	}
++
+ pass1_done:
+ 	cpi->cpi_pass = 1;
+ }
+@@ -3539,6 +3555,22 @@ cpuid_get_xsave_size()
+ 	    sizeof (struct xsave_state)));
+ }
+ 
++/*
++ * Return true if the CPUs on this system require 'pointer clearing' for the
++ * floating point error pointer exception handling. In the past, this has been
++ * true for all AMD K7 & K8 CPUs, although newer AMD CPUs have been changed to
++ * behave the same as Intel. This is checked via the CPUID_AMD_EBX_ERR_PTR_ZERO
++ * feature bit and is reflected in the cpi_fp_amd_save member. Once this has
++ * been confirmed on hardware which supports that feature, this test should be
++ * narrowed. In the meantime, we always follow the existing behavior on any AMD
++ * CPU.
++ */
++boolean_t
++cpuid_need_fp_excp_handling()
++{
++	return (cpuid_info0.cpi_vendor == X86_VENDOR_AMD);
++}
++
+ /*
+  * Returns the number of data TLB entries for a corresponding
+  * pagesize.  If it can't be computed, or isn't known, the
+diff --git a/usr/src/uts/i86pc/os/fpu_subr.c b/usr/src/uts/i86pc/os/fpu_subr.c
+index e65c65de92..5ff8fdb655 100644
+--- a/usr/src/uts/i86pc/os/fpu_subr.c
++++ b/usr/src/uts/i86pc/os/fpu_subr.c
+@@ -153,6 +153,10 @@ fpu_probe(void)
+ #endif
+ 
+ #if defined(__amd64)
++		/* Use the more complex exception clearing code if necessary */
++		if (cpuid_need_fp_excp_handling())
++			fpsave_ctxt = fpxsave_excp_clr_ctxt;
++
+ 		/*
+ 		 * SSE and SSE2 are required for the 64-bit ABI.
+ 		 *
+@@ -174,7 +178,31 @@ fpu_probe(void)
+ 
+ 			if (is_x86_feature(x86_featureset, X86FSET_XSAVE)) {
+ 				fp_save_mech = FP_XSAVE;
+-				fpsave_ctxt = xsave_ctxt;
++				if (is_x86_feature(x86_featureset,
++				    X86FSET_XSAVEOPT)) {
++					/*
++					 * Use the more complex exception
++					 * clearing code if necessary.
++					 */
++					if (cpuid_need_fp_excp_handling()) {
++						fpsave_ctxt =
++						    xsaveopt_excp_clr_ctxt;
++					} else {
++						fpsave_ctxt = xsaveopt_ctxt;
++					}
++					xsavep = xsaveopt;
++				} else {
++					/*
++					 * Use the more complex exception
++					 * clearing code if necessary.
++					 */
++					if (cpuid_need_fp_excp_handling()) {
++						fpsave_ctxt =
++						    xsave_excp_clr_ctxt;
++					} else {
++						fpsave_ctxt = xsave_ctxt;
++					}
++				}
+ 				patch_xsave();
+ 				fpsave_cachep = kmem_cache_create("xsave_cache",
+ 				    cpuid_get_xsave_size(), XSAVE_ALIGN,
+@@ -196,7 +224,15 @@ fpu_probe(void)
+ 			fp_kind |= __FP_SSE;
+ 			ENABLE_SSE();
+ 			fp_save_mech = FP_FXSAVE;
+-			fpsave_ctxt = fpxsave_ctxt;
++			/*
++			 * Use the more complex exception clearing code if
++			 * necessary.
++			 */
++			if (cpuid_need_fp_excp_handling()) {
++				fpsave_ctxt = fpxsave_excp_clr_ctxt;
++			} else {
++				fpsave_ctxt = fpxsave_ctxt;
++			}
+ 
+ 			if (is_x86_feature(x86_featureset, X86FSET_SSE2)) {
+ 				patch_sse2();
+@@ -210,7 +246,31 @@ fpu_probe(void)
+ 
+ 			if (is_x86_feature(x86_featureset, X86FSET_XSAVE)) {
+ 				fp_save_mech = FP_XSAVE;
+-				fpsave_ctxt = xsave_ctxt;
++				if (is_x86_feature(x86_featureset,
++				    X86FSET_XSAVEOPT)) {
++					/*
++					 * Use the more complex exception
++					 * clearing code if necessary.
++					 */
++					if (cpuid_need_fp_excp_handling()) {
++						fpsave_ctxt =
++						    xsaveopt_excp_clr_ctxt;
++					} else {
++						fpsave_ctxt = xsaveopt_ctxt;
++					}
++					xsavep = xsaveopt;
++				} else {
++					/*
++					 * Use the more complex exception
++					 * clearing code if necessary.
++					 */
++					if (cpuid_need_fp_excp_handling()) {
++						fpsave_ctxt =
++						    xsave_excp_clr_ctxt;
++					} else {
++						fpsave_ctxt = xsave_ctxt;
++					}
++				}
+ 				patch_xsave();
+ 				fpsave_cachep = kmem_cache_create("xsave_cache",
+ 				    cpuid_get_xsave_size(), XSAVE_ALIGN,
+diff --git a/usr/src/uts/i86pc/sys/asm_misc.h b/usr/src/uts/i86pc/sys/asm_misc.h
+index 57ac6ed0b1..b129ca10af 100644
+--- a/usr/src/uts/i86pc/sys/asm_misc.h
++++ b/usr/src/uts/i86pc/sys/asm_misc.h
+@@ -21,13 +21,12 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_ASM_MISC_H
+ #define	_SYS_ASM_MISC_H
+ 
+-#pragma ident	"%Z%%M%	%I%	%E% SMI"
+-
+ #ifdef	__cplusplus
+ extern "C" {
+ #endif
+@@ -84,23 +83,6 @@ extern "C" {
+ 
+ #endif	/* __i386 */
+ 
+-#if defined(__amd64)
+-
+-/*
+- * While as doesn't support fxsaveq/fxrstorq (fxsave/fxrstor with REX.W = 1)
+- * we will use the FXSAVEQ/FXRSTORQ macro
+- */
+-
+-#define	FXSAVEQ(x)	\
+-	.byte	0x48;	\
+-	fxsave	x
+-
+-#define	FXRSTORQ(x)	\
+-	.byte	0x48;	\
+-	fxrstor	x
+-
+-#endif	/* __amd64 */
+-
+ #endif /* _ASM */
+ 
+ #ifdef	__cplusplus
+diff --git a/usr/src/uts/intel/ia32/ml/exception.s b/usr/src/uts/intel/ia32/ml/exception.s
+index c6e2250f4e..8b538910e2 100644
+--- a/usr/src/uts/intel/ia32/ml/exception.s
++++ b/usr/src/uts/intel/ia32/ml/exception.s
+@@ -669,7 +669,7 @@ _emul_done:
+ 	movq (%rbx), %rbx		/* fpu_regs.kfpu_u.kfpu_XX pointer */
+ 	.globl  _patch_xrstorq_rbx
+ _patch_xrstorq_rbx:
+-	FXRSTORQ	((%rbx))
++	fxrstorq (%rbx)
+ 	cmpw	$KCS_SEL, REGOFF_CS(%rsp)
+ 	je	.return_to_kernel
+ 
+@@ -745,7 +745,7 @@ _patch_xrstorq_rbx:
+ 	movq (%rbx), %rbx		/* fpu_regs.kfpu_u.kfpu_XX pointer */
+ 	.globl  _patch_xrstorq_rbx
+ _patch_xrstorq_rbx:
+-	FXRSTORQ	((%rbx))
++	fxrstorq (%rbx)
+ 	popq	%rdx
+ 	popq	%rbx
+ 	popq	%rax
+diff --git a/usr/src/uts/intel/ia32/ml/float.s b/usr/src/uts/intel/ia32/ml/float.s
+index 73c1956054..4c45bce3d3 100644
+--- a/usr/src/uts/intel/ia32/ml/float.s
++++ b/usr/src/uts/intel/ia32/ml/float.s
+@@ -82,7 +82,7 @@ fxsave_insn(struct fxsave_state *fx)
+ #if defined(__amd64)
+ 
+ 	ENTRY_NP(fxsave_insn)
+-	FXSAVEQ	((%rdi))
++	fxsaveq (%rdi)
+ 	ret
+ 	SET_SIZE(fxsave_insn)
+ 
+@@ -232,7 +232,7 @@ patch_xsave(void)
+ 	pushq	%rbp
+ 	pushq	%r15
+ 	/
+-	/	FXRSTORQ (%rbx);	-> nop; xrstor (%rbx)
++	/	fxrstorq (%rbx);	-> nop; xrstor (%rbx)
+ 	/ loop doing the following for 4 bytes:
+ 	/     hot_patch_kernel_text(_patch_xrstorq_rbx, _xrstor_rbx_insn, 1)
+ 	/
+@@ -255,7 +255,7 @@ patch_xsave(void)
+ 	ret
+ 
+ _xrstor_rbx_insn:			/ see ndptrap_frstor()
+-	# Because the FXRSTORQ macro we're patching is 4 bytes long, due
++	# Because the fxrstorq instruction we're patching is 4 bytes long, due
+ 	# to the 0x48 prefix (indicating 64-bit operand size), we patch 4 bytes
+ 	# too.
+ 	nop
+@@ -277,6 +277,10 @@ void
+ xsave_ctxt(void *arg)
+ {}
+ 
++void
++xsaveopt_ctxt(void *arg)
++{}
++
+ /*ARGSUSED*/
+ void
+ fpxsave_ctxt(void *arg)
+@@ -291,20 +295,65 @@ fpnsave_ctxt(void *arg)
+ 
+ #if defined(__amd64)
+ 
++/*
++ * These three functions define the Intel "xsave" handling for CPUs with
++ * different features. Newer AMD CPUs can also use these functions. See the
++ * 'exception pointers' comment below.
++ */
+ 	ENTRY_NP(fpxsave_ctxt)	/* %rdi is a struct fpu_ctx */
+ 	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%rdi)
+ 	jne	1f
+-
+ 	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%rdi)
+ 	movq	FPU_CTX_FPU_REGS(%rdi), %rdi /* fpu_regs.kfpu_u.kfpu_fn ptr */
+-	FXSAVEQ	((%rdi))
++	fxsaveq	(%rdi)
++	STTS(%rsi)	/* trap on next fpu touch */
++1:	rep;	ret	/* use 2 byte return instruction when branch target */
++			/* AMD Software Optimization Guide - Section 6.2 */
++	SET_SIZE(fpxsave_ctxt)
+ 
++	ENTRY_NP(xsave_ctxt)
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%rdi)
++	jne	1f
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%rdi)
++	movl	FPU_CTX_FPU_XSAVE_MASK(%rdi), %eax /* xsave flags in EDX:EAX */
++	movl	FPU_CTX_FPU_XSAVE_MASK+4(%rdi), %edx
++	movq	FPU_CTX_FPU_REGS(%rdi), %rsi /* fpu_regs.kfpu_u.kfpu_xs ptr */
++	xsave	(%rsi)
++	STTS(%rsi)	/* trap on next fpu touch */
++1:	ret
++	SET_SIZE(xsave_ctxt)
++
++	ENTRY_NP(xsaveopt_ctxt)
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%rdi)
++	jne	1f
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%rdi)
++	movl	FPU_CTX_FPU_XSAVE_MASK(%rdi), %eax /* xsave flags in EDX:EAX */
++	movl	FPU_CTX_FPU_XSAVE_MASK+4(%rdi), %edx
++	movq	FPU_CTX_FPU_REGS(%rdi), %rsi /* fpu_regs.kfpu_u.kfpu_xs ptr */
++	xsaveopt (%rsi)
++	STTS(%rsi)	/* trap on next fpu touch */
++1:	ret
++	SET_SIZE(xsaveopt_ctxt)
++
++/*
++ * On certain AMD processors, the "exception pointers" (i.e. the last
++ * instruction pointer, last data pointer, and last opcode) are saved by the
++ * fxsave, xsave or xsaveopt instruction ONLY if the exception summary bit is
++ * set.
++ *
++ * On newer CPUs, AMD has changed their behavior to mirror the Intel behavior.
++ * We can detect this via an AMD specific cpuid feature bit
++ * (CPUID_AMD_EBX_ERR_PTR_ZERO) and use the simpler Intel-oriented functions.
++ * Otherwise we use these more complex functions on AMD CPUs. All three follow
++ * the same logic after the xsave* instruction.
++ */
++	ENTRY_NP(fpxsave_excp_clr_ctxt)	/* %rdi is a struct fpu_ctx */
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%rdi)
++	jne	1f
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%rdi)
++	movq	FPU_CTX_FPU_REGS(%rdi), %rdi /* fpu_regs.kfpu_u.kfpu_fn ptr */
++	fxsaveq	(%rdi)
+ 	/*
+-	 * On certain AMD processors, the "exception pointers" i.e. the last
+-	 * instruction pointer, last data pointer, and last opcode
+-	 * are saved by the fxsave instruction ONLY if the exception summary
+-	 * bit is set.
+-	 *
+ 	 * To ensure that we don't leak these values into the next context
+ 	 * on the cpu, we could just issue an fninit here, but that's
+ 	 * rather slow and so we issue an instruction sequence that
+@@ -319,33 +368,41 @@ fpnsave_ctxt(void *arg)
+ 	STTS(%rsi)	/* trap on next fpu touch */
+ 1:	rep;	ret	/* use 2 byte return instruction when branch target */
+ 			/* AMD Software Optimization Guide - Section 6.2 */
+-	SET_SIZE(fpxsave_ctxt)
++	SET_SIZE(fpxsave_excp_clr_ctxt)
+ 
+-	ENTRY_NP(xsave_ctxt)
++	ENTRY_NP(xsave_excp_clr_ctxt)
+ 	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%rdi)
+ 	jne	1f
+ 	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%rdi)
+-	/*
+-	 * Setup xsave flags in EDX:EAX
+-	 */
+ 	movl	FPU_CTX_FPU_XSAVE_MASK(%rdi), %eax
+ 	movl	FPU_CTX_FPU_XSAVE_MASK+4(%rdi), %edx
+ 	movq	FPU_CTX_FPU_REGS(%rdi), %rsi /* fpu_regs.kfpu_u.kfpu_xs ptr */
+ 	xsave	(%rsi)
++	btw	$7, FXSAVE_STATE_FSW(%rsi)	/* Test saved ES bit */
++	jnc	0f				/* jump if ES = 0 */
++	fnclex		/* clear pending x87 exceptions */
++0:	ffree	%st(7)	/* clear tag bit to remove possible stack overflow */
++	fildl	.fpzero_const(%rip) /* dummy load changes all excp. pointers */
++	STTS(%rsi)	/* trap on next fpu touch */
++1:	ret
++	SET_SIZE(xsave_excp_clr_ctxt)
+ 
+-	/*
+-	 * (see notes above about "exception pointers")
+-	 * TODO: does it apply to any machine that uses xsave?
+-	 */
++	ENTRY_NP(xsaveopt_excp_clr_ctxt)
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%rdi)
++	jne	1f
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%rdi)
++	movl	FPU_CTX_FPU_XSAVE_MASK(%rdi), %eax
++	movl	FPU_CTX_FPU_XSAVE_MASK+4(%rdi), %edx
++	movq	FPU_CTX_FPU_REGS(%rdi), %rsi /* fpu_regs.kfpu_u.kfpu_xs ptr */
++	xsaveopt (%rsi)
+ 	btw	$7, FXSAVE_STATE_FSW(%rsi)	/* Test saved ES bit */
+ 	jnc	0f				/* jump if ES = 0 */
+ 	fnclex		/* clear pending x87 exceptions */
+ 0:	ffree	%st(7)	/* clear tag bit to remove possible stack overflow */
+-	fildl	.fpzero_const(%rip)
+-			/* dummy load changes all exception pointers */
++	fildl	.fpzero_const(%rip) /* dummy load changes all excp. pointers */
+ 	STTS(%rsi)	/* trap on next fpu touch */
+ 1:	ret
+-	SET_SIZE(xsave_ctxt)
++	SET_SIZE(xsaveopt_excp_clr_ctxt)
+ 
+ #elif defined(__i386)
+ 
+@@ -353,7 +410,6 @@ fpnsave_ctxt(void *arg)
+ 	movl	4(%esp), %eax		/* a struct fpu_ctx */
+ 	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%eax)
+ 	jne	1f
+-
+ 	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%eax)
+ 	movl	FPU_CTX_FPU_REGS(%eax), %eax /* fpu_regs.kfpu_u.kfpu_fx ptr */
+ 	fnsave	(%eax)
+@@ -367,11 +423,54 @@ fpnsave_ctxt(void *arg)
+ 	movl	4(%esp), %eax		/* a struct fpu_ctx */
+ 	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%eax)
+ 	jne	1f
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%eax)
++	movl	FPU_CTX_FPU_REGS(%eax), %eax /* fpu_regs.kfpu_u.kfpu_fn ptr */
++	fxsave	(%eax)
++	STTS(%edx)	/* trap on next fpu touch */
++1:	rep;	ret	/* use 2 byte return instruction when branch target */
++			/* AMD Software Optimization Guide - Section 6.2 */
++	SET_SIZE(fpxsave_ctxt)
++
++	ENTRY_NP(xsave_ctxt)
++	movl	4(%esp), %ecx		/* a struct fpu_ctx */
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%ecx)
++	jne	1f
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%ecx)
++	movl	FPU_CTX_FPU_XSAVE_MASK(%ecx), %eax
++	movl	FPU_CTX_FPU_XSAVE_MASK+4(%ecx), %edx
++	movl	FPU_CTX_FPU_REGS(%ecx), %ecx /* fpu_regs.kfpu_u.kfpu_xs ptr */
++	xsave	(%ecx)
++	STTS(%edx)	/* trap on next fpu touch */
++1:	ret
++	SET_SIZE(xsave_ctxt)
++
++	ENTRY_NP(xsaveopt_ctxt)
++	movl	4(%esp), %ecx		/* a struct fpu_ctx */
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%ecx)
++	jne	1f
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%ecx)
++	movl	FPU_CTX_FPU_XSAVE_MASK(%ecx), %eax
++	movl	FPU_CTX_FPU_XSAVE_MASK+4(%ecx), %edx
++	movl	FPU_CTX_FPU_REGS(%ecx), %ecx /* fpu_regs.kfpu_u.kfpu_xs ptr */
++	xsaveopt (%ecx)
++	STTS(%edx)	/* trap on next fpu touch */
++1:	ret
++	SET_SIZE(xsaveopt_ctxt)
++
++/*
++ * See comment above the __amd64 implementation of fpxsave_excp_clr_ctxt()
++ * for details about the following threee functions for AMD "exception pointer"
++ * handling.
++ */
++
++	ENTRY_NP(fpxsave_excp_clr_ctxt)
++	movl	4(%esp), %eax		/* a struct fpu_ctx */
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%eax)
++	jne	1f
+ 
+ 	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%eax)
+ 	movl	FPU_CTX_FPU_REGS(%eax), %eax /* fpu_regs.kfpu_u.kfpu_fn ptr */
+ 	fxsave	(%eax)
+-			/* (see notes above about "exception pointers") */
+ 	btw	$7, FXSAVE_STATE_FSW(%eax)	/* Test saved ES bit */
+ 	jnc	0f				/* jump if ES = 0 */
+ 	fnclex		/* clear pending x87 exceptions */
+@@ -381,9 +480,9 @@ fpnsave_ctxt(void *arg)
+ 	STTS(%edx)	/* trap on next fpu touch */
+ 1:	rep;	ret	/* use 2 byte return instruction when branch target */
+ 			/* AMD Software Optimization Guide - Section 6.2 */
+-	SET_SIZE(fpxsave_ctxt)
++	SET_SIZE(fpxsave_excp_clr_ctxt)
+ 
+-	ENTRY_NP(xsave_ctxt)
++	ENTRY_NP(xsave_excp_clr_ctxt)
+ 	movl	4(%esp), %ecx		/* a struct fpu_ctx */
+ 	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%ecx)
+ 	jne	1f
+@@ -393,11 +492,26 @@ fpnsave_ctxt(void *arg)
+ 	movl	FPU_CTX_FPU_XSAVE_MASK+4(%ecx), %edx
+ 	movl	FPU_CTX_FPU_REGS(%ecx), %ecx /* fpu_regs.kfpu_u.kfpu_xs ptr */
+ 	xsave	(%ecx)
++	btw	$7, FXSAVE_STATE_FSW(%ecx)	/* Test saved ES bit */
++	jnc	0f				/* jump if ES = 0 */
++	fnclex		/* clear pending x87 exceptions */
++0:	ffree	%st(7)	/* clear tag bit to remove possible stack overflow */
++	fildl	.fpzero_const
++			/* dummy load changes all exception pointers */
++	STTS(%edx)	/* trap on next fpu touch */
++1:	ret
++	SET_SIZE(xsave_excp_clr_ctxt)
+ 
+-	/*
+-	 * (see notes above about "exception pointers")
+-	 * TODO: does it apply to any machine that uses xsave?
+-	 */
++	ENTRY_NP(xsaveopt_excp_clr_ctxt)
++	movl	4(%esp), %ecx		/* a struct fpu_ctx */
++	cmpl	$FPU_EN, FPU_CTX_FPU_FLAGS(%ecx)
++	jne	1f
++
++	movl	$_CONST(FPU_VALID|FPU_EN), FPU_CTX_FPU_FLAGS(%ecx)
++	movl	FPU_CTX_FPU_XSAVE_MASK(%ecx), %eax
++	movl	FPU_CTX_FPU_XSAVE_MASK+4(%ecx), %edx
++	movl	FPU_CTX_FPU_REGS(%ecx), %ecx /* fpu_regs.kfpu_u.kfpu_xs ptr */
++	xsaveopt (%ecx)
+ 	btw	$7, FXSAVE_STATE_FSW(%ecx)	/* Test saved ES bit */
+ 	jnc	0f				/* jump if ES = 0 */
+ 	fnclex		/* clear pending x87 exceptions */
+@@ -406,7 +520,7 @@ fpnsave_ctxt(void *arg)
+ 			/* dummy load changes all exception pointers */
+ 	STTS(%edx)	/* trap on next fpu touch */
+ 1:	ret
+-	SET_SIZE(xsave_ctxt)
++	SET_SIZE(xsaveopt_excp_clr_ctxt)
+ 
+ #endif	/* __i386 */
+ 
+@@ -435,13 +549,18 @@ void
+ xsave(struct xsave_state *f, uint64_t m)
+ {}
+ 
++/*ARGSUSED*/
++void
++xsaveopt(struct xsave_state *f, uint64_t m)
++{}
++
+ #else	/* __lint */
+ 
+ #if defined(__amd64)
+ 
+ 	ENTRY_NP(fpxsave)
+ 	CLTS
+-	FXSAVEQ	((%rdi))
++	fxsaveq (%rdi)
+ 	fninit				/* clear exceptions, init x87 tags */
+ 	STTS(%rdi)			/* set TS bit in %cr0 (disable FPU) */
+ 	ret
+@@ -459,6 +578,18 @@ xsave(struct xsave_state *f, uint64_t m)
+ 	ret
+ 	SET_SIZE(xsave)
+ 
++	ENTRY_NP(xsaveopt)
++	CLTS
++	movl	%esi, %eax		/* bv mask */
++	movq	%rsi, %rdx
++	shrq	$32, %rdx
++	xsaveopt (%rdi)
++
++	fninit				/* clear exceptions, init x87 tags */
++	STTS(%rdi)			/* set TS bit in %cr0 (disable FPU) */
++	ret
++	SET_SIZE(xsaveopt)
++
+ #elif defined(__i386)
+ 
+ 	ENTRY_NP(fpsave)
+@@ -490,6 +621,18 @@ xsave(struct xsave_state *f, uint64_t m)
+ 	ret
+ 	SET_SIZE(xsave)
+ 
++	ENTRY_NP(xsaveopt)
++	CLTS
++	movl	4(%esp), %ecx
++	movl	8(%esp), %eax
++	movl	12(%esp), %edx
++	xsaveopt (%ecx)
++
++	fninit				/* clear exceptions, init x87 tags */
++	STTS(%eax)			/* set TS bit in %cr0 (disable FPU) */
++	ret
++	SET_SIZE(xsaveopt)
++
+ #endif	/* __i386 */
+ #endif	/* __lint */
+ 
+@@ -516,7 +659,7 @@ xrestore(struct xsave_state *f, uint64_t m)
+ 
+ 	ENTRY_NP(fpxrestore)
+ 	CLTS
+-	FXRSTORQ	((%rdi))
++	fxrstorq	(%rdi)
+ 	ret
+ 	SET_SIZE(fpxrestore)
+ 
+@@ -607,7 +750,7 @@ fpinit(void)
+ 
+ 	/* fxsave */
+ 	leaq	sse_initial(%rip), %rax
+-	FXRSTORQ	((%rax))		/* load clean initial state */
++	fxrstorq	(%rax)			/* load clean initial state */
+ 	ret
+ 
+ 1:	/* xsave */
+diff --git a/usr/src/uts/intel/ia32/os/fpu.c b/usr/src/uts/intel/ia32/os/fpu.c
+index 33cd6b2e87..694d0f9feb 100644
+--- a/usr/src/uts/intel/ia32/os/fpu.c
++++ b/usr/src/uts/intel/ia32/os/fpu.c
+@@ -127,7 +127,7 @@ const struct xsave_state avx_initial = {
+ 	 * and CPU should initialize XMM/YMM.
+ 	 */
+ 	1,
+-	{0, 0}	/* These 2 bytes must be zero */
++	0	/* xs_xcomp_bv */
+ 	/* rest of structure is zero */
+ };
+ 
+@@ -165,6 +165,11 @@ void (*fpsave_ctxt)(void *) = fpxsave_ctxt;
+ void (*fpsave_ctxt)(void *) = fpnsave_ctxt;
+ #endif
+ 
++/*
++ * This function pointer is changed to xsaveopt if the CPU is xsaveopt capable.
++ */
++void (*xsavep)(struct xsave_state *, uint64_t) = xsave;
++
+ static int fpe_sicode(uint_t);
+ static int fpe_simd_sicode(uint_t);
+ 
+@@ -318,7 +323,7 @@ fp_save(struct fpu_ctx *fp)
+ 		break;
+ 
+ 	case FP_XSAVE:
+-		xsave(fp->fpu_regs.kfpu_u.kfpu_xs, fp->fpu_xsave_mask);
++		xsavep(fp->fpu_regs.kfpu_u.kfpu_xs, fp->fpu_xsave_mask);
+ 		break;
+ 	default:
+ 		panic("Invalid fp_save_mech");
+diff --git a/usr/src/uts/intel/sys/fp.h b/usr/src/uts/intel/sys/fp.h
+index 9e1c3a486e..e6d482fdd8 100644
+--- a/usr/src/uts/intel/sys/fp.h
++++ b/usr/src/uts/intel/sys/fp.h
+@@ -230,23 +230,46 @@ struct fxsave_state {
+ };	/* 512 bytes */
+ 
+ /*
+- * This structure is written to memory by an 'xsave' instruction.
+- * First 512 byte is compatible with the format of an 'fxsave' area.
++ * This structure is written to memory by one of the 'xsave' instruction
++ * variants. The first 512 bytes are compatible with the format of the 'fxsave'
++ * area. The header portion of the xsave layout is documented in section
++ * 13.4.2 of the Intel 64 and IA-32 Architectures Software Developer’s Manual,
++ * Volume 1 (IASDv1). The extended portion is documented in section 13.4.3.
+  *
+- * The size is at least AVX_XSAVE_SIZE (832 bytes), asserted in fpnoextflt().
+- * Enabling additional xsave-related CPU features increases the size.
+- * We dynamically allocate the per-lwp xsave area at runtime, based on the
+- * size needed for the CPU-specific features. The xsave_state structure simply
+- * defines the legacy layout of the beginning of the xsave area. The locations
+- * and size of new, extended components are determined dynamically by querying
+- * the CPU. See the xsave_info structure in cpuid.c.
++ * Our size is at least AVX_XSAVE_SIZE (832 bytes), asserted in fpnoextflt().
++ * Enabling additional xsave-related CPU features requires an increase in the
++ * size. We dynamically allocate the per-lwp xsave area at runtime, based on
++ * the size needed for the CPU-specific features. This xsave_state structure
++ * simply defines our historical layout for the beginning of the xsave area. The
++ * locations and size of new, extended, components is determined dynamically by
++ * querying the CPU. See the xsave_info structure in cpuid.c.
++ *
++ * xsave component usage is tracked using bits in the xs_xstate_bv field. The
++ * components are documented in section 13.1 of IASDv1. For easy reference,
++ * this is a summary of the currently defined component bit definitions:
++ *	x87			0x0001
++ *	SSE			0x0002
++ *	AVX			0x0004
++ *	bndreg (MPX)		0x0008
++ *	bndcsr (MPX)		0x0010
++ *	opmask (AVX512)		0x0020
++ *	zmm hi256 (AVX512)	0x0040
++ *	zmm hi16 (AVX512)	0x0080
++ *	PT			0x0100
++ *	PKRU			0x0200
++ * When xsaveopt_ctxt is being used to save into the xsave_state area, the
++ * xs_xstate_bv field is updated by the xsaveopt instruction to indicate which
++ * elements of the xsave area are active.
++ *
++ * xs_xcomp_bv should always be 0, since we do not currently use the compressed
++ * form of xsave (xsavec).
+  */
+ struct xsave_state {
+-	struct fxsave_state	xs_fxsave;
+-	uint64_t		xs_xstate_bv;	/* 512 */
+-	uint64_t		xs_rsv_mbz[2];
+-	uint64_t		xs_reserved[5];
+-	upad128_t		xs_ymm[16];	/* avx - 576 */
++	struct fxsave_state	xs_fxsave;	/* 0-511 legacy region */
++	uint64_t		xs_xstate_bv;	/* 512-519 start xsave header */
++	uint64_t		xs_xcomp_bv;	/* 520-527 */
++	uint64_t		xs_reserved[6];	/* 528-575 end xsave header */
++	upad128_t		xs_ymm[16];	/* 576 AVX component */
+ };
+ 
+ /*
+@@ -283,7 +306,12 @@ extern int fpu_probe_pentium_fdivbug(void);
+ extern void fpnsave_ctxt(void *);
+ extern void fpxsave_ctxt(void *);
+ extern void xsave_ctxt(void *);
++extern void xsaveopt_ctxt(void *);
++extern void fpxsave_excp_clr_ctxt(void *);
++extern void xsave_excp_clr_ctxt(void *);
++extern void xsaveopt_excp_clr_ctxt(void *);
+ extern void (*fpsave_ctxt)(void *);
++extern void (*xsavep)(struct xsave_state *, uint64_t);
+ 
+ extern void fxsave_insn(struct fxsave_state *);
+ extern void fpsave(struct fnsave_state *);
+@@ -291,6 +319,7 @@ extern void fprestore(struct fnsave_state *);
+ extern void fpxsave(struct fxsave_state *);
+ extern void fpxrestore(struct fxsave_state *);
+ extern void xsave(struct xsave_state *, uint64_t);
++extern void xsaveopt(struct xsave_state *, uint64_t);
+ extern void xrestore(struct xsave_state *, uint64_t);
+ 
+ extern void fpenable(void);
+diff --git a/usr/src/uts/intel/sys/x86_archext.h b/usr/src/uts/intel/sys/x86_archext.h
+index d606947533..8e51d4d77a 100644
+--- a/usr/src/uts/intel/sys/x86_archext.h
++++ b/usr/src/uts/intel/sys/x86_archext.h
+@@ -184,6 +184,11 @@ extern "C" {
+ #define	CPUID_AMD_ECX_TBM	0x00200000	/* AMD: trailing bit manips. */
+ #define	CPUID_AMD_ECX_TOPOEXT	0x00400000	/* AMD: Topology Extensions */
+ 
++/*
++ * AMD uses %ebx for some of their features (extended function 0x80000008).
++ */
++#define	CPUID_AMD_EBX_ERR_PTR_ZERO	0x00000004 /* AMD: FP Err. Ptr. Zero */
++
+ /*
+  * Intel now seems to have claimed part of the "extended" function
+  * space that we previously for non-Intel implementors to use.
+@@ -788,6 +793,7 @@ extern uint_t cpuid_get_procnodes_per_pkg(struct cpu *cpu);
+ extern uint_t cpuid_get_compunitid(struct cpu *cpu);
+ extern uint_t cpuid_get_cores_per_compunit(struct cpu *cpu);
+ extern size_t cpuid_get_xsave_size();
++extern boolean_t cpuid_need_fp_excp_handling();
+ extern int cpuid_is_cmt(struct cpu *);
+ extern int cpuid_syscall32_insn(struct cpu *);
+ extern int getl2cacheinfo(struct cpu *, int *, int *, int *);
+-- 
+2.21.0
+

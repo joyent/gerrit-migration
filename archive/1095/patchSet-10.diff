@@ -1,0 +1,662 @@
+From a92dfac3d4644e60f082b8562477e4f8344561e1 Mon Sep 17 00:00:00 2001
+From: Ryan Zezeski <rpz@joyent.com>
+Date: Thu, 17 Nov 2016 21:51:06 -0700
+Subject: [PATCH] OS-5363 dlmgmtd forking with write locks results in deadlock
+ chaos OS-5919 remove zone lock file
+
+---
+ usr/src/cmd/dlmgmtd/dlmgmt_db.c         | 69 +--------------------
+ usr/src/cmd/dlmgmtd/dlmgmt_door.c       | 72 ++++++----------------
+ usr/src/cmd/dlmgmtd/dlmgmt_impl.h       |  8 +--
+ usr/src/cmd/dlmgmtd/dlmgmt_main.c       |  4 +-
+ usr/src/cmd/dlmgmtd/dlmgmt_util.c       | 29 +++++++--
+ usr/src/cmd/zoneadmd/Makefile.com       |  5 +-
+ usr/src/cmd/zoneadmd/vplat.c            | 82 +++++++++++++++++++++++++
+ usr/src/lib/libdladm/common/libdlmgmt.c |  8 ++-
+ usr/src/uts/common/io/dls/dls_mgmt.c    |  4 +-
+ usr/src/uts/common/os/zone.c            |  7 +++
+ usr/src/uts/common/sys/dls_mgmt.h       |  8 ++-
+ 11 files changed, 156 insertions(+), 140 deletions(-)
+
+diff --git a/usr/src/cmd/dlmgmtd/dlmgmt_db.c b/usr/src/cmd/dlmgmtd/dlmgmt_db.c
+index 8eecc807e5..6ccd9d97b8 100644
+--- a/usr/src/cmd/dlmgmtd/dlmgmt_db.c
++++ b/usr/src/cmd/dlmgmtd/dlmgmt_db.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2015, Joyent Inc.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ #include <assert.h>
+@@ -44,7 +44,6 @@
+ #include <libcontract.h>
+ #include <libcontract_priv.h>
+ #include <sys/contract/process.h>
+-#include <sys/vnic.h>
+ #include <zone.h>
+ #include "dlmgmt_impl.h"
+ 
+@@ -1533,11 +1532,6 @@ done:
+ 
+ /*
+  * Remove all links in the given zoneid.
+- *
+- * We do this work in two different passes. In the first pass, we remove any
+- * entry that hasn't been loaned and mark every entry that has been loaned as
+- * something that is going to be tombstomed. In the second pass, we drop the
+- * table lock for every entry and remove the tombstombed entry for our zone.
+  */
+ void
+ dlmgmt_db_fini(zoneid_t zoneid)
+@@ -1547,66 +1541,9 @@ dlmgmt_db_fini(zoneid_t zoneid)
+ 	while (linkp != NULL) {
+ 		next_linkp = AVL_NEXT(&dlmgmt_name_avl, linkp);
+ 		if (linkp->ll_zoneid == zoneid) {
+-			boolean_t onloan = linkp->ll_onloan;
+-
+-			/*
+-			 * Cleanup any VNICs that were loaned to the zone
+-			 * before the zone goes away and we can no longer
+-			 * refer to the VNIC by the name/zoneid.
+-			 */
+-			if (onloan) {
+-				(void) dlmgmt_delete_db_entry(linkp,
+-				    DLMGMT_ACTIVE);
+-				linkp->ll_tomb = B_TRUE;
+-			} else {
+-				(void) dlmgmt_destroy_common(linkp,
+-				    DLMGMT_ACTIVE | DLMGMT_PERSIST);
+-			}
+-
++			(void) dlmgmt_destroy_common(linkp,
++			    DLMGMT_ACTIVE | DLMGMT_PERSIST);
+ 		}
+ 		linkp = next_linkp;
+ 	}
+-
+-again:
+-	linkp = avl_first(&dlmgmt_name_avl);
+-	while (linkp != NULL) {
+-		vnic_ioc_delete_t ioc;
+-
+-		next_linkp = AVL_NEXT(&dlmgmt_name_avl, linkp);
+-
+-		if (linkp->ll_zoneid != zoneid) {
+-			linkp = next_linkp;
+-			continue;
+-		}
+-		ioc.vd_vnic_id = linkp->ll_linkid;
+-		if (linkp->ll_tomb != B_TRUE)
+-			abort();
+-
+-		/*
+-		 * We have to drop the table lock while going up into the
+-		 * kernel. If we hold the table lock while deleting a vnic, we
+-		 * may get blocked on the mac perimeter and the holder of it may
+-		 * want something from dlmgmtd.
+-		 */
+-		dlmgmt_table_unlock();
+-
+-		if (ioctl(dladm_dld_fd(dld_handle),
+-		    VNIC_IOC_DELETE, &ioc) < 0)
+-			dlmgmt_log(LOG_WARNING, "dlmgmt_db_fini "
+-			    "delete VNIC ioctl failed %d %d",
+-			    ioc.vd_vnic_id, errno);
+-
+-		/*
+-		 * Even though we've dropped the lock, we know that nothing else
+-		 * could have removed us. Therefore, it should be safe to go
+-		 * through and delete ourselves, but do nothing else. We'll have
+-		 * to restart iteration from the beginning. This can be painful.
+-		 */
+-		dlmgmt_table_lock(B_TRUE);
+-
+-		(void) dlmgmt_destroy_common(linkp,
+-		    DLMGMT_ACTIVE | DLMGMT_PERSIST);
+-		goto again;
+-	}
+-
+ }
+diff --git a/usr/src/cmd/dlmgmtd/dlmgmt_door.c b/usr/src/cmd/dlmgmtd/dlmgmt_door.c
+index 137c2a6fb3..f2de893b98 100644
+--- a/usr/src/cmd/dlmgmtd/dlmgmt_door.c
++++ b/usr/src/cmd/dlmgmtd/dlmgmt_door.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2011, Joyent Inc. All rights reserved.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ /*
+@@ -59,9 +59,6 @@
+ #include <libsysevent.h>
+ #include <libdlmgmt.h>
+ #include <librcm.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
+-#include <fcntl.h>
+ #include <unistd.h>
+ #include "dlmgmt_impl.h"
+ 
+@@ -384,11 +381,6 @@ dlmgmt_upcall_destroy(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 	if ((err = dlmgmt_checkprivs(linkp->ll_class, cred)) != 0)
+ 		goto done;
+ 
+-	if (linkp->ll_tomb == B_TRUE) {
+-		err = EINPROGRESS;
+-		goto done;
+-	}
+-
+ 	if (((linkp->ll_flags & flags) & DLMGMT_ACTIVE) != 0) {
+ 		if ((err = dlmgmt_delete_db_entry(linkp, DLMGMT_ACTIVE)) != 0)
+ 			goto done;
+@@ -433,8 +425,11 @@ dlmgmt_getname(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 		retvalp->lr_flags = linkp->ll_flags;
+ 		retvalp->lr_class = linkp->ll_class;
+ 		retvalp->lr_media = linkp->ll_media;
++		retvalp->lr_flags |= (linkp->ll_trans == B_TRUE) ?
++		    DLMGMT_TRANSIENT : 0;
+ 	}
+ 
++
+ 	dlmgmt_table_unlock();
+ 	retvalp->lr_err = err;
+ }
+@@ -662,11 +657,6 @@ dlmgmt_remapid(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 	if ((err = dlmgmt_checkprivs(linkp->ll_class, cred)) != 0)
+ 		goto done;
+ 
+-	if (linkp->ll_tomb == B_TRUE) {
+-		err = EBUSY;
+-		goto done;
+-	}
+-
+ 
+ 	if (link_by_name(remapid->ld_link, linkp->ll_zoneid) != NULL) {
+ 		err = EEXIST;
+@@ -729,11 +719,6 @@ dlmgmt_upid(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 	if ((err = dlmgmt_checkprivs(linkp->ll_class, cred)) != 0)
+ 		goto done;
+ 
+-	if (linkp->ll_tomb == B_TRUE) {
+-		err = EBUSY;
+-		goto done;
+-	}
+-
+ 	if (linkp->ll_flags & DLMGMT_ACTIVE) {
+ 		err = EINVAL;
+ 		goto done;
+@@ -1241,11 +1226,6 @@ dlmgmt_setzoneid(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 	if ((err = dlmgmt_checkprivs(linkp->ll_class, cred)) != 0)
+ 		goto done;
+ 
+-	if (linkp->ll_tomb == B_TRUE) {
+-		err = EBUSY;
+-		goto done;
+-	}
+-
+ 	/* We can only assign an active link to a zone. */
+ 	if (!(linkp->ll_flags & DLMGMT_ACTIVE)) {
+ 		err = EINVAL;
+@@ -1269,6 +1249,21 @@ dlmgmt_setzoneid(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 	}
+ 
+ 	if (oldzoneid != GLOBAL_ZONEID) {
++		if (newzoneid == GLOBAL_ZONEID && linkp->ll_onloan) {
++			/*
++			 * In this case we are attempting to assign a
++			 * loaned datalink from an NGZ to the GZ. We
++			 * can only reassign a loaned VNIC back to the
++			 * GZ when the zone is shutting down --
++			 * because otherwise the VNIC is in use by the
++			 * zone and will be busy. Leave the VNIC
++			 * loaned to the zone and return EBUSY to the
++			 * caller.
++			 */
++			err = EBUSY;
++			goto done;
++		}
++
+ 		if (zone_remove_datalink(oldzoneid, linkid) != 0) {
+ 			err = errno;
+ 			dlmgmt_log(LOG_WARNING, "unable to remove link %d from "
+@@ -1276,18 +1271,6 @@ dlmgmt_setzoneid(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 			goto done;
+ 		}
+ 
+-		if (newzoneid == GLOBAL_ZONEID && linkp->ll_onloan) {
+-			/*
+-			 * We can only reassign a loaned VNIC back to the
+-			 * global zone when the zone is shutting down, since
+-			 * otherwise the VNIC is in use by the zone and will be
+-			 * busy.  Leave the VNIC assigned to the zone so we can
+-			 * still see it and delete it when dlmgmt_zonehalt()
+-			 * runs.
+-			 */
+-			goto done;
+-		}
+-
+ 		linkp->ll_onloan = B_FALSE;
+ 	}
+ 	if (newzoneid != GLOBAL_ZONEID) {
+@@ -1361,26 +1344,9 @@ dlmgmt_zonehalt(void *argp, void *retp, size_t *sz, zoneid_t zoneid,
+ 		} else if (zonehalt->ld_zoneid == GLOBAL_ZONEID) {
+ 			err = EINVAL;
+ 		} else {
+-			/*
+-			 * dls and mac don't honor the locking rules defined in
+-			 * mac. In order to try and make that case less likely
+-			 * to happen, we try to serialize some of the zone
+-			 * activity here between dlmgmtd and the brands on
+-			 * /etc/dladm/zone.lck
+-			 */
+-			int fd;
+-
+-			while ((fd = open(ZONE_LOCK, O_WRONLY |
+-			    O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)) < 0)
+-			(void) sleep(1);
+-			(void) write(fd, my_pid, sizeof (my_pid));
+-			(void) close(fd);
+-
+ 			dlmgmt_table_lock(B_TRUE);
+ 			dlmgmt_db_fini(zonehalt->ld_zoneid);
+ 			dlmgmt_table_unlock();
+-
+-			(void) unlink(ZONE_LOCK);
+ 		}
+ 	}
+ 	retvalp->lr_err = err;
+diff --git a/usr/src/cmd/dlmgmtd/dlmgmt_impl.h b/usr/src/cmd/dlmgmtd/dlmgmt_impl.h
+index dde27ef66e..aa786b8023 100644
+--- a/usr/src/cmd/dlmgmtd/dlmgmt_impl.h
++++ b/usr/src/cmd/dlmgmtd/dlmgmt_impl.h
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2011, Joyent Inc. All rights reserved.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ /*
+@@ -65,10 +65,9 @@ typedef struct dlmgmt_link_s {
+ 	boolean_t		ll_onloan;
+ 	avl_node_t		ll_name_node;
+ 	avl_node_t		ll_id_node;
+-	avl_node_t		ll_loan_node;
+ 	uint32_t		ll_flags;
+ 	uint32_t		ll_gen;		/* generation number */
+-	boolean_t		ll_tomb;	/* tombstombed */
++	boolean_t		ll_trans;	/* transient link */
+ } dlmgmt_link_t;
+ 
+ /*
+@@ -86,8 +85,6 @@ typedef struct dlmgmt_dlconf_s {
+ 	avl_node_t		ld_node;
+ } dlmgmt_dlconf_t;
+ 
+-#define	ZONE_LOCK	"/etc/dladm/zone.lck"
+-
+ extern boolean_t	debug;
+ extern const char	*progname;
+ extern char		cachefile[];
+@@ -95,7 +92,6 @@ extern dladm_handle_t	dld_handle;
+ extern datalink_id_t	dlmgmt_nextlinkid;
+ extern avl_tree_t	dlmgmt_name_avl;
+ extern avl_tree_t	dlmgmt_id_avl;
+-extern avl_tree_t	dlmgmt_loan_avl;
+ extern avl_tree_t	dlmgmt_dlconf_avl;
+ 
+ boolean_t	linkattr_equal(dlmgmt_linkattr_t **, const char *, void *,
+diff --git a/usr/src/cmd/dlmgmtd/dlmgmt_main.c b/usr/src/cmd/dlmgmtd/dlmgmt_main.c
+index d8397cc0e6..60466fd773 100644
+--- a/usr/src/cmd/dlmgmtd/dlmgmt_main.c
++++ b/usr/src/cmd/dlmgmtd/dlmgmt_main.c
+@@ -22,7 +22,7 @@
+ /*
+  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2014 Joyent, Inc.  All rights reserved.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ /*
+@@ -306,8 +306,6 @@ dlmgmt_init(void)
+ 		return (err);
+ 	}
+ 
+-	(void) unlink(ZONE_LOCK);
+-
+ 	/*
+ 	 * First derive the name of the cache file from the FMRI name. This
+ 	 * cache name is used to keep active datalink configuration.
+diff --git a/usr/src/cmd/dlmgmtd/dlmgmt_util.c b/usr/src/cmd/dlmgmtd/dlmgmt_util.c
+index 7493ee3577..50e7361030 100644
+--- a/usr/src/cmd/dlmgmtd/dlmgmt_util.c
++++ b/usr/src/cmd/dlmgmtd/dlmgmt_util.c
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2011, Joyent Inc. All rights reserved.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ /*
+@@ -354,9 +354,9 @@ link_destroy(dlmgmt_link_t *linkp)
+ }
+ 
+ /*
+- * Set the DLMGMT_ACTIVE flag on the link to note that it is active.  When a
+- * link becomes active and it belongs to a non-global zone, it is also added
+- * to that zone.
++ * Set the DLMGMT_ACTIVE flag on the link to note that it is active.
++ * When a link is active and assigned to an NGZ it is added to that
++ * zone's datalink list and marked as on loan.
+  */
+ int
+ link_activate(dlmgmt_link_t *linkp)
+@@ -384,6 +384,7 @@ link_activate(dlmgmt_link_t *linkp)
+ 		}
+ 	} else if (linkp->ll_zoneid != GLOBAL_ZONEID) {
+ 		err = zone_add_datalink(linkp->ll_zoneid, linkp->ll_linkid);
++		linkp->ll_onloan = B_TRUE;
+ 	}
+ done:
+ 	if (err == 0)
+@@ -439,6 +440,10 @@ dlmgmt_create_common(const char *name, datalink_class_t class, uint32_t media,
+ 		return (EINVAL);
+ 	if (dlmgmt_nextlinkid == DATALINK_INVALID_LINKID)
+ 		return (ENOSPC);
++	if (flags & ~(DLMGMT_ACTIVE | DLMGMT_PERSIST | DLMGMT_TRANSIENT) ||
++	    ((flags & DLMGMT_PERSIST) && (flags & DLMGMT_TRANSIENT)) ||
++	    flags == 0)
++		return (EINVAL);
+ 
+ 	if ((linkp = calloc(1, sizeof (dlmgmt_link_t))) == NULL) {
+ 		err = ENOMEM;
+@@ -451,7 +456,15 @@ dlmgmt_create_common(const char *name, datalink_class_t class, uint32_t media,
+ 	linkp->ll_linkid = dlmgmt_nextlinkid;
+ 	linkp->ll_zoneid = zoneid;
+ 	linkp->ll_gen = 0;
+-	linkp->ll_tomb = B_FALSE;
++
++	/*
++	 * While DLMGMT_TRANSIENT starts off as a flag it is converted
++	 * into a link field since it is really a substate of
++	 * DLMGMT_ACTIVE -- it should not survive as a flag beyond
++	 * this point.
++	 */
++	linkp->ll_trans = (flags & DLMGMT_TRANSIENT) ? B_TRUE : B_FALSE;
++	flags &= ~DLMGMT_TRANSIENT;
+ 
+ 	if (avl_find(&dlmgmt_name_avl, linkp, &name_where) != NULL ||
+ 	    avl_find(&dlmgmt_id_avl, linkp, &id_where) != NULL) {
+@@ -481,6 +494,12 @@ done:
+ int
+ dlmgmt_destroy_common(dlmgmt_link_t *linkp, uint32_t flags)
+ {
++	/*
++	 * After dlmgmt_create_common() the link flags should only
++	 * ever include ACTIVE or PERSIST.
++	 */
++	assert((linkp->ll_flags & ~(DLMGMT_ACTIVE | DLMGMT_PERSIST)) == 0);
++
+ 	if ((linkp->ll_flags & flags) == 0) {
+ 		/*
+ 		 * The link does not exist in the specified space.
+diff --git a/usr/src/cmd/zoneadmd/Makefile.com b/usr/src/cmd/zoneadmd/Makefile.com
+index c8becc3e8c..0f81ce1539 100644
+--- a/usr/src/cmd/zoneadmd/Makefile.com
++++ b/usr/src/cmd/zoneadmd/Makefile.com
+@@ -20,7 +20,7 @@
+ 
+ #
+ # Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
+-# Copyright 2014, Joyent, Inc. All rights reserved.
++# Copyright 2016 Joyent, Inc.
+ #
+ 
+ PROG= zoneadmd
+@@ -37,6 +37,9 @@ LDLIBS += -lsocket -lzonecfg -lnsl -ldevinfo -ldevice -lnvpair \
+ 	-lgen -lbsm -lcontract -lzfs -luuid -lbrand -ldladm -ltsnet -ltsol \
+ 	-linetutil -lproc -lscf
+ 
++C99MODE=	-xc99=%all
++C99LMODE=	-Xc99=%all
++
+ .KEEP_STATE:
+ 
+ %.o:    ../%.c
+diff --git a/usr/src/cmd/zoneadmd/vplat.c b/usr/src/cmd/zoneadmd/vplat.c
+index 9a6f0ceb87..d75ec91e6f 100644
+--- a/usr/src/cmd/zoneadmd/vplat.c
++++ b/usr/src/cmd/zoneadmd/vplat.c
+@@ -78,6 +78,7 @@
+ #include <sys/conf.h>
+ #include <sys/systeminfo.h>
+ #include <sys/secflags.h>
++#include <sys/vnic.h>
+ 
+ #include <libdlpi.h>
+ #include <libdllink.h>
+@@ -5151,6 +5152,80 @@ unmounted:
+ 	}
+ }
+ 
++/*
++ * Delete all transient VNICs belonging to this zone. A transient VNIC
++ * is one that is created and destroyed along with the lifetime of the
++ * zone. Non-transient VNICs, ones that are assigned from the GZ to a
++ * NGZ, are reassigned to the GZ in zone_shutdown() via the
++ * zone-specific data (zsd) callbacks.
++ */
++static int
++delete_transient_vnics(zlog_t *zlogp, zoneid_t zoneid)
++{
++	dladm_status_t status;
++	int num_links = 0;
++	datalink_id_t *links, link;
++	uint32_t link_flags;
++	datalink_class_t link_class;
++	char link_name[MAXLINKNAMELEN];
++	vnic_ioc_delete_t ioc;
++
++	if (zone_list_datalink(zoneid, &num_links, NULL) != 0) {
++		zerror(zlogp, B_TRUE, "unable to determine "
++		    "number of network interfaces");
++		return (-1);
++	}
++
++	if (num_links == 0)
++		return (0);
++
++	links = malloc(num_links * sizeof (datalink_id_t));
++
++	if (links == NULL) {
++		zerror(zlogp, B_TRUE, "failed to delete "
++		    "network interfaces because of alloc fail");
++		return (-1);
++	}
++
++	if (zone_list_datalink(zoneid, &num_links, links) != 0) {
++		zerror(zlogp, B_TRUE, "failed to delete "
++		    "network interfaces because of failure "
++		    "to list them");
++		return (-1);
++	}
++
++	for (int i = 0; i < num_links; i++) {
++		char dlerr[DLADM_STRSIZE];
++		link = links[i];
++
++		status = dladm_datalink_id2info(dld_handle, link, &link_flags,
++		    &link_class, NULL, link_name, sizeof (link_name));
++
++		if (status != DLADM_STATUS_OK) {
++			zerror(zlogp, B_FALSE, "failed to "
++			    "delete network interface (%u)"
++			    "due to failure to get link info: %s",
++			    link,
++			    dladm_status2str(status, dlerr));
++			return (-1);
++		}
++
++		if (link_flags & DLADM_OPT_TRANSIENT) {
++			assert(link_class & DATALINK_CLASS_VNIC);
++
++			ioc.vd_vnic_id = link;
++			if (ioctl(dladm_dld_fd(dld_handle), VNIC_IOC_DELETE,
++			    &ioc) < 0) {
++				zerror(zlogp, B_TRUE,
++				    "delete VNIC ioctl failed %d", link);
++				return (-1);
++			}
++		}
++	}
++
++	return (0);
++}
++
+ int
+ vplat_teardown(zlog_t *zlogp, boolean_t unmount_cmd, boolean_t rebooting,
+     boolean_t debug)
+@@ -5262,11 +5337,18 @@ vplat_teardown(zlog_t *zlogp, boolean_t unmount_cmd, boolean_t rebooting,
+ 			}
+ 			break;
+ 		case ZS_EXCLUSIVE:
++			if (delete_transient_vnics(zlogp, zoneid) != 0) {
++				zerror(zlogp, B_FALSE, "unable to delete "
++				    "transient vnics in zone");
++				goto error;
++			}
++
+ 			status = dladm_zone_halt(dld_handle, zoneid);
+ 			if (status != DLADM_STATUS_OK) {
+ 				zerror(zlogp, B_FALSE, "unable to notify "
+ 				    "dlmgmtd of zone halt: %s",
+ 				    dladm_status2str(status, errmsg));
++				goto error;
+ 			}
+ 			break;
+ 		}
+diff --git a/usr/src/lib/libdladm/common/libdlmgmt.c b/usr/src/lib/libdladm/common/libdlmgmt.c
+index c9c7906934..b5d7aadb4f 100644
+--- a/usr/src/lib/libdladm/common/libdlmgmt.c
++++ b/usr/src/lib/libdladm/common/libdlmgmt.c
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2011, Joyent Inc. All rights reserved.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ #include <door.h>
+@@ -125,6 +125,7 @@ dladm_create_datalink_id(dladm_handle_t handle, const char *link,
+ 
+ 	dlmgmt_flags = (flags & DLADM_OPT_ACTIVE) ? DLMGMT_ACTIVE : 0;
+ 	dlmgmt_flags |= (flags & DLADM_OPT_PERSIST) ? DLMGMT_PERSIST : 0;
++	dlmgmt_flags |= (flags & DLADM_OPT_TRANSIENT) ? DLMGMT_TRANSIENT : 0;
+ 
+ 	(void) strlcpy(createid.ld_link, link, MAXLINKNAMELEN);
+ 	createid.ld_class = class;
+@@ -286,6 +287,7 @@ dladm_walk_datalink_id(int (*fn)(dladm_handle_t, datalink_id_t, void *),
+ 
+ 	dlmgmt_flags = (flags & DLADM_OPT_ACTIVE) ? DLMGMT_ACTIVE : 0;
+ 	dlmgmt_flags |= ((flags & DLADM_OPT_PERSIST) ? DLMGMT_PERSIST : 0);
++	dlmgmt_flags |= ((flags & DLADM_OPT_TRANSIENT) ? DLMGMT_TRANSIENT : 0);
+ 
+ 	getnext.ld_cmd = DLMGMT_CMD_GETNEXT;
+ 	getnext.ld_class = class;
+@@ -638,10 +640,12 @@ dladm_datalink_id2info(dladm_handle_t handle, datalink_id_t linkid,
+ 	if (mediap != NULL)
+ 		*mediap = retval.lr_media;
+ 	if (flagp != NULL) {
+-		*flagp = retval.lr_flags & DLMGMT_ACTIVE ?
++		*flagp = (retval.lr_flags & DLMGMT_ACTIVE) ?
+ 		    DLADM_OPT_ACTIVE : 0;
+ 		*flagp |= (retval.lr_flags & DLMGMT_PERSIST) ?
+ 		    DLADM_OPT_PERSIST : 0;
++		*flagp |= (retval.lr_flags & DLMGMT_TRANSIENT) ?
++		    DLADM_OPT_TRANSIENT : 0;
+ 	}
+ 	return (DLADM_STATUS_OK);
+ }
+diff --git a/usr/src/uts/common/io/dls/dls_mgmt.c b/usr/src/uts/common/io/dls/dls_mgmt.c
+index 105c55c7ce..992bc5e18d 100644
+--- a/usr/src/uts/common/io/dls/dls_mgmt.c
++++ b/usr/src/uts/common/io/dls/dls_mgmt.c
+@@ -21,7 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ /*
+@@ -1414,7 +1414,7 @@ dls_devnet_phydev(datalink_id_t vlanid, dev_t *devp)
+  *    This case does not change the <link name, linkid> mapping, so the link's
+  *    kstats need to be updated with using name associated the given id2.
+  *
+- * The zonename parameter is used to allow us to create a VNIC in the global
++ * The zoneinit parameter is used to allow us to create a VNIC in the global
+  * zone which is assigned to a non-global zone.  Since there is a race condition
+  * in the create process if two VNICs have the same name, we need to rename it
+  * after it has been assigned to the zone.
+diff --git a/usr/src/uts/common/os/zone.c b/usr/src/uts/common/os/zone.c
+index af77ef4774..59cb19162c 100644
+--- a/usr/src/uts/common/os/zone.c
++++ b/usr/src/uts/common/os/zone.c
+@@ -7766,6 +7766,13 @@ zone_list_datalink(zoneid_t zoneid, int *nump, datalink_id_t *idarray)
+ 	mutex_exit(&zone->zone_lock);
+ 	zone_rele(zone);
+ 
++	/*
++	 * Prevent returning negative nump values -- we should never
++	 * have this many links anyways.
++	 */
++	if (num > INT_MAX)
++		return (set_errno(EOVERFLOW));
++
+ 	/* Increased or decreased, caller should be notified. */
+ 	if (num != dlcount) {
+ 		if (copyout(&num, nump, sizeof (num)) != 0)
+diff --git a/usr/src/uts/common/sys/dls_mgmt.h b/usr/src/uts/common/sys/dls_mgmt.h
+index 214e225ac9..6fec277991 100644
+--- a/usr/src/uts/common/sys/dls_mgmt.h
++++ b/usr/src/uts/common/sys/dls_mgmt.h
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 2008, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2015, Joyent, Inc.
++ * Copyright 2016 Joyent, Inc.
+  */
+ 
+ #ifndef	_DLS_MGMT_H
+@@ -114,10 +114,14 @@ typedef uint64_t	datalink_media_t;
+ #define	DLMGMT_CMD_BASE			128
+ 
+ /*
+- * Indicate the link mapping is active or persistent
++ * Indicate if the link mapping is active, persistent, or transient. A
++ * transient link is an active link with a twist -- it is an active
++ * link which is destroyed along with the zone rather than reassigned
++ * to the GZ.
+  */
+ #define	DLMGMT_ACTIVE		0x01
+ #define	DLMGMT_PERSIST		0x02
++#define	DLMGMT_TRANSIENT	0x04
+ 
+ /* upcall argument */
+ typedef struct dlmgmt_door_arg {
+-- 
+2.21.0
+

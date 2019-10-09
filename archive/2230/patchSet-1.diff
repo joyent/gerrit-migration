@@ -1,0 +1,628 @@
+From 4656ff33f735f5d9bcfa95112ae07acdf08baaf6 Mon Sep 17 00:00:00 2001
+From: Patrick Mooney <pmooney@pfmooney.com>
+Date: Tue, 18 Jul 2017 20:34:09 +0000
+Subject: [PATCH] OS-6116 epoll should better detect fd reassignment
+
+---
+ usr/src/uts/common/io/devpoll.c    | 300 ++++++++++++++---------------
+ usr/src/uts/common/os/fio.c        |  28 ++-
+ usr/src/uts/common/sys/file.h      |   6 +-
+ usr/src/uts/common/sys/poll_impl.h |   1 +
+ usr/src/uts/common/sys/user.h      |  21 +-
+ 5 files changed, 189 insertions(+), 167 deletions(-)
+
+diff --git a/usr/src/uts/common/io/devpoll.c b/usr/src/uts/common/io/devpoll.c
+index d34ea968d0..96631ffd93 100644
+--- a/usr/src/uts/common/io/devpoll.c
++++ b/usr/src/uts/common/io/devpoll.c
+@@ -245,30 +245,20 @@ dpinfo(dev_info_t *dip, ddi_info_cmd_t infocmd, void *arg, void **result)
+  *	 stale entries!
+  */
+ static int
+-dp_pcache_poll(dp_entry_t *dpep, void *dpbuf,
+-    pollcache_t *pcp, nfds_t nfds, int *fdcntp)
++dp_pcache_poll(dp_entry_t *dpep, void *dpbuf, pollcache_t *pcp, nfds_t nfds,
++    int *fdcntp)
+ {
+-	int		start, ostart, end;
+-	int		fdcnt, fd;
+-	boolean_t	done;
+-	file_t		*fp;
+-	short		revent;
+-	boolean_t	no_wrap;
+-	pollhead_t	*php;
+-	polldat_t	*pdp;
++	int		start, ostart, end, fdcnt, error = 0;
++	boolean_t	done, no_wrap;
+ 	pollfd_t	*pfdp;
+ 	epoll_event_t	*epoll;
+-	int		error = 0;
+-	short		mask = POLLRDHUP | POLLWRBAND;
+-	boolean_t	is_epoll = (dpep->dpe_flag & DP_ISEPOLLCOMPAT) != 0;
++	const short	mask = POLLRDHUP | POLLWRBAND;
++	const boolean_t	is_epoll = (dpep->dpe_flag & DP_ISEPOLLCOMPAT) != 0;
+ 
+ 	ASSERT(MUTEX_HELD(&pcp->pc_lock));
+ 	if (pcp->pc_bitmap == NULL) {
+-		/*
+-		 * No Need to search because no poll fd
+-		 * has been cached.
+-		 */
+-		return (error);
++		/* No Need to search because no poll fd has been cached. */
++		return (0);
+ 	}
+ 
+ 	if (is_epoll) {
+@@ -281,7 +271,6 @@ dp_pcache_poll(dp_entry_t *dpep, void *dpbuf,
+ retry:
+ 	start = ostart = pcp->pc_mapstart;
+ 	end = pcp->pc_mapend;
+-	php = NULL;
+ 
+ 	if (start == 0) {
+ 		/*
+@@ -294,8 +283,11 @@ retry:
+ 	done = B_FALSE;
+ 	fdcnt = 0;
+ 	while ((fdcnt < nfds) && !done) {
+-		php = NULL;
+-		revent = 0;
++		pollhead_t *php = NULL;
++		short revent = 0;
++		uf_entry_gen_t gen;
++		int fd;
++
+ 		/*
+ 		 * Examine the bit map in a circular fashion
+ 		 * to avoid starvation. Always resume from
+@@ -305,6 +297,9 @@ retry:
+ 		fd = bt_getlowbit(pcp->pc_bitmap, start, end);
+ 		ASSERT(fd <= end);
+ 		if (fd >= 0) {
++			file_t *fp;
++			polldat_t *pdp;
++
+ 			if (fd == end) {
+ 				if (no_wrap) {
+ 					done = B_TRUE;
+@@ -328,28 +323,14 @@ repoll:
+ 				 */
+ 				continue;
+ 			}
+-			if ((fp = getf(fd)) == NULL) {
+-				/*
+-				 * The fd has been closed, but user has not
+-				 * done a POLLREMOVE on this fd yet. Instead
+-				 * of cleaning it here implicitly, we return
+-				 * POLLNVAL. This is consistent with poll(2)
+-				 * polling a closed fd. Hope this will remind
+-				 * user to do a POLLREMOVE.
+-				 */
+-				if (!is_epoll && pfdp != NULL) {
+-					pfdp[fdcnt].fd = fd;
+-					pfdp[fdcnt].revents = POLLNVAL;
+-					fdcnt++;
+-					continue;
+-				}
+-
+-				/*
+-				 * In the epoll compatibility case, we actually
+-				 * perform the implicit removal to remain
+-				 * closer to the epoll semantics.
+-				 */
++			if ((fp = getf_gen(fd, &gen)) == NULL) {
+ 				if (is_epoll) {
++					/*
++					 * In the epoll compatibility case, we
++					 * actually perform the implicit
++					 * removal to remain closer to the
++					 * epoll semantics.
++					 */
+ 					pdp->pd_fp = NULL;
+ 					pdp->pd_events = 0;
+ 
+@@ -360,30 +341,36 @@ repoll:
+ 					}
+ 
+ 					BT_CLEAR(pcp->pc_bitmap, fd);
+-					continue;
++				} else if (pfdp != NULL) {
++					/*
++					 * The fd has been closed, but user has
++					 * not done a POLLREMOVE on this fd
++					 * yet. Instead of cleaning it here
++					 * implicitly, we return POLLNVAL. This
++					 * is consistent with poll(2) polling a
++					 * closed fd. Hope this will remind
++					 * user to do a POLLREMOVE.
++					 */
++					pfdp[fdcnt].fd = fd;
++					pfdp[fdcnt].revents = POLLNVAL;
++					fdcnt++;
+ 				}
++				continue;
+ 			}
+ 
+-			if (fp != pdp->pd_fp) {
++			/*
++			 * Detect a change to the resource underlying a cached
++			 * file descriptor.  While the fd generation comparison
++			 * will catch nearly all cases, the file_t comparison
++			 * is maintained as a failsafe as well.
++			 */
++			if (gen != pdp->pd_gen || fp != pdp->pd_fp) {
+ 				/*
+ 				 * The user is polling on a cached fd which was
+ 				 * closed and then reused.  Unfortunately there
+ 				 * is no good way to communicate this fact to
+ 				 * the consumer.
+ 				 *
+-				 * If the file struct is also reused, we may
+-				 * not be able to detect the fd reuse at all.
+-				 * As long as this does not cause system
+-				 * failure and/or memory leaks, we will play
+-				 * along.  The man page states that if the user
+-				 * does not clean up closed fds, polling
+-				 * results will be indeterministic.
+-				 *
+-				 * XXX: perhaps log the detection of fd reuse?
+-				 */
+-				pdp->pd_fp = fp;
+-
+-				/*
+ 				 * When this situation has been detected, it's
+ 				 * likely that any existing pollhead is
+ 				 * ill-suited to perform proper wake-ups.
+@@ -396,6 +383,29 @@ repoll:
+ 					pollhead_delete(pdp->pd_php, pdp);
+ 					pdp->pd_php = NULL;
+ 				}
++
++				/*
++				 * Since epoll is expected to act on the
++				 * underlying 'struct file' (in Linux terms,
++				 * our vnode_t would be a closer analog) rather
++				 * than the fd itself, an implicit remove
++				 * is necessary under these circumstances to
++				 * suppress any results (or errors) from the
++				 * new resource occupying the fd.
++				 */
++				if (is_epoll) {
++					pdp->pd_fp = NULL;
++					pdp->pd_events = 0;
++					BT_CLEAR(pcp->pc_bitmap, fd);
++					releasef(fd);
++					continue;
++				} else {
++					/*
++					 * Regular /dev/poll is unbothered
++					 * about the fd reassignment.
++					 */
++					pdp->pd_fp = fp;
++				}
+ 			}
+ 			/*
+ 			 * XXX - pollrelock() logic needs to know which
+@@ -700,14 +710,10 @@ dpwrite(dev_t dev, struct uio *uiop, cred_t *credp)
+ 	pollfd_t	*pollfdp, *pfdp;
+ 	dvpoll_epollfd_t *epfdp;
+ 	uintptr_t	limit;
+-	int		error, size;
+-	ssize_t		uiosize;
+-	size_t		copysize;
++	int		error;
++	unsigned	size;
++	size_t		copysize, uiosize;
+ 	nfds_t		pollfdnum;
+-	struct pollhead	*php = NULL;
+-	polldat_t	*pdp;
+-	int		fd;
+-	file_t		*fp;
+ 	boolean_t	is_epoll, fds_added = B_FALSE;
+ 
+ 	minor = getminor(dev);
+@@ -732,7 +738,12 @@ dpwrite(dev_t dev, struct uio *uiop, cred_t *credp)
+ 		pcp->pc_pid = curproc->p_pid;
+ 	}
+ 
+-	uiosize = uiop->uio_resid;
++	if (uiop->uio_resid < 0) {
++		/* No one else is this careful, but maybe they should be. */
++		return (EINVAL);
++	}
++
++	uiosize = (size_t)uiop->uio_resid;
+ 	pollfdnum = uiosize / size;
+ 
+ 	/*
+@@ -855,7 +866,9 @@ dpwrite(dev_t dev, struct uio *uiop, cred_t *credp)
+ 	}
+ 	for (pfdp = pollfdp; (uintptr_t)pfdp < limit;
+ 	    pfdp = (pollfd_t *)((uintptr_t)pfdp + size)) {
+-		fd = pfdp->fd;
++		int fd = pfdp->fd;
++		polldat_t *pdp;
++
+ 		if ((uint_t)fd >= P_FINFO(curproc)->fi_nfiles) {
+ 			/*
+ 			 * epoll semantics demand that we return EBADF if our
+@@ -871,78 +884,61 @@ dpwrite(dev_t dev, struct uio *uiop, cred_t *credp)
+ 
+ 		pdp = pcache_lookup_fd(pcp, fd);
+ 		if (pfdp->events != POLLREMOVE) {
++			uf_entry_gen_t gen;
++			file_t *fp = NULL;
++			struct pollhead *php = NULL;
+ 
+-			fp = NULL;
+-
+-			if (pdp == NULL) {
+-				/*
+-				 * If we're in epoll compatibility mode, check
+-				 * that the fd is valid before allocating
+-				 * anything for it; epoll semantics demand that
+-				 * we return EBADF if our specified fd is
+-				 * invalid.
+-				 */
+-				if (is_epoll) {
+-					if ((fp = getf(fd)) == NULL) {
+-						error = EBADF;
+-						break;
+-					}
++			/*
++			 * If we're in epoll compatibility mode, check that the
++			 * fd is valid before allocating anything for it; epoll
++			 * semantics demand that we return EBADF if our
++			 * specified fd is invalid.
++			 */
++			if (is_epoll) {
++				if ((fp = getf_gen(fd, &gen)) == NULL) {
++					error = EBADF;
++					break;
+ 				}
+-
++			}
++			if (pdp == NULL) {
+ 				pdp = pcache_alloc_fd(0);
+ 				pdp->pd_fd = fd;
+ 				pdp->pd_pcache = pcp;
+ 				pcache_insert_fd(pcp, pdp, pollfdnum);
+-			} else {
++			}
++
++			if (is_epoll) {
+ 				/*
+-				 * epoll semantics demand that we error out if
+-				 * a file descriptor is added twice, which we
+-				 * check (imperfectly) by checking if we both
+-				 * have the file descriptor cached and the
+-				 * file pointer that correponds to the file
+-				 * descriptor matches our cached value.  If
+-				 * there is a pointer mismatch, the file
+-				 * descriptor was closed without being removed.
+-				 * The converse is clearly not true, however,
+-				 * so to narrow the window by which a spurious
+-				 * EEXIST may be returned, we also check if
+-				 * this fp has been added to an epoll control
+-				 * descriptor in the past; if it hasn't, we
+-				 * know that this is due to fp reuse -- it's
+-				 * not a true EEXIST case.  (By performing this
+-				 * additional check, we limit the window of
+-				 * spurious EEXIST to situations where a single
+-				 * file descriptor is being used across two or
+-				 * more epoll control descriptors -- and even
+-				 * then, the file descriptor must be closed and
+-				 * reused in a relatively tight time span.)
++				 * If the fd is already a member of the epoll
++				 * set, error emission is needed only when the
++				 * fd assignment generation matches the one
++				 * recorded in the polldat_t.  Absence of such
++				 * a generation match indicates that a new
++				 * resource has been assigned at that fd.
++				 *
++				 * Caveat: It is possible to force a generation
++				 * update while keeping the same backing
++				 * resource.  This is possible via dup2, but
++				 * does not represent real-world use cases,
++				 * making the lack of error acceptable.
+ 				 */
+-				if (is_epoll) {
+-					if (pdp->pd_fp != NULL &&
+-					    (fp = getf(fd)) != NULL &&
+-					    fp == pdp->pd_fp &&
+-					    (fp->f_flag2 & FEPOLLED)) {
+-						error = EEXIST;
+-						releasef(fd);
+-						break;
+-					}
+-
+-					/*
+-					 * We have decided that the cached
+-					 * information was stale: it either
+-					 * didn't match, or the fp had never
+-					 * actually been epoll()'d on before.
+-					 * We need to now clear our pd_events
+-					 * to assure that we don't mistakenly
+-					 * operate on cached event disposition.
+-					 */
+-					pdp->pd_events = 0;
++				if (pdp->pd_fp != NULL && pdp->pd_gen == gen) {
++					error = EEXIST;
++					releasef(fd);
++					break;
+ 				}
+-			}
+ 
+-			if (is_epoll) {
++				/*
++				 * We have decided that the cached information
++				 * was stale.  Clear pd_events to assure that
++				 * we don't mistakenly operate on cached event
++				 * disposition.
++				 */
++				pdp->pd_events = 0;
++
+ 				epfdp = (dvpoll_epollfd_t *)pfdp;
+ 				pdp->pd_epolldata = epfdp->dpep_data;
++
+ 			}
+ 
+ 			ASSERT(pdp->pd_fd == fd);
+@@ -955,39 +951,36 @@ dpwrite(dev_t dev, struct uio *uiop, cred_t *credp)
+ 			if (fd > pcp->pc_mapend) {
+ 				pcp->pc_mapend = fd;
+ 			}
+-			if (fp == NULL && (fp = getf(fd)) == NULL) {
+-				/*
+-				 * The fd is not valid. Since we can't pass
+-				 * this error back in the write() call, set
+-				 * the bit in bitmap to force DP_POLL ioctl
+-				 * to examine it.
+-				 */
+-				BT_SET(pcp->pc_bitmap, fd);
+-				pdp->pd_events |= pfdp->events;
+-				continue;
+-			}
+ 
+-			/*
+-			 * To (greatly) reduce EEXIST false positives, we
+-			 * denote that this fp has been epoll()'d.  We do this
+-			 * regardless of epoll compatibility mode, as the flag
+-			 * is harmless if not in epoll compatibility mode.
+-			 */
+-			fp->f_flag2 |= FEPOLLED;
++			if (!is_epoll) {
++				ASSERT(fp == NULL);
+ 
+-			/*
+-			 * Don't do VOP_POLL for an already cached fd with
+-			 * same poll events.
+-			 */
+-			if ((pdp->pd_events == pfdp->events) &&
+-			    (pdp->pd_fp == fp)) {
++				if ((fp = getf_gen(fd, &gen)) == NULL) {
++					/*
++					 * The fd is not valid. Since we can't
++					 * pass this error back in the write()
++					 * call, set the bit in bitmap to force
++					 * DP_POLL ioctl to examine it.
++					 */
++					BT_SET(pcp->pc_bitmap, fd);
++					pdp->pd_events |= pfdp->events;
++					continue;
++				}
+ 				/*
+-				 * the events are already cached
++				 * Don't do VOP_POLL for an already cached fd
++				 * with same poll events.
+ 				 */
+-				releasef(fd);
+-				continue;
++				if ((pdp->pd_events == pfdp->events) &&
++				    (pdp->pd_fp == fp)) {
++					/*
++					 * the events are already cached
++					 */
++					releasef(fd);
++					continue;
++				}
+ 			}
+ 
++
+ 			/*
+ 			 * do VOP_POLL and cache this poll fd.
+ 			 */
+@@ -1045,6 +1038,7 @@ dpwrite(dev_t dev, struct uio *uiop, cred_t *credp)
+ 				break;
+ 			}
+ 			pdp->pd_fp = fp;
++			pdp->pd_gen = gen;
+ 			pdp->pd_events |= pfdp->events;
+ 			if (php != NULL) {
+ 				if (pdp->pd_php == NULL) {
+diff --git a/usr/src/uts/common/os/fio.c b/usr/src/uts/common/os/fio.c
+index 62f7a307f1..41e7e63d2b 100644
+--- a/usr/src/uts/common/os/fio.c
++++ b/usr/src/uts/common/os/fio.c
+@@ -386,6 +386,7 @@ flist_grow(int maxfd)
+ 		dst->uf_flag = src->uf_flag;
+ 		dst->uf_busy = src->uf_busy;
+ 		dst->uf_portfd = src->uf_portfd;
++		dst->uf_gen = src->uf_gen;
+ 	}
+ 
+ 	/*
+@@ -575,13 +576,12 @@ is_active_fd(kthread_t *t, int fd)
+ }
+ 
+ /*
+- * Convert a user supplied file descriptor into a pointer to a file
+- * structure.  Only task is to check range of the descriptor (soft
+- * resource limit was enforced at open time and shouldn't be checked
+- * here).
++ * Convert a user supplied file descriptor into a pointer to a file structure.
++ * Only task is to check range of the descriptor (soft resource limit was
++ * enforced at open time and shouldn't be checked here).
+  */
+ file_t *
+-getf(int fd)
++getf_gen(int fd, uf_entry_gen_t *genp)
+ {
+ 	uf_info_t *fip = P_FINFO(curproc);
+ 	uf_entry_t *ufp;
+@@ -607,6 +607,9 @@ getf(int fd)
+ 		return (NULL);
+ 	}
+ 	ufp->uf_refcnt++;
++	if (genp != NULL) {
++		*genp = ufp->uf_gen;
++	}
+ 
+ 	set_active_fd(fd);	/* record the active file descriptor */
+ 
+@@ -615,6 +618,12 @@ getf(int fd)
+ 	return (fp);
+ }
+ 
++file_t *
++getf(int fd)
++{
++	return (getf_gen(fd, NULL));
++}
++
+ /*
+  * Close whatever file currently occupies the file descriptor slot
+  * and install the new file, usually NULL, in the file descriptor slot.
+@@ -667,6 +676,7 @@ closeandsetf(int fd, file_t *newfp)
+ 			ASSERT(ufp->uf_flag == 0);
+ 			fd_reserve(fip, fd, 1);
+ 			ufp->uf_file = newfp;
++			ufp->uf_gen++;
+ 			UF_EXIT(ufp);
+ 			mutex_exit(&fip->fi_lock);
+ 			return (0);
+@@ -861,6 +871,7 @@ flist_fork(uf_info_t *pfip, uf_info_t *cfip)
+ 		cufp->uf_alloc = pufp->uf_alloc;
+ 		cufp->uf_flag = pufp->uf_flag;
+ 		cufp->uf_busy = pufp->uf_busy;
++		cufp->uf_gen = pufp->uf_gen;
+ 		if (pufp->uf_file == NULL) {
+ 			ASSERT(pufp->uf_flag == 0);
+ 			if (pufp->uf_busy) {
+@@ -1029,6 +1040,9 @@ ufalloc_file(int start, file_t *fp)
+ 	fd_reserve(fip, fd, 1);
+ 	ASSERT(ufp->uf_file == NULL);
+ 	ufp->uf_file = fp;
++	if (fp != NULL) {
++		ufp->uf_gen++;
++	}
+ 	UF_EXIT(ufp);
+ 	mutex_exit(&fip->fi_lock);
+ 	return (fd);
+@@ -1184,6 +1198,7 @@ setf(int fd, file_t *fp)
+ 	} else {
+ 		UF_ENTER(ufp, fip, fd);
+ 		ASSERT(ufp->uf_busy);
++		ufp->uf_gen++;
+ 	}
+ 	ASSERT(ufp->uf_fpollinfo == NULL);
+ 	ASSERT(ufp->uf_flag == 0);
+@@ -1213,8 +1228,7 @@ f_getfl(int fd, int *flagp)
+ 			error = EBADF;
+ 		else {
+ 			vnode_t *vp = fp->f_vnode;
+-			int flag = fp->f_flag |
+-			    ((fp->f_flag2 & ~FEPOLLED) << 16);
++			int flag = fp->f_flag | (fp->f_flag2 << 16);
+ 
+ 			/*
+ 			 * BSD fcntl() FASYNC compatibility.
+diff --git a/usr/src/uts/common/sys/file.h b/usr/src/uts/common/sys/file.h
+index 146987ff55..eb1328f38d 100644
+--- a/usr/src/uts/common/sys/file.h
++++ b/usr/src/uts/common/sys/file.h
+@@ -121,11 +121,6 @@ typedef struct fpollinfo {
+ 
+ #ifdef _KERNEL
+ 
+-/*
+- * This is a flag that is set on f_flag2, but is never user-visible
+- */
+-#define	FEPOLLED	0x8000
+-
+ /*
+  * Fake flags for driver ioctl calls to inform them of the originating
+  * process' model.  See <sys/model.h>
+@@ -199,6 +194,7 @@ struct vnodeops;
+ struct vattr;
+ 
+ extern file_t *getf(int);
++extern file_t *getf_gen(int, uf_entry_gen_t *);
+ extern void releasef(int);
+ extern void areleasef(int, uf_info_t *);
+ #ifndef	_BOOT
+diff --git a/usr/src/uts/common/sys/poll_impl.h b/usr/src/uts/common/sys/poll_impl.h
+index 2cd0b59233..3e0eb3b21f 100644
+--- a/usr/src/uts/common/sys/poll_impl.h
++++ b/usr/src/uts/common/sys/poll_impl.h
+@@ -226,6 +226,7 @@ struct polldat {
+ 	int		pd_nsets;	/* num of xref sets, used by poll(2) */
+ 	xref_t		*pd_ref;	/* ptr to xref info, 1 for each set */
+ 	port_kevent_t	*pd_portev;	/* associated port event struct */
++	uf_entry_gen_t	pd_gen;		/* fd generation at cache time */
+ 	uint64_t	pd_epolldata;	/* epoll data, if any */
+ };
+ 
+diff --git a/usr/src/uts/common/sys/user.h b/usr/src/uts/common/sys/user.h
+index 66250a3f2b..b711614b63 100644
+--- a/usr/src/uts/common/sys/user.h
++++ b/usr/src/uts/common/sys/user.h
+@@ -26,7 +26,7 @@
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+ /*	  All Rights Reserved	*/
+ /*
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ 
+@@ -81,6 +81,21 @@ struct exdata {
+ extern "C" {
+ #endif
+ 
++/*
++ * File Descriptor assignment generation.
++ *
++ * Certain file descriptor consumers (namely epoll) need to be able to detect
++ * when the resource underlying an fd change due to (re)assignment.  Checks
++ * comparing old and new file_t pointers work OK, but could easily be fooled by
++ * an entry freed-to and reused-from the cache.  To better detect such
++ * assingments, a generation number is kept in the uf_entry.  Whenever a
++ * non-NULL file_t is assigned to the entry, the generation is incremented,
++ * indicating the change.  There is a minute possibility that a rollover of the
++ * value could cause assigments to evade detection by consumers, but it is
++ * considered acceptably small.
++ */
++typedef unsigned uf_entry_gen_t;
++
+ /*
+  * Entry in the per-process list of open files.
+  * Note: only certain fields are copied in flist_grow() and flist_fork().
+@@ -97,10 +112,12 @@ typedef struct uf_entry {
+ 	kcondvar_t	uf_wanted_cv;	/* waiting for setf() [never copied] */
+ 	kcondvar_t	uf_closing_cv;	/* waiting for close() [never copied] */
+ 	struct portfd 	*uf_portfd;	/* associated with port [grow] */
++	uf_entry_gen_t	uf_gen;		/* assigned fd generation [grow,fork] */
+ 	/* Avoid false sharing - pad to coherency granularity (64 bytes) */
+ 	char		uf_pad[64 - sizeof (kmutex_t) - 2 * sizeof (void*) -
+ 		2 * sizeof (int) - 2 * sizeof (short) -
+-		2 * sizeof (kcondvar_t) - sizeof (struct portfd *)];
++		2 * sizeof (kcondvar_t) - sizeof (struct portfd *) -
++		sizeof (uf_entry_gen_t)];
+ } uf_entry_t;
+ 
+ /*
+-- 
+2.21.0
+

@@ -1,0 +1,219 @@
+From 395cef7e24dda5ca46c875361bf0fd23489eebbf Mon Sep 17 00:00:00 2001
+From: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date: Fri, 28 Apr 2017 19:20:10 +0000
+Subject: [PATCH] OS-5097 lxbrand mlock(2) permissions too strict
+
+---
+ usr/src/man/man5/resource_controls.5         | 10 +++--
+ usr/src/uts/common/brand/lx/syscall/lx_mem.c | 47 ++++++++++++++++++--
+ usr/src/uts/common/os/rctl.c                 | 15 ++-----
+ usr/src/uts/common/os/rctl_proc.c            | 23 +++++++++-
+ 4 files changed, 77 insertions(+), 18 deletions(-)
+
+diff --git a/usr/src/man/man5/resource_controls.5 b/usr/src/man/man5/resource_controls.5
+index 1315880e70..8dba24173f 100644
+--- a/usr/src/man/man5/resource_controls.5
++++ b/usr/src/man/man5/resource_controls.5
+@@ -4,7 +4,7 @@
+ .\" The contents of this file are subject to the terms of the Common Development and Distribution License (the "License").  You may not use this file except in compliance with the License.
+ .\" You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE or http://www.opensolaris.org/os/licensing.  See the License for the specific language governing permissions and limitations under the License.
+ .\" When distributing Covered Code, include this CDDL HEADER in each file and include the License file at usr/src/OPENSOLARIS.LICENSE.  If applicable, add the following below this CDDL HEADER, with the fields enclosed by brackets "[]" replaced with your own identifying information: Portions Copyright [yyyy] [name of copyright owner]
+-.TH RESOURCE_CONTROLS 5 "April 18, 2017"
++.TH RESOURCE_CONTROLS 5 "April 28, 2017"
+ .SH NAME
+ resource_controls \- resource controls available through projects and zones
+ .SH DESCRIPTION
+@@ -128,7 +128,11 @@ number of bytes.
+ .sp .6
+ .RS 4n
+ Total amount of physical memory that can be locked by this process, expressed
+-as a number of bytes.
++as a number of bytes. This limit is not enforced for a process with the
++\fB\fBPRIV_PROC_LOCK_MEMORY\fR\fR privilege. Because the ability to lock memory
++is controlled by the \fB\fBPRIV_PROC_LOCK_MEMORY\fR\fR privilege within native
++zones, this resource control is only useful within branded zones which might
++support a different policy for locking memory.
+ .RE
+ 
+ .sp
+@@ -1094,7 +1098,7 @@ Interface Stability	Evolving
+ \fBprctl\fR(1), \fBpooladm\fR(1M), \fBpoolcfg\fR(1M), \fBprojadd\fR(1M),
+ \fBprojmod\fR(1M), \fBrctladm\fR(1M), \fBsetrctl\fR(2),
+ \fBrctlblk_set_value\fR(3C), \fBlibpool\fR(3LIB), \fBproject\fR(4),
+-\fBattributes\fR(5), \fBFSS\fR(7)
++\fBattributes\fR(5), \fBprivileges\fR(5), \fBzones\fR(5), \fBFSS\fR(7)
+ .sp
+ .LP
+ \fISystem Administration Guide:  Virtualization Using the Solaris Operating
+diff --git a/usr/src/uts/common/brand/lx/syscall/lx_mem.c b/usr/src/uts/common/brand/lx/syscall/lx_mem.c
+index 4bf0ce886f..d1919307af 100644
+--- a/usr/src/uts/common/brand/lx/syscall/lx_mem.c
++++ b/usr/src/uts/common/brand/lx/syscall/lx_mem.c
+@@ -21,12 +21,24 @@
+ #include <sys/mman.h>
+ #include <sys/debug.h>
+ #include <sys/sysmacros.h>
++#include <sys/policy.h>
++#include <sys/lx_brand.h>
++#include <vm/as.h>
+ 
+ /* From uts/common/os/grow.c */
+ extern int mprotect(caddr_t, size_t, int);
+ /* From uts/common/syscall/memcntl.c */
+ extern int memcntl(caddr_t, size_t, int, caddr_t, int, int);
+ 
++/*
++ * After Linux 2.6.8, an unprivileged process can lock memory up to its
++ * RLIMIT_MEMLOCK resource limit.
++ *
++ * Within memcntl() it assumes we have PRIV_PROC_LOCK_MEMORY, or the check in
++ * secpolicy_lock_memory() will fail when we attempt to lock memory. Thus,
++ * to support the Linux semantics, we bypass memcntl() and perform the locking
++ * operations directly.
++ */
+ 
+ #define	LX_MADV_NORMAL		0
+ #define	LX_MADV_RANDOM		1
+@@ -55,6 +67,8 @@ extern int memcntl(caddr_t, size_t, int, caddr_t, int, int);
+ static int
+ lx_mlock_common(int op, uintptr_t addr, size_t len)
+ {
++	int err;
++	struct as *as = curproc->p_as;
+ 	const uintptr_t align_addr = addr & (uintptr_t)PAGEMASK;
+ 	const size_t align_len = P2ROUNDUP(len + (addr & PAGEOFFSET), PAGESIZE);
+ 
+@@ -66,7 +80,13 @@ lx_mlock_common(int op, uintptr_t addr, size_t len)
+ 		return (set_errno(EINVAL));
+ 	}
+ 
+-	return (memcntl((caddr_t)align_addr, align_len, op, 0, 0, 0));
++	if (lx_kern_release_cmp(curzone, "2.6.9") < 0) {
++		if ((err = secpolicy_lock_memory(CRED())) != 0)
++			return (set_errno(err));
++	}
++
++	err = as_ctl(as, (caddr_t)align_addr, align_len, op, 0, 0, NULL, 0);
++	return (err == 0 ? 0 : set_errno(err));
+ }
+ 
+ int
+@@ -84,13 +104,34 @@ lx_munlock(uintptr_t addr, size_t len)
+ int
+ lx_mlockall(int flags)
+ {
+-	return (memcntl(0, 0, MC_LOCKAS, (caddr_t)(uintptr_t)flags, 0, 0));
++	int err;
++	struct as *as = curproc->p_as;
++
++	if (lx_kern_release_cmp(curzone, "2.6.9") < 0) {
++		if ((err = secpolicy_lock_memory(CRED())) != 0)
++			return (set_errno(err));
++	}
++
++	if ((flags & ~(MCL_FUTURE | MCL_CURRENT)) || flags == 0)
++		return (set_errno(EINVAL));
++
++	err = as_ctl(as, 0, 0, MC_LOCKAS, 0, (uintptr_t)flags, NULL, 0);
++	return (err == 0 ? 0 : set_errno(err));
+ }
+ 
+ int
+ lx_munlockall(void)
+ {
+-	return (memcntl(0, 0, MC_UNLOCKAS, 0, 0, 0));
++	int err;
++	struct as *as = curproc->p_as;
++
++	if (lx_kern_release_cmp(curzone, "2.6.9") < 0) {
++		if ((err = secpolicy_lock_memory(CRED())) != 0)
++			return (set_errno(err));
++	}
++
++	err = as_ctl(as, 0, 0, MC_UNLOCKAS, 0, 0, NULL, 0);
++	return (err == 0 ? 0 : set_errno(err));
+ }
+ 
+ int
+diff --git a/usr/src/uts/common/os/rctl.c b/usr/src/uts/common/os/rctl.c
+index fb5b07a939..e0a1126567 100644
+--- a/usr/src/uts/common/os/rctl.c
++++ b/usr/src/uts/common/os/rctl.c
+@@ -2943,22 +2943,15 @@ rctl_incr_locked_mem(proc_t *p, kproject_t *proj, rctl_qty_t inc,
+ 	}
+ 
+ 	if (chargeproc != 0) {
+-		rlim64_t p_max;
+-
+-		p_max = rctl_enforced_value(rc_process_maxlockedmem, p->p_rctls,
+-		    p);
+-
+ 		/* Check for overflow */
+ 		if ((p->p_locked_mem + inc) < p->p_locked_mem) {
+ 			ret = EAGAIN;
+ 			goto out;
+ 		}
+-		if ((p->p_locked_mem + inc) > p_max) {
+-			if (rctl_test_entity(rc_process_maxlockedmem,
+-			    p->p_rctls, p, &e, inc, 0) & RCT_DENY) {
+-				ret = EAGAIN;
+-				goto out;
+-			}
++		if (rctl_test_entity(rc_process_maxlockedmem, p->p_rctls, p,
++		    &e, inc, 0) & RCT_DENY) {
++			ret = EAGAIN;
++			goto out;
+ 		}
+ 
+ 		p->p_locked_mem += inc;
+diff --git a/usr/src/uts/common/os/rctl_proc.c b/usr/src/uts/common/os/rctl_proc.c
+index 6daba9cf29..c62540d2b4 100644
+--- a/usr/src/uts/common/os/rctl_proc.c
++++ b/usr/src/uts/common/os/rctl_proc.c
+@@ -33,6 +33,7 @@
+ #include <sys/port_kernel.h>
+ #include <sys/signal.h>
+ #include <sys/var.h>
++#include <sys/policy.h>
+ 
+ #include <sys/vmparam.h>
+ #include <sys/machparam.h>
+@@ -213,6 +214,26 @@ static rctl_ops_t proc_vmem_ops = {
+ 	rcop_no_test
+ };
+ 
++/*
++ * process.max-locked-memory
++ */
++/*ARGSUSED*/
++static int
++proc_maxlockedmem_test(struct rctl *r, struct proc *p, rctl_entity_p_t *e,
++    struct rctl_val *rv, rctl_qty_t i, uint_t f)
++{
++	if (secpolicy_lock_memory(CRED()) == 0)
++		return (0);
++	return ((p->p_locked_mem + i) > rv->rcv_value);
++}
++
++static rctl_ops_t proc_maxlockedmem_ops = {
++	rcop_no_action,
++	rcop_no_usage,
++	rcop_no_set,
++	proc_maxlockedmem_test
++};
++
+ /*
+  * void rctlproc_default_init()
+  *
+@@ -388,7 +409,7 @@ rctlproc_init(void)
+ 	rc_process_maxlockedmem = rctl_register("process.max-locked-memory",
+ 	    RCENTITY_PROCESS, RCTL_GLOBAL_LOWERABLE | RCTL_GLOBAL_DENY_ALWAYS |
+ 	    RCTL_GLOBAL_SIGNAL_NEVER | RCTL_GLOBAL_BYTES,
+-	    ULONG_MAX, UINT32_MAX, &rctl_default_ops);
++	    ULONG_MAX, UINT32_MAX, &proc_maxlockedmem_ops);
+ 
+ 	/*
+ 	 * Place minimal set of controls on "sched" process for inheritance by
+-- 
+2.21.0
+

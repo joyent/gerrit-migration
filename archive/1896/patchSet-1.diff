@@ -1,0 +1,565 @@
+From 350aa19e429a9f980d67b15e84fe081ac7e000e1 Mon Sep 17 00:00:00 2001
+From: Robert Mustacchi <rm@joyent.com>
+Date: Wed, 3 May 2017 23:05:11 +0000
+Subject: [PATCH] OS-6098 snoop seems to delay packets doing DNS resolution
+ OS-6103 traceroute should warn when name services are slow OS-6104 netstat
+ should warn when name services are slow OS-6106 ping name space warnings
+ should only happen once
+
+---
+ .../cmd/cmd-inet/usr.bin/netstat/netstat.c    | 107 ++++++++++++++++--
+ usr/src/cmd/cmd-inet/usr.sbin/ping/ping.c     |  22 ++--
+ .../cmd-inet/usr.sbin/snoop/snoop_ipaddr.c    |  58 +++++++---
+ .../cmd-inet/usr.sbin/traceroute/traceroute.c |  65 +++++++++++
+ 4 files changed, 212 insertions(+), 40 deletions(-)
+
+diff --git a/usr/src/cmd/cmd-inet/usr.bin/netstat/netstat.c b/usr/src/cmd/cmd-inet/usr.bin/netstat/netstat.c
+index 47296e9bd4..6b7d03ab46 100644
+--- a/usr/src/cmd/cmd-inet/usr.bin/netstat/netstat.c
++++ b/usr/src/cmd/cmd-inet/usr.bin/netstat/netstat.c
+@@ -23,6 +23,7 @@
+  * Copyright (c) 1990  Mentat Inc.
+  * netstat.c 2.2, last change 9/9/91
+  * MROUTING Revision 3.5
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -55,6 +56,8 @@
+ #include <kstat.h>
+ #include <assert.h>
+ #include <locale.h>
++#include <synch.h>
++#include <thread.h>
+ 
+ #include <sys/types.h>
+ #include <sys/stream.h>
+@@ -252,6 +255,15 @@ static	int	v4compat = 0;	/* Compatible printing format for status */
+ static int	proto = IPPROTO_MAX;	/* all protocols */
+ kstat_ctl_t	*kc = NULL;
+ 
++/*
++ * Name service timeout detection constants.
++ */
++static mutex_t ns_lock = ERRORCHECKMUTEX;
++static boolean_t ns_active = B_FALSE;	/* Is a lookup ongoing? */
++static hrtime_t ns_starttime;		/* Time the lookup started */
++static int ns_sleeptime = 2;		/* Time in seconds between checks */
++static int ns_warntime = 2;		/* Time in seconds before warning */
++
+ /*
+  * Sizes of data structures extracted from the base mib.
+  * This allows the size of the tables entries to grow while preserving
+@@ -349,6 +361,54 @@ static uint_t timestamp_fmt = NODATE;
+ #define	TEXT_DOMAIN "SYS_TEST"		/* Use this only if it isn't */
+ #endif
+ 
++static void
++ns_lookup_start(void)
++{
++	mutex_enter(&ns_lock);
++	ns_active = B_TRUE;
++	ns_starttime = gethrtime();
++	mutex_exit(&ns_lock);
++}
++
++static void
++ns_lookup_end(void)
++{
++	mutex_enter(&ns_lock);
++	ns_active = B_FALSE;
++	mutex_exit(&ns_lock);
++}
++
++/*
++ * When name services are not functioning, this program appears to hang to the
++ * user. To try and give the user a chance of figuring out that this might be
++ * the case, we end up warning them and suggest that they may want to use the -n
++ * flag.
++ */
++static void *
++ns_warning_thr(void *unsued)
++{
++	for (;;) {
++		hrtime_t now;
++
++		(void) sleep(ns_sleeptime);
++		now = gethrtime();
++		mutex_enter(&ns_lock);
++		if (ns_active && now - ns_starttime >= ns_warntime * NANOSEC) {
++			(void) fprintf(stderr, "warning: data "
++			    "available, but name service lookups are "
++			    "taking a while. Use the -n option to "
++			    "disable name service lookups.\n");
++			mutex_exit(&ns_lock);
++			return (NULL);
++		}
++		mutex_exit(&ns_lock);
++	}
++
++	/* LINTED: E_STMT_NOT_REACHED */
++	return (NULL);
++}
++
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -558,6 +618,15 @@ main(int argc, char **argv)
+ 	if (interval)
+ 		setbuf(stdout, NULL);
+ 
++	/*
++	 * Start up the thread to check for name services warnings.
++	 */
++	if (thr_create(NULL, 0, ns_warning_thr, NULL,
++	    THR_DETACHED | THR_DAEMON, NULL) != 0) {
++		fatal(1, "%s: failed to create name services "
++		    "thread: %s\n", name, strerror(errno));
++	}
++
+ 	if (DHCPflag) {
+ 		dhcp_report(Iflag ? ifname : NULL);
+ 		exit(0);
+@@ -972,7 +1041,8 @@ mib_item_dup(mib_item_t *item)
+  * for item->mib_id == 0
+  */
+ static mib_item_t *
+-mib_item_diff(mib_item_t *item1, mib_item_t *item2) {
++mib_item_diff(mib_item_t *item1, mib_item_t *item2)
++{
+ 	int	nitems	= 0; /* no. of items in item2 */
+ 	mib_item_t *tempp2;  /* walking copy of item2 */
+ 	mib_item_t *tempp1;  /* walking copy of item1 */
+@@ -1498,7 +1568,8 @@ mibdiff_out_of_memory:;
+  * mib_item_diff
+  */
+ static void
+-mib_item_destroy(mib_item_t **itemp) {
++mib_item_destroy(mib_item_t **itemp)
++{
+ 	int	nitems = 0;
+ 	int	c = 0;
+ 	mib_item_t *tempp;
+@@ -3264,8 +3335,9 @@ if_report(mib_item_t *item, char *matchname,
+ 
+ static void
+ if_report_ip4(mib2_ipAddrEntry_t *ap,
+-	char ifname[], char logintname[], struct ifstat *statptr,
+-	boolean_t ksp_not_null) {
++    char ifname[], char logintname[], struct ifstat *statptr,
++    boolean_t ksp_not_null)
++{
+ 
+ 	char abuf[MAXHOSTNAMELEN + 1];
+ 	char dstbuf[MAXHOSTNAMELEN + 1];
+@@ -3297,7 +3369,7 @@ if_report_ip4(mib2_ipAddrEntry_t *ap,
+ 		(void) printf("%-5s %-4u ", logintname, ap->ipAdEntInfo.ae_mtu);
+ 		if (ap->ipAdEntInfo.ae_flags & IFF_POINTOPOINT)
+ 			(void) pr_addr(ap->ipAdEntInfo.ae_pp_dst_addr, abuf,
+-			sizeof (abuf));
++			    sizeof (abuf));
+ 		else
+ 			(void) pr_netaddr(ap->ipAdEntAddr, ap->ipAdEntNetMask,
+ 			    abuf, sizeof (abuf));
+@@ -3312,8 +3384,9 @@ if_report_ip4(mib2_ipAddrEntry_t *ap,
+ 
+ static void
+ if_report_ip6(mib2_ipv6AddrEntry_t *ap6,
+-	char ifname[], char logintname[], struct ifstat *statptr,
+-	boolean_t ksp_not_null) {
++    char ifname[], char logintname[], struct ifstat *statptr,
++    boolean_t ksp_not_null)
++{
+ 
+ 	char abuf[MAXHOSTNAMELEN + 1];
+ 	char dstbuf[MAXHOSTNAMELEN + 1];
+@@ -5450,8 +5523,7 @@ plurales(int n)
+ }
+ 
+ static char *
+-pktscale(n)
+-	int n;
++pktscale(int n)
+ {
+ 	static char buf[6];
+ 	char t;
+@@ -5735,8 +5807,10 @@ pr_addr(uint_t addr, char *dst, uint_t dstlen)
+ 	}
+ 	cp = NULL;
+ 	if (!Nflag) {
++		ns_lookup_start();
+ 		hp = getipnodebyaddr((char *)&addr, sizeof (uint_t), AF_INET,
+ 		    &error_num);
++		ns_lookup_end();
+ 		if (hp) {
+ 			if ((cp = strchr(hp->h_name, '.')) != NULL &&
+ 			    strcasecmp(cp + 1, domain) == 0)
+@@ -5791,8 +5865,10 @@ pr_addr6(const struct in6_addr *addr, char *dst, uint_t dstlen)
+ 	}
+ 	cp = NULL;
+ 	if (!Nflag) {
++		ns_lookup_start();
+ 		hp = getipnodebyaddr((char *)addr,
+ 		    sizeof (struct in6_addr), AF_INET6, &error_num);
++		ns_lookup_end();
+ 		if (hp) {
+ 			if ((cp = strchr(hp->h_name, '.')) != NULL &&
+ 			    strcasecmp(cp + 1, domain) == 0)
+@@ -5943,15 +6019,19 @@ pr_net(uint_t addr, uint_t mask, char *dst, uint_t dstlen)
+ 		net = addr & mask;
+ 		while ((mask & 1) == 0)
+ 			mask >>= 1, net >>= 1;
++		ns_lookup_start();
+ 		np = getnetbyaddr(net, AF_INET);
++		ns_lookup_end();
+ 		if (np && np->n_net == net)
+ 			cp = np->n_name;
+ 		else {
+ 			/*
+ 			 * Look for subnets in hosts map.
+ 			 */
++			ns_lookup_start();
+ 			hp = getipnodebyaddr((char *)&addr, sizeof (uint_t),
+ 			    AF_INET, &error_num);
++			ns_lookup_end();
+ 			if (hp)
+ 				cp = hp->h_name;
+ 		}
+@@ -6025,15 +6105,19 @@ pr_netaddr(uint_t addr, uint_t mask, char *dst, uint_t dstlen)
+ 
+ 	/* Try looking up name unless -n was specified. */
+ 	if (!Nflag) {
++		ns_lookup_start();
+ 		np = getnetbyaddr(netshifted, AF_INET);
++		ns_lookup_end();
+ 		if (np && np->n_net == netshifted)
+ 			cp = np->n_name;
+ 		else {
+ 			/*
+ 			 * Look for subnets in hosts map.
+ 			 */
++			ns_lookup_start();
+ 			hp = getipnodebyaddr((char *)&nbo_addr, sizeof (uint_t),
+ 			    AF_INET, &error_num);
++			ns_lookup_end();
+ 			if (hp)
+ 				cp = hp->h_name;
+ 		}
+@@ -6133,8 +6217,11 @@ portname(uint_t port, char *proto, char *dst, uint_t dstlen)
+ {
+ 	struct servent *sp = NULL;
+ 
+-	if (!Nflag && port)
++	if (!Nflag && port) {
++		ns_lookup_start();
+ 		sp = getservbyport(htons(port), proto);
++		ns_lookup_end();
++	}
+ 	if (sp || port == 0)
+ 		(void) snprintf(dst, dstlen, "%.*s", MAXHOSTNAMELEN,
+ 		    sp ? sp->s_name : "*");
+diff --git a/usr/src/cmd/cmd-inet/usr.sbin/ping/ping.c b/usr/src/cmd/cmd-inet/usr.sbin/ping/ping.c
+index 2d79419245..c6f8257ae9 100644
+--- a/usr/src/cmd/cmd-inet/usr.sbin/ping/ping.c
++++ b/usr/src/cmd/cmd-inet/usr.sbin/ping/ping.c
+@@ -38,7 +38,7 @@
+  */
+ 
+ /*
+- * Copyright 2015, Joyent, Inc.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <assert.h>
+@@ -187,7 +187,6 @@ static boolean_t ns_active = _B_FALSE;	/* Lookup is going on */
+ static hrtime_t ns_starttime;		/* Time the lookup started */
+ static int ns_sleeptime = 2;		/* Time in seconds between checks */
+ static int ns_warntime = 2;		/* Time in seconds before warning */
+-static int ns_warninter = 60;		/* Time in seconds between warnings */
+ 
+ /*
+  * This buffer stores the received packets. Currently it needs to be 32 bit
+@@ -1927,7 +1926,7 @@ send_scheduled_probe()
+  */
+ static void
+ recv_icmp_packet(struct addrinfo *ai_dst, int recv_sock6, int recv_sock,
+-ushort_t udp_src_port6, ushort_t udp_src_port)
++    ushort_t udp_src_port6, ushort_t udp_src_port)
+ {
+ 	struct msghdr in_msg;
+ 	struct iovec iov;
+@@ -2591,7 +2590,6 @@ ping_gettime(struct msghdr *msg, struct timeval *tv)
+ static void *
+ ns_warning_thr(void *unused)
+ {
+-	hrtime_t last_warn = 0;
+ 	for (;;) {
+ 		hrtime_t now;
+ 
+@@ -2600,15 +2598,13 @@ ns_warning_thr(void *unused)
+ 		mutex_enter(&ns_lock);
+ 		if (ns_active == _B_TRUE &&
+ 		    now - ns_starttime >= ns_warntime * NANOSEC) {
+-			if (now - last_warn >=
+-			    ns_warninter * NANOSEC) {
+-				last_warn = now;
+-				Fprintf(stderr, "%s: warning: ICMP responses "
+-				    "received, but name service lookups are "
+-				    "taking a while. Use ping -n to disable "
+-				    "name service lookups.\n",
+-				    progname);
+-			}
++			Fprintf(stderr, "%s: warning: ICMP responses "
++			    "received, but name service lookups are "
++			    "taking a while. Use ping -n to disable "
++			    "name service lookups.\n",
++			    progname);
++			mutex_exit(&ns_lock);
++			return (NULL);
+ 		}
+ 		mutex_exit(&ns_lock);
+ 	}
+diff --git a/usr/src/cmd/cmd-inet/usr.sbin/snoop/snoop_ipaddr.c b/usr/src/cmd/cmd-inet/usr.sbin/snoop/snoop_ipaddr.c
+index c42c55dfef..9c44e4ff00 100644
+--- a/usr/src/cmd/cmd-inet/usr.sbin/snoop/snoop_ipaddr.c
++++ b/usr/src/cmd/cmd-inet/usr.sbin/snoop/snoop_ipaddr.c
+@@ -21,6 +21,7 @@
+ /*
+  * Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ #include <stdio.h>
+@@ -39,9 +40,12 @@
+ #include <signal.h>
+ #include <setjmp.h>
+ #include <arpa/inet.h>
++#include <sys/time.h>
+ #include "snoop.h"
+ 
+ static sigjmp_buf nisjmp;
++static hrtime_t snoop_lastwarn;		/* Last time NS warning fired */
++static unsigned snoop_warninter = 60;	/* Time in seconds between warnings */
+ 
+ #define	MAXHASH 1024  /* must be a power of 2 */
+ 
+@@ -86,6 +90,19 @@ wakeup(int n)
+ 
+ extern char *inet_ntoa();
+ 
++static void
++snoop_nswarn(void)
++{
++	hrtime_t now = gethrtime();
++
++	if (now - snoop_lastwarn >= snoop_warninter * NANOSEC) {
++		snoop_lastwarn = now;
++		(void) fprintf(stderr, "snoop: warning: packets captured, but "
++		    "name service lookups are timing out. Use snoop -r to "
++		    "disable name service lookups\n");
++	}
++}
++
+ static struct hostdata *
+ iplookup(struct in_addr ipaddr)
+ {
+@@ -112,17 +129,21 @@ iplookup(struct in_addr ipaddr)
+ 	 * an unresponsive name server.
+ 	 * Give it 3 sec to do its work.
+ 	 */
+-	if (! rflg && sigsetjmp(nisjmp, 1) == 0) {
+-		(void) snoop_alarm(3, wakeup);
+-		hp = getipnodebyaddr((char *)&ipaddr, sizeof (int),
+-		    AF_INET, &error_num);
+-		if (hp == NULL && inet_lnaof(ipaddr) == 0) {
+-			np = getnetbyaddr(inet_netof(ipaddr), AF_INET);
+-			if (np)
+-				return (addhost(AF_INET, &ipaddr, np->n_name,
+-				    np->n_aliases));
++	if (!rflg) {
++		if (sigsetjmp(nisjmp, 1) == 0) {
++			(void) snoop_alarm(3, wakeup);
++			hp = getipnodebyaddr((char *)&ipaddr, sizeof (int),
++			    AF_INET, &error_num);
++			if (hp == NULL && inet_lnaof(ipaddr) == 0) {
++				np = getnetbyaddr(inet_netof(ipaddr), AF_INET);
++				if (np)
++					return (addhost(AF_INET, &ipaddr,
++					    np->n_name, np->n_aliases));
++			}
++			(void) snoop_alarm(0, wakeup);
++		} else {
++			snoop_nswarn();
+ 		}
+-		(void) snoop_alarm(0, wakeup);
+ 	}
+ 
+ 	retval = addhost(AF_INET, &ipaddr,
+@@ -158,11 +179,15 @@ ip6lookup(const struct in6_addr *ip6addr)
+ 	 * an unresponsive name server.
+ 	 * Give it 3 sec to do its work.
+ 	 */
+-	if (! rflg && sigsetjmp(nisjmp, 1) == 0) {
+-		(void) snoop_alarm(3, wakeup);
+-		hp = getipnodebyaddr(ip6addr, sizeof (struct in6_addr),
+-		    AF_INET6, &error_num);
+-		(void) snoop_alarm(0, wakeup);
++	if (!rflg) {
++		if (sigsetjmp(nisjmp, 1) == 0) {
++			(void) snoop_alarm(3, wakeup);
++			hp = getipnodebyaddr(ip6addr, sizeof (struct in6_addr),
++			    AF_INET6, &error_num);
++			(void) snoop_alarm(0, wakeup);
++		} else {
++			snoop_nswarn();
++		}
+ 	} else {
+ 		hp = NULL;
+ 	}
+@@ -295,8 +320,7 @@ addrtoname(int family, const void *ipaddr)
+ }
+ 
+ void
+-load_names(fname)
+-	char *fname;
++load_names(char *fname)
+ {
+ 	char buf[1024];
+ 	char *addr, *name, *alias;
+diff --git a/usr/src/cmd/cmd-inet/usr.sbin/traceroute/traceroute.c b/usr/src/cmd/cmd-inet/usr.sbin/traceroute/traceroute.c
+index b8b56259ad..3a75dde503 100644
+--- a/usr/src/cmd/cmd-inet/usr.sbin/traceroute/traceroute.c
++++ b/usr/src/cmd/cmd-inet/usr.sbin/traceroute/traceroute.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*
+@@ -61,6 +62,8 @@
+ #include <setjmp.h>
+ #include <limits.h>
+ #include <zone.h>
++#include <thread.h>
++#include <synch.h>
+ 
+ #include <priv_utils.h>
+ 
+@@ -184,6 +187,15 @@ ushort_t off = 0;		/* set DF bit */
+ static jmp_buf env;		/* stack environment for longjmp() */
+ boolean_t raw_req;		/* if sndsock for IPv4 must be raw */
+ 
++/*
++ * Name service lookup related data.
++ */
++static mutex_t tr_nslock = ERRORCHECKMUTEX;
++static boolean_t tr_nsactive = _B_FALSE;	/* Lookup ongoing */
++static hrtime_t tr_nsstarttime;			/* Start time */
++static int tr_nssleeptime = 2;			/* Interval between checks */
++static int tr_nswarntime = 2;			/* Interval to warn after */
++
+ /* Forwards */
+ static uint_t calc_packetlen(int, struct pr_set *);
+ extern int check_reply(struct msghdr *, int, int, uchar_t *, uchar_t *);
+@@ -237,6 +249,7 @@ static void tv_sub(struct timeval *, struct timeval *);
+ static void usage(void);
+ static int wait_for_reply(int, struct msghdr *, struct timeval *);
+ static double xsqrt(double);
++static void *ns_warning_thr(void *);
+ 
+ /*
+  * main
+@@ -515,6 +528,17 @@ main(int argc, char **argv)
+ 		exit(EXIT_FAILURE);
+ 	}
+ 
++	/*
++	 * Start up the name services warning thread.
++	 */
++	if (thr_create(NULL, 0, ns_warning_thr, NULL,
++	    THR_DETACHED | THR_DAEMON, NULL) != 0) {
++		Fprintf(stderr, "%s: failed to create name services "
++		    "thread: %s\n", prog, strerror(errno));
++		exit(EXIT_FAILURE);
++	}
++
++
+ 	/* resolve hostnames */
+ 	resolve_nodes(&family_input, &ai_dst);
+ 	if (ai_dst == NULL) {
+@@ -1980,6 +2004,10 @@ inet_name(union any_in_addr *in, int family)
+ 	if (first && !nflag) {
+ 		/* find out the domain name */
+ 		first = _B_FALSE;
++		mutex_enter(&tr_nslock);
++		tr_nsactive = _B_TRUE;
++		tr_nsstarttime = gethrtime();
++		mutex_exit(&tr_nslock);
+ 		if (gethostname(domain, MAXHOSTNAMELEN) == 0 &&
+ 		    (cp = strchr(domain, '.')) != NULL) {
+ 			(void) strncpy(domain, cp + 1, sizeof (domain) - 1);
+@@ -1987,9 +2015,16 @@ inet_name(union any_in_addr *in, int family)
+ 		} else {
+ 			domain[0] = '\0';
+ 		}
++		mutex_enter(&tr_nslock);
++		tr_nsactive = _B_FALSE;
++		mutex_exit(&tr_nslock);
+ 	}
+ 
+ 	flags = (nflag) ? NI_NUMERICHOST : NI_NAMEREQD;
++	mutex_enter(&tr_nslock);
++	tr_nsactive = _B_TRUE;
++	tr_nsstarttime = gethrtime();
++	mutex_exit(&tr_nslock);
+ 	if (getnameinfo(sa, slen, hbuf, sizeof (hbuf), NULL, 0, flags) != 0) {
+ 		if (inet_ntop(family, (const void *)&in->addr6,
+ 		    hbuf, sizeof (hbuf)) == NULL)
+@@ -1998,6 +2033,9 @@ inet_name(union any_in_addr *in, int family)
+ 	    strcmp(cp + 1, domain) == 0) {
+ 		*cp = '\0';
+ 	}
++	mutex_enter(&tr_nslock);
++	tr_nsactive = _B_FALSE;
++	mutex_exit(&tr_nslock);
+ 	(void) strlcpy(line, hbuf, sizeof (line));
+ 
+ 	return (line);
+@@ -2205,3 +2243,30 @@ usage(void)
+ 	    "[packetlen]\n", prog);
+ 	exit(EXIT_FAILURE);
+ }
++
++static void *
++ns_warning_thr(void *unused)
++{
++	for (;;) {
++		hrtime_t now;
++
++		(void) sleep(tr_nssleeptime);
++
++		now = gethrtime();
++		mutex_enter(&tr_nslock);
++		if (tr_nsactive && now - tr_nsstarttime >=
++		    tr_nswarntime * NANOSEC) {
++			Fprintf(stderr, "%s: warning: responses "
++			    "received, but name service lookups are "
++			    "taking a while. Use %s -n to disable "
++			    "name service lookups.\n",
++			    prog, prog);
++			mutex_exit(&tr_nslock);
++			return (NULL);
++		}
++		mutex_exit(&tr_nslock);
++	}
++
++	/* LINTED: E_STMT_NOT_REACHED */
++	return (NULL);
++}
+-- 
+2.21.0
+

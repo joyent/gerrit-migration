@@ -1,0 +1,641 @@
+From 6eafeebd23839f487e27c579aec8513666f1a2a4 Mon Sep 17 00:00:00 2001
+From: Jerry Jelinek <jerry.jelinek@joyent.com>
+Date: Mon, 15 May 2017 20:33:11 +0000
+Subject: [PATCH] OS-6080 xsave area should size dynamically, based on CPU
+ features
+
+---
+ usr/src/uts/common/os/lwp.c           |   2 +
+ usr/src/uts/common/sys/proc.h         |   3 +-
+ usr/src/uts/i86pc/os/cpuid.c          |  18 +++--
+ usr/src/uts/i86pc/os/fpu_subr.c       |  13 ++++
+ usr/src/uts/i86pc/os/machdep.c        |  15 +++-
+ usr/src/uts/intel/ia32/ml/exception.s |  13 +++-
+ usr/src/uts/intel/ia32/ml/float.s     |  13 +++-
+ usr/src/uts/intel/ia32/os/archdep.c   |   8 +-
+ usr/src/uts/intel/ia32/os/fpu.c       | 103 ++++++++++++++++++++------
+ usr/src/uts/intel/ia32/os/sundep.c    |   3 +
+ usr/src/uts/intel/sys/archsystm.h     |   3 +-
+ usr/src/uts/intel/sys/fp.h            |  17 +++--
+ usr/src/uts/intel/sys/x86_archext.h   |   1 +
+ usr/src/uts/sun4/os/machdep.c         |   7 +-
+ 14 files changed, 174 insertions(+), 45 deletions(-)
+
+diff --git a/usr/src/uts/common/os/lwp.c b/usr/src/uts/common/os/lwp.c
+index cde81f511a..341e4ae356 100644
+--- a/usr/src/uts/common/os/lwp.c
++++ b/usr/src/uts/common/os/lwp.c
+@@ -746,6 +746,8 @@ grow:
+ 		BROP(p)->b_initlwp_post(lwp);
+ 	}
+ 
++	lwp_fp_init(lwp);
++
+ 	if (state == TS_RUN) {
+ 		/*
+ 		 * We set the new lwp running immediately.
+diff --git a/usr/src/uts/common/sys/proc.h b/usr/src/uts/common/sys/proc.h
+index 9f36a34ebd..018a7c0581 100644
+--- a/usr/src/uts/common/sys/proc.h
++++ b/usr/src/uts/common/sys/proc.h
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1988, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2016 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+@@ -778,6 +778,7 @@ extern	void	lwp_freeregs(klwp_t *, int);
+ extern	caddr_t	lwp_stk_init(klwp_t *, caddr_t);
+ extern	void	lwp_stk_cache_init(void);
+ extern	void	lwp_stk_fini(klwp_t *);
++extern	void	lwp_fp_init(klwp_t *);
+ extern	void	lwp_installctx(klwp_t *);
+ extern	void	lwp_rtt(void);
+ extern	void	lwp_rtt_initial(void);
+diff --git a/usr/src/uts/i86pc/os/cpuid.c b/usr/src/uts/i86pc/os/cpuid.c
+index e1459a8b12..0396e92871 100644
+--- a/usr/src/uts/i86pc/os/cpuid.c
++++ b/usr/src/uts/i86pc/os/cpuid.c
+@@ -282,11 +282,12 @@ struct mwait_info {
+ /*
+  * xsave/xrestor info.
+  *
+- * This structure contains HW feature bits and size of the xsave save area.
+- * Note: the kernel uses a fixed size (AVX_XSAVE_SIZE) to store supported
+- * hardware features. Our xsave area does not handle new features beyond AVX
+- * and it does not optimize for potential memory savings if features in the
+- * middle or end of the save area are not enabled.
++ * This structure contains HW feature bits and the size of the xsave save area.
++ * Note: the kernel declares a fixed size (AVX_XSAVE_SIZE) structure
++ * (xsave_state) to describe the xsave layout. However, at runtime the
++ * per-lwp xsave area is dynamically allocated based on xsav_max_size. The
++ * xsave_state structure simply represents the legacy layout of the beginning
++ * of the xsave area.
+  */
+ struct xsave_info {
+ 	uint32_t	xsav_hw_features_low;   /* Supported HW features */
+@@ -3531,6 +3532,13 @@ cpuid_get_addrsize(cpu_t *cpu, uint_t *pabits, uint_t *vabits)
+ 		*vabits = cpi->cpi_vabits;
+ }
+ 
++size_t
++cpuid_get_xsave_size()
++{
++	return (MAX(cpuid_info0.cpi_xsave.xsav_max_size,
++	    sizeof (struct xsave_state)));
++}
++
+ /*
+  * Returns the number of data TLB entries for a corresponding
+  * pagesize.  If it can't be computed, or isn't known, the
+diff --git a/usr/src/uts/i86pc/os/fpu_subr.c b/usr/src/uts/i86pc/os/fpu_subr.c
+index 0598b913f1..b661ecd1a7 100644
+--- a/usr/src/uts/i86pc/os/fpu_subr.c
++++ b/usr/src/uts/i86pc/os/fpu_subr.c
+@@ -21,6 +21,7 @@
+ 
+ /*
+  * Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -37,6 +38,12 @@
+ 
+ #define	XMM_ALIGN	16
+ 
++/*
++ * See section 13.4 in the Intel 64 and IA-32 Architectures Software
++ * Developer’s Manual, Volume 1.
++ */
++#define	XSAVE_ALIGN	64
++
+ /*
+  * If fpu_exists is non-zero, fpu_probe will attempt to use any
+  * hardware FPU (subject to other constraints, see below).  If
+@@ -163,6 +170,9 @@ fpu_probe(void)
+ 				fp_save_mech = FP_XSAVE;
+ 				fpsave_ctxt = xsave_ctxt;
+ 				patch_xsave();
++				xsave_cachep = kmem_cache_create("xsave_cache",
++				    cpuid_get_xsave_size(), XSAVE_ALIGN,
++				    NULL, NULL, NULL, NULL, NULL, 0);
+ 			}
+ 		}
+ #elif defined(__i386)
+@@ -190,6 +200,9 @@ fpu_probe(void)
+ 				fp_save_mech = FP_XSAVE;
+ 				fpsave_ctxt = xsave_ctxt;
+ 				patch_xsave();
++				xsave_cachep = kmem_cache_create("xsave_cache",
++				    cpuid_get_xsave_size(), XSAVE_ALIGN,
++				    NULL, NULL, NULL, NULL, NULL, 0);
+ 			} else {
+ 				patch_sse();	/* use fxrstor */
+ 			}
+diff --git a/usr/src/uts/i86pc/os/machdep.c b/usr/src/uts/i86pc/os/machdep.c
+index 674e6e2bbc..41b5c7a7f6 100644
+--- a/usr/src/uts/i86pc/os/machdep.c
++++ b/usr/src/uts/i86pc/os/machdep.c
+@@ -21,6 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1992, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017, Joyent, Inc.
+  */
+ /*
+  * Copyright (c) 2010, Intel Corporation.
+@@ -889,10 +890,20 @@ lwp_stk_init(klwp_t *lwp, caddr_t stk)
+ 	return (stk);
+ }
+ 
+-/*ARGSUSED*/
++/*
++ * Use this opportunity to free any dynamically allocated fp storage.
++ */
+ void
+ lwp_stk_fini(klwp_t *lwp)
+-{}
++{
++	fp_lwp_cleanup(lwp);
++}
++
++void
++lwp_fp_init(klwp_t *lwp)
++{
++	fp_lwp_init(lwp);
++}
+ 
+ /*
+  * If we're not the panic CPU, we wait in panic_idle for reboot.
+diff --git a/usr/src/uts/intel/ia32/ml/exception.s b/usr/src/uts/intel/ia32/ml/exception.s
+index e7a004efe5..5855ef4b81 100644
+--- a/usr/src/uts/intel/ia32/ml/exception.s
++++ b/usr/src/uts/intel/ia32/ml/exception.s
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (c) 2004, 2010, Oracle and/or its affiliates. All rights reserved.
+  * Copyright (c) 2013, 2014 by Delphix. All rights reserved.
++ * Copyright (c) 2017 Joyent, Inc.
+  */
+ 
+ /*
+@@ -667,6 +668,9 @@ _emul_done:
+ 	ALTENTRY(ndptrap_frstor)
+ 	.globl  _patch_xrstorq_rbx
+ _patch_xrstorq_rbx:
++	nop
++	nop
++	nop
+ 	FXRSTORQ	((%rbx))
+ 	cmpw	$KCS_SEL, REGOFF_CS(%rsp)
+ 	je	.return_to_kernel
+@@ -742,6 +746,9 @@ _patch_xrstorq_rbx:
+ 	ALTENTRY(ndptrap_frstor)
+ 	.globl  _patch_xrstorq_rbx
+ _patch_xrstorq_rbx:
++	nop
++	nop
++	nop
+ 	FXRSTORQ	((%rbx))
+ 	popq	%rdx
+ 	popq	%rbx
+@@ -808,8 +815,10 @@ _patch_xrstorq_rbx:
+ _patch_fxrstor_ebx:
+ 	.globl  _patch_xrstor_ebx
+ _patch_xrstor_ebx:
+-	frstor	(%ebx)		/* may be patched to fxrstor */
+-	nop			/* (including this byte) */
++	frstor	(%ebx)		/* may be patched to fxrstor or xrstor */
++	nop			/* (including these bytes) */
++	nop
++	nop
+ 	popl	%gs
+ 	popl	%ds
+ 	popl	%edx
+diff --git a/usr/src/uts/intel/ia32/ml/float.s b/usr/src/uts/intel/ia32/ml/float.s
+index 5a8962c9ff..b173108591 100644
+--- a/usr/src/uts/intel/ia32/ml/float.s
++++ b/usr/src/uts/intel/ia32/ml/float.s
+@@ -21,6 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1992, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2017, Joyent, Inc.
+  */
+ 
+ /*      Copyright (c) 1990, 1991 UNIX System Laboratories, Inc. */
+@@ -203,10 +204,11 @@ _lfence_ret_insn:			/ see membar_consumer()
+ 	/
+ 	/	frstor (%ebx); nop	-> xrstor (%ebx)
+ 	/
+-	_HOT_PATCH(_xrstor_ebx_insn, _patch_xrstor_ebx, 3)
++	_HOT_PATCH(_xrstor_ebx_insn, _patch_xrstor_ebx, 5)
+ 	_HOT_PATCH_EPILOG
+ 	ret
+ _xrstor_ebx_insn:			/ see ndptrap_frstor()
++	movl	(%ebx), %ebx
+ 	#xrstor (%ebx)
+ 	.byte	0x0f, 0xae, 0x2b
+ 	SET_SIZE(patch_xsave)
+@@ -232,12 +234,14 @@ patch_xsave(void)
+ 	pushq	%rbp
+ 	pushq	%r15
+ 	/
++	/	nop; nop; nop;		-> movq(%rbx), %rbx
+ 	/	FXRSTORQ (%rbx);	-> xrstor (%rbx)
+-	/ hot_patch(_xrstor_rbx_insn, _patch_xrstorq_rbx, 4)
++	/ loop doing the following for 7 bytes:
++	/     hot_patch_kernel_text(_patch_xrstorq_rbx, _xrstor_rbx_insn, 1)
+ 	/
+ 	leaq	_patch_xrstorq_rbx(%rip), %rbx
+ 	leaq	_xrstor_rbx_insn(%rip), %rbp
+-	movq	$4, %r15
++	movq	$7, %r15
+ 1:
+ 	movq	%rbx, %rdi			/* patch address */
+ 	movzbq	(%rbp), %rsi			/* instruction byte */
+@@ -254,6 +258,7 @@ patch_xsave(void)
+ 	ret
+ 
+ _xrstor_rbx_insn:			/ see ndptrap_frstor()
++	movq	(%rbx), %rbx
+ 	#rex.W=1 (.byte 0x48)
+ 	#xrstor (%rbx)
+ 	.byte	0x48, 0x0f, 0xae, 0x2b
+@@ -327,6 +332,7 @@ fpnsave_ctxt(void *arg)
+ 	movl	FPU_CTX_FPU_XSAVE_MASK(%rdi), %eax
+ 	movl	FPU_CTX_FPU_XSAVE_MASK+4(%rdi), %edx
+ 	leaq	FPU_CTX_FPU_REGS(%rdi), %rsi
++	movq	(%rsi), %rsi	/* load fpu_regs.kfpu_u.kfpu_xs pointer */
+ 	#xsave	(%rsi)
+ 	.byte	0x0f, 0xae, 0x26
+ 	
+@@ -387,6 +393,7 @@ fpnsave_ctxt(void *arg)
+ 	movl	FPU_CTX_FPU_XSAVE_MASK(%ecx), %eax
+ 	movl	FPU_CTX_FPU_XSAVE_MASK+4(%ecx), %edx
+ 	leal	FPU_CTX_FPU_REGS(%ecx), %ecx
++	movl	(%ecx), %ecx	/* load fpu_regs.kfpu_u.kfpu_xs pointer */
+ 	#xsave	(%ecx)
+ 	.byte	0x0f, 0xae, 0x21
+ 	
+diff --git a/usr/src/uts/intel/ia32/os/archdep.c b/usr/src/uts/intel/ia32/os/archdep.c
+index c96aff4a19..d8b4f5d6e8 100644
+--- a/usr/src/uts/intel/ia32/os/archdep.c
++++ b/usr/src/uts/intel/ia32/os/archdep.c
+@@ -25,7 +25,7 @@
+ /*	Copyright (c) 1984, 1986, 1987, 1988, 1989 AT&T	*/
+ /*	  All Rights Reserved  	*/
+ /*
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  * Copyright 2012 Nexenta Systems, Inc.  All rights reserved.
+  */
+ 
+@@ -307,10 +307,10 @@ setfpregs(klwp_t *lwp, fpregset_t *fp)
+ 
+ 	case FP_XSAVE:
+ 		fpregset_to_fxsave(fp,
+-		    &fpu->fpu_regs.kfpu_u.kfpu_xs.xs_fxsave);
++		    &fpu->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave);
+ 		fpu->fpu_regs.kfpu_xstatus =
+ 		    fp->fp_reg_set.fpchip_state.xstatus;
+-		fpu->fpu_regs.kfpu_u.kfpu_xs.xs_xstate_bv |=
++		fpu->fpu_regs.kfpu_u.kfpu_xs->xs_xstate_bv |=
+ 		    (XFEATURE_LEGACY_FP | XFEATURE_SSE);
+ 		break;
+ 	default:
+@@ -370,7 +370,7 @@ getfpregs(klwp_t *lwp, fpregset_t *fp)
+ 			break;
+ 		case FP_XSAVE:
+ 			fxsave_to_fpregset(
+-			    &fpu->fpu_regs.kfpu_u.kfpu_xs.xs_fxsave, fp);
++			    &fpu->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave, fp);
+ 			fp->fp_reg_set.fpchip_state.xstatus =
+ 			    fpu->fpu_regs.kfpu_xstatus;
+ 			break;
+diff --git a/usr/src/uts/intel/ia32/os/fpu.c b/usr/src/uts/intel/ia32/os/fpu.c
+index dc3e286ad5..ebaaa25c66 100644
+--- a/usr/src/uts/intel/ia32/os/fpu.c
++++ b/usr/src/uts/intel/ia32/os/fpu.c
+@@ -20,6 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1992, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1990, 1991 UNIX System Laboratories, Inc. */
+@@ -60,6 +61,8 @@
+ #include <sys/sysmacros.h>
+ #include <sys/cmn_err.h>
+ 
++kmem_cache_t *xsave_cachep;
++
+ /* Legacy fxsave layout + xsave header + ymm */
+ #define	AVX_XSAVE_SIZE		(512 + 64 + 256)
+ 
+@@ -219,8 +222,10 @@ fp_new_lwp(kthread_id_t t, kthread_id_t ct)
+ 	case FP_XSAVE:
+ 		cfp->fpu_xsave_mask = fp->fpu_xsave_mask;
+ 
+-		fx = &fp->fpu_regs.kfpu_u.kfpu_xs.xs_fxsave;
+-		cxs = &cfp->fpu_regs.kfpu_u.kfpu_xs;
++		VERIFY(fp->fpu_regs.kfpu_u.kfpu_xs != NULL);
++
++		fx = &fp->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave;
++		cxs = cfp->fpu_regs.kfpu_u.kfpu_xs;
+ 		cfx = &cxs->xs_fxsave;
+ 
+ 		bcopy(&avx_initial, cxs, sizeof (*cxs));
+@@ -247,12 +252,12 @@ fp_new_lwp(kthread_id_t t, kthread_id_t ct)
+ /*
+  * Free any state associated with floating point context.
+  * Fp_free can be called in three cases:
+- * 1) from reaper -> thread_free -> ctxfree -> fp_free
++ * 1) from reaper -> thread_free -> freectx-> fp_free
+  *	fp context belongs to a thread on deathrow
+  *	nothing to do,  thread will never be resumed
+  *	thread calling ctxfree is reaper
+  *
+- * 2) from exec -> ctxfree -> fp_free
++ * 2) from exec -> freectx -> fp_free
+  *	fp context belongs to the current thread
+  *	must disable fpu, thread calling ctxfree is curthread
+  *
+@@ -313,7 +318,7 @@ fp_save(struct fpu_ctx *fp)
+ 		break;
+ 
+ 	case FP_XSAVE:
+-		xsave(&fp->fpu_regs.kfpu_u.kfpu_xs, fp->fpu_xsave_mask);
++		xsave(fp->fpu_regs.kfpu_u.kfpu_xs, fp->fpu_xsave_mask);
+ 		break;
+ 	default:
+ 		panic("Invalid fp_save_mech");
+@@ -344,7 +349,7 @@ fp_restore(struct fpu_ctx *fp)
+ 		break;
+ 
+ 	case FP_XSAVE:
+-		xrestore(&fp->fpu_regs.kfpu_u.kfpu_xs, fp->fpu_xsave_mask);
++		xrestore(fp->fpu_regs.kfpu_u.kfpu_xs, fp->fpu_xsave_mask);
+ 		break;
+ 	default:
+ 		panic("Invalid fp_save_mech");
+@@ -392,6 +397,63 @@ fp_seed(void)
+ 	fp->fpu_flags = FPU_EN;
+ }
+ 
++/*
++ * When using xsave/xrstor, these three functions are used by the lwp code to
++ * manage the memory for the xsave area.
++ */
++void
++fp_lwp_init(struct _klwp *lwp)
++{
++	if (fp_save_mech == FP_XSAVE) {
++		struct fpu_ctx *fp = &lwp->lwp_pcb.pcb_fpu;
++
++		ASSERT(cpuid_get_xsave_size() >= sizeof (struct xsave_state));
++
++		/*
++		 * We keep a copy of the pointer in lwp_fpu so that we can
++		 * restore the value in forklwp() after we duplicate the
++		 * parent's LWP state.
++		 *
++		 * We bzero since the fpinit() code path will only
++		 * partially initialize the xsave area using avx_inital.
++		 */
++		lwp->lwp_fpu = fp->fpu_regs.kfpu_u.kfpu_xs =
++		    kmem_cache_alloc(xsave_cachep, KM_SLEEP);
++		bzero(fp->fpu_regs.kfpu_u.kfpu_xs, cpuid_get_xsave_size());
++	}
++}
++
++void
++fp_lwp_cleanup(struct _klwp *lwp)
++{
++	struct fpu_ctx *fp = &lwp->lwp_pcb.pcb_fpu;
++
++	if (fp_save_mech == FP_XSAVE && fp->fpu_regs.kfpu_u.kfpu_xs != NULL) {
++		kmem_cache_free(xsave_cachep, fp->fpu_regs.kfpu_u.kfpu_xs);
++		lwp->lwp_fpu = fp->fpu_regs.kfpu_u.kfpu_xs = NULL;
++	}
++}
++
++/*
++ * Called during the process of forklwp(). The xsave pointer may have been
++ * overwritten while copying the parent's LWP structure. We have a valid copy
++ * stashed in the child's lwp_fpu which we use to restore the correct value.
++ */
++void
++fp_lwp_dup(struct _klwp *lwp)
++{
++	if (fp_save_mech == FP_XSAVE) {
++		struct xsave_state *xp = (struct xsave_state *)lwp->lwp_fpu;
++
++		/* copy the parent's values into the new lwp's struct */
++		bcopy(lwp->lwp_pcb.pcb_fpu.fpu_regs.kfpu_u.kfpu_xs,
++		    xp, cpuid_get_xsave_size());
++		/* now restore the pointer */
++		lwp->lwp_pcb.pcb_fpu.fpu_regs.kfpu_u.kfpu_xs = xp;
++	}
++}
++
++
+ /*
+  * This routine is called from trap() when User thread takes No Extension
+  * Fault. The possiblities are:
+@@ -420,11 +482,6 @@ fpnoextflt(struct regs *rp)
+ #endif	/* __i386 */
+ #endif	/* !__lint */
+ 
+-	/*
+-	 * save area MUST be 16-byte aligned, else will page fault
+-	 */
+-	ASSERT(((uintptr_t)(&fp->fpu_regs.kfpu_u.kfpu_fx) & 0xf) == 0);
+-
+ 	kpreempt_disable();
+ 	/*
+ 	 * Now we can enable the interrupts.
+@@ -559,14 +616,14 @@ fpexterrflt(struct regs *rp)
+ 		break;
+ 
+ 	case FP_XSAVE:
+-		fpsw = fp->fpu_regs.kfpu_u.kfpu_xs.xs_fxsave.fx_fsw;
+-		fpcw = fp->fpu_regs.kfpu_u.kfpu_xs.xs_fxsave.fx_fcw;
+-		fp->fpu_regs.kfpu_u.kfpu_xs.xs_fxsave.fx_fsw &= ~FPS_SW_EFLAGS;
++		fpsw = fp->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave.fx_fsw;
++		fpcw = fp->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave.fx_fcw;
++		fp->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave.fx_fsw &= ~FPS_SW_EFLAGS;
+ 		/*
+ 		 * Always set LEGACY_FP as it may have been cleared by XSAVE
+ 		 * instruction
+ 		 */
+-		fp->fpu_regs.kfpu_u.kfpu_xs.xs_xstate_bv |= XFEATURE_LEGACY_FP;
++		fp->fpu_regs.kfpu_u.kfpu_xs->xs_xstate_bv |= XFEATURE_LEGACY_FP;
+ 		break;
+ 	default:
+ 		panic("Invalid fp_save_mech");
+@@ -620,10 +677,14 @@ fpsimderrflt(struct regs *rp)
+ 	 */
+ 	fp_save(fp); 		/* save the FPU state */
+ 
+-	mxcsr = fp->fpu_regs.kfpu_u.kfpu_fx.fx_mxcsr;
+-
+-	fp->fpu_regs.kfpu_status = fp->fpu_regs.kfpu_u.kfpu_fx.fx_fsw;
+-
++	if (fp_save_mech == FP_XSAVE) {
++		mxcsr = fp->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave.fx_mxcsr;
++		fp->fpu_regs.kfpu_status =
++		    fp->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave.fx_fsw;
++	} else {
++		mxcsr = fp->fpu_regs.kfpu_u.kfpu_fx.fx_mxcsr;
++		fp->fpu_regs.kfpu_status = fp->fpu_regs.kfpu_u.kfpu_fx.fx_fsw;
++	}
+ 	fp->fpu_regs.kfpu_xstatus = mxcsr;
+ 
+ 	/*
+@@ -741,14 +802,14 @@ fpsetcw(uint16_t fcw, uint32_t mxcsr)
+ 		break;
+ 
+ 	case FP_XSAVE:
+-		fx = &fp->fpu_regs.kfpu_u.kfpu_xs.xs_fxsave;
++		fx = &fp->fpu_regs.kfpu_u.kfpu_xs->xs_fxsave;
+ 		fx->fx_fcw = fcw;
+ 		fx->fx_mxcsr = sse_mxcsr_mask & mxcsr;
+ 		/*
+ 		 * Always set LEGACY_FP as it may have been cleared by XSAVE
+ 		 * instruction
+ 		 */
+-		fp->fpu_regs.kfpu_u.kfpu_xs.xs_xstate_bv |= XFEATURE_LEGACY_FP;
++		fp->fpu_regs.kfpu_u.kfpu_xs->xs_xstate_bv |= XFEATURE_LEGACY_FP;
+ 		break;
+ 	default:
+ 		panic("Invalid fp_save_mech");
+diff --git a/usr/src/uts/intel/ia32/os/sundep.c b/usr/src/uts/intel/ia32/os/sundep.c
+index a8ce06fa4c..3911d6ebaa 100644
+--- a/usr/src/uts/intel/ia32/os/sundep.c
++++ b/usr/src/uts/intel/ia32/os/sundep.c
+@@ -20,6 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1992, 2010, Oracle and/or its affiliates. All rights reserved.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ /*	Copyright (c) 1990, 1991 UNIX System Laboratories, Inc. */
+@@ -403,6 +404,8 @@ lwp_forkregs(klwp_t *lwp, klwp_t *clwp)
+ 	ASSERT(lwptot(clwp)->t_post_sys);
+ #endif
+ 
++	fp_lwp_dup(clwp);
++
+ 	bcopy(lwp->lwp_regs, clwp->lwp_regs, sizeof (struct regs));
+ }
+ 
+diff --git a/usr/src/uts/intel/sys/archsystm.h b/usr/src/uts/intel/sys/archsystm.h
+index e06e79de97..80b860f2d0 100644
+--- a/usr/src/uts/intel/sys/archsystm.h
++++ b/usr/src/uts/intel/sys/archsystm.h
+@@ -21,7 +21,7 @@
+ 
+ /*
+  * Copyright (c) 1993, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright 2015 Joyent, Inc.
++ * Copyright 2017 Joyent, Inc.
+  */
+ 
+ #ifndef _SYS_ARCHSYSTM_H
+@@ -60,6 +60,7 @@ extern void patch_sse2(void);
+ #endif
+ 
+ extern void patch_xsave(void);
++extern kmem_cache_t *xsave_cachep;
+ 
+ extern void cli(void);
+ extern void sti(void);
+diff --git a/usr/src/uts/intel/sys/fp.h b/usr/src/uts/intel/sys/fp.h
+index 1b4cce820f..e785838bba 100644
+--- a/usr/src/uts/intel/sys/fp.h
++++ b/usr/src/uts/intel/sys/fp.h
+@@ -233,10 +233,13 @@ struct fxsave_state {
+  * This structure is written to memory by an 'xsave' instruction.
+  * First 512 byte is compatible with the format of an 'fxsave' area.
+  *
+- * The current size is AVX_XSAVE_SIZE (832 bytes), asserted in fpnoextflt().
+- * Enabling MPX and AVX512 requires a total size of 2696 bytes. The locations
+- * and size of new, extended components are determined dynamically by
+- * querying the CPU. See the xsave_info structure in cpuid.c.
++ * The size is at least AVX_XSAVE_SIZE (832 bytes), asserted in fpnoextflt().
++ * Enabling additional xsave-related CPU features increases the size.
++ * We dynamically allocate the per-lwp xsave area at runtime, based on the
++ * size needed for the CPU-specific features. The xsave_state structure simply
++ * defines the legacy layout of the beginning of the xsave area. The locations
++ * and size of new, extended components are determined dynamically by querying
++ * the CPU. See the xsave_info structure in cpuid.c.
+  */
+ struct xsave_state {
+ 	struct fxsave_state	xs_fxsave;
+@@ -255,7 +258,7 @@ typedef struct {
+ #if defined(__i386)
+ 		struct fnsave_state kfpu_fn;
+ #endif
+-		struct xsave_state kfpu_xs;
++		struct xsave_state *kfpu_xs;
+ 	} kfpu_u;
+ 	uint32_t kfpu_status;		/* saved at #mf exception */
+ 	uint32_t kfpu_xstatus;		/* saved at #xm exception */
+@@ -305,6 +308,10 @@ extern int fpextovrflt(struct regs *);
+ extern int fpexterrflt(struct regs *);
+ extern int fpsimderrflt(struct regs *);
+ extern void fpsetcw(uint16_t, uint32_t);
++struct _klwp;
++extern void fp_lwp_init(struct _klwp *);
++extern void fp_lwp_cleanup(struct _klwp *);
++extern void fp_lwp_dup(struct _klwp *);
+ 
+ #endif	/* _KERNEL */
+ 
+diff --git a/usr/src/uts/intel/sys/x86_archext.h b/usr/src/uts/intel/sys/x86_archext.h
+index 1055706561..d606947533 100644
+--- a/usr/src/uts/intel/sys/x86_archext.h
++++ b/usr/src/uts/intel/sys/x86_archext.h
+@@ -787,6 +787,7 @@ extern uint_t cpuid_get_procnodeid(struct cpu *cpu);
+ extern uint_t cpuid_get_procnodes_per_pkg(struct cpu *cpu);
+ extern uint_t cpuid_get_compunitid(struct cpu *cpu);
+ extern uint_t cpuid_get_cores_per_compunit(struct cpu *cpu);
++extern size_t cpuid_get_xsave_size();
+ extern int cpuid_is_cmt(struct cpu *);
+ extern int cpuid_syscall32_insn(struct cpu *);
+ extern int getl2cacheinfo(struct cpu *, int *, int *, int *);
+diff --git a/usr/src/uts/sun4/os/machdep.c b/usr/src/uts/sun4/os/machdep.c
+index b9c01971ac..96a39c29df 100644
+--- a/usr/src/uts/sun4/os/machdep.c
++++ b/usr/src/uts/sun4/os/machdep.c
+@@ -20,7 +20,7 @@
+  */
+ /*
+  * Copyright (c) 1993, 2010, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2015, Joyent, Inc.  All rights reserved.
++ * Copyright (c) 201&, Joyent, Inc.  All rights reserved.
+  */
+ 
+ #include <sys/types.h>
+@@ -174,6 +174,11 @@ lwp_stk_fini(klwp_t *lwp)
+ 	mpcb->mpcb_wbuf_pa = -1;
+ }
+ 
++/*ARGSUSED*/
++void
++lwp_stk_fini(klwp_t *lwp)
++{
++}
+ 
+ /*
+  * Copy regs from parent to child.
+-- 
+2.21.0
+
