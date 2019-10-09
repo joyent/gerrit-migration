@@ -160,7 +160,7 @@ Gerrit CR as a GitHub PR.
 2. Run the archive script:
 
     ```
-    ./bin/cr.joyent.us-archive ./archive/
+    ./bin/cr.joyent.us-archive ./archive
     ```
 
     However cr.joyent.us is flaky. It will (a) times out or crashes in SSH API
@@ -176,7 +176,7 @@ Gerrit CR as a GitHub PR.
     # Then run this:
     while true; do
         echo ""; echo ""; echo "";
-        ./bin/cr.joyent.us-archive ./archive/;
+        ./bin/cr.joyent.us-archive ./archive;
         echo ""; echo "";
         echo "# will retry in 5 seconds"; sleep 5;
     done
