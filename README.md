@@ -231,6 +231,7 @@ Trent is the only one that should need to do this.
 2. Run the archive script:
 
     ```
+    ssh cr gerrit ls-projects | sed 1d > archive/remaining-projects.txt
     ./bin/cr.joyent.us-archive ./archive
     ```
 
