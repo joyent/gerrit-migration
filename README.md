@@ -106,7 +106,49 @@ Substitute with your project/repo.
     - Change `State: Hidden`
     - Click "Save Changes"
 
-6.  Add a comment to [TOOLS-2327](https://jira.joyent.us/browse/TOOLS-2327)
+6.  Modify the jenkins job for this repository to remove gerrit references.
+    If you do not have permissions to do this, ping us in ~mib.
+
+    - Visit `https://jenkins.joyent.us/job/<your job>/configure`
+    - remove the `$BRANCH` parameter description text that describes
+      how to build from gerrit
+    - In the 'Source Code Management' section, click the red 'X' to remove
+      the `https://cr.joyent.us/joyent/<repository>` box
+
+    If you do not do this, then Jenkins build of this project will fail,
+    with a message similar to:
+
+    ```
+        Fetching upstream changes from https://cr.joyent.us/joyent/triton-cmon-agent.git
+    > git --version # timeout=10
+    > git fetch --tags --progress https://cr.joyent.us/joyent/triton-cmon-agent.git +refs/changes/*:refs/remotes/cr/*
+    ERROR: Error fetching remote repo 'cr'
+    hudson.plugins.git.GitException: Failed to fetch from https://cr.joyent.us/joyent/triton-cmon-agent.git
+        at hudson.plugins.git.GitSCM.fetchFrom(GitSCM.java:894)
+        at hudson.plugins.git.GitSCM.retrieveChanges(GitSCM.java:1161)
+        at hudson.plugins.git.GitSCM.checkout(GitSCM.java:1192)
+        at hudson.scm.SCM.checkout(SCM.java:504)
+        at hudson.model.AbstractProject.checkout(AbstractProject.java:1208)
+        at hudson.model.AbstractBuild$AbstractBuildExecution.defaultCheckout(AbstractBuild.java:574)
+        at jenkins.scm.SCMCheckoutStrategy.checkout(SCMCheckoutStrategy.java:86)
+        at hudson.model.AbstractBuild$AbstractBuildExecution.run(AbstractBuild.java:499)
+        at hudson.model.Run.execute(Run.java:1815)
+        at hudson.model.FreeStyleBuild.run(FreeStyleBuild.java:43)
+        at hudson.model.ResourceController.execute(ResourceController.java:97)
+        at hudson.model.Executor.run(Executor.java:429)
+    Caused by: hudson.plugins.git.GitException: Command "git fetch --tags --progress https://cr.joyent.us/joyent/triton-cmon-agent.git +refs/changes/*:refs/remotes/cr/*" returned status code 128:
+    stdout: 
+    stderr: fatal: remote error: Git repository not found
+
+        at org.jenkinsci.plugins.gitclient.CliGitAPIImpl.launchCommandIn(CliGitAPIImpl.java:2160)
+        at org.jenkinsci.plugins.gitclient.CliGitAPIImpl.launchCommandWithCredentials(CliGitAPIImpl.java:1852)
+        at org.jenkinsci.plugins.gitclient.CliGitAPIImpl.access$500(CliGitAPIImpl.java:78)
+        .
+        .
+        .
+    ```
+
+7.  Add a comment to [TOOLS-2327](https://jira.joyent.us/browse/TOOLS-2327)
     stating that you've moved the repo. Please mention the unmoved CRs if
     any remain for your repo.
 
