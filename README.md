@@ -3,8 +3,7 @@ Engineering's migration *away* from the Gerrit at https://cr.joyent.us to using
 GitHub PRs.
 
 See [MANTA-4594](https://jira.joyent.us/browse/MANTA-4594) ([bugview
-link](https://smartos.org/bugview/MANTA-4594))for full details.
-
+link](https://smartos.org/bugview/MANTA-4594)) for full details.
 
 ## How to move a repo from cr.joyent.us (Gerrit) to GitHub PRs
 
@@ -137,7 +136,7 @@ Substitute with your project/repo.
         at hudson.model.ResourceController.execute(ResourceController.java:97)
         at hudson.model.Executor.run(Executor.java:429)
     Caused by: hudson.plugins.git.GitException: Command "git fetch --tags --progress https://cr.joyent.us/joyent/triton-cmon-agent.git +refs/changes/*:refs/remotes/cr/*" returned status code 128:
-    stdout: 
+    stdout:
     stderr: fatal: remote error: Git repository not found
 
         at org.jenkinsci.plugins.gitclient.CliGitAPIImpl.launchCommandIn(CliGitAPIImpl.java:2160)
@@ -155,30 +154,61 @@ Substitute with your project/repo.
 
 ## How to move an archived CR to a PR
 
-All cr.joyent.us CRs have been archived at
+All cr.joyent.us CRs are periodically archived (by Trent, manually) at
 https://github.com/joyent/gerrit-migration/tree/master/archive
-The following is a best-effort and manual process for re-submitting a
-Gerrit CR as a GitHub PR.
+This repo provides a tool, `cr2pr`, to migrate an open CR from the archive
+to a GitHub PR on the appropriate "joyent" org repo.
 
-1. Get a clone of the archive:
+Here is a query of PRs that have been migrated using this tool:
+<https://github.com/pulls?q=is%3Apr+user%3Ajoyent+migrated-from-gerrit>
 
-        git clone https://github.com/joyent/gerrit-migration.git
+WARNING: If your CR is new, or recently updated, the archive might not have
+your CR (in which case `cr2pr` will fail) or the archive might have an outdated
+patch set (in which case `cr2pr` will **use the outdated patch set**).
+Please either check with Trent or confirm that the "./archive/$CRNUM/" dir
+has the expected number of "patchSet-N.diff" files.
 
-2.  XXX
+To move a CR to a PR:
 
+0. Assumptions/Prerequisites:
+
+    - You have `json` on your PATH (`npm install -g json`)
+    - You have the `hub` tool on your PATH
+      (<https://github.com/github/hub#installation>).
+    - You have push access to the relevant "joyent/NAME" repo.
+    - `ssh cr gerrit --help` works for you.
+
+1. Use one of the following to run `cr2pr`:
+
+    - curl-n-bash it:
+
+            bash -c "$(curl -ksSL https://raw.githubusercontent.com/joyent/gerrit-migration/master/bin/cr2pr)"
+
+    - or download and run it:
+
+            curl -ksSL -O https://raw.githubusercontent.com/joyent/gerrit-migration/master/bin/cr2pr
+            chmod +x ./cr2pr
+            ./cr2pr CR-NUM
+
+    - or, run it from a clone of this repo (warning: this repo is big):
+
+            git clone git@github.com:joyent/gerrit-migration.git
+            ./bin/cr2pr CR-NUM
 
 
 
 ## How to update the cr.joyent.us archive
+
+Trent is the only one that should need to do this.
 
 0. If you are making huge updates to the archives (e.g. starting from an
    empty archive), then you'll want to prefetch all the repos from cr.joyent.us
    via:
 
     ```
-    ssh cr gerrit ls-projects | sed 1d > archive/all-projects.txt
-    export CACHE_DIR=/var/cr.joyent.us-archive/repos
-    cat archive/all-projects.txt | while read p; do
+    ssh cr gerrit ls-projects | sed 1d > archive/remaining-projects.txt
+    export CACHE_DIR=/var/tmp/cr.joyent.us-archive/repos
+    cat archive/remaining-projects.txt | while read p; do
         if [[ "$p" == "joyent/postgres" ]]; then
             echo "";
             echo "# skip $p (broken clone from cr.joyent.us)"
