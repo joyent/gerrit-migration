@@ -180,11 +180,7 @@ To move a CR to a PR:
 
 1. Use one of the following to run `cr2pr`:
 
-    - curl-n-bash it:
-
-            bash -c "$(curl -ksSL https://raw.githubusercontent.com/joyent/gerrit-migration/master/bin/cr2pr)"
-
-    - or download and run it:
+    - download and run it:
 
             curl -ksSL -O https://raw.githubusercontent.com/joyent/gerrit-migration/master/bin/cr2pr
             chmod +x ./cr2pr
@@ -195,6 +191,9 @@ To move a CR to a PR:
             git clone git@github.com:joyent/gerrit-migration.git
             ./bin/cr2pr CR-NUM
 
+
+See https://gist.github.com/trentm/6188f14cd7487ac288c85080bfa7c3f3 for what
+an example run looks like.
 
 
 ## How to update the cr.joyent.us archive
