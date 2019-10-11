@@ -258,7 +258,7 @@ Trent is the only one that should need to do this.
     json -gaf archive/all-changes.json \
         -c this.open \
         -e 'this.subj=this.subject.split(" ")[0]' url project subj -o json-0 \
-        | tabula -s project -s url > archive/open-crs.txt
+        | tabula -H -s project -s url > archive/open-crs.txt
     ```
 
 4. Git add and commit the updates:
