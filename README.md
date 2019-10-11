@@ -200,9 +200,9 @@ an example run looks like.
 
 Trent is the only one that should need to do this.
 
-0. If you are making huge updates to the archives (e.g. starting from an
-   empty archive), then you'll want to prefetch all the repos from cr.joyent.us
-   via:
+0. Optional. If you are making huge updates to the archives (e.g. starting from
+   an empty archive), then you'll want to prefetch all the repos from
+   cr.joyent.us via:
 
     ```
     ssh cr gerrit ls-projects | sed 1d > archive/remaining-projects.txt
@@ -256,7 +256,7 @@ Trent is the only one that should need to do this.
     vi bin/cr.joyent.us-archive
     ```
 
-3. Update remaining repos/projects and open CRs:
+3. Update list of remaining repos/projects and open CRs:
 
     ```
     ssh cr gerrit ls-projects | sed 1d > archive/remaining-projects.txt
@@ -273,3 +273,16 @@ Trent is the only one that should need to do this.
     git commit archive -m "MANTA-4595: update cr.joyent.us archive to latest"
     git push origin master
     ```
+
+
+
+## Statistics
+
+Getting a list of remaining projects that have *no open CRs*:
+
+    cat archive/open-crs.txt  | awk '{print $2}' | uniq > projects-with-open-crs.txt
+    comm -23 archive/remaining-projects.txt projects-with-open-crs.txt > remaining-projects-without-crs.txt
+
+Remaining projects *with open CRs*:
+
+    comm -12 archive/remaining-projects.txt projects-with-open-crs.txt
