@@ -233,26 +233,22 @@ Trent is the only one that should need to do this.
     ./bin/cr.joyent.us-archive ./archive
     ```
 
-    However cr.joyent.us is flaky. It will (a) times out or crashes in SSH API
-    requests and (b) hang on "git clone" and "git fetch" frequently. I've
-    settled on running the following and watching for hangs. When it
-    hangs, hit `Ctrl+C` to abort and have it retry:
+    However cr.joyent.us is flaky. It will often (a) time out or crashe in SSH
+    API requests and (b) hang on "git clone" and "git fetch". I've settled on
+    running the following and watching for hangs. When it hangs, hit `Ctrl+C` to
+    abort and have it retry:
 
     ```
-    # First edit the file and set this in the "globals/config" section:
-    #      regenerateAllChanges = False
-    vi bin/cr.joyent.us-archive
+    # Run once to update the "archive/all-changes.json" file.
+    ./bin/cr.joyent.us-archive ./archive
 
-    # Then run this:
+    # Then run this to re-run without regenerating the all-changes.json file:
     while true; do
         echo ""; echo ""; echo "";
-        ./bin/cr.joyent.us-archive ./archive;
+        ./bin/cr.joyent.us-archive -C ./archive;
         echo ""; echo "";
         echo "# will retry in 5 seconds"; sleep 5;
     done
-
-    # Then remember to undo your script change.
-    vi bin/cr.joyent.us-archive
     ```
 
 3. Update list of remaining repos/projects and open CRs:
@@ -262,7 +258,7 @@ Trent is the only one that should need to do this.
     json -gaf archive/all-changes.json \
         -c this.open \
         -e 'this.subj=this.subject.split(" ")[0]' url project subj -o json-0 \
-        | tabula -s project > archive/open-crs.txt
+        | tabula -s project -s url > archive/open-crs.txt
     ```
 
 4. Git add and commit the updates:
