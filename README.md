@@ -73,9 +73,8 @@ Substitute with your project/repo.
     - If you want to disable "Allow rebase merging", I am fine with that
       personally. Feel free to ask.
 
-4.  Do a commit directly to the GitHub master that updates the language about
-    Gerrit/PR usage in the README.md and/or CONTRIBUTING.md (if the repo
-    has it).
+4.  Update the repo's README.md and/or CONTRIBUTING.md to remove any language
+    about Gerrit usage, if the repo has it.
 
     For example:
 
