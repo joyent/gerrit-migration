@@ -231,7 +231,6 @@ Trent is the only one that should need to do this.
 2. Run the archive script:
 
     ```
-    ssh cr gerrit ls-projects | sed 1d > archive/remaining-projects.txt
     ./bin/cr.joyent.us-archive ./archive
     ```
 
@@ -257,7 +256,17 @@ Trent is the only one that should need to do this.
     vi bin/cr.joyent.us-archive
     ```
 
-3. Git add and commit the updates:
+3. Update remaining repos/projects and open CRs:
+
+    ```
+    ssh cr gerrit ls-projects | sed 1d > archive/remaining-projects.txt
+    json -gaf archive/all-changes.json \
+        -c this.open \
+        -e 'this.subj=this.subject.split(" ")[0]' url project subj -o json-0 \
+        | tabula -s project > archive/open-crs.txt
+    ```
+
+4. Git add and commit the updates:
 
     ```
     git add ./archive
