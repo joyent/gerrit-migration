@@ -251,14 +251,18 @@ Trent is the only one that should need to do this.
     done
     ```
 
-3. Update list of remaining repos/projects and open CRs:
+3. Update list of remaining repos/projects and open CRs, and some other stats:
 
     ```
     ssh cr gerrit ls-projects | sed 1d > archive/remaining-projects.txt
+
     json -gaf archive/all-changes.json \
         -c this.open \
         -e 'this.subj=this.subject.split(" ")[0]' url project subj -o json-0 \
         | tabula -H -s project -s url > archive/open-crs.txt
+
+    cat archive/open-crs.txt  | awk '{print $2}' | uniq > archive/projects-with-open-crs.txt
+    comm -23 archive/remaining-projects.txt projects-with-open-crs.txt > archive/projects-without-open-crs.txt
     ```
 
 4. Git add and commit the updates:
@@ -268,16 +272,3 @@ Trent is the only one that should need to do this.
     git commit archive -m "MANTA-4595: update cr.joyent.us archive to latest"
     git push origin master
     ```
-
-
-
-## Statistics
-
-Getting a list of remaining projects that have *no open CRs*:
-
-    cat archive/open-crs.txt  | awk '{print $2}' | uniq > projects-with-open-crs.txt
-    comm -23 archive/remaining-projects.txt projects-with-open-crs.txt > remaining-projects-without-crs.txt
-
-Remaining projects *with open CRs*:
-
-    comm -12 archive/remaining-projects.txt projects-with-open-crs.txt
