@@ -262,7 +262,7 @@ Trent is the only one that should need to do this.
         | tabula -H -s project -s url > archive/open-crs.txt
 
     cat archive/open-crs.txt  | awk '{print $2}' | uniq > archive/projects-with-open-crs.txt
-    comm -23 archive/remaining-projects.txt projects-with-open-crs.txt > archive/projects-without-open-crs.txt
+    comm -23 archive/remaining-projects.txt archive/projects-with-open-crs.txt > archive/projects-without-open-crs.txt
     ```
 
 4. Git add and commit the updates:
