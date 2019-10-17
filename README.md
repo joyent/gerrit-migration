@@ -7,6 +7,47 @@ link](https://smartos.org/bugview/MANTA-4594)) for full details.
 
 ## How to move a repo from cr.joyent.us (Gerrit) to GitHub PRs
 
+The following steps can be partially automated by using the [move-a-repo](./bin/move-a-repo)
+tool. Here is an example run:
+
+```
+$ ./bin/move-a-repo joyent/binder
+
+## Move open CRs for joyent/binder
+(no open CRs)
+
+## Update 'not use GitHub PRs' possible hits in README.md et al
+Checking '~/joy/binder' for candidate hits:
+
+If there were candidate hits, please create a PR to update those:
+    cd ~/joy/binder
+    giddyup
+    vi README.md
+    git checkout -b TOOLS-2327
+    git ci -am "$(jirash TOOLS-2327) (drop referral to Gerrit for CR)"
+    git push origin TOOLS-2327
+    hub pull-request --no-edit
+
+Print 'Enter' when done
+
+## Set GitHub repo branch protection (via 'jr gh set-branch-protection')
+Updated "binder" repo "master" branch protection (https://github.com/joyent/binder/settings/branches)
+Press 'Enter' to continue
+
+## Turn off merge commits
+Opening 'https://github.com/joyent/binder/settings' so you can tweak settings
+Press 'Enter' when done
+
+## Hide the repo in Gerrit
+Print 'Enter' when done (set 'State: Hidden', then 'Save Changes')
+
+## Update the Jenkins job (drop gerrit BRANCH ref, and cr.joyent.us repo)
+Press 'Enter' when done
+
+Successfully moved repo 'joyent/binder' to https://github.com/joyent/binder
+```
+
+
 We will use "joyent/node-manta" as the example project/repo in these notes.
 Substitute with your project/repo.
 
