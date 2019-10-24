@@ -1,0 +1,923 @@
+From 6e652a370666bc2acc535d3df6f1b58918530198 Mon Sep 17 00:00:00 2001
+From: Ryan Zezeski <rpz@joyent.com>
+Date: Thu, 17 Oct 2019 16:53:25 -0600
+Subject: [PATCH] OS-8027 reinstate mac-loopback hardware emulation on Tx (undo
+ OS-6778)
+
+---
+ usr/src/uts/common/inet/ip/ip6_input.c      |  24 +--
+ usr/src/uts/common/inet/ip/ip_input.c       |  55 +-----
+ usr/src/uts/common/inet/ip_impl.h           |   9 +-
+ usr/src/uts/common/io/bridge.c              | 177 +++++---------------
+ usr/src/uts/common/io/dls/dls_link.c        |  43 +----
+ usr/src/uts/common/io/mac/mac.c             |  28 +++-
+ usr/src/uts/common/io/mac/mac_client.c      |  17 +-
+ usr/src/uts/common/io/mac/mac_provider.c    |   4 +-
+ usr/src/uts/common/io/mac/mac_sched.c       |  32 ++--
+ usr/src/uts/common/io/mac/mac_util.c        |  23 ++-
+ usr/src/uts/common/io/overlay/overlay_mux.c |   5 -
+ usr/src/uts/common/sys/mac.h                |   2 +
+ usr/src/uts/common/sys/mac_client_impl.h    |   3 +-
+ usr/src/uts/common/sys/pattr.h              |  19 ---
+ usr/src/uts/i86pc/io/viona/viona_rx.c       |  42 +----
+ 15 files changed, 121 insertions(+), 362 deletions(-)
+
+diff --git a/usr/src/uts/common/inet/ip/ip6_input.c b/usr/src/uts/common/inet/ip/ip6_input.c
+index d70015f3a4..066b5c3f56 100644
+--- a/usr/src/uts/common/inet/ip/ip6_input.c
++++ b/usr/src/uts/common/inet/ip/ip6_input.c
+@@ -977,6 +977,9 @@ ire_recv_forward_v6(ire_t *ire, mblk_t *mp, void *iph_arg, ip_recv_attr_t *ira)
+ 		ira->ira_pktlen = ntohs(ip6h->ip6_plen) + IPV6_HDR_LEN;
+ 	}
+ 
++	/* Packet is being forwarded. Turning off hwcksum flag. */
++	DB_CKSUMFLAGS(mp) = 0;
++
+ 	/*
+ 	 * Per RFC 3513 section 2.5.2, we must not forward packets with
+ 	 * an unspecified source address.
+@@ -1098,14 +1101,7 @@ ip_forward_xmit_v6(nce_t *nce, mblk_t *mp, ip6_t *ip6h, ip_recv_attr_t *ira,
+ 
+ 	BUMP_MIB(dst_ill->ill_ip_mib, ipIfStatsHCOutForwDatagrams);
+ 
+-	/*
+-	 * If the packet arrived via MAC-loopback then it might be an
+-	 * LSO packet; in this case the MAC layer will take care to
+-	 * segment it. Otherwise, we have a normal packet that is
+-	 * being forwarded from a source interface with an MTU larger
+-	 * than the destination's; in this case IP must fragment it.
+-	 */
+-	if (pkt_len > mtu && (DB_CKSUMFLAGS(mp) & HW_LSO) == 0) {
++	if (pkt_len > mtu) {
+ 		BUMP_MIB(dst_ill->ill_ip_mib, ipIfStatsOutFragFails);
+ 		ip_drop_output("ipIfStatsOutFragFails", mp, dst_ill);
+ 		if (iraflags & IRAF_SYSTEM_LABELED) {
+@@ -1895,16 +1891,6 @@ ip_input_cksum_v6(iaflags_t iraflags, mblk_t *mp, ip6_t *ip6h,
+ 		return (B_TRUE);
+ 	}
+ 
+-	hck_flags = DB_CKSUMFLAGS(mp);
+-
+-	if (hck_flags & HW_LOCAL_MAC) {
+-		/*
+-		 * The packet is from a same-machine sender in which
+-		 * case we assume data integrity.
+-		 */
+-		return (B_TRUE);
+-	}
+-
+ 	/*
+ 	 * Revert to software checksum calculation if the interface
+ 	 * isn't capable of checksum offload.
+@@ -1917,6 +1903,8 @@ ip_input_cksum_v6(iaflags_t iraflags, mblk_t *mp, ip6_t *ip6h,
+ 		return (ip_input_sw_cksum_v6(mp, ip6h, ira));
+ 	}
+ 
++	hck_flags = DB_CKSUMFLAGS(mp);
++
+ 	/*
+ 	 * We apply this for all ULP protocols. Does the HW know to
+ 	 * not set the flags for SCTP and other protocols.
+diff --git a/usr/src/uts/common/inet/ip/ip_input.c b/usr/src/uts/common/inet/ip/ip_input.c
+index dd6f329ebe..cd6c50c446 100644
+--- a/usr/src/uts/common/inet/ip/ip_input.c
++++ b/usr/src/uts/common/inet/ip/ip_input.c
+@@ -664,8 +664,7 @@ ill_input_short_v4(mblk_t *mp, void *iph_arg, void *nexthop_arg,
+ 	 * there is a good HW IP header checksum, we clear the need
+ 	 * look at the IP header checksum.
+ 	 */
+-	if ((DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) ||
+-	    ((DB_CKSUMFLAGS(mp) & HCK_IPV4_HDRCKSUM) &&
++	if (((DB_CKSUMFLAGS(mp) & HCK_IPV4_HDRCKSUM) &&
+ 	    ILL_HCKSUM_CAPABLE(ill) && dohwcksum)) {
+ 		/* Header checksum was ok. Clear the flag */
+ 		DB_CKSUMFLAGS(mp) &= ~HCK_IPV4_HDRCKSUM;
+@@ -1003,26 +1002,8 @@ ire_recv_forward_v4(ire_t *ire, mblk_t *mp, void *iph_arg, ip_recv_attr_t *ira)
+ 		ira->ira_pktlen = ntohs(ipha->ipha_length);
+ 	}
+ 
+-	/*
+-	 * The packet came here via MAC-loopback so we must reinstate
+-	 * its hardware IP header checksum request.
+-	 *
+-	 * IP input clears the HCK_IPV4_HDRCKSUM_OK flag. Since
+-	 * HCK_IPV4_HDRCKSUM_OK and HCK_IPV4_HDRCKSUM use the same
+-	 * value, we end up clearing the client's request to use
+-	 * hardware IP header checksum offload. We check for
+-	 * HW_LOCAL_MAC and an IP header checksum value of zero as an
+-	 * indicator that this packet requires reinstatement of the
+-	 * HCK_IPV4_HDRCKSUM flag. That said, zero is a valid
+-	 * checksum, and given hardware that doesn't support IP header
+-	 * checksum offload, this could result in the checksum being
+-	 * computed twice. This is fine because the checksum value is
+-	 * zero, and thus will retain its value on recalculation.
+-	 */
+-	if (((DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) != 0) &&
+-	    ipha->ipha_hdr_checksum == 0) {
+-		DB_CKSUMFLAGS(mp) |= HCK_IPV4_HDRCKSUM;
+-	}
++	/* Packet is being forwarded. Turning off hwcksum flag. */
++	DB_CKSUMFLAGS(mp) = 0;
+ 
+ 	/*
+ 	 * Martian Address Filtering [RFC 1812, Section 5.3.7]
+@@ -1164,15 +1145,6 @@ ip_forward_xmit_v4(nce_t *nce, ill_t *ill, mblk_t *mp, ipha_t *ipha,
+ 	sum = (int)ipha->ipha_hdr_checksum + IP_HDR_CSUM_TTL_ADJUST;
+ 	ipha->ipha_hdr_checksum = (uint16_t)(sum + (sum >> 16));
+ 
+-	/*
+-	 * Zero the IP header checksum if this is a mac-loopback
+-	 * packet which has requested IP header checksum offload.
+-	 */
+-	if (((DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) != 0) &&
+-	    (DB_CKSUMFLAGS(mp) & HCK_IPV4_HDRCKSUM) != 0) {
+-		ipha->ipha_hdr_checksum = 0;
+-	}
+-
+ 	/* Check if there are options to update */
+ 	if (iraflags & IRAF_IPV4_OPTIONS) {
+ 		ASSERT(ipha->ipha_version_and_hdr_length !=
+@@ -1206,14 +1178,7 @@ ip_forward_xmit_v4(nce_t *nce, ill_t *ill, mblk_t *mp, ipha_t *ipha,
+ 
+ 	ixaflags = IXAF_IS_IPV4 | IXAF_NO_DEV_FLOW_CTL;
+ 
+-	/*
+-	 * If the packet arrived via MAC-loopback, then it might be an
+-	 * LSO packet; in this case the MAC layer will take care to
+-	 * segment it. Otherwise, we have a normal packet that is
+-	 * being forwarded from a source interface with an MTU larger
+-	 * than the desination's; in this case IP must fragment it.
+-	 */
+-	if (pkt_len > mtu && (DB_CKSUMFLAGS(mp) & HW_LSO) == 0) {
++	if (pkt_len > mtu) {
+ 		/*
+ 		 * It needs fragging on its way out.  If we haven't
+ 		 * verified the header checksum yet we do it now since
+@@ -2282,16 +2247,6 @@ ip_input_cksum_v4(iaflags_t iraflags, mblk_t *mp, ipha_t *ipha,
+ 		return (B_TRUE);
+ 	}
+ 
+-	hck_flags = DB_CKSUMFLAGS(mp);
+-
+-	if (hck_flags & HW_LOCAL_MAC) {
+-		/*
+-		 * The packet is from a same-machine sender in which
+-		 * case we assume data integrity.
+-		 */
+-		return (B_TRUE);
+-	}
+-
+ 	/*
+ 	 * Revert to software checksum calculation if the interface
+ 	 * isn't capable of checksum offload.
+@@ -2304,6 +2259,8 @@ ip_input_cksum_v4(iaflags_t iraflags, mblk_t *mp, ipha_t *ipha,
+ 		return (ip_input_sw_cksum_v4(mp, ipha, ira));
+ 	}
+ 
++	hck_flags = DB_CKSUMFLAGS(mp);
++
+ 	/*
+ 	 * We apply this for all ULP protocols. Does the HW know to
+ 	 * not set the flags for SCTP and other protocols.
+diff --git a/usr/src/uts/common/inet/ip_impl.h b/usr/src/uts/common/inet/ip_impl.h
+index fc90e6f217..87086b4c17 100644
+--- a/usr/src/uts/common/inet/ip_impl.h
++++ b/usr/src/uts/common/inet/ip_impl.h
+@@ -21,7 +21,7 @@
+ /*
+  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ #ifndef	_INET_IP_IMPL_H
+@@ -167,10 +167,7 @@ extern "C" {
+  *
+  * o The mblk is not a data message.
+  *
+- * o There is more than one outstanding reference to the mblk and it
+- *   does not originate from a local MAC client. If the mblk does
+- *   originate from a local MAC then allow it to pass through with
+- *   more than one reference and leave the copying up to the consumer.
++ * o There is more than one outstanding reference to the mblk.
+  *
+  * o The IP header is not aligned (we assume alignment in the checksum
+  *   routine).
+@@ -179,7 +176,7 @@ extern "C" {
+  */
+ #define	MBLK_RX_FANOUT_SLOWPATH(mp, ipha)				\
+ 	(DB_TYPE(mp) != M_DATA ||					\
+-	(DB_REF(mp) != 1 && ((DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) == 0)) || \
++	(DB_REF(mp) != 1) ||						\
+ 	!OK_32PTR(ipha) ||						\
+ 	(((uchar_t *)ipha + IP_SIMPLE_HDR_LENGTH) >= (mp)->b_wptr))
+ 
+diff --git a/usr/src/uts/common/io/bridge.c b/usr/src/uts/common/io/bridge.c
+index 276ad238f2..389948e295 100644
+--- a/usr/src/uts/common/io/bridge.c
++++ b/usr/src/uts/common/io/bridge.c
+@@ -1695,8 +1695,7 @@ bridge_learn(bridge_link_t *blp, const uint8_t *saddr, uint16_t ingress_nick,
+  * The passed-in tci is the "impossible" value 0xFFFF when no tag is present.
+  */
+ static mblk_t *
+-reform_vlan_header(mblk_t *mp, uint16_t vlanid, uint16_t tci, uint16_t pvid,
+-    boolean_t keep_flags)
++reform_vlan_header(mblk_t *mp, uint16_t vlanid, uint16_t tci, uint16_t pvid)
+ {
+ 	boolean_t source_has_tag = (tci != 0xFFFF);
+ 	mblk_t *mpcopy;
+@@ -1709,12 +1708,12 @@ reform_vlan_header(mblk_t *mp, uint16_t vlanid, uint16_t tci, uint16_t pvid,
+ 		return (mp);
+ 
+ 	/*
+-	 * A forwarded packet cannot have HW offloads enabled unless
+-	 * the destination is known to be local to the host and HW
+-	 * offloads haven't been emulated.
++	 * A forwarded packet cannot have hardware offloads enabled
++	 * because we don't know if the destination can handle them.
++	 * By this point, any hardware offloads present should have
++	 * been emulated.
+ 	 */
+-	if (!keep_flags)
+-		DB_CKSUMFLAGS(mp) = 0;
++	DB_CKSUMFLAGS(mp) = 0;
+ 
+ 	/* Get the no-modification cases out of the way first */
+ 	if (!source_has_tag && vlanid == pvid)		/* 1a */
+@@ -1916,43 +1915,19 @@ bridge_forward(bridge_link_t *blp, mac_header_info_t *hdr_info, mblk_t *mp,
+ 				mutex_exit(&blp->bl_trilllock);
+ 				update_header(mp, hdr_info, B_FALSE);
+ 
+-				if (is_xmit) {
+-					mac_hw_emul(&mp, NULL, NULL,
+-					    MAC_HWCKSUM_EMUL | MAC_LSO_EMUL);
++				/*
++				 * All trill data frames have
++				 * Inner.VLAN.
++				 */
++				mp = reform_vlan_header(mp, vlanid, tci, 0);
+ 
+-					if (mp == NULL) {
+-						KIINCR(bki_drops);
+-						goto done;
+-					}
++				if (mp == NULL) {
++					KIINCR(bki_drops);
++					goto done;
+ 				}
+ 
+-				while (mp != NULL) {
+-					mblk_t *next = mp->b_next;
+-
+-					mp->b_next = NULL;
+-
+-					/*
+-					 * All trill data frames have
+-					 * Inner.VLAN.
+-					 */
+-					mp = reform_vlan_header(mp, vlanid, tci,
+-					    0, B_FALSE);
+-
+-					if (mp == NULL) {
+-						/*
+-						 * Make sure to free
+-						 * any remaining
+-						 * segments.
+-						 */
+-						freemsgchain(next);
+-						KIINCR(bki_drops);
+-						goto done;
+-					}
+-
+-					trill_encap_fn(tdp, blp, hdr_info, mp,
+-					    bfp->bf_trill_nick);
+-					mp = next;
+-				}
++				trill_encap_fn(tdp, blp, hdr_info, mp,
++				    bfp->bf_trill_nick);
+ 
+ done:
+ 				mutex_enter(&blp->bl_trilllock);
+@@ -1996,48 +1971,15 @@ done:
+ 				mpsend = copymsg(mp);
+ 			}
+ 
+-			/*
+-			 * If the destination is not local to the host
+-			 * then we need to emulate HW offloads because
+-			 * we can't guarantee the forwarding
+-			 * destination provides them.
+-			 */
+-			if (!from_trill && is_xmit &&
+-			    !(bfp->bf_flags & BFF_LOCALADDR)) {
+-				mac_hw_emul(&mpsend, NULL, NULL,
+-				    MAC_HWCKSUM_EMUL | MAC_LSO_EMUL);
++			mpsend = reform_vlan_header(mpsend, vlanid, tci,
++			    blpsend->bl_pvid);
+ 
+-				if (mpsend == NULL) {
+-					KIINCR(bki_drops);
+-					continue;
+-				}
++			if (mpsend == NULL) {
++				KIINCR(bki_drops);
++				continue;
+ 			}
+ 
+-			/*
+-			 * The HW emulation above may have segmented
+-			 * an LSO mblk.
+-			 */
+-			while ((mpsend != NULL) &&
+-			    !(bfp->bf_flags & BFF_LOCALADDR)) {
+-				mblk_t *next = mpsend->b_next;
+-
+-				mpsend->b_next = NULL;
+-				mpsend = reform_vlan_header(mpsend, vlanid, tci,
+-				    blpsend->bl_pvid, B_FALSE);
+-
+-				if (mpsend == NULL) {
+-					KIINCR(bki_drops);
+-					mpsend = next;
+-					continue;
+-				}
+-
+-				KIINCR(bki_forwards);
+-				KLPINCR(blpsend, bkl_xmit);
+-				mpsend = mac_ring_tx(blpsend->bl_mh, NULL,
+-				    mpsend);
+-				freemsg(mpsend);
+-				mpsend = next;
+-			}
++			KIINCR(bki_forwards);
+ 
+ 			/*
+ 			 * No need to bump up the link reference count, as
+@@ -2045,16 +1987,12 @@ done:
+ 			 * the link.
+ 			 */
+ 			if (bfp->bf_flags & BFF_LOCALADDR) {
+-				mpsend = reform_vlan_header(mpsend, vlanid, tci,
+-				    blpsend->bl_pvid, B_TRUE);
+-
+-				if (mpsend == NULL) {
+-					KIINCR(bki_drops);
+-					continue;
+-				}
+-
+-				KIINCR(bki_forwards);
+ 				mac_rx_common(blpsend->bl_mh, NULL, mpsend);
++			} else {
++				KLPINCR(blpsend, bkl_xmit);
++				mpsend = mac_ring_tx(blpsend->bl_mh, NULL,
++				    mpsend);
++				freemsg(mpsend);
+ 			}
+ 		}
+ 
+@@ -2093,7 +2031,7 @@ done:
+ 					 * Inner.VLAN
+ 					 */
+ 					mpsend = reform_vlan_header(mpsend,
+-					    vlanid, tci, 0, B_FALSE);
++					    vlanid, tci, 0);
+ 					if (mpsend == NULL) {
+ 						KIINCR(bki_drops);
+ 					} else {
+@@ -2144,57 +2082,26 @@ done:
+ 				mpsend = copymsg(mp);
+ 			}
+ 
+-			/*
+-			 * In this case, send to all links connected
+-			 * to the bridge. Some of these destinations
+-			 * may not provide HW offload -- so just
+-			 * emulate it here.
+-			 */
+-			if (!from_trill && is_xmit) {
+-				mac_hw_emul(&mpsend, NULL, NULL,
+-				    MAC_HWCKSUM_EMUL | MAC_LSO_EMUL);
++			mpsend = reform_vlan_header(mpsend, vlanid, tci,
++			    blpsend->bl_pvid);
+ 
+-				if (mpsend == NULL) {
+-					KIINCR(bki_drops);
+-					continue;
+-				}
++			if (mpsend == NULL) {
++				KIINCR(bki_drops);
++				continue;
+ 			}
+ 
+-			/*
+-			 * The HW emulation above may have segmented
+-			 * an LSO mblk.
+-			 */
+-			while (mpsend != NULL) {
+-				mblk_t *next = mpsend->b_next;
+-
+-				mpsend->b_next = NULL;
+-				mpsend = reform_vlan_header(mpsend, vlanid, tci,
+-				    blpsend->bl_pvid, B_FALSE);
+-
+-				if (mpsend == NULL) {
+-					KIINCR(bki_drops);
+-					mpsend = next;
+-					continue;
+-				}
+-
+-				if (hdr_info->mhi_dsttype ==
+-				    MAC_ADDRTYPE_UNICAST)
+-					KIINCR(bki_unknown);
+-				else
+-					KIINCR(bki_mbcast);
+-
+-				KLPINCR(blpsend, bkl_xmit);
+-				if ((mpcopy = copymsg(mpsend)) != NULL) {
+-					mac_rx_common(blpsend->bl_mh, NULL,
+-					    mpcopy);
+-				}
++			if (hdr_info->mhi_dsttype == MAC_ADDRTYPE_UNICAST)
++				KIINCR(bki_unknown);
++			else
++				KIINCR(bki_mbcast);
+ 
+-				mpsend = mac_ring_tx(blpsend->bl_mh, NULL,
+-				    mpsend);
+-				freemsg(mpsend);
+-				mpsend = next;
++			KLPINCR(blpsend, bkl_xmit);
++			if ((mpcopy = copymsg(mpsend)) != NULL) {
++				mac_rx_common(blpsend->bl_mh, NULL, mpcopy);
+ 			}
+ 
++			mpsend = mac_ring_tx(blpsend->bl_mh, NULL, mpsend);
++			freemsg(mpsend);
+ 			link_unref(blpsend);
+ 		}
+ 	}
+diff --git a/usr/src/uts/common/io/dls/dls_link.c b/usr/src/uts/common/io/dls/dls_link.c
+index bde55d4dfc..eee3569b10 100644
+--- a/usr/src/uts/common/io/dls/dls_link.c
++++ b/usr/src/uts/common/io/dls/dls_link.c
+@@ -21,7 +21,7 @@
+ /*
+  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+  * Use is subject to license terms.
+- * Copyright 2018 Joyent, Inc.
++ * Copyright 2019 Joyent, Inc.
+  */
+ 
+ /*
+@@ -30,7 +30,6 @@
+ 
+ #include	<sys/sysmacros.h>
+ #include	<sys/strsubr.h>
+-#include	<sys/pattr.h>
+ #include	<sys/strsun.h>
+ #include	<sys/vlan.h>
+ #include	<sys/dld_impl.h>
+@@ -163,18 +162,6 @@ i_dls_link_subchain(dls_link_t *dlp, mblk_t *mp, const mac_header_info_t *mhip,
+ 		uint16_t cvid, cpri;
+ 		int err;
+ 
+-		/*
+-		 * If this message is from a same-machine sender, then
+-		 * there may be HW checksum offloads to emulate.
+-		 */
+-		if (DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) {
+-			mblk_t *tmpnext = mp->b_next;
+-
+-			mp->b_next = NULL;
+-			mac_hw_emul(&mp, NULL, NULL, MAC_HWCKSUM_EMUL);
+-			mp->b_next = tmpnext;
+-		}
+-
+ 		DLS_PREPARE_PKT(dlp->dl_mh, mp, &cmhi, err);
+ 		if (err != 0)
+ 			break;
+@@ -368,22 +355,6 @@ i_dls_link_rx(void *arg, mac_resource_handle_t mrh, mblk_t *mp,
+ 	uint16_t			vid;
+ 	int				err, rval;
+ 
+-	/*
+-	 * The mac_hw_emul() function, by design, doesn't predicate on
+-	 * HW_LOCAL_MAC. But since we are in Rx context we know that
+-	 * any LSO packet must also be from a same-machine sender. We
+-	 * take advantage of that and forgoe writing a manual loop to
+-	 * predicate on HW_LOCAL_MAC.
+-	 *
+-	 * But for checksum emulation we need to predicate on
+-	 * HW_LOCAL_MAC to avoid calling mac_hw_emul() on packets that
+-	 * don't need it (thanks to the fact that HCK_IPV4_HDRCKSUM
+-	 * and HCK_IPV4_HDRCKSUM_OK use the same value). Therefore we
+-	 * do the checksum emulation in the second loop and in
+-	 * subchain matching.
+-	 */
+-	mac_hw_emul(&mp, NULL, NULL, MAC_LSO_EMUL);
+-
+ 	/*
+ 	 * Walk the packet chain.
+ 	 */
+@@ -393,18 +364,6 @@ i_dls_link_rx(void *arg, mac_resource_handle_t mrh, mblk_t *mp,
+ 		 */
+ 		accepted = B_FALSE;
+ 
+-		/*
+-		 * If this message is from a same-machine sender, then
+-		 * there may be HW checksum offloads to emulate.
+-		 */
+-		if (DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) {
+-			mblk_t *tmpnext = mp->b_next;
+-
+-			mp->b_next = NULL;
+-			mac_hw_emul(&mp, NULL, NULL, MAC_HWCKSUM_EMUL);
+-			mp->b_next = tmpnext;
+-		}
+-
+ 		DLS_PREPARE_PKT(dlp->dl_mh, mp, &mhi, err);
+ 		if (err != 0) {
+ 			atomic_inc_32(&(dlp->dl_unknowns));
+diff --git a/usr/src/uts/common/io/mac/mac.c b/usr/src/uts/common/io/mac/mac.c
+index f2a18c98f2..467e61da4d 100644
+--- a/usr/src/uts/common/io/mac/mac.c
++++ b/usr/src/uts/common/io/mac/mac.c
+@@ -4738,6 +4738,32 @@ mac_bridge_tx(mac_impl_t *mip, mac_ring_handle_t rh, mblk_t *mp)
+ 	if (mh == NULL) {
+ 		mp = mac_ring_tx((mac_handle_t)mip, rh, mp);
+ 	} else {
++		/*
++		 * The bridge may place this mblk on a provider's Tx
++		 * path, a mac's Rx path, or both. Since we don't have
++		 * enough information at this point, we can't be sure
++		 * that the desination(s) are capable of handling the
++		 * hardware offloads requested by the mblk. We emulate
++		 * them here as it is the safest choice. In the
++		 * future, if bridge performance becomes a priority,
++		 * we can elide the emulation here and leave the
++		 * choice up to bridge.
++		 *
++		 * We don't clear the DB_CKSUMFLAGS here because
++		 * HCK_IPV4_HDRCKSUM (Tx) and HCK_IPV4_HDRCKSUM_OK
++		 * (Rx) still have the same value. If the bridge
++		 * receives a packet from a HCKSUM_IPHDRCKSUM NIC then
++		 * the mac(s) it is forwarded on may calculate the
++		 * checksum again, but incorrectly (because the
++		 * checksum field is not zero). Until the
++		 * HCK_IPV4_HDRCKSUM/HCK_IPV4_HDRCKSUM_OK issue is
++		 * resovled, we leave the flag clearing in bridge
++		 * itself.
++		 */
++		if ((DB_CKSUMFLAGS(mp) & (HCK_TX_FLAGS | HW_LSO_FLAGS)) != 0) {
++			mac_hw_emul(&mp, NULL, NULL, MAC_ALL_EMULS);
++		}
++
+ 		mp = mac_bridge_tx_cb(mh, rh, mp);
+ 		mac_bridge_ref_cb(mh, B_FALSE);
+ 	}
+@@ -8832,7 +8858,7 @@ mac_provider_tx(mac_impl_t *mip, mac_ring_handle_t rh, mblk_t *mp,
+ 		rh = mip->mi_default_tx_ring;
+ 
+ 	if (mip->mi_promisc_list != NULL)
+-		mac_promisc_dispatch(mip, mp, mcip);
++		mac_promisc_dispatch(mip, mp, mcip, B_FALSE);
+ 
+ 	if (mip->mi_bridge_link == NULL)
+ 		return (mac_ring_tx((mac_handle_t)mip, rh, mp));
+diff --git a/usr/src/uts/common/io/mac/mac_client.c b/usr/src/uts/common/io/mac/mac_client.c
+index 5c60bc9563..e26a028243 100644
+--- a/usr/src/uts/common/io/mac/mac_client.c
++++ b/usr/src/uts/common/io/mac/mac_client.c
+@@ -3619,12 +3619,6 @@ mac_tx(mac_client_handle_t mch, mblk_t *mp_chain, uintptr_t hint,
+ 		obytes = (mp_chain->b_cont == NULL ? MBLKL(mp_chain) :
+ 		    msgdsize(mp_chain));
+ 
+-		/*
+-		 * There's a chance this primary client might be part
+-		 * of a bridge and the packet forwarded to a local
+-		 * receiver -- mark the packet accordingly.
+-		 */
+-		DB_CKSUMFLAGS(mp_chain) |= HW_LOCAL_MAC;
+ 		mp_chain = mac_provider_tx(mip, srs_tx->st_arg2, mp_chain,
+ 		    mcip);
+ 
+@@ -4109,10 +4103,9 @@ mac_client_get_effective_resources(mac_client_handle_t mch,
+  */
+ static void
+ mac_promisc_dispatch_one(mac_promisc_impl_t *mpip, mblk_t *mp,
+-    boolean_t loopback)
++    boolean_t loopback, boolean_t local)
+ {
+ 	mblk_t *mp_next;
+-	boolean_t local = (DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) != 0;
+ 
+ 	if (!mpip->mpi_no_copy || mpip->mpi_strip_vlan_tag ||
+ 	    (mpip->mpi_do_fixups && local)) {
+@@ -4205,7 +4198,7 @@ mac_is_mcast(mac_impl_t *mip, mblk_t *mp)
+  */
+ void
+ mac_promisc_dispatch(mac_impl_t *mip, mblk_t *mp_chain,
+-    mac_client_impl_t *sender)
++    mac_client_impl_t *sender, boolean_t local)
+ {
+ 	mac_promisc_impl_t *mpip;
+ 	mac_cb_t *mcb;
+@@ -4246,7 +4239,8 @@ mac_promisc_dispatch(mac_impl_t *mip, mblk_t *mp_chain,
+ 			if (is_sender ||
+ 			    mpip->mpi_type == MAC_CLIENT_PROMISC_ALL ||
+ 			    is_mcast) {
+-				mac_promisc_dispatch_one(mpip, mp, is_sender);
++				mac_promisc_dispatch_one(mpip, mp, is_sender,
++					local);
+ 			}
+ 		}
+ 	}
+@@ -4276,7 +4270,8 @@ mac_promisc_client_dispatch(mac_client_impl_t *mcip, mblk_t *mp_chain)
+ 			mpip = (mac_promisc_impl_t *)mcb->mcb_objp;
+ 			if (mpip->mpi_type == MAC_CLIENT_PROMISC_FILTERED &&
+ 			    !is_mcast) {
+-				mac_promisc_dispatch_one(mpip, mp, B_FALSE);
++				mac_promisc_dispatch_one(mpip, mp, B_FALSE,
++					B_FALSE);
+ 			}
+ 		}
+ 	}
+diff --git a/usr/src/uts/common/io/mac/mac_provider.c b/usr/src/uts/common/io/mac/mac_provider.c
+index d99a885bcb..2c4ac0a1af 100644
+--- a/usr/src/uts/common/io/mac/mac_provider.c
++++ b/usr/src/uts/common/io/mac/mac_provider.c
+@@ -723,7 +723,7 @@ mac_trill_snoop(mac_handle_t mh, mblk_t *mp)
+ 	mac_impl_t *mip = (mac_impl_t *)mh;
+ 
+ 	if (mip->mi_promisc_list != NULL)
+-		mac_promisc_dispatch(mip, mp, NULL);
++		mac_promisc_dispatch(mip, mp, NULL, B_FALSE);
+ }
+ 
+ /*
+@@ -743,7 +743,7 @@ mac_rx_common(mac_handle_t mh, mac_resource_handle_t mrh, mblk_t *mp_chain)
+ 	 * this MAC, pass them a copy if appropriate.
+ 	 */
+ 	if (mip->mi_promisc_list != NULL)
+-		mac_promisc_dispatch(mip, mp_chain, NULL);
++		mac_promisc_dispatch(mip, mp_chain, NULL, B_FALSE);
+ 
+ 	if (mr != NULL) {
+ 		/*
+diff --git a/usr/src/uts/common/io/mac/mac_sched.c b/usr/src/uts/common/io/mac/mac_sched.c
+index c4086d6bb6..94ec8add16 100644
+--- a/usr/src/uts/common/io/mac/mac_sched.c
++++ b/usr/src/uts/common/io/mac/mac_sched.c
+@@ -2322,7 +2322,7 @@ check_again:
+ 				if (smcip->mci_mip->mi_promisc_list != NULL) {
+ 					mutex_exit(lock);
+ 					mac_promisc_dispatch(smcip->mci_mip,
+-					    head, NULL);
++					    head, NULL, B_FALSE);
+ 					mutex_enter(lock);
+ 				}
+ 			}
+@@ -4346,14 +4346,6 @@ mac_tx_send(mac_client_handle_t mch, mac_ring_handle_t ring, mblk_t *mp_chain,
+ 			obytes += (mp->b_cont == NULL ? MBLKL(mp) :
+ 			    msgdsize(mp));
+ 
+-			/*
+-			 * Mark all packets as local so that a
+-			 * receiver can determine if a packet arrived
+-			 * from a local source or from the network.
+-			 * This allows some consumers to avoid
+-			 * unecessary work like checksum computation.
+-			 */
+-			DB_CKSUMFLAGS(mp) |= HW_LOCAL_MAC;
+ 			CHECK_VID_AND_ADD_TAG(mp);
+ 			mp = mac_provider_tx(mip, ring, mp, src_mcip);
+ 
+@@ -4394,14 +4386,6 @@ mac_tx_send(mac_client_handle_t mch, mac_ring_handle_t ring, mblk_t *mp_chain,
+ 		obytes += pkt_size;
+ 		CHECK_VID_AND_ADD_TAG(mp);
+ 
+-		/*
+-		 * Mark all packets as local so that a receiver can
+-		 * determine if a packet arrived from a local source
+-		 * or from the network. This allows some consumers to
+-		 * avoid unecessary work like checksum computation.
+-		 */
+-		DB_CKSUMFLAGS(mp) |= HW_LOCAL_MAC;
+-
+ 		/*
+ 		 * Find the destination.
+ 		 */
+@@ -4448,17 +4432,21 @@ mac_tx_send(mac_client_handle_t mch, mac_ring_handle_t ring, mblk_t *mp_chain,
+ 				 * macro.
+ 				 */
+ 				if (mip->mi_promisc_list != NULL) {
+-					mac_promisc_dispatch(mip, mp, src_mcip);
++					mac_promisc_dispatch(mip, mp, src_mcip,
++					    B_TRUE);
+ 				}
+ 
+ 				do_switch = ((src_mcip->mci_state_flags &
+ 				    dst_mcip->mci_state_flags &
+ 				    MCIS_CLIENT_POLL_CAPABLE) != 0);
+ 
+-				(dst_flow_ent->fe_cb_fn)(
+-				    dst_flow_ent->fe_cb_arg1,
+-				    dst_flow_ent->fe_cb_arg2,
+-				    mp, do_switch);
++				mac_hw_emul(&mp, NULL, NULL, MAC_ALL_EMULS);
++				if (mp != NULL) {
++					(dst_flow_ent->fe_cb_fn)(
++						dst_flow_ent->fe_cb_arg1,
++						dst_flow_ent->fe_cb_arg2,
++						mp, do_switch);
++				}
+ 
+ 			}
+ 			FLOW_REFRELE(dst_flow_ent);
+diff --git a/usr/src/uts/common/io/mac/mac_util.c b/usr/src/uts/common/io/mac/mac_util.c
+index 61671a8886..6e33fb7f56 100644
+--- a/usr/src/uts/common/io/mac/mac_util.c
++++ b/usr/src/uts/common/io/mac/mac_util.c
+@@ -384,10 +384,6 @@ mac_sw_cksum(mblk_t *mp, mac_emul_t emul)
+ 
+ 	mac_hcksum_get(mp, &start, &stuff, &end, &value, NULL);
+ 
+-	/*
+-	 * We use DB_CKSUMFLAGS (instead of mac_hcksum_get()) because
+-	 * we don't want to mask-out the HW_LOCAL_MAC flag.
+-	 */
+ 	flags = DB_CKSUMFLAGS(mp);
+ 
+ 	/* Why call this if checksum emulation isn't needed? */
+@@ -1307,14 +1303,17 @@ fail:
+  * nothing for the caller to free. In any event, the caller shouldn't
+  * assume that '*mp_chain' is non-NULL on return.
+  *
+- * This function was written with two main use cases in mind.
++ * This function was written with three main use cases in mind.
++ *
++ * 1. To emulate hardware offloads when traveling mac-loopback (two
++ *    clients on the same mac). This is wired up in mac_tx_send().
+  *
+- * 1. A way for MAC clients to emulate hardware offloads when they
+- *    can't directly handle LSO packets or packets without fully
+- *    calculated checksums.
++ * 2. To provide hardware offloads to the client when the underlying
++ *    provider cannot. This is currently wired up in mac_tx() but we
++ *    still only negotiate offloads when the underlying provider
++ *    supports them.
+  *
+- * 2. A way for MAC to offer hardware offloads when the underlying
+- *    hardware can't or won't.
++ * 3. To emulate real hardware in simnet.
+  */
+ void
+ mac_hw_emul(mblk_t **mp_chain, mblk_t **otail, uint_t *ocount, mac_emul_t emul)
+@@ -1569,10 +1568,10 @@ mac_strip_vlan_tag_chain(mblk_t *mp_chain)
+  */
+ /* ARGSUSED */
+ void
+-mac_rx_def(void *arg, mac_resource_handle_t resource, mblk_t *mp,
++mac_rx_def(void *arg, mac_resource_handle_t resource, mblk_t *mp_chain,
+     boolean_t loopback)
+ {
+-	freemsgchain(mp);
++	freemsgchain(mp_chain);
+ }
+ 
+ /*
+diff --git a/usr/src/uts/common/io/overlay/overlay_mux.c b/usr/src/uts/common/io/overlay/overlay_mux.c
+index 58e9f2665d..0c21bb8689 100644
+--- a/usr/src/uts/common/io/overlay/overlay_mux.c
++++ b/usr/src/uts/common/io/overlay/overlay_mux.c
+@@ -132,11 +132,6 @@ overlay_mux_recv(ksocket_t ks, mblk_t *mpchain, size_t msgsize, int oob,
+ 		 * packets and check the inside-VXLAN IP packets' checksums,
+ 		 * or do LSO with VXLAN), we should clear any HW-accelerated-
+ 		 * performed bits.
+-		 *
+-		 * We do this, even in cases of HW_LOCAL_MAC, because we
+-		 * absolutely have NO context about the inner packet.
+-		 * It could've arrived off an external NIC and been forwarded
+-		 * to the overlay network, which means no context.
+ 		 */
+ 		DB_CKSUMFLAGS(mp) = 0;
+ 
+diff --git a/usr/src/uts/common/sys/mac.h b/usr/src/uts/common/sys/mac.h
+index afe554ba03..1d7ddf9648 100644
+--- a/usr/src/uts/common/sys/mac.h
++++ b/usr/src/uts/common/sys/mac.h
+@@ -651,6 +651,8 @@ typedef enum mac_emul {
+ } mac_emul_t;
+ 
+ #define	MAC_HWCKSUM_EMULS	(MAC_HWCKSUM_EMUL | MAC_IPCKSUM_EMUL)
++#define	MAC_ALL_EMULS		(MAC_HWCKSUM_EMUL | MAC_IPCKSUM_EMUL | \
++				MAC_LSO_EMUL)
+ 
+ /*
+  * Driver interface functions.
+diff --git a/usr/src/uts/common/sys/mac_client_impl.h b/usr/src/uts/common/sys/mac_client_impl.h
+index 21e8620121..21641b884d 100644
+--- a/usr/src/uts/common/sys/mac_client_impl.h
++++ b/usr/src/uts/common/sys/mac_client_impl.h
+@@ -411,7 +411,8 @@ extern	int	mac_tx_percpu_cnt;
+ extern void mac_promisc_client_dispatch(mac_client_impl_t *, mblk_t *);
+ extern void mac_client_init(void);
+ extern void mac_client_fini(void);
+-extern void mac_promisc_dispatch(mac_impl_t *, mblk_t *, mac_client_impl_t *);
++extern void mac_promisc_dispatch(mac_impl_t *, mblk_t *, mac_client_impl_t *,
++    boolean_t);
+ 
+ extern int mac_validate_props(mac_impl_t *, mac_resource_props_t *);
+ 
+diff --git a/usr/src/uts/common/sys/pattr.h b/usr/src/uts/common/sys/pattr.h
+index f04eb7c081..a1fb21ad21 100644
+--- a/usr/src/uts/common/sys/pattr.h
++++ b/usr/src/uts/common/sys/pattr.h
+@@ -108,25 +108,6 @@ typedef struct pattr_hcksum_s {
+ 
+ #define	HW_LSO_FLAGS		HW_LSO	/* All LSO flags, currently only one */
+ 
+-/*
+- * The packet originates from a MAC on the same machine as the
+- * receiving MAC. There are two ways this can happen.
+- *
+- * 1. MAC loopback: When a packet is destined for a MAC client on the
+- *                  same MAC as the sender. This datapath is taken in
+- *                  max_tx_send().
+- *
+- * 2. Bridge Fwd: When a packet is destined for a MAC client on the
+- *                same bridge as the sender. This datapath is taken in
+- *                bridge_forward().
+- *
+- * Presented with this flag, a receiver can then decide whether or not
+- * it needs to emulate some or all of the HW offloads that the NIC
+- * would have performed otherwise -- or whether it should accept the
+- * packet as-is.
+- */
+-#define	HW_LOCAL_MAC		0x100
+-
+ /*
+  * Structure used for zerocopy attribute.
+  */
+diff --git a/usr/src/uts/i86pc/io/viona/viona_rx.c b/usr/src/uts/i86pc/io/viona/viona_rx.c
+index 63beaba662..7e6830b539 100644
+--- a/usr/src/uts/i86pc/io/viona/viona_rx.c
++++ b/usr/src/uts/i86pc/io/viona/viona_rx.c
+@@ -466,50 +466,14 @@ viona_rx_common(viona_vring_t *ring, mblk_t *mp, boolean_t is_loopback)
+ 
+ 	size_t nrx = 0, ndrop = 0;
+ 
+-	/*
+-	 * The mac_hw_emul() function, by design, doesn't predicate on
+-	 * HW_LOCAL_MAC. Since we are in Rx context we know that any
+-	 * LSO packet must also be from a same-machine sender. We take
+-	 * advantage of that and forgoe writing a manual loop to
+-	 * predicate on HW_LOCAL_MAC.
+-	 *
+-	 * For checksum emulation we need to predicate on HW_LOCAL_MAC
+-	 * to avoid calling mac_hw_emul() on packets that don't need
+-	 * it (thanks to the fact that HCK_IPV4_HDRCKSUM and
+-	 * HCK_IPV4_HDRCKSUM_OK use the same value). Therefore, we do
+-	 * the checksum emulation in the second loop.
+-	 */
+-	if (!guest_tso4)
+-		mac_hw_emul(&mp, NULL, NULL, MAC_LSO_EMUL);
+-
+ 	while (mp != NULL) {
+-		mblk_t *next, *pad = NULL;
+-		size_t size;
++		mblk_t *next = mp->b_next;
++		mblk_t *pad = NULL;
++		size_t size = msgsize(mp);
+ 		int err = 0;
+ 
+-		next = mp->b_next;
+ 		mp->b_next = NULL;
+ 
+-		if (DB_CKSUMFLAGS(mp) & HW_LOCAL_MAC) {
+-			/*
+-			 * The VIRTIO_NET_HDR_F_DATA_VALID flag only
+-			 * covers the ULP checksum -- so we still have
+-			 * to populate the IP header checksum.
+-			 */
+-			if (guest_csum) {
+-				mac_hw_emul(&mp, NULL, NULL, MAC_IPCKSUM_EMUL);
+-			} else {
+-				mac_hw_emul(&mp, NULL, NULL, MAC_HWCKSUM_EMUL);
+-			}
+-
+-			if (mp == NULL) {
+-				mp = next;
+-				continue;
+-			}
+-		}
+-
+-		size = msgsize(mp);
+-
+ 		/*
+ 		 * We treat both a 'drop' response and errors the same here
+ 		 * and put the packet on the drop chain.  As packets may be
+-- 
+2.17.2 (Apple Git-113)
+
