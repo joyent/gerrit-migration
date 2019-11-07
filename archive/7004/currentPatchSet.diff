@@ -1,0 +1,1313 @@
+From 1a8216e92b6ba7c790379c66c0e008696fe652ce Mon Sep 17 00:00:00 2001
+From: Evan Layton <evan.layton@nexenta.com>
+Date: Thu, 22 Mar 2018 12:55:23 -0600
+Subject: [PATCH] NEX-16452 NFS server in a zone state database needs to be per
+ zone Reviewed by: Gordon Ross <gordon.ross@nexenta.com> Reviewed by: Sanjay
+ Nadkarni <sanjay.nadkarni@nexenta.com>
+
+---
+ usr/src/uts/common/fs/nfs/nfs4_db.c    |  64 ++-
+ usr/src/uts/common/fs/nfs/nfs4_srv.c   |  13 +-
+ usr/src/uts/common/fs/nfs/nfs4_state.c | 557 ++++++++++++++-----------
+ usr/src/uts/common/nfs/nfs4.h          |  92 +++-
+ 4 files changed, 456 insertions(+), 270 deletions(-)
+
+diff --git a/usr/src/uts/common/fs/nfs/nfs4_db.c b/usr/src/uts/common/fs/nfs/nfs4_db.c
+index bedefc9e60..03be0c3c15 100644
+--- a/usr/src/uts/common/fs/nfs/nfs4_db.c
++++ b/usr/src/uts/common/fs/nfs/nfs4_db.c
+@@ -254,6 +254,50 @@ rfs4_database_destroy(rfs4_database_t *db)
+ 	kmem_free(db, sizeof (rfs4_database_t));
+ }
+ 
++/*
++ * Used to get the correct kmem_cache database for the state table being
++ * created.
++ * Helper function for rfs4_table_create
++ */
++static kmem_cache_t *
++get_db_mem_cache(char *name)
++{
++	int i;
++
++	for (i = 0; i < RFS4_DB_MEM_CACHE_NUM; i++) {
++		if (strcmp(name, rfs4_db_mem_cache_table[i].r_db_name) == 0)
++			return (rfs4_db_mem_cache_table[i].r_db_mem_cache);
++	}
++	/*
++	 * There is no associated kmem cache for this NFS4 server state
++	 * table name
++	 */
++	return (NULL);
++}
++
++/*
++ * Used to initialize the global NFSv4 server state database.
++ * Helper funtion for rfs4_state_g_init and called when module is loaded.
++ */
++kmem_cache_t *
++/* CSTYLED */
++nfs4_init_mem_cache(char *cache_name, uint32_t idxcnt, uint32_t size, uint32_t idx)
++{
++	kmem_cache_t *mem_cache = kmem_cache_create(cache_name,
++	    sizeof (rfs4_dbe_t) + idxcnt * sizeof (rfs4_link_t) + size,
++	    0,
++	    rfs4_dbe_kmem_constructor,
++	    rfs4_dbe_kmem_destructor,
++	    NULL,
++	    NULL,
++	    NULL,
++	    0);
++	(void) strlcpy(rfs4_db_mem_cache_table[idx].r_db_name, cache_name,
++	    strlen(cache_name) + 1);
++	rfs4_db_mem_cache_table[idx].r_db_mem_cache = mem_cache;
++	return (mem_cache);
++}
++
+ rfs4_table_t *
+ rfs4_table_create(rfs4_database_t *db, char *tabname, time_t max_cache_time,
+     uint32_t idxcnt, bool_t (*create)(rfs4_entry_t, void *),
+@@ -309,15 +353,11 @@ rfs4_table_create(rfs4_database_t *db, char *tabname, time_t max_cache_time,
+ 	table->dbt_destroy = destroy;
+ 	table->dbt_expiry = expiry;
+ 
+-	table->dbt_mem_cache = kmem_cache_create(cache_name,
+-	    sizeof (rfs4_dbe_t) + idxcnt * sizeof (rfs4_link_t) + size,
+-	    0,
+-	    rfs4_dbe_kmem_constructor,
+-	    rfs4_dbe_kmem_destructor,
+-	    NULL,
+-	    table,
+-	    NULL,
+-	    0);
++	/*
++	 * get the correct kmem_cache for this table type based on the name.
++	 */
++	table->dbt_mem_cache = get_db_mem_cache(cache_name);
++
+ 	kmem_free(cache_name, len+13);
+ 
+ 	table->dbt_debug = db->db_debug_flags;
+@@ -369,7 +409,7 @@ rfs4_table_destroy(rfs4_database_t *db, rfs4_table_t *table)
+ 	kmem_free(table->dbt_name, strlen(table->dbt_name) + 1);
+ 	if (table->dbt_id_space)
+ 		id_space_destroy(table->dbt_id_space);
+-	kmem_cache_destroy(table->dbt_mem_cache);
++	table->dbt_mem_cache = NULL;
+ 	kmem_free(table, sizeof (rfs4_table_t));
+ }
+ 
+@@ -688,12 +728,14 @@ retry:
+ boolean_t
+ rfs4_cpr_callb(void *arg, int code)
+ {
+-	rfs4_table_t *table = rfs4_client_tab;
+ 	rfs4_bucket_t *buckets, *bp;
+ 	rfs4_link_t *l;
+ 	rfs4_client_t *cp;
+ 	int i;
+ 
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
++	rfs4_table_t *table = nsrv4->rfs4_client_tab;
++
+ 	/*
+ 	 * We get called for Suspend and Resume events.
+ 	 * For the suspend case we simply don't care!  Nor do we care if
+diff --git a/usr/src/uts/common/fs/nfs/nfs4_srv.c b/usr/src/uts/common/fs/nfs/nfs4_srv.c
+index d4964ccb09..c44fb3a395 100644
+--- a/usr/src/uts/common/fs/nfs/nfs4_srv.c
++++ b/usr/src/uts/common/fs/nfs/nfs4_srv.c
+@@ -537,11 +537,14 @@ rfs4_zone_init(zoneid_t zoneid)
+ 		verf.tv_sec = (time_t)tverf.tv_sec;
+ 		verf.tv_nsec = tverf.tv_nsec;
+ 	}
++	nsrv4->write4verf = *(uint64_t *)&verf;
+ 
++	/* Used to manage create/destroy of server state */
++	nsrv4->nfs4_server_state = NULL;
+ 	nsrv4->nfs4_cur_servinst = NULL;
+ 	nsrv4->nfs4_deleg_policy = SRV_NEVER_DELEGATE;
+-	nsrv4->write4verf = *(uint64_t *)&verf;
+ 	mutex_init(&nsrv4->deleg_lock, NULL, MUTEX_DEFAULT, NULL);
++	mutex_init(&nsrv4->state_lock, NULL, MUTEX_DEFAULT, NULL);
+ 	mutex_init(&nsrv4->servinst_lock, NULL, MUTEX_DEFAULT, NULL);
+ 	rw_init(&nsrv4->deleg_policy_lock, NULL, RW_DEFAULT, NULL);
+ 
+@@ -555,6 +558,7 @@ rfs4_zone_fini(zoneid_t zoneid, void *data)
+ 	nfs4_srv_t *nsrv4 = data;
+ 
+ 	mutex_destroy(&nsrv4->deleg_lock);
++	mutex_destroy(&nsrv4->state_lock);
+ 	mutex_destroy(&nsrv4->servinst_lock);
+ 	rw_destroy(&nsrv4->deleg_policy_lock);
+ 
+@@ -570,8 +574,6 @@ rfs4_srvrinit(void)
+ 
+ 	rfs4_attr_init();
+ 
+-	/* Used to manage create/destroy of server state */
+-	mutex_init(&rfs4_state_lock, NULL, MUTEX_DEFAULT, NULL);
+ 
+ 	if (fem_create("deleg_rdops", nfs4_rd_deleg_tmpl, &deleg_rdops) != 0) {
+ 		rfs4_disable_delegation();
+@@ -597,8 +599,6 @@ rfs4_srvrfini(void)
+ 
+ 	rfs4_state_g_fini();
+ 
+-	mutex_destroy(&rfs4_state_lock);
+-
+ 	fem_free(deleg_rdops);
+ 	fem_free(deleg_wrops);
+ 
+@@ -627,7 +627,6 @@ rfs4_do_server_start(int server_upordown,
+ 	} else {
+ 		/* Cold start */
+ 		nsrv4->rfs4_start_time = 0;
+-		nsrv4->cpr_id = 0;
+ 		rfs4_state_zone_init(nsrv4);
+ 		nsrv4->nfs4_drc = rfs4_init_drc(nfs4_drc_max,
+ 		    nfs4_drc_hash);
+@@ -805,6 +804,7 @@ rfs4_servinst_create(nfs4_srv_t *nsrv4, int start_grace,
+ 	    sizeof (rfs4_dss_path_t *), KM_SLEEP);
+ 
+ 	for (i = 0; i < dss_npaths; i++) {
++		/* CSTYLED */
+ 		sip->dss_paths[i] = rfs4_dss_newpath(nsrv4, sip, dss_paths[i], i);
+ 	}
+ 
+@@ -10020,6 +10020,7 @@ hanfsv4_failover(nfs4_srv_t *nsrv4)
+ 
+ 		/* create a new server instance, and start its grace period */
+ 		start_grace = 1;
++		/* CSTYLED */
+ 		rfs4_servinst_create(nsrv4, start_grace, numadded_paths, added_paths);
+ 
+ 		/* read in the stable storage state from these paths */
+diff --git a/usr/src/uts/common/fs/nfs/nfs4_state.c b/usr/src/uts/common/fs/nfs/nfs4_state.c
+index 1d7f477685..000081631d 100644
+--- a/usr/src/uts/common/fs/nfs/nfs4_state.c
++++ b/usr/src/uts/common/fs/nfs/nfs4_state.c
+@@ -75,6 +75,7 @@ int rfs4_debug;
+ 
+ static uint32_t rfs4_database_debug = 0x00;
+ 
++/* CSTYLED */
+ static void rfs4_ss_clid_write(nfs4_srv_t *nsrv4, rfs4_client_t *cp, char *leaf);
+ static void rfs4_ss_clid_write_one(rfs4_client_t *cp, char *dir, char *leaf);
+ static void rfs4_dss_clear_oldstate(rfs4_servinst_t *sip);
+@@ -136,6 +137,11 @@ deep_lock_copy(LOCK4res *dres, LOCK4res *sres)
+ 	}
+ }
+ 
++/*
++ * CPR callback id -- not related to v4 callbacks
++ */
++static callb_id_t cpr_id = 0;
++
+ static void
+ deep_lock_free(LOCK4res *res)
+ {
+@@ -271,41 +277,6 @@ rfs4_copy_reply(nfs_resop4 *dst, nfs_resop4 *src)
+ 
+ #define	ADDRHASH(key) ((unsigned long)(key) >> 3)
+ 
+-/* Used to serialize create/destroy of rfs4_server_state database */
+-kmutex_t        rfs4_state_lock;
+-static rfs4_database_t *rfs4_server_state = NULL;
+-
+-/* Used to serialize lookups of clientids */
+-static	krwlock_t	rfs4_findclient_lock;
+-
+-/*
+- * For now this "table" is exposed so that the CPR callback
+- * function can tromp through it..
+- */
+-rfs4_table_t *rfs4_client_tab;
+-
+-static rfs4_index_t *rfs4_clientid_idx;
+-static rfs4_index_t *rfs4_nfsclnt_idx;
+-static rfs4_table_t *rfs4_clntip_tab;
+-static rfs4_index_t *rfs4_clntip_idx;
+-static rfs4_table_t *rfs4_openowner_tab;
+-static rfs4_index_t *rfs4_openowner_idx;
+-static rfs4_table_t *rfs4_state_tab;
+-static rfs4_index_t *rfs4_state_idx;
+-static rfs4_index_t *rfs4_state_owner_file_idx;
+-static rfs4_index_t *rfs4_state_file_idx;
+-static rfs4_table_t *rfs4_lo_state_tab;
+-static rfs4_index_t *rfs4_lo_state_idx;
+-static rfs4_index_t *rfs4_lo_state_owner_idx;
+-static rfs4_table_t *rfs4_lockowner_tab;
+-static rfs4_index_t *rfs4_lockowner_idx;
+-static rfs4_index_t *rfs4_lockowner_pid_idx;
+-static rfs4_table_t *rfs4_file_tab;
+-static rfs4_index_t *rfs4_file_idx;
+-static rfs4_table_t *rfs4_deleg_state_tab;
+-static rfs4_index_t *rfs4_deleg_idx;
+-static rfs4_index_t *rfs4_deleg_state_idx;
+-
+ #define	MAXTABSZ 1024*1024
+ 
+ /* The values below are rfs4_lease_time units */
+@@ -328,16 +299,25 @@ static rfs4_index_t *rfs4_deleg_state_idx;
+ #define	DELEG_STATE_CACHE_TIME 1
+ #endif
+ 
++/*
++ * NFSv4 server state databases
++ *
++ * Initilized when the module is loaded and used by NFSv4 state tables.
++ * These kmem_cache databases are global, the tables that make use of these
++ * are per zone.
++ */
++kmem_cache_t *rfs4_client_mem_cache;
++kmem_cache_t *rfs4_clntIP_mem_cache;
++kmem_cache_t *rfs4_openown_mem_cache;
++kmem_cache_t *rfs4_openstID_mem_cache;
++kmem_cache_t *rfs4_lockstID_mem_cache;
++kmem_cache_t *rfs4_lockown_mem_cache;
++kmem_cache_t *rfs4_file_mem_cache;
++kmem_cache_t *rfs4_delegstID_mem_cache;
+ 
+-static time_t rfs4_client_cache_time = 0;
+-static time_t rfs4_clntip_cache_time = 0;
+-static time_t rfs4_openowner_cache_time = 0;
+-static time_t rfs4_state_cache_time = 0;
+-static time_t rfs4_lo_state_cache_time = 0;
+-static time_t rfs4_lockowner_cache_time = 0;
+-static time_t rfs4_file_cache_time = 0;
+-static time_t rfs4_deleg_state_cache_time = 0;
+-
++/*
++ * NFSv4 state table functions
++ */
+ static bool_t rfs4_client_create(rfs4_entry_t, void *);
+ static void rfs4_dss_remove_cpleaf(rfs4_client_t *);
+ static void rfs4_dss_remove_leaf(rfs4_servinst_t *, char *, char *);
+@@ -793,7 +773,9 @@ rfs4_dss_readstate(nfs4_srv_t *nsrv4, int npaths, char **paths)
+ 		 *    and move the latter's contents to old state
+ 		 *    directory.
+ 		 */
++		/* CSTYLED */
+ 		rfs4_ss_oldstate(nsrv4->nfs4_cur_servinst->oldstate, oldstate, NULL);
++		/* CSTYLED */
+ 		rfs4_ss_oldstate(nsrv4->nfs4_cur_servinst->oldstate, state, oldstate);
+ 	}
+ 
+@@ -1149,7 +1131,9 @@ rfs4_client_scrub(rfs4_entry_t ent, void *arg)
+ void
+ rfs4_clear_client_state(struct nfs4clrst_args *clr)
+ {
+-	(void) rfs4_dbe_walk(rfs4_client_tab, rfs4_client_scrub, clr);
++	nfs4_srv_t *nsrv4;
++	nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
++	(void) rfs4_dbe_walk(nsrv4->rfs4_client_tab, rfs4_client_scrub, clr);
+ }
+ 
+ /*
+@@ -1159,44 +1143,156 @@ rfs4_clear_client_state(struct nfs4clrst_args *clr)
+ void
+ rfs4_state_g_init()
+ {
++	extern boolean_t rfs4_cpr_callb(void *, int);
++	/*
++	 * Add a CPR callback so that we can update client
++	 * access times to extend the lease after a suspend
++	 * and resume (using the same class as rpcmod/connmgr)
++	 */
++	cpr_id = callb_add(rfs4_cpr_callb, 0, CB_CL_CPR_RPC, "rfs4");
++
++	/*
++	 * NFSv4 server state databases
++	 *
++	 * Initilized when the module is loaded and used by NFSv4 state tables.
++	 * These kmem_cache free pools are used globally, the NFSv4 state
++	 * tables which make use of these kmem_cache free pools are per zone.
++	 *
++	 * initialize the global kmem_cache free pools which will be used by
++	 * the NFSv4 state tables.
++	 */
++	/* CSTYLED */
++	rfs4_client_mem_cache = nfs4_init_mem_cache("Client_entry_cache", 2, sizeof (rfs4_client_t), 0);
++	/* CSTYLED */
++	rfs4_clntIP_mem_cache = nfs4_init_mem_cache("ClntIP_entry_cache", 1, sizeof (rfs4_clntip_t), 1);
++	/* CSTYLED */
++	rfs4_openown_mem_cache = nfs4_init_mem_cache("OpenOwner_entry_cache", 1, sizeof (rfs4_openowner_t), 2);
++	/* CSTYLED */
++	rfs4_openstID_mem_cache = nfs4_init_mem_cache("OpenStateID_entry_cache", 3, sizeof (rfs4_state_t), 3);
++	/* CSTYLED */
++	rfs4_lockstID_mem_cache = nfs4_init_mem_cache("LockStateID_entry_cache", 3, sizeof (rfs4_lo_state_t), 4);
++	/* CSTYLED */
++	rfs4_lockown_mem_cache = nfs4_init_mem_cache("Lockowner_entry_cache", 2, sizeof (rfs4_lockowner_t), 5);
++	/* CSTYLED */
++	rfs4_file_mem_cache = nfs4_init_mem_cache("File_entry_cache", 1, sizeof (rfs4_file_t), 6);
++	/* CSTYLED */
++	rfs4_delegstID_mem_cache = nfs4_init_mem_cache("DelegStateID_entry_cache", 2, sizeof (rfs4_deleg_state_t), 7);
+ 
+-	mutex_enter(&rfs4_state_lock);
++	rfs4_client_clrst = rfs4_clear_client_state;
++}
++
++
++/*
++ * Used at server shutdown to cleanup all of the NFSv4 server's structures
++ * and other state.
++ */
++void
++rfs4_state_g_fini()
++{
++	int i;
++	/*
++	 * Cleanup the CPR callback.
++	 */
++	if (cpr_id)
++		(void) callb_delete(cpr_id);
++
++	rfs4_client_clrst = NULL;
++
++	/* free the NFSv4 state databases */
++	for (i = 0; i < RFS4_DB_MEM_CACHE_NUM; i++) {
++		kmem_cache_destroy(rfs4_db_mem_cache_table[i].r_db_mem_cache);
++		rfs4_db_mem_cache_table[i].r_db_mem_cache = NULL;
++	}
++
++	rfs4_client_mem_cache = NULL;
++	rfs4_clntIP_mem_cache = NULL;
++	rfs4_openown_mem_cache = NULL;
++	rfs4_openstID_mem_cache = NULL;
++	rfs4_lockstID_mem_cache = NULL;
++	rfs4_lockown_mem_cache = NULL;
++	rfs4_file_mem_cache = NULL;
++	rfs4_delegstID_mem_cache = NULL;
++
++	/* DSS: distributed stable storage */
++	nvlist_free(rfs4_dss_oldpaths);
++	nvlist_free(rfs4_dss_paths);
++	rfs4_dss_paths = rfs4_dss_oldpaths = NULL;
++}
++
++/*
++ * Used to initialize the per zone NFSv4 server's state
++ */
++void
++rfs4_state_zone_init(nfs4_srv_t *nsrv4)
++{
++	time_t start_time;
++	int start_grace;
++	char *dss_path = NFS4_DSS_VAR_DIR;
++
++	/* DSS: distributed stable storage: initialise served paths list */
++	nsrv4->dss_pathlist = NULL;
++
++	/*
++	 * Set the boot time.  If the server
++	 * has been restarted quickly and has had the opportunity to
++	 * service clients, then the start_time needs to be bumped
++	 * regardless.  A small window but it exists...
++	 */
++	start_time = gethrestime_sec();
++	if (nsrv4->rfs4_start_time < start_time)
++		nsrv4->rfs4_start_time = start_time;
++	else
++		nsrv4->rfs4_start_time++;
++
++	/*
++	 * Create the first server instance, or a new one if the server has
++	 * been restarted; see above comments on rfs4_start_time. Don't
++	 * start its grace period; that will be done later, to maximise the
++	 * clients' recovery window.
++	 */
++	start_grace = 0;
++	rfs4_servinst_create(nsrv4, start_grace, 1, &dss_path);
++
++	/* reset the "first NFSv4 request" status */
++	nsrv4->seen_first_compound = 0;
++
++	mutex_enter(&nsrv4->state_lock);
+ 
+ 	/*
+ 	 * If the server state database has already been initialized,
+ 	 * skip it
+ 	 */
+-	if (rfs4_server_state != NULL) {
+-		mutex_exit(&rfs4_state_lock);
++	if (nsrv4->nfs4_server_state != NULL) {
++		mutex_exit(&nsrv4->state_lock);
+ 		return;
+ 	}
+ 
+-	rw_init(&rfs4_findclient_lock, NULL, RW_DEFAULT, NULL);
++	rw_init(&nsrv4->rfs4_findclient_lock, NULL, RW_DEFAULT, NULL);
+ 
+ 	/* set the various cache timers for table creation */
+-	if (rfs4_client_cache_time == 0)
+-		rfs4_client_cache_time = CLIENT_CACHE_TIME;
+-	if (rfs4_openowner_cache_time == 0)
+-		rfs4_openowner_cache_time = OPENOWNER_CACHE_TIME;
+-	if (rfs4_state_cache_time == 0)
+-		rfs4_state_cache_time = STATE_CACHE_TIME;
+-	if (rfs4_lo_state_cache_time == 0)
+-		rfs4_lo_state_cache_time = LO_STATE_CACHE_TIME;
+-	if (rfs4_lockowner_cache_time == 0)
+-		rfs4_lockowner_cache_time = LOCKOWNER_CACHE_TIME;
+-	if (rfs4_file_cache_time == 0)
+-		rfs4_file_cache_time = FILE_CACHE_TIME;
+-	if (rfs4_deleg_state_cache_time == 0)
+-		rfs4_deleg_state_cache_time = DELEG_STATE_CACHE_TIME;
++	if (nsrv4->rfs4_client_cache_time == 0)
++		nsrv4->rfs4_client_cache_time = CLIENT_CACHE_TIME;
++	if (nsrv4->rfs4_openowner_cache_time == 0)
++		nsrv4->rfs4_openowner_cache_time = OPENOWNER_CACHE_TIME;
++	if (nsrv4->rfs4_state_cache_time == 0)
++		nsrv4->rfs4_state_cache_time = STATE_CACHE_TIME;
++	if (nsrv4->rfs4_lo_state_cache_time == 0)
++		nsrv4->rfs4_lo_state_cache_time = LO_STATE_CACHE_TIME;
++	if (nsrv4->rfs4_lockowner_cache_time == 0)
++		nsrv4->rfs4_lockowner_cache_time = LOCKOWNER_CACHE_TIME;
++	if (nsrv4->rfs4_file_cache_time == 0)
++		nsrv4->rfs4_file_cache_time = FILE_CACHE_TIME;
++	if (nsrv4->rfs4_deleg_state_cache_time == 0)
++		nsrv4->rfs4_deleg_state_cache_time = DELEG_STATE_CACHE_TIME;
+ 
+ 	/* Create the overall database to hold all server state */
+-	rfs4_server_state = rfs4_database_create(rfs4_database_debug);
++	nsrv4->nfs4_server_state = rfs4_database_create(rfs4_database_debug);
+ 
+ 	/* Now create the individual tables */
+-	rfs4_client_cache_time *= rfs4_lease_time;
+-	rfs4_client_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_client_cache_time *= rfs4_lease_time;
++	nsrv4->rfs4_client_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "Client",
+-	    rfs4_client_cache_time,
++	    nsrv4->rfs4_client_cache_time,
+ 	    2,
+ 	    rfs4_client_create,
+ 	    rfs4_client_destroy,
+@@ -1204,19 +1300,19 @@ rfs4_state_g_init()
+ 	    sizeof (rfs4_client_t),
+ 	    TABSIZE,
+ 	    MAXTABSZ/8, 100);
+-	rfs4_nfsclnt_idx = rfs4_index_create(rfs4_client_tab,
++	nsrv4->rfs4_nfsclnt_idx = rfs4_index_create(nsrv4->rfs4_client_tab,
+ 	    "nfs_client_id4", nfsclnt_hash,
+ 	    nfsclnt_compare, nfsclnt_mkkey,
+ 	    TRUE);
+-	rfs4_clientid_idx = rfs4_index_create(rfs4_client_tab,
++	nsrv4->rfs4_clientid_idx = rfs4_index_create(nsrv4->rfs4_client_tab,
+ 	    "client_id", clientid_hash,
+ 	    clientid_compare, clientid_mkkey,
+ 	    FALSE);
+ 
+-	rfs4_clntip_cache_time = 86400 * 365;	/* about a year */
+-	rfs4_clntip_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_clntip_cache_time = 86400 * 365;	/* about a year */
++	nsrv4->rfs4_clntip_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "ClntIP",
+-	    rfs4_clntip_cache_time,
++	    nsrv4->rfs4_clntip_cache_time,
+ 	    1,
+ 	    rfs4_clntip_create,
+ 	    rfs4_clntip_destroy,
+@@ -1224,15 +1320,15 @@ rfs4_state_g_init()
+ 	    sizeof (rfs4_clntip_t),
+ 	    TABSIZE,
+ 	    MAXTABSZ, 100);
+-	rfs4_clntip_idx = rfs4_index_create(rfs4_clntip_tab,
++	nsrv4->rfs4_clntip_idx = rfs4_index_create(nsrv4->rfs4_clntip_tab,
+ 	    "client_ip", clntip_hash,
+ 	    clntip_compare, clntip_mkkey,
+ 	    TRUE);
+ 
+-	rfs4_openowner_cache_time *= rfs4_lease_time;
+-	rfs4_openowner_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_openowner_cache_time *= rfs4_lease_time;
++	nsrv4->rfs4_openowner_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "OpenOwner",
+-	    rfs4_openowner_cache_time,
++	    nsrv4->rfs4_openowner_cache_time,
+ 	    1,
+ 	    rfs4_openowner_create,
+ 	    rfs4_openowner_destroy,
+@@ -1240,15 +1336,15 @@ rfs4_state_g_init()
+ 	    sizeof (rfs4_openowner_t),
+ 	    TABSIZE,
+ 	    MAXTABSZ, 100);
+-	rfs4_openowner_idx = rfs4_index_create(rfs4_openowner_tab,
++	nsrv4->rfs4_openowner_idx = rfs4_index_create(nsrv4->rfs4_openowner_tab,
+ 	    "open_owner4", openowner_hash,
+ 	    openowner_compare,
+ 	    openowner_mkkey, TRUE);
+ 
+-	rfs4_state_cache_time *= rfs4_lease_time;
+-	rfs4_state_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_state_cache_time *= rfs4_lease_time;
++	nsrv4->rfs4_state_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "OpenStateID",
+-	    rfs4_state_cache_time,
++	    nsrv4->rfs4_state_cache_time,
+ 	    3,
+ 	    rfs4_state_create,
+ 	    rfs4_state_destroy,
+@@ -1257,25 +1353,26 @@ rfs4_state_g_init()
+ 	    TABSIZE,
+ 	    MAXTABSZ, 100);
+ 
+-	rfs4_state_owner_file_idx = rfs4_index_create(rfs4_state_tab,
++	/* CSTYLED */
++	nsrv4->rfs4_state_owner_file_idx = rfs4_index_create(nsrv4->rfs4_state_tab,
+ 	    "Openowner-File",
+ 	    state_owner_file_hash,
+ 	    state_owner_file_compare,
+ 	    state_owner_file_mkkey, TRUE);
+ 
+-	rfs4_state_idx = rfs4_index_create(rfs4_state_tab,
++	nsrv4->rfs4_state_idx = rfs4_index_create(nsrv4->rfs4_state_tab,
+ 	    "State-id", state_hash,
+ 	    state_compare, state_mkkey, FALSE);
+ 
+-	rfs4_state_file_idx = rfs4_index_create(rfs4_state_tab,
++	nsrv4->rfs4_state_file_idx = rfs4_index_create(nsrv4->rfs4_state_tab,
+ 	    "File", state_file_hash,
+ 	    state_file_compare, state_file_mkkey,
+ 	    FALSE);
+ 
+-	rfs4_lo_state_cache_time *= rfs4_lease_time;
+-	rfs4_lo_state_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_lo_state_cache_time *= rfs4_lease_time;
++	nsrv4->rfs4_lo_state_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "LockStateID",
+-	    rfs4_lo_state_cache_time,
++	    nsrv4->rfs4_lo_state_cache_time,
+ 	    2,
+ 	    rfs4_lo_state_create,
+ 	    rfs4_lo_state_destroy,
+@@ -1284,22 +1381,23 @@ rfs4_state_g_init()
+ 	    TABSIZE,
+ 	    MAXTABSZ, 100);
+ 
+-	rfs4_lo_state_owner_idx = rfs4_index_create(rfs4_lo_state_tab,
++	/* CSTYLED */
++	nsrv4->rfs4_lo_state_owner_idx = rfs4_index_create(nsrv4->rfs4_lo_state_tab,
+ 	    "lockownerxstate",
+ 	    lo_state_lo_hash,
+ 	    lo_state_lo_compare,
+ 	    lo_state_lo_mkkey, TRUE);
+ 
+-	rfs4_lo_state_idx = rfs4_index_create(rfs4_lo_state_tab,
++	nsrv4->rfs4_lo_state_idx = rfs4_index_create(nsrv4->rfs4_lo_state_tab,
+ 	    "State-id",
+ 	    lo_state_hash, lo_state_compare,
+ 	    lo_state_mkkey, FALSE);
+ 
+-	rfs4_lockowner_cache_time *= rfs4_lease_time;
++	nsrv4->rfs4_lockowner_cache_time *= rfs4_lease_time;
+ 
+-	rfs4_lockowner_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_lockowner_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "Lockowner",
+-	    rfs4_lockowner_cache_time,
++	    nsrv4->rfs4_lockowner_cache_time,
+ 	    2,
+ 	    rfs4_lockowner_create,
+ 	    rfs4_lockowner_destroy,
+@@ -1308,20 +1406,21 @@ rfs4_state_g_init()
+ 	    TABSIZE,
+ 	    MAXTABSZ, 100);
+ 
+-	rfs4_lockowner_idx = rfs4_index_create(rfs4_lockowner_tab,
++	nsrv4->rfs4_lockowner_idx = rfs4_index_create(nsrv4->rfs4_lockowner_tab,
+ 	    "lock_owner4", lockowner_hash,
+ 	    lockowner_compare,
+ 	    lockowner_mkkey, TRUE);
+ 
+-	rfs4_lockowner_pid_idx = rfs4_index_create(rfs4_lockowner_tab,
++	/* CSTYLED */
++	nsrv4->rfs4_lockowner_pid_idx = rfs4_index_create(nsrv4->rfs4_lockowner_tab,
+ 	    "pid", pid_hash,
+ 	    pid_compare, pid_mkkey,
+ 	    FALSE);
+ 
+-	rfs4_file_cache_time *= rfs4_lease_time;
+-	rfs4_file_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_file_cache_time *= rfs4_lease_time;
++	nsrv4->rfs4_file_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "File",
+-	    rfs4_file_cache_time,
++	    nsrv4->rfs4_file_cache_time,
+ 	    1,
+ 	    rfs4_file_create,
+ 	    rfs4_file_destroy,
+@@ -1330,14 +1429,15 @@ rfs4_state_g_init()
+ 	    TABSIZE,
+ 	    MAXTABSZ, -1);
+ 
+-	rfs4_file_idx = rfs4_index_create(rfs4_file_tab,
++	nsrv4->rfs4_file_idx = rfs4_index_create(nsrv4->rfs4_file_tab,
+ 	    "Filehandle", file_hash,
+ 	    file_compare, file_mkkey, TRUE);
+ 
+-	rfs4_deleg_state_cache_time *= rfs4_lease_time;
+-	rfs4_deleg_state_tab = rfs4_table_create(rfs4_server_state,
++	nsrv4->rfs4_deleg_state_cache_time *= rfs4_lease_time;
++	/* CSTYLED */
++	nsrv4->rfs4_deleg_state_tab = rfs4_table_create(nsrv4->nfs4_server_state,
+ 	    "DelegStateID",
+-	    rfs4_deleg_state_cache_time,
++	    nsrv4->rfs4_deleg_state_cache_time,
+ 	    2,
+ 	    rfs4_deleg_state_create,
+ 	    rfs4_deleg_state_destroy,
+@@ -1345,113 +1445,20 @@ rfs4_state_g_init()
+ 	    sizeof (rfs4_deleg_state_t),
+ 	    TABSIZE,
+ 	    MAXTABSZ, 100);
+-	rfs4_deleg_idx = rfs4_index_create(rfs4_deleg_state_tab,
++	nsrv4->rfs4_deleg_idx = rfs4_index_create(nsrv4->rfs4_deleg_state_tab,
+ 	    "DelegByFileClient",
+ 	    deleg_hash,
+ 	    deleg_compare,
+ 	    deleg_mkkey, TRUE);
+ 
+-	rfs4_deleg_state_idx = rfs4_index_create(rfs4_deleg_state_tab,
++	/* CSTYLED */
++	nsrv4->rfs4_deleg_state_idx = rfs4_index_create(nsrv4->rfs4_deleg_state_tab,
+ 	    "DelegState",
+ 	    deleg_state_hash,
+ 	    deleg_state_compare,
+ 	    deleg_state_mkkey, FALSE);
+ 
+-	rfs4_client_clrst = rfs4_clear_client_state;
+-
+-	mutex_exit(&rfs4_state_lock);
+-}
+-
+-
+-/*
+- * Used at server shutdown to cleanup all of the NFSv4 server's structures
+- * and other state.
+- */
+-void
+-rfs4_state_g_fini()
+-{
+-	rfs4_database_t *dbp;
+-
+-	mutex_enter(&rfs4_state_lock);
+-
+-	if (rfs4_server_state == NULL) {
+-		mutex_exit(&rfs4_state_lock);
+-		return;
+-	}
+-
+-	rfs4_client_clrst = NULL;
+-
+-	dbp = rfs4_server_state;
+-	rfs4_server_state = NULL;
+-
+-	rw_destroy(&rfs4_findclient_lock);
+-
+-	/* First stop all of the reaper threads in the database */
+-	rfs4_database_shutdown(dbp);
+-	/* Now actually destroy/release the database and its tables */
+-	rfs4_database_destroy(dbp);
+-
+-	/* Reset the cache timers for next time */
+-	rfs4_client_cache_time = 0;
+-	rfs4_openowner_cache_time = 0;
+-	rfs4_state_cache_time = 0;
+-	rfs4_lo_state_cache_time = 0;
+-	rfs4_lockowner_cache_time = 0;
+-	rfs4_file_cache_time = 0;
+-	rfs4_deleg_state_cache_time = 0;
+-
+-	mutex_exit(&rfs4_state_lock);
+-
+-	/* DSS: distributed stable storage */
+-	nvlist_free(rfs4_dss_oldpaths);
+-	nvlist_free(rfs4_dss_paths);
+-	rfs4_dss_paths = rfs4_dss_oldpaths = NULL;
+-}
+-
+-/*
+- * Used to initialize the per zone NFSv4 server's state
+- */
+-void
+-rfs4_state_zone_init(nfs4_srv_t *nsrv4)
+-{
+-	extern boolean_t rfs4_cpr_callb(void *, int);
+-	time_t start_time;
+-	int start_grace;
+-	char *dss_path = NFS4_DSS_VAR_DIR;
+-
+-	/* DSS: distributed stable storage: initialise served paths list */
+-	nsrv4->dss_pathlist = NULL;
+-
+-	/*
+-	 * Set the boot time.  If the server
+-	 * has been restarted quickly and has had the opportunity to
+-	 * service clients, then the start_time needs to be bumped
+-	 * regardless.  A small window but it exists...
+-	 */
+-	start_time = gethrestime_sec();
+-	if (nsrv4->rfs4_start_time < start_time)
+-		nsrv4->rfs4_start_time = start_time;
+-	else
+-		nsrv4->rfs4_start_time++;
+-
+-	/*
+-	 * Add a CPR callback so that we can update client
+-	 * access times to extend the lease after a suspend
+-	 * and resume (using the same class as rpcmod/connmgr)
+-	 */
+-	nsrv4->cpr_id = callb_add(rfs4_cpr_callb, 0, CB_CL_CPR_RPC, "rfs4");
+-
+-	/*
+-	 * Create the first server instance, or a new one if the server has
+-	 * been restarted; see above comments on rfs4_start_time. Don't
+-	 * start its grace period; that will be done later, to maximise the
+-	 * clients' recovery window.
+-	 */
+-	start_grace = 0;
+-	rfs4_servinst_create(nsrv4, start_grace, 1, &dss_path);
+-
+-	/* reset the "first NFSv4 request" status */
+-	nsrv4->seen_first_compound = 0;
++	mutex_exit(&nsrv4->state_lock);
+ 
+ 	/*
+ 	 * Init the stable storage.
+@@ -1466,16 +1473,18 @@ rfs4_state_zone_init(nfs4_srv_t *nsrv4)
+ void
+ rfs4_state_zone_fini()
+ {
++	rfs4_database_t *dbp;
+ 	nfs4_srv_t *nsrv4;
+ 	nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	rfs4_set_deleg_policy(nsrv4, SRV_NEVER_DELEGATE);
+ 
+-	/*
+-	 * Cleanup the CPR callback.
+-	 */
+-	if (nsrv4->cpr_id)
+-		(void) callb_delete(nsrv4->cpr_id);
++	if (nsrv4->nfs4_server_state == NULL) {
++		mutex_exit(&nsrv4->state_lock);
++		return;
++	}
++
++	mutex_enter(&nsrv4->state_lock);
+ 
+ 	/* destroy server instances and current instance ptr */
+ 	rfs4_servinst_destroy_all(nsrv4);
+@@ -1483,9 +1492,29 @@ rfs4_state_zone_fini()
+ 	/* reset the "first NFSv4 request" status */
+ 	nsrv4->seen_first_compound = 0;
+ 
++	dbp = nsrv4->nfs4_server_state;
++	nsrv4->nfs4_server_state = NULL;
++
++	rw_destroy(&nsrv4->rfs4_findclient_lock);
++
++	/* First stop all of the reaper threads in the database */
++	rfs4_database_shutdown(dbp);
++	/* Now destroy/release the database tables */
++	rfs4_database_destroy(dbp);
++
++	/* Reset the cache timers for next time */
++	nsrv4->rfs4_client_cache_time = 0;
++	nsrv4->rfs4_openowner_cache_time = 0;
++	nsrv4->rfs4_state_cache_time = 0;
++	nsrv4->rfs4_lo_state_cache_time = 0;
++	nsrv4->rfs4_lockowner_cache_time = 0;
++	nsrv4->rfs4_file_cache_time = 0;
++	nsrv4->rfs4_deleg_state_cache_time = 0;
++
++	mutex_exit(&nsrv4->state_lock);
++
+ 	/* clean up any dangling stable storage structures */
+ 	rfs4_ss_fini(nsrv4);
+-
+ }
+ 
+ typedef union {
+@@ -1779,22 +1808,24 @@ rfs4_client_t *
+ rfs4_findclient(nfs_client_id4 *client, bool_t *create,	rfs4_client_t *oldcp)
+ {
+ 	rfs4_client_t *cp;
++	nfs4_srv_t *nsrv4;
++	nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 
+ 	if (oldcp) {
+-		rw_enter(&rfs4_findclient_lock, RW_WRITER);
++		rw_enter(&nsrv4->rfs4_findclient_lock, RW_WRITER);
+ 		rfs4_dbe_hide(oldcp->rc_dbe);
+ 	} else {
+-		rw_enter(&rfs4_findclient_lock, RW_READER);
++		rw_enter(&nsrv4->rfs4_findclient_lock, RW_READER);
+ 	}
+ 
+-	cp = (rfs4_client_t *)rfs4_dbsearch(rfs4_nfsclnt_idx, client,
++	cp = (rfs4_client_t *)rfs4_dbsearch(nsrv4->rfs4_nfsclnt_idx, client,
+ 	    create, (void *)client, RFS4_DBS_VALID);
+ 
+ 	if (oldcp)
+ 		rfs4_dbe_unhide(oldcp->rc_dbe);
+ 
+-	rw_exit(&rfs4_findclient_lock);
++	rw_exit(&nsrv4->rfs4_findclient_lock);
+ 
+ 	return (cp);
+ }
+@@ -1805,17 +1836,18 @@ rfs4_findclient_by_id(clientid4 clientid, bool_t find_unconfirmed)
+ 	rfs4_client_t *cp;
+ 	bool_t create = FALSE;
+ 	cid *cidp = (cid *)&clientid;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	/* If we're a cluster and the nodeid isn't right, short-circuit */
+ 	if (cluster_bootflags & CLUSTER_BOOTED && foreign_clientid(cidp))
+ 		return (NULL);
+ 
+-	rw_enter(&rfs4_findclient_lock, RW_READER);
++	rw_enter(&nsrv4->rfs4_findclient_lock, RW_READER);
+ 
+-	cp = (rfs4_client_t *)rfs4_dbsearch(rfs4_clientid_idx, &clientid,
++	cp = (rfs4_client_t *)rfs4_dbsearch(nsrv4->rfs4_clientid_idx, &clientid,
+ 	    &create, NULL, RFS4_DBS_VALID);
+ 
+-	rw_exit(&rfs4_findclient_lock);
++	rw_exit(&nsrv4->rfs4_findclient_lock);
+ 
+ 	if (cp && cp->rc_need_confirm && find_unconfirmed == FALSE) {
+ 		rfs4_client_rele(cp);
+@@ -1923,13 +1955,16 @@ rfs4_clntip_t *
+ rfs4_find_clntip(struct sockaddr *addr, bool_t *create)
+ {
+ 	rfs4_clntip_t *cp;
++	nfs4_srv_t *nsrv4;
+ 
+-	rw_enter(&rfs4_findclient_lock, RW_READER);
++	nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
++
++	rw_enter(&nsrv4->rfs4_findclient_lock, RW_READER);
+ 
+-	cp = (rfs4_clntip_t *)rfs4_dbsearch(rfs4_clntip_idx, addr,
++	cp = (rfs4_clntip_t *)rfs4_dbsearch(nsrv4->rfs4_clntip_idx, addr,
+ 	    create, addr, RFS4_DBS_VALID);
+ 
+-	rw_exit(&rfs4_findclient_lock);
++	rw_exit(&nsrv4->rfs4_findclient_lock);
+ 
+ 	return (cp);
+ }
+@@ -1939,19 +1974,20 @@ rfs4_invalidate_clntip(struct sockaddr *addr)
+ {
+ 	rfs4_clntip_t *cp;
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	rw_enter(&rfs4_findclient_lock, RW_READER);
++	rw_enter(&nsrv4->rfs4_findclient_lock, RW_READER);
+ 
+-	cp = (rfs4_clntip_t *)rfs4_dbsearch(rfs4_clntip_idx, addr,
++	cp = (rfs4_clntip_t *)rfs4_dbsearch(nsrv4->rfs4_clntip_idx, addr,
+ 	    &create, NULL, RFS4_DBS_VALID);
+ 	if (cp == NULL) {
+-		rw_exit(&rfs4_findclient_lock);
++		rw_exit(&nsrv4->rfs4_findclient_lock);
+ 		return;
+ 	}
+ 	rfs4_dbe_invalidate(cp->ri_dbe);
+ 	rfs4_dbe_rele(cp->ri_dbe);
+ 
+-	rw_exit(&rfs4_findclient_lock);
++	rw_exit(&nsrv4->rfs4_findclient_lock);
+ }
+ 
+ bool_t
+@@ -2099,14 +2135,15 @@ rfs4_openowner_create(rfs4_entry_t u_entry, void *arg)
+ 	seqid4 seqid = argp->ro_open_seqid;
+ 	rfs4_client_t *cp;
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	rw_enter(&rfs4_findclient_lock, RW_READER);
++	rw_enter(&nsrv4->rfs4_findclient_lock, RW_READER);
+ 
+-	cp = (rfs4_client_t *)rfs4_dbsearch(rfs4_clientid_idx,
++	cp = (rfs4_client_t *)rfs4_dbsearch(nsrv4->rfs4_clientid_idx,
+ 	    &openowner->clientid,
+ 	    &create, NULL, RFS4_DBS_VALID);
+ 
+-	rw_exit(&rfs4_findclient_lock);
++	rw_exit(&nsrv4->rfs4_findclient_lock);
+ 
+ 	if (cp == NULL)
+ 		return (FALSE);
+@@ -2148,10 +2185,12 @@ rfs4_findopenowner(open_owner4 *openowner, bool_t *create, seqid4 seqid)
+ {
+ 	rfs4_openowner_t *oo;
+ 	rfs4_openowner_t arg;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	arg.ro_owner = *openowner;
+ 	arg.ro_open_seqid = seqid;
+-	oo = (rfs4_openowner_t *)rfs4_dbsearch(rfs4_openowner_idx, openowner,
++	/* CSTYLED */
++	oo = (rfs4_openowner_t *)rfs4_dbsearch(nsrv4->rfs4_openowner_idx, openowner,
+ 	    create, &arg, RFS4_DBS_VALID);
+ 
+ 	return (oo);
+@@ -2294,14 +2333,15 @@ rfs4_lockowner_create(rfs4_entry_t u_entry, void *arg)
+ 	lock_owner4 *lockowner = (lock_owner4 *)arg;
+ 	rfs4_client_t *cp;
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	rw_enter(&rfs4_findclient_lock, RW_READER);
++	rw_enter(&nsrv4->rfs4_findclient_lock, RW_READER);
+ 
+-	cp = (rfs4_client_t *)rfs4_dbsearch(rfs4_clientid_idx,
++	cp = (rfs4_client_t *)rfs4_dbsearch(nsrv4->rfs4_clientid_idx,
+ 	    &lockowner->clientid,
+ 	    &create, NULL, RFS4_DBS_VALID);
+ 
+-	rw_exit(&rfs4_findclient_lock);
++	rw_exit(&nsrv4->rfs4_findclient_lock);
+ 
+ 	if (cp == NULL)
+ 		return (FALSE);
+@@ -2322,8 +2362,10 @@ rfs4_lockowner_t *
+ rfs4_findlockowner(lock_owner4 *lockowner, bool_t *create)
+ {
+ 	rfs4_lockowner_t *lo;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	lo = (rfs4_lockowner_t *)rfs4_dbsearch(rfs4_lockowner_idx, lockowner,
++	/* CSTYLED */
++	lo = (rfs4_lockowner_t *)rfs4_dbsearch(nsrv4->rfs4_lockowner_idx, lockowner,
+ 	    create, lockowner, RFS4_DBS_VALID);
+ 
+ 	return (lo);
+@@ -2334,8 +2376,9 @@ rfs4_findlockowner_by_pid(pid_t pid)
+ {
+ 	rfs4_lockowner_t *lo;
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	lo = (rfs4_lockowner_t *)rfs4_dbsearch(rfs4_lockowner_pid_idx,
++	lo = (rfs4_lockowner_t *)rfs4_dbsearch(nsrv4->rfs4_lockowner_pid_idx,
+ 	    (void *)(uintptr_t)pid, &create, NULL, RFS4_DBS_VALID);
+ 
+ 	return (lo);
+@@ -2446,12 +2489,14 @@ rfs4_findfile(vnode_t *vp, nfs_fh4 *fh, bool_t *create)
+ {
+ 	rfs4_file_t *fp;
+ 	rfs4_fcreate_arg arg;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	arg.vp = vp;
+ 	arg.fh = fh;
+ 
+ 	if (*create == TRUE)
+-		fp = (rfs4_file_t *)rfs4_dbsearch(rfs4_file_idx, vp, create,
++		/* CSTYLED */
++		fp = (rfs4_file_t *)rfs4_dbsearch(nsrv4->rfs4_file_idx, vp, create,
+ 		    &arg, RFS4_DBS_VALID);
+ 	else {
+ 		mutex_enter(&vp->v_vsd_lock);
+@@ -2486,6 +2531,7 @@ rfs4_findfile_withlock(vnode_t *vp, nfs_fh4 *fh, bool_t *create)
+ 	rfs4_file_t *fp;
+ 	rfs4_fcreate_arg arg;
+ 	bool_t screate = *create;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	if (screate == FALSE) {
+ 		mutex_enter(&vp->v_vsd_lock);
+@@ -2516,8 +2562,8 @@ retry:
+ 		arg.vp = vp;
+ 		arg.fh = fh;
+ 
+-		fp = (rfs4_file_t *)rfs4_dbsearch(rfs4_file_idx, vp, create,
+-		    &arg, RFS4_DBS_VALID);
++		fp = (rfs4_file_t *)rfs4_dbsearch(nsrv4->rfs4_file_idx, vp,
++		    create, &arg, RFS4_DBS_VALID);
+ 		if (fp != NULL) {
+ 			rw_enter(&fp->rf_file_rwlock, RW_WRITER);
+ 			if (fp->rf_vp == NULL) {
+@@ -2672,8 +2718,9 @@ rfs4_findlo_state(stateid_t *id, bool_t lock_fp)
+ {
+ 	rfs4_lo_state_t *lsp;
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	lsp = (rfs4_lo_state_t *)rfs4_dbsearch(rfs4_lo_state_idx, id,
++	lsp = (rfs4_lo_state_t *)rfs4_dbsearch(nsrv4->rfs4_lo_state_idx, id,
+ 	    &create, NULL, RFS4_DBS_VALID);
+ 	if (lock_fp == TRUE && lsp != NULL)
+ 		rw_enter(&lsp->rls_state->rs_finfo->rf_file_rwlock, RW_READER);
+@@ -2712,12 +2759,13 @@ rfs4_findlo_state_by_owner(rfs4_lockowner_t *lo, rfs4_state_t *sp,
+ {
+ 	rfs4_lo_state_t *lsp;
+ 	rfs4_lo_state_t arg;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	arg.rls_locker = lo;
+ 	arg.rls_state = sp;
+ 
+-	lsp = (rfs4_lo_state_t *)rfs4_dbsearch(rfs4_lo_state_owner_idx, &arg,
+-	    create, &arg, RFS4_DBS_VALID);
++	lsp = (rfs4_lo_state_t *)rfs4_dbsearch(nsrv4->rfs4_lo_state_owner_idx,
++	    &arg, create, &arg, RFS4_DBS_VALID);
+ 
+ 	return (lsp);
+ }
+@@ -2986,11 +3034,12 @@ rfs4_deleg_state_t *
+ rfs4_finddeleg(rfs4_state_t *sp, bool_t *create)
+ {
+ 	rfs4_deleg_state_t ds, *dsp;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	ds.rds_client = sp->rs_owner->ro_client;
+ 	ds.rds_finfo = sp->rs_finfo;
+ 
+-	dsp = (rfs4_deleg_state_t *)rfs4_dbsearch(rfs4_deleg_idx, &ds,
++	dsp = (rfs4_deleg_state_t *)rfs4_dbsearch(nsrv4->rfs4_deleg_idx, &ds,
+ 	    create, &ds, RFS4_DBS_VALID);
+ 
+ 	return (dsp);
+@@ -3001,9 +3050,10 @@ rfs4_finddelegstate(stateid_t *id)
+ {
+ 	rfs4_deleg_state_t *dsp;
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	dsp = (rfs4_deleg_state_t *)rfs4_dbsearch(rfs4_deleg_state_idx, id,
+-	    &create, NULL, RFS4_DBS_VALID);
++	dsp = (rfs4_deleg_state_t *)rfs4_dbsearch(nsrv4->rfs4_deleg_state_idx,
++	    id, &create, NULL, RFS4_DBS_VALID);
+ 
+ 	return (dsp);
+ }
+@@ -3118,16 +3168,17 @@ state_file_mkkey(rfs4_entry_t u_entry)
+ 
+ rfs4_state_t *
+ rfs4_findstate_by_owner_file(rfs4_openowner_t *oo, rfs4_file_t *fp,
+-	bool_t *create)
++    bool_t *create)
+ {
+ 	rfs4_state_t *sp;
+ 	rfs4_state_t key;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+ 	key.rs_owner = oo;
+ 	key.rs_finfo = fp;
+ 
+-	sp = (rfs4_state_t *)rfs4_dbsearch(rfs4_state_owner_file_idx, &key,
+-	    create, &key, RFS4_DBS_VALID);
++	sp = (rfs4_state_t *)rfs4_dbsearch(nsrv4->rfs4_state_owner_file_idx,
++	    &key, create, &key, RFS4_DBS_VALID);
+ 
+ 	return (sp);
+ }
+@@ -3137,8 +3188,9 @@ static rfs4_state_t *
+ rfs4_findstate_by_file(rfs4_file_t *fp)
+ {
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	return ((rfs4_state_t *)rfs4_dbsearch(rfs4_state_file_idx, fp,
++	return ((rfs4_state_t *)rfs4_dbsearch(nsrv4->rfs4_state_file_idx, fp,
+ 	    &create, fp, RFS4_DBS_VALID));
+ }
+ 
+@@ -3189,8 +3241,9 @@ rfs4_findstate(stateid_t *id, rfs4_dbsearch_type_t find_invalid, bool_t lock_fp)
+ {
+ 	rfs4_state_t *sp;
+ 	bool_t create = FALSE;
++	nfs4_srv_t *nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
+ 
+-	sp = (rfs4_state_t *)rfs4_dbsearch(rfs4_state_idx, id,
++	sp = (rfs4_state_t *)rfs4_dbsearch(nsrv4->rfs4_state_idx, id,
+ 	    &create, NULL, find_invalid);
+ 	if (lock_fp == TRUE && sp != NULL)
+ 		rw_enter(&sp->rs_finfo->rf_file_rwlock, RW_READER);
+@@ -3275,7 +3328,8 @@ rfs4_check_clientid(clientid4 *cp, int setclid_confirm)
+ 	 * by the client (via the clientid) and this is NOT a
+ 	 * setclientid_confirm then return EXPIRED.
+ 	 */
+-	if (!setclid_confirm && cidp->impl_id.start_time == nsrv4->rfs4_start_time)
++	if (!setclid_confirm &&
++	    cidp->impl_id.start_time == nsrv4->rfs4_start_time)
+ 		return (NFS4ERR_EXPIRED);
+ 
+ 	return (NFS4ERR_STALE_CLIENTID);
+@@ -4029,17 +4083,22 @@ rfs4_file_walk_callout(rfs4_entry_t u_entry, void *e)
+ void
+ rfs4_clean_state_exi(struct exportinfo *exi)
+ {
+-	mutex_enter(&rfs4_state_lock);
++	nfs4_srv_t *nsrv4;
++
++	nsrv4 = zone_getspecific(rfs4_zone_key, curzone);
++	mutex_enter(&nsrv4->state_lock);
+ 
+-	if (rfs4_server_state == NULL) {
+-		mutex_exit(&rfs4_state_lock);
++	if (nsrv4->nfs4_server_state == NULL) {
++		mutex_exit(&nsrv4->state_lock);
+ 		return;
+ 	}
+ 
+-	rfs4_dbe_walk(rfs4_lo_state_tab, rfs4_lo_state_walk_callout, exi);
+-	rfs4_dbe_walk(rfs4_state_tab, rfs4_state_walk_callout, exi);
+-	rfs4_dbe_walk(rfs4_deleg_state_tab, rfs4_deleg_state_walk_callout, exi);
+-	rfs4_dbe_walk(rfs4_file_tab, rfs4_file_walk_callout, exi);
++	/* CSTYLED */
++	rfs4_dbe_walk(nsrv4->rfs4_lo_state_tab, rfs4_lo_state_walk_callout, exi);
++	rfs4_dbe_walk(nsrv4->rfs4_state_tab, rfs4_state_walk_callout, exi);
++	/* CSTYLED */
++	rfs4_dbe_walk(nsrv4->rfs4_deleg_state_tab, rfs4_deleg_state_walk_callout, exi);
++	rfs4_dbe_walk(nsrv4->rfs4_file_tab, rfs4_file_walk_callout, exi);
+ 
+-	mutex_exit(&rfs4_state_lock);
++	mutex_exit(&nsrv4->state_lock);
+ }
+diff --git a/usr/src/uts/common/nfs/nfs4.h b/usr/src/uts/common/nfs/nfs4.h
+index 0aa9dd41d9..1a9ec7c7a5 100644
+--- a/usr/src/uts/common/nfs/nfs4.h
++++ b/usr/src/uts/common/nfs/nfs4.h
+@@ -120,7 +120,21 @@ typedef struct {		/* opaque entry type for later use */
+ 	rfs4_dbe_t *dbe;
+ } *rfs4_entry_t;
+ 
+-extern rfs4_table_t *rfs4_client_tab;
++/*
++ * NFSv4 server state databases
++ *
++ * Initilized when the module is loaded and used by NFSv4 state tables.
++ * These kmem_cache free pools are used globally, the NFSv4 state tables
++ * which make use of these kmem_cache free pools are per zone.
++ */
++extern kmem_cache_t *rfs4_client_mem_cache;
++extern kmem_cache_t *rfs4_clntIP_mem_cache;
++extern kmem_cache_t *rfs4_openown_mem_cache;
++extern kmem_cache_t *rfs4_openstID_mem_cache;
++extern kmem_cache_t *rfs4_lockstID_mem_cache;
++extern kmem_cache_t *rfs4_lockown_mem_cache;
++extern kmem_cache_t *rfs4_file_mem_cache;
++extern kmem_cache_t *rfs4_delegstID_mem_cache;
+ 
+ /* database, table, index creation entry points */
+ extern rfs4_database_t *rfs4_database_create(uint32_t);
+@@ -129,6 +143,8 @@ extern void		rfs4_database_destroy(rfs4_database_t *);
+ 
+ extern void		rfs4_database_destroy(rfs4_database_t *);
+ 
++extern kmem_cache_t	*nfs4_init_mem_cache(char *, uint32_t, uint32_t,
++				uint32_t);
+ extern rfs4_table_t	*rfs4_table_create(rfs4_database_t *, char *,
+ 				time_t, uint32_t,
+ 				bool_t (*create)(rfs4_entry_t, void *),
+@@ -772,6 +788,9 @@ typedef struct nfs4_srv {
+ 	verifier4	write4verf;
+ 	/* Delegation lock */
+ 	kmutex_t	deleg_lock;
++	/* Used to serialize create/destroy of nfs4_server_state database */
++	kmutex_t	state_lock;
++	rfs4_database_t *nfs4_server_state;
+ 	/* Used to manage access to server instance linked list */
+ 	kmutex_t	servinst_lock;
+ 	rfs4_servinst_t *nfs4_cur_servinst;
+@@ -790,10 +809,76 @@ typedef struct nfs4_srv {
+ 	rfs4_drc_t	*nfs4_drc;
+ 	/* nfsv4 server start time */
+ 	time_t rfs4_start_time;
+-	/* CPR callback id -- not related to v4 callbacks */
+-	callb_id_t cpr_id;
++	/* Used to serialize lookups of clientids */
++	krwlock_t rfs4_findclient_lock;
++
++	/* NFSv4 server state client tables */
++	/* table expiry times */
++	time_t rfs4_client_cache_time;
++	time_t rfs4_openowner_cache_time;
++	time_t rfs4_state_cache_time;
++	time_t rfs4_lo_state_cache_time;
++	time_t rfs4_lockowner_cache_time;
++	time_t rfs4_file_cache_time;
++	time_t rfs4_deleg_state_cache_time;
++	time_t rfs4_clntip_cache_time;
++	/* tables and indexes */
++	/* client table */
++	rfs4_table_t *rfs4_client_tab;
++	rfs4_index_t *rfs4_clientid_idx;
++	rfs4_index_t *rfs4_nfsclnt_idx;
++	/* client IP table */
++	rfs4_table_t *rfs4_clntip_tab;
++	rfs4_index_t *rfs4_clntip_idx;
++	/* Open Owner table */
++	rfs4_table_t *rfs4_openowner_tab;
++	rfs4_index_t *rfs4_openowner_idx;
++	/* Open State ID table */
++	rfs4_table_t *rfs4_state_tab;
++	rfs4_index_t *rfs4_state_idx;
++	rfs4_index_t *rfs4_state_owner_file_idx;
++	rfs4_index_t *rfs4_state_file_idx;
++	/* Lock State ID table */
++	rfs4_table_t *rfs4_lo_state_tab;
++	rfs4_index_t *rfs4_lo_state_idx;
++	rfs4_index_t *rfs4_lo_state_owner_idx;
++	/* Lock owner table */
++	rfs4_table_t *rfs4_lockowner_tab;
++	rfs4_index_t *rfs4_lockowner_idx;
++	rfs4_index_t *rfs4_lockowner_pid_idx;
++	/* File table */
++	rfs4_table_t *rfs4_file_tab;
++	rfs4_index_t *rfs4_file_idx;
++	/* Deleg State table */
++	rfs4_table_t *rfs4_deleg_state_tab;
++	rfs4_index_t *rfs4_deleg_idx;
++	rfs4_index_t *rfs4_deleg_state_idx;
++
++	/* client stable storage */
++	int rfs4_ss_enabled;
+ } nfs4_srv_t;
+ 
++/*
++ * max length of the NFSv4 server database name
++ */
++#define	RFS4_MAX_MEM_CACHE_NAME 48
++
++/*
++ * global NFSv4 server kmem caches
++ * r_db_name - The name of the state database and the table that will use it
++ *             These tables are defined in nfs4_srv_t
++ * r_db_mem_cache - The kmem cache associated with the state database name
++ */
++typedef struct rfs4_db_mem_cache {
++	char		r_db_name[RFS4_MAX_MEM_CACHE_NAME];
++	kmem_cache_t	*r_db_mem_cache;
++} rfs4_db_mem_cache_t;
++
++#define	RFS4_DB_MEM_CACHE_NUM 8
++
++rfs4_db_mem_cache_t rfs4_db_mem_cache_table[RFS4_DB_MEM_CACHE_NUM];
++
++
+ extern srv_deleg_policy_t nfs4_get_deleg_policy();
+ 
+ extern void		rfs4_servinst_create(nfs4_srv_t *, int, int, char **);
+@@ -814,7 +899,6 @@ extern void		rfs4_dss_readstate(nfs4_srv_t *, int, char **);
+  * Various interfaces to manipulate the state structures introduced
+  * above
+  */
+-extern	kmutex_t	rfs4_state_lock;
+ extern	void		rfs4_clean_state_exi(struct exportinfo *exi);
+ extern	void		rfs4_free_reply(nfs_resop4 *);
+ extern	void		rfs4_copy_reply(nfs_resop4 *, nfs_resop4 *);
+-- 
+2.17.2 (Apple Git-113)
+
