@@ -208,6 +208,11 @@ patch set (in which case `cr2pr` will **use the outdated patch set**).
 Please either check with Trent or confirm that the "./archive/$CRNUM/" dir
 has the expected number of "patchSet-N.diff" files.
 
+WARNING: When moving CRs, the ownership of the new PR will be set to the owner
+of the GitHub API Token that `hub` is running with. This has implications if
+you're moving CRs on behalf of other users. See the section
+`How to duplicate a PR` for more details.
+
 To move a CR to a PR:
 
 0. Assumptions/Prerequisites:
@@ -234,6 +239,67 @@ To move a CR to a PR:
 
 See https://gist.github.com/trentm/6188f14cd7487ac288c85080bfa7c3f3 for what
 an example run looks like.
+
+## How to duplicate a PR
+
+As mentioned above, when moving a CR to a PR, the submitter of the PR is
+the user who performed the migration.
+
+If you need to re-assert ownership of a PR (important, because GitHub's
+green `Squash and merge` button will use the PR submitter as the primary
+`Author:` field in the git commit it creates) we have written a tool to do that.
+
+To duplicate a PR:
+
+0. Assumptions/Prerequisites:
+
+    - You have `json` on your PATH (`npm install -g json`)
+    - You have the `hub` tool on your PATH
+      (<https://github.com/github/hub#installation>).
+    - You have push access to the relevant "joyent/NAME" repo.
+
+1. Use one of the following to run `dup-pr`:
+
+    - download and run it:
+
+            curl -ksSL -O https://raw.githubusercontent.com/joyent/gerrit-migration/master/bin/dup-pr
+            chmod +x ./dup-pr
+            ./dup-pr -C <local git repo> PR-NUM1 ... PR-NUMn
+
+    - or, run it from a clone of this repo (warning: this repo is big):
+
+            git clone git@github.com:joyent/gerrit-migration.git
+            ./bin/dup-pr -C <local git repo> PR-NUM1 ... PR-NUMn
+
+The dup-pr script does not make modifications to the repository pointed to
+by the -C argument, but merely uses it to determine the origin to use when
+finding pull requests.
+
+As it clones a local copy of the git repository, it will be more efficient
+when operating on multiple PRs at once.
+
+The default behavior is to close the original PRs having duplicated them, but
+with the `-n` option, the script will **not** close the old PRs.
+
+The default behaviour is to only operate on PRs opened by `joyent-automation`,
+but with the `-f` option, the script will operate on any PR.
+
+`dup-pr` is **not** idempotent: attempting to re-create a duplicate PR when
+one already exists will fail with an error message like:
+
+```
+## Creating the new PR
+Everything up-to-date
+Branch 'new-ia-test-dup-pr' set up to track remote branch 'new-ia-test-dup-pr' from 'origin'.
+Error creating pull request: Unprocessable Entity (HTTP 422)
+A pull request already exists for joyent:new-ia-test-dup-pr.
+```
+
+This is a GitHub limitation. The workaround is to close the existing
+duplicated PR before attempting to run the script again.
+
+See https://gist.github.com/timfoster/178c5ae3b347fd9eac8bd1677219301c
+for what an example run looks like.
 
 
 ## How to update the cr.joyent.us archive
