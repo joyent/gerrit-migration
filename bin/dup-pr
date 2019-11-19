@@ -1,0 +1,273 @@
+#!/bin/bash
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# Copyright 2019 Joyent, Inc.
+#
+
+#
+# Call this script to open a new PR to duplicate one created by
+# 'joyent-automation'. Once pushed, that new PR will have the 'Author:'
+# field set to the user who ran this script, rather than 'Joyent Automation'
+#
+# This will do the following:
+# - Use 'hub api' to get the body, submitter and creation date of a PR
+# - If the PR is owned by 'joyent-automation', get the PR body and collect
+#   comments and review comments made to the PR after its creation
+# - rename the local and remote branches, appending '-dup-pr' to allow us
+#   to create a new PR
+# - Use 'hub api' to create that identical PR using the body, referring to the
+#   original PR
+# - re-assign reviewers to the new PR
+#
+# Prerequisites:
+# - You have "json" and "hub" installed and on your PATH.
+#
+# Limitations:
+# -
+#
+# Usage (prompts for parameters):
+#   bash -c "$(curl -ksSL https://raw.githubusercontent.com/joyent/gerrit-migration/master/bin/dup-pr)"
+#
+# or:
+#   curl -ksSL -O https://raw.githubusercontent.com/joyent/gerrit-migration/master/bin/dup-pr
+#   chmod +x ./dup-pr
+#   ./dup-pr [-C git repo, to lookup 'origin'] PR-NUM ...
+#
+
+if [[ -n "$TRACE" ]]; then
+    export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
+    set -o xtrace
+fi
+set -o errexit
+set -o pipefail
+
+VERSION=1.0.0
+
+
+# ---- support functions
+
+function fatal
+{
+    echo "$0: fatal error: $*"
+    exit 1
+}
+
+function usage
+{
+    echo "Usage: ./dup-pr [-C git repo] [-n] [-f] PR-NUM ..."
+}
+
+# ---- mainline
+
+TOP=$(cd $(dirname $0)/../; pwd)
+
+JSON=$(which json)
+[[ -n "$JSON" ]] || fatal "'json' is not on your PATH"
+HUB=$(which hub)
+[[ -n "$HUB" ]] \
+    || fatal "'hub' is not on your PATH, install it https://hub.github.com/"
+
+while getopts "fhnC:" opt
+do
+    case "$opt" in
+        f)
+            ALLOW_NON_JOYENT_AUTOMATION=true
+            ;;
+        n)
+            KEEP_OLD_PR=true
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        C)
+            REPO=$OPTARG
+            ;;
+        *)
+            usage
+            fatal "unknown option: -$opt"
+            exit 1
+            ;;
+    esac
+done
+shift $(( $OPTIND - 1 ))
+
+prNums=$*
+[[ -n "$prNums" ]] || fatal "missing PR-NUMS argument"
+
+[[ -n "$REPO" ]] || fatal "missing -C REPO argument"
+
+# Version (can help when getting surprised by curl'ing and caching).
+echo "dup-pr version $VERSION"
+
+# Working temp dir.
+wrkDir=/var/tmp/dup-pr-$(date '+%Y%m%dT%H%M%S')
+echo "Temporary working dir: $wrkDir"
+mkdir $wrkDir
+cd $wrkDir
+
+repository=$(git -C $REPO remote get-url origin | sed -e 's/.git$//g')
+is_git=$(echo $repository | grep ^git@ || true)
+is_http=$(echo $repository | grep '^https?://' || true)
+project=""
+if [[ -n "$is_git" ]]; then
+    project=$(echo $repository | awk -F: '{print $2}')
+elif [[ -n "is_http" ]]; then
+    project=$(echo $repository | awk -F/ '{print $4 "/" $5}')
+fi
+
+if [[ -z "$project" ]]; then
+    fatal "unable to determine GitHub 'organization/repo' name for $repository"
+fi
+
+echo $project
+
+# some validation.
+if [[ ${project} != joyent/* ]]; then
+    fatal "'$project' not a joyent/NAME repo: this script doesn't support those"
+fi
+
+repoName=$(basename $project)
+
+# Get a repo clone to work with.
+echo ""
+echo "# Getting a local clone of git@github.com:$project"
+git clone git@github.com:$project $repoName
+cd $repoName
+
+for prNum in $*; do
+    echo ""
+    echo "# Duplicating https://github.com/joyent/$repoName/pull/$prNum"
+    echo ""
+
+    hub pr checkout $prNum
+
+    mkdir dup-pr-$prNum
+    chpr="dup-pr-$prNum"
+
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    new_branch="${current_branch}-dup-pr"
+
+    # Get all of the data from the PR
+    hub api /repos/$project/pulls/$prNum > $chpr/pr.json
+
+    current_url=$(json -f $chpr/pr.json html_url)
+    current_title=$(json -f $chpr/pr.json title)
+    current_submitter=$(json -f $chpr/pr.json user.login)
+    current_state=$(json -f $chpr/pr.json state)
+    current_reviewers=$(json -f $chpr/pr.json requested_reviewers | json -a login)
+
+    # guard against closing non joyent-automation PRs and non-open PRs
+    if [[ "$current_submitter" != "joyent-automation" && -z "$ALLOW_NON_JOYENT_AUTOMATION" ]]; then
+       echo "WARNING: PR $prNum was submitted by $current_submitter not joyent-automation!"
+       echo "skipping $prNum"
+       continue
+    fi
+
+    if [[ "$current_state" != "open" ]]; then
+        echo "WARNING: Can only duplicate open PRs. PR $prNum is in state '$current_state'"
+        echo "skipping $prNum"
+        continue
+    fi
+
+    echo $current_title > $chpr/body.md
+    echo "" >> $chpr/body.md
+    echo "**This PR was migrated from $current_url**" >> $chpr/body.md
+    echo ""  >> $chpr/body.md
+
+    # No need to emit output for PRs with a 'null' body field
+    json -a -c 'this.body' -f $chpr/pr.json body >> $chpr/body.md
+
+    # Deal with comments
+    hub api /repos/$project/issues/$prNum/comments > $chpr/comments.json
+    HAS_COMMENTS=$(json -f $chpr/comments.json -ac 'this')
+    if [[ -n "$HAS_COMMENTS" ]]; then
+        echo "### comments copied from PR $prNum" >> $chpr/body.md
+        for comment_id in $(json -af $chpr/comments.json id); do
+            json -f $chpr/comments.json -ac "this.id === $comment_id" user.login created_at | while read user created ; do
+                echo "**$user commented at $created**" >> $chpr/body.md
+            done
+            json -f $chpr/comments.json -ac "this.id === $comment_id" body >> $chpr/body.md
+            echo "" >> $chpr/body.md
+        done
+    fi
+
+    # copy review comments, a bit less elegantly
+    hub api /repos/$project/pulls/$prNum/reviews > $chpr/reviews.json
+    HAS_REVIEWS=$(json -f $chpr/reviews.json -ac 'this')
+    if [[ -n "$HAS_REVIEWS" ]]; then
+        echo "### reviews from PR $prNum" >> $chpr/body.md
+        json -f $chpr/reviews.json -a user.login submitted_at state body >> $chpr/body.md
+    fi
+
+    # rename the branch, otherwise the GitHub API won't let us submit a new PR
+    echo "# Renaming branch $current_branch to $new_branch"
+    git branch -m "${new_branch}"
+    git push origin -u "${new_branch}"
+
+    # Create the pull request.
+    echo ""
+    echo "# Creating the new PR"
+
+    hub pull-request -F $chpr/body.md -p | tee $chpr/new-pr.txt
+    new_url=$(tail -1 $chpr/new-pr.txt)
+    new_prNum=$(echo $new_url | awk -F/ '{print $NF}')
+
+
+    if [[ -n "$current_reviewers" ]]; then
+        echo "# Re-requesting reviews from $current_reviewers on $new_url"
+        rev_json=""
+        for reviewer in $current_reviewers; do
+            if [[ -z "$rev_json" ]]; then
+                rev_json="[\"$reviewer\""
+            else
+                rev_json="$rev_json,\"$reviewer\""
+            fi
+        done
+        rev_json="$rev_json]"
+        hub api /repos/$project/pulls/$new_prNum/requested_reviewers -X POST --input - <<< "{\"reviewers\": $rev_json}"
+    fi
+
+    echo " Successfully copied $current_url to $new_url"
+    if [[ -z "$KEEP_OLD_PR" ]]; then
+        echo "# Closing old PR $currentPR ..."
+        hub -C $PWD api  /repos/$project/pulls/$prNum -X PATCH --input - <<< '{"state": "closed"}' | json state
+    fi
+    echo ""
+    echo ""
+
+    echo "# To undo the branch rename, and close this *new* PR, run:"
+    echo "#    git -C $PWD branch -m $current_branch"
+    echo "#    git -C $PWD push origin -u $current_branch"
+    echo "#    hub -C $PWD api  /repos/$project/pulls/$new_prNum -X PATCH --input - <<< '{\"state\": \"closed\"}' | json state"
+    echo "#"
+    if [[ -n "$KEEP_OLD_PR" ]]; then
+        echo "# Otherwise, to close the *old* PR, run:"
+        echo "#    hub -C $PWD api  /repos/$project/pulls/$prNum -X PATCH --input - <<< '{\"state\": \"closed\"}' | json state"
+        echo "#"
+    else
+        echo "# To *reopen* the old PR, run:"
+        echo "#    hub -C $PWD api  /repos/$project/pulls/$prNum -X PATCH --input - <<< '{\"state\": \"open\"}' | json state"
+        echo "#"
+    fi
+    NEW_PRS="$NEW_PRS $new_url"
+
+done
+
+if [[ -n "$NEW_PRS" ]]; then
+    echo ""
+    echo ""
+    echo "# The following PRs were created:"
+    for new_pr in $NEW_PRS; do
+        echo "#    $new_pr"
+    done
+    echo ""
+    echo "# The metadata used to create the new PR is available in"
+    echo "#     $PWD"
+    echo "#"
+else
+    echo "# No new PRs were created."
+fi
