@@ -245,9 +245,11 @@ an example run looks like.
 As mentioned above, when moving a CR to a PR, the submitter of the PR is
 the user who performed the migration.
 
-If you need to re-assert ownership of a PR (important, because GitHub's
-green `Squash and merge` button will use the PR submitter as the primary
-`Author:` field in the git commit it creates) we have written a tool to do that.
+If you want to re-assert ownership of a migrated PR (GitHub's green
+`Squash and merge` button will use the PR submitter as the primary `Author:`
+field in the git commit it creates, and as the `joyent-automation` account
+was used to do the migration, that's going to be used as the Author) we have
+written a tool to do that.
 
 To duplicate a PR:
 
